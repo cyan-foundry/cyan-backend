@@ -26,7 +26,6 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::{
     actors::{make_topic_id, ActorHandle, ActorMessage, SystemCommand},
-    bootstrap_node_id,
     models::events::SwiftEvent,
     storage,
 };
@@ -115,6 +114,7 @@ impl DiscoveryActor {
     pub async fn spawn(
         node_id: String,
         discovery_key: String,
+        bootstrap_peers: Vec<PublicKey>,
         gossip: Arc<Gossip>,
         network_tx: UnboundedSender<DiscoveryNetworkCmd>,
         event_tx: UnboundedSender<SwiftEvent>,
@@ -125,14 +125,9 @@ impl DiscoveryActor {
         let topic_str = format!("cyan/discovery/{}", discovery_key);
         let topic_id = make_topic_id(&topic_str)?;
 
-        // Get bootstrap peer
-        let bootstrap_peers: Vec<PublicKey> = match PublicKey::from_str(bootstrap_node_id()) {
-            Ok(pk) => vec![pk],
-            Err(_) => {
-                tracing::warn!("⚠️ Invalid bootstrap node ID, starting without bootstrap");
-                vec![]
-            }
-        };
+        // Bootstrap peers for the discovery topic are chosen by the caller from the
+        // node's DiscoveryPolicy (Bootstrap(id) → [id]; MdnsOnly → []). Production
+        // passes the default bootstrap node id, so behavior is unchanged.
 
         tracing::info!(
             "🔍 [DISCOVERY] Subscribing to topic: {} with {} bootstrap peers",

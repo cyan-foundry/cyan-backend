@@ -21,6 +21,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use iroh::discovery::mdns::MdnsDiscovery;
+use iroh::discovery::static_provider::StaticProvider;
 use iroh::{
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
@@ -41,7 +42,7 @@ use crate::{
     models::{
         commands::NetworkCommand,
         events::{NetworkEvent, SwiftEvent},
-        node_config::{relay_mode_for, NodeConfig},
+        node_config::{relay_mode_for, DiscoveryPolicy, NodeConfig},
     },
     storage,
 };
@@ -185,10 +186,13 @@ pub struct NetworkActor {
     /// Groups currently needing snapshot sync
     groups_needing_snapshot: HashSet<String>,
 
-    /// This node's network config (relay/discovery/discovery_key). `discovery_key`
-    /// is read in `start()`; the rest is retained for per-node discovery wiring.
-    #[allow(dead_code)]
+    /// This node's network config (relay/discovery/discovery_key), read in `start()`
+    /// to pick the discovery key and the discovery-topic bootstrap peers.
     cfg: NodeConfig,
+
+    /// Out-of-band static address provider (see `new`). Retained so it can be cloned
+    /// out via `static_discovery()`; inert unless a caller adds entries.
+    static_discovery: StaticProvider,
 }
 
 impl NetworkActor {
@@ -209,6 +213,12 @@ impl NetworkActor {
         // DM senders map (shared between struct and DM handler)
         let dm_senders = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
+        // A StaticProvider lets callers feed in known peer addresses out of band. It is
+        // INERT in production (no entries ⇒ resolves nothing; mDNS still does the work),
+        // and is the supported way for the in-process test harness to inject loopback
+        // addresses so nodes can dial each other without relying on mDNS multicast.
+        let static_discovery = StaticProvider::new();
+
         // Build endpoint with all ALPNs
         let endpoint = Endpoint::builder()
             .secret_key(secret_key)
@@ -220,6 +230,7 @@ impl NetworkActor {
             ])
             .relay_mode(relay_mode)
             .discovery(MdnsDiscovery::builder())
+            .discovery(static_discovery.clone())
             .bind()
             .await?;
 
@@ -275,7 +286,21 @@ impl NetworkActor {
             topic_network_tx,
             groups_needing_snapshot: HashSet::new(),
             cfg,
+            static_discovery,
         })
+    }
+
+    /// A clone of this actor's endpoint. Test-support seam: the in-process harness uses
+    /// it to read each node's `EndpointAddr` (loopback direct addresses) so peers can be
+    /// wired to each other without mDNS. Cheap (the endpoint is internally reference-counted).
+    pub fn endpoint(&self) -> Endpoint {
+        self.endpoint.clone()
+    }
+
+    /// A clone of this actor's static address provider. Test-support seam: the harness
+    /// calls `add_endpoint_info(addr)` on it to make a peer dialable out of band.
+    pub fn static_discovery(&self) -> StaticProvider {
+        self.static_discovery.clone()
     }
 
     /// Start the network actor - spawns discovery and runs command loop
@@ -285,14 +310,33 @@ impl NetworkActor {
         eprintln!("🚀 [NET] ════════════════════════════════════════════════════════════");
         tracing::info!("🚀 [NET] Starting NetworkActor");
 
-        // Spawn DiscoveryActor (key comes from this node's config)
+        // Spawn DiscoveryActor (key + bootstrap peers come from this node's config).
+        // Production config is DiscoveryPolicy::Bootstrap(bootstrap_node_id()), so the
+        // bootstrap set is the same default peer as before — behavior unchanged. A
+        // per-node bootstrap (or MdnsOnly → no bootstrap) is what lets the in-process
+        // harness seed one node off another instead of an unreachable global default.
         let discovery_key = self.cfg.discovery_key.clone();
+        let disc_bootstrap: Vec<PublicKey> = match &self.cfg.discovery {
+            DiscoveryPolicy::Bootstrap(hex) => match PublicKey::from_str(hex) {
+                Ok(pk) => vec![pk],
+                Err(e) => {
+                    tracing::warn!("⚠️ [NET] Invalid discovery bootstrap id '{}': {}", hex, e);
+                    vec![]
+                }
+            },
+            DiscoveryPolicy::MdnsOnly => vec![],
+        };
 
-        eprintln!("🔍 [NET] Spawning DiscoveryActor with key: {}", discovery_key);
+        eprintln!(
+            "🔍 [NET] Spawning DiscoveryActor with key: {} ({} bootstrap peers)",
+            discovery_key,
+            disc_bootstrap.len()
+        );
 
         match DiscoveryActor::spawn(
             self.node_id.clone(),
             discovery_key,
+            disc_bootstrap,
             self.gossip.clone(),
             self.discovery_tx.clone(),
             self.event_tx.clone(),
