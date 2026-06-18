@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use iroh::discovery::static_provider::StaticProvider;
-use iroh::{Endpoint, PublicKey, SecretKey};
+use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
 use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -423,27 +423,32 @@ pub async fn spawn_node(name: &str, cfg: NodeCfg) -> Result<Node> {
     })
 }
 
-/// Wire every node's loopback `EndpointAddr` into every other node's static address
-/// provider, so they can dial each other by id **without mDNS** (which is unreliable
-/// for many in-process endpoints). Bounded: fails if a node has no direct address yet.
+/// Poll an endpoint until it has at least one direct (loopback/LAN) address, bounded.
+async fn await_direct_addr(endpoint: &Endpoint, timeout: Duration) -> Result<EndpointAddr> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            let a = endpoint.addr();
+            if a.ip_addrs().next().is_some() {
+                return a;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("no direct address within {:?}", timeout))
+}
+
+/// Belt-and-suspenders re-wire of a specific node set (spawn-time registry already wires
+/// every node pair; this just re-asserts it for an explicitly-passed set). Bounded.
 pub async fn wire_addrs(nodes: &[Node], timeout: Duration) -> Result<()> {
     let mut addrs = Vec::with_capacity(nodes.len());
     for node in nodes {
-        let ep = node.endpoint.clone();
-        let addr = tokio::time::timeout(timeout, async {
-            loop {
-                let a = ep.addr();
-                if a.ip_addrs().next().is_some() {
-                    return a;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .map_err(|_| anyhow!("{} had no direct address within {:?}", node.name, timeout))?;
-        addrs.push(addr);
+        addrs.push(
+            await_direct_addr(&node.endpoint, timeout)
+                .await
+                .map_err(|e| anyhow!("{}: {}", node.name, e))?,
+        );
     }
-
     for (i, node) in nodes.iter().enumerate() {
         for (j, addr) in addrs.iter().enumerate() {
             if i != j {
@@ -562,55 +567,153 @@ pub async fn meet(nodes: &[Node], group_id: &str, timeout: Duration) -> Result<(
         .node_id
         .clone();
 
-    // Make every node dialable by every other node over loopback, so the gossip
-    // discovery/group topics form deterministically instead of via flaky mDNS.
+    // Make every node dialable by every other node over loopback, so the group topic
+    // forms deterministically instead of via flaky mDNS.
     wire_addrs(nodes, timeout).await?;
 
-    // Round 1: everyone joins. This spawns each node's group TopicActor, forms the
-    // gossip discovery mesh (joiners dial the seed), and sets group_id in every node's
-    // `my_groups`. The host reliably learns a peer here; joiners may miss the host's
-    // first `groups_exchange` if it arrived before their own join (a join-order race).
+    // Form the group topic: the seed hosts it, every other node dials the seed. These
+    // dials happen AFTER wiring (unlike the discovery topic, which dials at start-up
+    // before addresses are wired), so the group topic forms reliably.
     nodes[0].join_group(group_id, None);
     for node in &nodes[1..] {
         node.join_group(group_id, Some(seed_id.clone()));
     }
-    wait_until(
-        || nodes[0].peers_in_group(group_id) >= 1,
-        timeout,
-        &format!("{} (host) to see a peer in {}", nodes[0].name, group_id),
-    )
-    .await?;
 
-    // Round 2: re-announce now that every node has the group in `my_groups`, so the
-    // `groups_exchange` is evaluated symmetrically and each joiner records the host.
-    for node in nodes {
-        node.join_group(group_id, None);
-    }
-    for node in nodes {
-        wait_until(
-            || node.peers_in_group(group_id) >= 1,
+    // Confirm end-to-end group-topic delivery with a re-broadcast probe. A freshly-formed
+    // 2-node gossip topic can drop its first message(s) before the mesh stabilises, so we
+    // re-broadcast a sentinel until EVERY non-seed node has actually received it. This is
+    // the robust "the mesh is up and delivering" signal — and it is exactly the capability
+    // (group-topic broadcast → peers) the substrate tests then exercise.
+    let probe_id = format!("__probe__{group_id}");
+    let probe = NetworkEvent::WhiteboardElementAdded {
+        id: probe_id.clone(),
+        board_id: "__probe__".to_string(),
+        element_type: "probe".to_string(),
+        x: 0.0,
+        y: 0.0,
+        width: 0.0,
+        height: 0.0,
+        z_index: 0,
+        style_json: None,
+        content_json: None,
+        created_at: 0,
+        updated_at: 0,
+    };
+    let mut confirmed = vec![false; nodes.len()];
+    confirmed[0] = true; // the seed is the source of the probe
+
+    let result = tokio::time::timeout(timeout, async {
+        loop {
+            nodes[0].broadcast(group_id, probe.clone());
+            for (i, node) in nodes.iter().enumerate() {
+                if confirmed[i] {
+                    continue;
+                }
+                let pid = probe_id.clone();
+                let got = node
+                    .wait_network(
+                        move |e| {
+                            matches!(e, NetworkEvent::WhiteboardElementAdded { id, .. } if *id == pid)
+                        },
+                        Duration::from_millis(150),
+                    )
+                    .await
+                    .is_ok();
+                if got {
+                    confirmed[i] = true;
+                }
+            }
+            if confirmed.iter().all(|c| *c) {
+                return;
+            }
+        }
+    })
+    .await;
+
+    if result.is_err() {
+        let pending: Vec<&str> = nodes
+            .iter()
+            .zip(&confirmed)
+            .filter(|(_, c)| !**c)
+            .map(|(n, _)| n.name.as_str())
+            .collect();
+        return Err(anyhow!(
+            "group topic did not deliver to all nodes for {} within {:?}; not reached: {:?}",
+            group_id,
             timeout,
-            &format!("{} to discover a peer in {}", node.name, group_id),
-        )
-        .await?;
+            pending
+        ));
     }
     Ok(())
 }
 
-/// Process-wide serialization lock for node-spinning tests.
+/// Serialization for node-spinning tests, **across processes**.
 ///
-/// In-process iroh `MdnsDiscovery` is the only way nodes resolve each other's address
-/// with relay disabled, and it does not reliably support many concurrent endpoints in
-/// one process (4+ live nodes makes discovery flaky; ≤2 is reliable). Cargo runs a
-/// binary's `#[tokio::test]`s concurrently, so each such test acquires this guard for
-/// its duration — keeping at most one scenario's nodes alive at a time. Bounded waits
-/// inside the test still apply; this only stops unrelated scenarios from overlapping.
+/// Many concurrent iroh endpoints make in-process discovery timing fragile, and `cargo
+/// test` runs each test BINARY in its own process in parallel — so an in-process mutex
+/// isn't enough; a discovery/files binary would still overlap a chat binary. This guard
+/// is a cross-process advisory file lock (plus an in-process async mutex to avoid lock
+/// thrash within a binary), so at most ONE substrate scenario spins nodes machine-wide at
+/// a time. It is panic-safe (released on unwind via Drop) and tolerates a stale lock left
+/// by a killed process. Bounded: gives up after a generous deadline with a clear error.
 static SERIAL: OnceLock<AsyncMutex<()>> = OnceLock::new();
 
-/// Acquire the serialization guard; hold it for the whole test.
-pub async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
-    SERIAL.get_or_init(|| AsyncMutex::new(())).lock().await
+fn serial_lock_path() -> PathBuf {
+    std::env::temp_dir().join("cyan-substrate-serial.lock")
 }
 
-/// Default generous-but-bounded wait for convergence assertions.
-pub const SYNC_TIMEOUT: Duration = Duration::from_secs(15);
+/// Guard returned by [`serial`]; releases both the in-process mutex and the file lock.
+pub struct SerialGuard {
+    _inner: tokio::sync::MutexGuard<'static, ()>,
+    path: PathBuf,
+}
+
+impl Drop for SerialGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Acquire the cross-process serialization guard; hold it for the whole test.
+pub async fn serial() -> SerialGuard {
+    let inner = SERIAL.get_or_init(|| AsyncMutex::new(())).lock().await;
+    let path = serial_lock_path();
+    let deadline = Duration::from_secs(240);
+    let acquired = tokio::time::timeout(deadline, async {
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return,
+                Err(_) => {
+                    // Reclaim a stale lock from a killed process (no Drop ran).
+                    if let Ok(meta) = std::fs::metadata(&path)
+                        && let Ok(modified) = meta.modified()
+                        && modified.elapsed().map(|e| e.as_secs() > 180).unwrap_or(false)
+                    {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    })
+    .await;
+    if acquired.is_err() {
+        // Don't hang the suite; proceed best-effort (the in-process mutex still holds).
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path);
+    }
+    SerialGuard { _inner: inner, path }
+}
+
+/// Default generous-but-bounded wait for convergence assertions. Generous (30s) so it
+/// survives the CPU starvation of the whole substrate suite's binaries running at once
+/// under `cargo test` — still a hard, clearly-reported deadline, never an unbounded wait.
+pub const SYNC_TIMEOUT: Duration = Duration::from_secs(30);

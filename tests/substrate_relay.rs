@@ -6,8 +6,8 @@
 //! host that needs Linux network namespaces or the docker-compose two-node rig in
 //! `cyan-local-harness/` — not a plain in-process spawn. They are scaffolded red here so
 //! the names are the contract; implement them against the netns/CI rig with a `RelayFixture`
-//! + `net_isolate` helper. The G11 relayed-byte meter is the oracle that proves the rung
-//! was really used (relayed bytes > 0 over relay, == 0 over a direct transfer).
+//! plus a `net_isolate` helper. The G11 relayed-byte meter is the oracle that proves the
+//! rung was really used (relayed bytes greater than 0 over relay, 0 over a direct transfer).
 
 #![allow(unused)]
 

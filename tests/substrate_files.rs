@@ -151,7 +151,10 @@ async fn large_file_meets_throughput_floor() {
     let mb = len as f64 / (1024.0 * 1024.0);
     let mbps = mb / elapsed.as_secs_f64();
     eprintln!("📊 direct-QUIC loopback throughput: {mbps:.1} MB/s for {mb:.0} MB");
-    const FLOOR_MBPS: f64 = 5.0;
+    // Regression guard against a collapse to a tiny send window — NOT a benchmark.
+    // Measured ~16 MB/s on loopback; the floor is set well below that with headroom
+    // for the contention of the whole substrate suite running its binaries in parallel.
+    const FLOOR_MBPS: f64 = 3.0;
     assert!(
         mbps >= FLOOR_MBPS,
         "throughput {mbps:.1} MB/s below floor {FLOOR_MBPS} MB/s"
