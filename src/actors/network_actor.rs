@@ -24,7 +24,7 @@ use iroh::discovery::mdns::MdnsDiscovery;
 use iroh::{
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
-    Endpoint, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey,
+    Endpoint, PublicKey, SecretKey,
 };
 use iroh_gossip::net::Gossip;
 use serde::{Deserialize, Serialize};
@@ -41,8 +41,9 @@ use crate::{
     models::{
         commands::NetworkCommand,
         events::{NetworkEvent, SwiftEvent},
+        node_config::{relay_mode_for, NodeConfig},
     },
-    storage, DISCOVERY_KEY, RELAY_URL,
+    storage,
 };
 // ═══════════════════════════════════════════════════════════════════════════
 // ALPN PROTOCOLS
@@ -183,6 +184,11 @@ pub struct NetworkActor {
 
     /// Groups currently needing snapshot sync
     groups_needing_snapshot: HashSet<String>,
+
+    /// This node's network config (relay/discovery/discovery_key). `discovery_key`
+    /// is read in `start()`; the rest is retained for per-node discovery wiring.
+    #[allow(dead_code)]
+    cfg: NodeConfig,
 }
 
 impl NetworkActor {
@@ -190,26 +196,15 @@ impl NetworkActor {
         secret_key: SecretKey,
         event_tx: UnboundedSender<SwiftEvent>,
         peers_per_group: Arc<std::sync::Mutex<HashMap<String, HashSet<PublicKey>>>>,
+        cfg: NodeConfig,
     ) -> Result<Self> {
         let node_id = secret_key.public().to_string();
         tracing::info!("🌐 [NET] Creating NetworkActor for node {}", &node_id[..16]);
 
-        // Configure relay mode
-        let relay_mode = if let Some(url_str) = RELAY_URL.get() {
-            match RelayUrl::from_str(url_str) {
-                Ok(url) => {
-                    tracing::info!("🌐 [NET] Using custom relay: {}", url);
-                    RelayMode::Custom(RelayMap::from(url))
-                }
-                Err(e) => {
-                    tracing::warn!("⚠️ [NET] Invalid relay URL '{}': {}, using default", url_str, e);
-                    RelayMode::Default
-                }
-            }
-        } else {
-            tracing::info!("🌐 [NET] Using default Iroh relays");
-            RelayMode::Default
-        };
+        // Configure relay mode from this node's policy (pure mapping; behavior for
+        // the production `RELAY_URL`-derived config is identical to before).
+        let relay_mode = relay_mode_for(&cfg.relay);
+        tracing::info!("🌐 [NET] Relay policy: {:?}", cfg.relay);
 
         // DM senders map (shared between struct and DM handler)
         let dm_senders = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -279,6 +274,7 @@ impl NetworkActor {
             topic_network_rx,
             topic_network_tx,
             groups_needing_snapshot: HashSet::new(),
+            cfg,
         })
     }
 
@@ -289,11 +285,8 @@ impl NetworkActor {
         eprintln!("🚀 [NET] ════════════════════════════════════════════════════════════");
         tracing::info!("🚀 [NET] Starting NetworkActor");
 
-        // Spawn DiscoveryActor
-        let discovery_key = DISCOVERY_KEY
-            .get()
-            .cloned()
-            .unwrap_or_else(|| "cyan-dev".to_string());
+        // Spawn DiscoveryActor (key comes from this node's config)
+        let discovery_key = self.cfg.discovery_key.clone();
 
         eprintln!("🔍 [NET] Spawning DiscoveryActor with key: {}", discovery_key);
 

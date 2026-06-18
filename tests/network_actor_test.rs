@@ -31,9 +31,11 @@ use tokio::sync::mpsc;
 
 use cyan_backend::{
     actors::NetworkActor,
+    bootstrap_node_id,
     models::{
         commands::NetworkCommand,
         events::SwiftEvent,
+        node_config::{DiscoveryPolicy, NodeConfig, RelayPolicy},
     },
     storage, DISCOVERY_KEY, RELAY_URL,
 };
@@ -240,7 +242,12 @@ async fn run_host() -> Result<()> {
 
     // Create and start NetworkActor
     println!("🚀 Starting NetworkActor...");
-    let actor = NetworkActor::new(secret_key, event_tx, peers_per_group).await?;
+    let node_cfg = NodeConfig {
+        relay: RelayPolicy::Url(RELAY_URL_CONST.to_string()),
+        discovery: DiscoveryPolicy::Bootstrap(bootstrap_node_id().to_string()),
+        discovery_key: DISCOVERY_KEY_CONST.to_string(),
+    };
+    let actor = NetworkActor::new(secret_key, event_tx, peers_per_group, node_cfg).await?;
 
     // Spawn actor in background
     tokio::spawn(async move {
@@ -341,7 +348,12 @@ async fn run_join() -> Result<()> {
     //   2. Load TEST_GROUP_ID from DB → spawn TopicActor
     //   3. DiscoveryActor broadcasts GroupsExchange with our groups
     println!("🚀 Starting NetworkActor...");
-    let actor = NetworkActor::new(secret_key, event_tx, peers_per_group).await?;
+    let node_cfg = NodeConfig {
+        relay: RelayPolicy::Url(RELAY_URL_CONST.to_string()),
+        discovery: DiscoveryPolicy::Bootstrap(bootstrap_node_id().to_string()),
+        discovery_key: DISCOVERY_KEY_CONST.to_string(),
+    };
+    let actor = NetworkActor::new(secret_key, event_tx, peers_per_group, node_cfg).await?;
 
     tokio::spawn(async move {
         actor.start(cmd_rx).await;

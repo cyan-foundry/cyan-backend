@@ -318,7 +318,23 @@ impl CyanSystem {
         });
         eprintln!("🔵 Step 5: CommandActor spawned");
 
-        // Spawn NEW NetworkActor from actors module
+        // Spawn NEW NetworkActor from actors module.
+        // Build its NodeConfig from the existing globals so behavior is unchanged
+        // (this is a seam, not a change): RELAY_URL → relay policy, DISCOVERY_KEY →
+        // key, BOOTSTRAP_NODE_ID → bootstrap discovery.
+        let node_cfg = crate::models::node_config::NodeConfig {
+            relay: match RELAY_URL.get() {
+                Some(url) => crate::models::node_config::RelayPolicy::Url(url.clone()),
+                None => crate::models::node_config::RelayPolicy::Default,
+            },
+            discovery: crate::models::node_config::DiscoveryPolicy::Bootstrap(
+                bootstrap_node_id().to_string(),
+            ),
+            discovery_key: DISCOVERY_KEY
+                .get()
+                .cloned()
+                .unwrap_or_else(|| "cyan-dev".to_string()),
+        };
         let event_tx_for_network = event_tx.clone();
         eprintln!("🚀 Spawning NetworkActor (new architecture)...");
         RUNTIME.get().unwrap().spawn(async move {
@@ -326,6 +342,7 @@ impl CyanSystem {
                 secret_key_clone,
                 event_tx_for_network,
                 peers_per_group_clone,
+                node_cfg,
             ).await {
                 Ok(actor) => {
                     println!("✅ NetworkActor created, starting...");

@@ -37,9 +37,11 @@ use tokio::sync::mpsc;
 
 use cyan_backend::{
     actors::NetworkActor,
+    bootstrap_node_id,
     models::{
         commands::NetworkCommand,
         events::{NetworkEvent, SwiftEvent},
+        node_config::{DiscoveryPolicy, NodeConfig, RelayPolicy},
     },
     storage, DISCOVERY_KEY, RELAY_URL,
 };
@@ -128,7 +130,12 @@ async fn run_host() -> Result<()> {
     let peers_per_group = Arc::new(std::sync::Mutex::new(HashMap::<String, HashSet<PublicKey>>::new()));
 
     // Start actor
-    let actor = NetworkActor::new(secret_key, event_tx, peers_per_group).await?;
+    let node_cfg = NodeConfig {
+        relay: RelayPolicy::Url(RELAY_URL_CONST.to_string()),
+        discovery: DiscoveryPolicy::Bootstrap(bootstrap_node_id().to_string()),
+        discovery_key: DISCOVERY_KEY_CONST.to_string(),
+    };
+    let actor = NetworkActor::new(secret_key, event_tx, peers_per_group, node_cfg).await?;
     tokio::spawn(async move {
         actor.start(cmd_rx).await;
     });
@@ -251,7 +258,12 @@ async fn run_join() -> Result<()> {
     let peers_per_group = Arc::new(std::sync::Mutex::new(HashMap::<String, HashSet<PublicKey>>::new()));
 
     // Start actor
-    let actor = NetworkActor::new(secret_key, event_tx, peers_per_group).await?;
+    let node_cfg = NodeConfig {
+        relay: RelayPolicy::Url(RELAY_URL_CONST.to_string()),
+        discovery: DiscoveryPolicy::Bootstrap(bootstrap_node_id().to_string()),
+        discovery_key: DISCOVERY_KEY_CONST.to_string(),
+    };
+    let actor = NetworkActor::new(secret_key, event_tx, peers_per_group, node_cfg).await?;
     tokio::spawn(async move {
         actor.start(cmd_rx).await;
     });
