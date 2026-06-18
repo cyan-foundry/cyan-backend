@@ -91,3 +91,34 @@ Consequences for the substrate suite:
 - 2026-06-18 13:30 PDT — END. Gate: `cargo build` ✅; `cargo test --test substrate_discovery` ✅
   (2/2, reliable across 5 runs); `cargo test --lib node_config` ✅ (4/4); all targets compile ✅;
   0 new clippy warnings from my diff. GREEN within scope. Committing.
+
+## PHASE 3 — fan out the in-process suite
+
+- 2026-06-18 13:30–14:18 PDT — Built and greened, one file per commit:
+  - `substrate_sync.rs` (G3/G4): 4 delta tests green (board element, notebook cell, workspace
+    structure, three-node convergence) via the receiver's per-node `SwiftEvent::Network` channel.
+    `late_joiner_gets_full_snapshot` (G3) **#[ignore]** — snapshot needs per-node storage (engine
+    DB is a process-global singleton) and the blocking `subscribe_and_join` dead-locks a one-process
+    host-seeds-then-joiner-syncs ordering; belongs to the multi-process rig.
+  - `substrate_chat.rs` (G5/G7): 3 chat tests green (group/workspace/board via `ChatSent`).
+    `chat_with_attachment_shares_file_into_scope` (G7) **#[ignore]** — no `NetworkCommand` carries
+    an attachment (`DmAttachment` is never wired to a command).
+  - `substrate_files.rs` (G6/G8): file share at group/workspace/board scope, 100MB transfer, and a
+    throughput floor — all green, blake3-verified on the received bytes. Measured ~16 MB/s direct-QUIC
+    loopback (floor 3). `large_file_1gb_transfers_intact` **#[ignore]** (CI cost; runs on demand).
+  - `substrate_offline.rs` (G9): discovery+delta, chat-all-levels, file share + multi-MB transfer
+    re-run under `RelayPolicy::Disabled` + `MdnsOnly` — all green; guarded with `assert_offline`.
+- Reliability: root-caused an intrinsic ~25% meeting flake (discovery-topic groups_exchange drop) and
+  fixed it — `meet()` now gates on the group topic via a re-broadcast probe; `serial()` is a
+  cross-process file lock. Each binary 0 failures over 8–15 runs; full `cargo test --no-fail-fast`
+  clean except the pre-existing `diagram_gen` lib failure.
+
+## PHASE 4 — red scaffolds
+
+- 2026-06-18 14:00 PDT — `substrate_relay.rs` (6 tests), `substrate_swarm.rs` (4), `substrate_lens.rs`
+  (1): all `#[ignore]` + `unimplemented!()`, compile clean, stay ignored. Need the netns/docker relay
+  rig (relay), the swarming engine work (swarm), and `CyanLensClient` wiring (lens).
+- Gate: `cargo build` ✅; whole substrate suite green/ignored and reliable; 0 new clippy warnings from
+  my diff. The only red anywhere is the pre-existing, untouched `diagram_gen` lib test.
+
+## FINISH — see STATUS.md for the full per-test ledger and findings.
