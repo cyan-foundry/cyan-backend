@@ -45,7 +45,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex as AsyncMutex;
 
 use cyan_backend::models::commands::NetworkCommand;
-use cyan_backend::models::events::SwiftEvent;
+use cyan_backend::models::events::{NetworkEvent, SwiftEvent};
 use cyan_backend::models::node_config::{
     DiscoveryPolicy as EngineDiscoveryPolicy, NodeConfig as EngineNodeConfig,
     RelayPolicy as EngineRelayPolicy,
@@ -141,6 +141,34 @@ impl Node {
         });
     }
 
+    /// Broadcast a delta/chat `NetworkEvent` into `group_id` (the live-collaboration path).
+    pub fn broadcast(&self, group_id: &str, event: NetworkEvent) {
+        self.cmd(NetworkCommand::Broadcast {
+            group_id: group_id.to_string(),
+            event,
+        });
+    }
+
+    /// Await the first received `SwiftEvent::Network(..)` whose inner event matches `pred`.
+    /// This is the per-node oracle for live deltas/chat: the receiver surfaces every event
+    /// it gets over the mesh on its own event channel (it also persists it, but the engine's
+    /// storage is process-global so the channel — not storage — is the per-node signal).
+    pub async fn wait_network<F>(&self, pred: F, timeout: Duration) -> Result<NetworkEvent>
+    where
+        F: Fn(&NetworkEvent) -> bool,
+    {
+        let ev = self
+            .wait_for(
+                |e| matches!(e, SwiftEvent::Network(ne) if pred(ne)),
+                timeout,
+            )
+            .await?;
+        match ev {
+            SwiftEvent::Network(ne) => Ok(ne),
+            _ => unreachable!("predicate guarantees Network"),
+        }
+    }
+
     /// Await the first event matching `pred`, or fail after `timeout`. Non-matching
     /// events seen before the match are consumed (fine for the convergence asserts here).
     pub async fn wait_for<F>(&self, pred: F, timeout: Duration) -> Result<SwiftEvent>
@@ -185,6 +213,16 @@ impl Node {
         )
         .await
         .map(|_| ())
+    }
+
+    /// Whether this node has a live topic for `group_id` yet (the engine inserts the
+    /// `peers_per_group` key when it spawns the group's TopicActor). Used as a deterministic
+    /// "this node has joined and is past start-up group loading" signal.
+    pub fn has_group(&self, group_id: &str) -> bool {
+        self.peers_per_group
+            .lock()
+            .map(|m| m.contains_key(group_id))
+            .unwrap_or(false)
     }
 
     /// Number of peers this node currently tracks in `group_id` (secondary oracle for
@@ -344,6 +382,56 @@ pub async fn wire_addrs(nodes: &[Node], timeout: Duration) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Seed a host fixture into the (shared) DB: a group with one workspace, one board,
+/// `elements` board elements, `chats` chats, and one file-meta record. Returns
+/// `(workspace_id, board_id)`. Call this AFTER nodes are spawned (so no node loads the
+/// group at start and blocks on the snapshot join) and BEFORE a joiner requests a snapshot.
+pub fn seed_group_fixture(group_id: &str, elements: usize, chats: usize) -> (String, String) {
+    let ws = format!("{group_id}-ws");
+    let board = format!("{group_id}-board");
+    let _ = storage::group_insert_simple(group_id, "Fixture Group", "folder.fill", "#00AEEF");
+    let _ = storage::workspace_insert_simple(&ws, group_id, "Main Workspace");
+    let _ = storage::board_insert_simple(&board, &ws, "Canvas", 1);
+    for i in 0..elements {
+        let _ = storage::element_insert_simple(
+            &format!("{group_id}-elem-{i}"),
+            &board,
+            "rectangle",
+            i as f64,
+            i as f64,
+            100.0,
+            50.0,
+            i as i32,
+            Some("{\"fill\":\"#00AEEF\"}"),
+            Some("{\"text\":\"x\"}"),
+            1,
+            1,
+        );
+    }
+    for i in 0..chats {
+        let _ = storage::chat_insert_simple(
+            &format!("{group_id}-chat-{i}"),
+            &ws,
+            &format!("message {i}"),
+            "author",
+            None,
+            1,
+        );
+    }
+    let _ = storage::file_insert_simple(
+        &format!("{group_id}-file-0"),
+        Some(group_id),
+        Some(&ws),
+        Some(&board),
+        "doc.pdf",
+        "deadbeefdeadbeef",
+        1024,
+        None,
+        1,
+    );
+    (ws, board)
 }
 
 /// Spawn `n` nodes that share one discovery key and form a mesh. `node[0]` is the
