@@ -141,6 +141,34 @@ impl Node {
         });
     }
 
+    /// Ask this node to download `file_id` (blake3 `hash`) from `source_peer` over the
+    /// file-transfer protocol. The node must already share the file's group (have a TopicActor).
+    pub fn request_download(&self, file_id: &str, hash: &str, source_peer: &str) {
+        self.cmd(NetworkCommand::RequestFileDownload {
+            file_id: file_id.to_string(),
+            hash: hash.to_string(),
+            source_peer: source_peer.to_string(),
+            resume_offset: 0,
+        });
+    }
+
+    /// Await `SwiftEvent::FileDownloaded { file_id, local_path }` for `file_id`, returning
+    /// the local path the bytes landed at. (The engine blake3-verifies before emitting this,
+    /// so the event already implies an intact transfer; tests re-verify the bytes too.)
+    pub async fn wait_file_downloaded(&self, file_id: &str, timeout: Duration) -> Result<String> {
+        let want = file_id.to_string();
+        let ev = self
+            .wait_for(
+                move |e| matches!(e, SwiftEvent::FileDownloaded { file_id, .. } if *file_id == want),
+                timeout,
+            )
+            .await?;
+        match ev {
+            SwiftEvent::FileDownloaded { local_path, .. } => Ok(local_path),
+            _ => unreachable!("predicate guarantees FileDownloaded"),
+        }
+    }
+
     /// Broadcast a delta/chat `NetworkEvent` into `group_id` (the live-collaboration path).
     pub fn broadcast(&self, group_id: &str, event: NetworkEvent) {
         self.cmd(NetworkCommand::Broadcast {
@@ -253,10 +281,52 @@ fn shared_db() -> PathBuf {
             let path = dir.path().join("substrate.db");
             init_base_schema(&path).expect("init base schema");
             storage::init_db(path.to_str().expect("utf8 db path")).expect("storage::init_db");
+            // The engine writes downloads under DATA_DIR (a process-global OnceCell); point
+            // it at this leaked tempdir so file transfers have a real place to land.
+            let data_dir = dir.path().join("data");
+            std::fs::create_dir_all(&data_dir).expect("create data dir");
+            let _ = cyan_backend::DATA_DIR.set(data_dir);
             std::mem::forget(dir); // keep the dir alive for the whole test process
             path
         })
         .clone()
+}
+
+/// Stage a file on a "host" node so it can be served over the file-transfer protocol:
+/// write `content` to disk, compute its blake3, and register it in the (shared) DB with
+/// that local path so `file_get_for_transfer` finds it. Returns the blake3 hex hash.
+/// `source_peer` is the host's node id (the address a downloader dials).
+pub fn stage_file(
+    file_id: &str,
+    group_id: &str,
+    workspace_id: Option<&str>,
+    board_id: Option<&str>,
+    content: &[u8],
+    source_peer: &str,
+) -> String {
+    let hash = blake3::hash(content).to_hex().to_string();
+    let data_dir = cyan_backend::DATA_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("."));
+    let staged = data_dir.join("staged");
+    std::fs::create_dir_all(&staged).expect("create staged dir");
+    let path = staged.join(file_id);
+    std::fs::write(&path, content).expect("write staged file");
+    let name = format!("{file_id}.bin");
+    let _ = storage::file_insert_simple(
+        file_id,
+        Some(group_id),
+        workspace_id,
+        board_id,
+        &name,
+        &hash,
+        content.len() as u64,
+        Some(source_peer),
+        1,
+    );
+    let _ = storage::file_set_local_path(file_id, path.to_str().expect("utf8 staged path"));
+    hash
 }
 
 /// Create the base tables the migrations assume exist (mirrors the multi-process bins'
