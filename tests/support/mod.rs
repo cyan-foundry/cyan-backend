@@ -52,6 +52,7 @@ use cyan_backend::models::node_config::{
 };
 use cyan_backend::actors::NetworkActor;
 use cyan_backend::storage;
+use cyan_backend::swarm::BlobSwarm;
 
 /// Per-node network policy — the in-process subset (see module docs).
 #[derive(Clone, Debug)]
@@ -121,6 +122,9 @@ pub struct Node {
     // nodes so they dial each other without depending on flaky in-process mDNS.
     endpoint: Endpoint,
     static_discovery: StaticProvider,
+    // This node's content-addressed blob swarm (G10), mounted by the NetworkActor on the same
+    // endpoint. Per-node store == an honest per-node oracle even under the shared SQLite DB.
+    swarm: Arc<BlobSwarm>,
     // The spawned actor task. Held so a resilience test can "pull the plug" on a peer
     // via `shutdown()` — aborting this drops the actor (and the gossip/topic/router it
     // owns), which is the in-process equivalent of a peer going away.
@@ -270,6 +274,38 @@ impl Node {
     /// this is the SAME db for every node — see module docs.
     pub fn db(&self) -> &Path {
         &self.db_path
+    }
+
+    /// This node's blob swarm handle (G10). The per-node `iroh-blobs` store is the honest
+    /// per-node oracle for swarm tests (`has`/`holders`) — unaffected by the shared SQLite DB.
+    pub fn swarm(&self) -> Arc<BlobSwarm> {
+        self.swarm.clone()
+    }
+
+    /// Announce over `group_id`'s gossip that this node holds the blob `hash` (G10 i-have).
+    pub fn swarm_announce(&self, group_id: &str, hash: &str) {
+        self.cmd(NetworkCommand::SwarmAnnounce {
+            group_id: group_id.to_string(),
+            hash: hash.to_string(),
+        });
+    }
+
+    /// Ask `group_id`'s gossip which peers hold the blob `hash` (G10 who-has).
+    pub fn swarm_who_has(&self, group_id: &str, hash: &str) {
+        self.cmd(NetworkCommand::SwarmWhoHas {
+            group_id: group_id.to_string(),
+            hash: hash.to_string(),
+        });
+    }
+
+    /// Seed a plugin file (`path`, Blake3 `hash`) into this node's swarm and announce it to
+    /// `group_id` — the engine's `.cyanplugin` distribution hook (G10).
+    pub fn seed_plugin(&self, group_id: &str, hash: &str, path: &str) {
+        self.cmd(NetworkCommand::SeedAndAnnounceBlob {
+            group_id: group_id.to_string(),
+            hash: hash.to_string(),
+            path: path.to_string(),
+        });
     }
 
     /// "Pull the plug" on this peer: abort its actor task (dropping the gossip/topic/router
@@ -422,6 +458,7 @@ pub async fn spawn_node(name: &str, cfg: NodeCfg) -> Result<Node> {
     // Grab the test-support seams before the actor is moved into its task.
     let endpoint = actor.endpoint();
     let static_discovery = actor.static_discovery();
+    let swarm = actor.swarm();
 
     let actor_handle = tokio::spawn(async move {
         actor.start(cmd_rx).await;
@@ -436,6 +473,7 @@ pub async fn spawn_node(name: &str, cfg: NodeCfg) -> Result<Node> {
         db_path,
         endpoint,
         static_discovery,
+        swarm,
         actor_handle,
     })
 }
