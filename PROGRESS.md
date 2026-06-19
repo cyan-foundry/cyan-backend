@@ -122,3 +122,38 @@ Consequences for the substrate suite:
   my diff. The only red anywhere is the pre-existing, untouched `diagram_gen` lib test.
 
 ## FINISH — see STATUS.md for the full per-test ledger and findings.
+
+---
+
+# OVERNIGHT RUN (additive-only) — reliability + multi-process snapshot rig
+
+This is a separate, strictly-additive run per `OVERNIGHT_RUN.md`. Its phase
+numbering is independent of the NodeConfig run above. Rules: stay on
+`feat/substrate-e2e`; ADD only under `tests/` + one new bin `src/bin/cyan_node.rs`
++ `Cargo.toml` `[[bin]]`/`[[test]]` entries; NO edits to `src/**` lib/FFI/storage.
+
+## PHASE 0 — branch + baseline
+- 2026-06-18 — START. Branch `feat/substrate-e2e` confirmed (not main). `git status`
+  clean except untracked `OVERNIGHT_RUN.md`. `cargo build` ✅.
+- 2026-06-18 — Baseline substrate suite GREEN via
+  `cargo test --no-fail-fast --test substrate_discovery --test substrate_sync
+   --test substrate_chat --test substrate_files --test substrate_offline`:
+  - substrate_chat: 3 passed, 1 ignored (attachment/G7)
+  - substrate_discovery: 2 passed, 0 ignored
+  - substrate_files: 5 passed, 1 ignored (1GB on-demand)
+  - substrate_offline: 3 passed, 0 ignored
+  - substrate_sync: 4 passed, 1 ignored (late_joiner — process-global DB)
+  Pre-existing `diagram_gen` unit failure + ~1000 clippy warnings left untouched (out of scope).
+- 2026-06-18 — END. Gate: baseline GREEN. Proceeding to PHASE 1 (reliability suite).
+
+## PHASE 1 — reliability suite
+- 2026-06-18 — START. Added `scripts/reliability.sh` (loops each green substrate binary
+  N times, default 20 / `RELIABILITY_N`, fails on first red, per-binary tally, bounded)
+  and `tests/substrate_reliability.rs` (`repeat_discovery_is_stable` 15×,
+  `concurrent_meshes_do_not_interfere` 3 meshes, `larger_mesh_converges` 5 nodes).
+- 2026-06-18 — New file green 3× in a row (~18s each, 3 passed/0 failed each run).
+- 2026-06-18 — `RELIABILITY_N=20 ./scripts/reliability.sh` = ALL GREEN:
+  substrate_discovery 20/20, substrate_sync 20/20, substrate_chat 20/20,
+  substrate_files 20/20, substrate_offline 20/20.
+- 2026-06-18 — Clippy: new files introduce zero new warnings.
+- 2026-06-18 — END. Gate GREEN. Committing PHASE 1; proceeding to PHASE 2 (multi-process rig).
