@@ -18,12 +18,6 @@ mod xaero_ffi {
 }
 pub use xaero_ffi::*;
 
-mod integration_bridge;
-pub use integration_bridge::IntegrationBridge;
-
-mod lens_bridge;
-pub use lens_bridge::{LensBridge, RawEvent, XfEvent};
-
 mod ai_bridge;
 pub mod diagram_gen;
 pub mod cyan_lens_client;
@@ -32,7 +26,6 @@ mod ffi;
 pub mod actors;
 pub mod storage;
 pub mod lens_commands;
-pub mod import_orchestrator;
 
 use crate::models::commands::{CommandMsg, NetworkCommand};
 use crate::models::core::{Group, Workspace};
@@ -117,8 +110,6 @@ pub struct CyanSystem {
     pub db: Arc<Mutex<Connection>>,
     /// Peers per group, shared with NetworkActor for FFI queries
     pub peers_per_group: Arc<Mutex<HashMap<String, HashSet<PublicKey>>>>,
-    /// Integration bridge for managing external integrations
-    pub integration_bridge: Arc<IntegrationBridge>,
     /// AI bridge for XaeroAI integration
     pub ai_bridge: Arc<AIBridge>,
 }
@@ -260,17 +251,6 @@ impl CyanSystem {
         let peers_per_group_clone = peers_per_group.clone();
 
         let db_arc = Arc::new(Mutex::new(db));
-        
-        // Get discovery_key as default group_id for Lens broadcasts
-        let lens_group_id = DISCOVERY_KEY.get().cloned();
-        
-        let integration_bridge = Arc::new(IntegrationBridge::new_with_lens(
-            db_arc.clone(),
-            event_tx.clone(),
-            None,  // xaeroflux_tx - not using LensBridge channel approach
-            lens_group_id,
-            Some(net_tx.clone()),  // network_tx for gossip broadcast
-        ));
 
         // Create AI bridge
         let ai_bridge = Arc::new(AIBridge::new(
@@ -280,9 +260,6 @@ impl CyanSystem {
         ai_bridge.set_cyan_db_path(PathBuf::from(db_path_clone)).await;
         ai_bridge.start_insight_generator();
         eprintln!("🔵 Step 3: AI bridge started");
-
-        // Start background task to forward integration events to Swift
-        integration_bridge.start_event_forwarder();
 
         let system = Self {
             node_id: node_id.clone(),
@@ -298,7 +275,6 @@ impl CyanSystem {
             integration_event_buffer,
             db: db_arc.clone(),
             peers_per_group,
-            integration_bridge,
             ai_bridge,
         };
         eprintln!("🔵 Step 4: System struct created (per-component event routing)");
