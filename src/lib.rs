@@ -28,6 +28,7 @@ pub mod storage;
 pub mod swarm;
 pub mod lens_commands;
 pub mod mcp_host;
+pub mod identity;
 
 use crate::models::commands::{CommandMsg, NetworkCommand};
 use crate::models::core::{Group, Workspace};
