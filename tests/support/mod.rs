@@ -51,6 +51,7 @@ use cyan_backend::models::node_config::{
     RelayPolicy as EngineRelayPolicy,
 };
 use cyan_backend::actors::NetworkActor;
+use cyan_backend::identity::MeshAuthorizer;
 use cyan_backend::storage;
 use cyan_backend::swarm::BlobSwarm;
 
@@ -125,6 +126,9 @@ pub struct Node {
     // This node's content-addressed blob swarm (G10), mounted by the NetworkActor on the same
     // endpoint. Per-node store == an honest per-node oracle even under the shared SQLite DB.
     swarm: Arc<BlobSwarm>,
+    // This node's mesh-write authorizer (identity/RBAC mesh half). A fresh `Arc` per node, like
+    // `peers_per_group` — the honest per-node oracle for grant enforcement under the shared DB.
+    authorizer: Arc<Mutex<MeshAuthorizer>>,
     // The spawned actor task. Held so a resilience test can "pull the plug" on a peer
     // via `shutdown()` — aborting this drops the actor (and the gossip/topic/router it
     // owns), which is the in-process equivalent of a peer going away.
@@ -280,6 +284,12 @@ impl Node {
     /// per-node oracle for swarm tests (`has`/`holders`) — unaffected by the shared SQLite DB.
     pub fn swarm(&self) -> Arc<BlobSwarm> {
         self.swarm.clone()
+    }
+
+    /// This node's mesh-write authorizer (identity/RBAC mesh half). The honest per-node oracle
+    /// for grant enforcement: `enforce_group`, `set_admin`, `present_grant`, `authorize_write`.
+    pub fn authorizer(&self) -> Arc<Mutex<MeshAuthorizer>> {
+        self.authorizer.clone()
     }
 
     /// Announce over `group_id`'s gossip that this node holds the blob `hash` (G10 i-have).
@@ -459,6 +469,7 @@ pub async fn spawn_node(name: &str, cfg: NodeCfg) -> Result<Node> {
     let endpoint = actor.endpoint();
     let static_discovery = actor.static_discovery();
     let swarm = actor.swarm();
+    let authorizer = actor.authorizer();
 
     let actor_handle = tokio::spawn(async move {
         actor.start(cmd_rx).await;
@@ -474,6 +485,7 @@ pub async fn spawn_node(name: &str, cfg: NodeCfg) -> Result<Node> {
         endpoint,
         static_discovery,
         swarm,
+        authorizer,
         actor_handle,
     })
 }

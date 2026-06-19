@@ -31,6 +31,7 @@ use iroh_gossip::net::Gossip;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
+use crate::identity::MeshAuthorizer;
 use crate::models::protocol::FileTransferMsg;
 use crate::swarm::{BlobSwarm, BLOB_ALPN};
 use crate::{
@@ -207,6 +208,12 @@ pub struct NetworkActor {
     /// Content-addressed blob swarm (G10). Shared with each TopicActor so i-have/who-has
     /// negotiation rides the group gossip, and exposed via `swarm()` for the swarm-fetch path.
     swarm: Arc<BlobSwarm>,
+
+    /// Per-node mesh-write authority (identity/RBAC mesh half). Shared with each TopicActor so
+    /// inbound writes are gated by `authorize_write(group, from_peer)`. **Fail-open by default**:
+    /// a group is only enforced after `MeshAuthorizer::enforce_group`, so shipping behavior is
+    /// unchanged for groups that have not opted into grant enforcement. Exposed via `authorizer()`.
+    authorizer: Arc<std::sync::Mutex<MeshAuthorizer>>,
 }
 
 impl NetworkActor {
@@ -316,7 +323,15 @@ impl NetworkActor {
             cfg,
             static_discovery,
             swarm,
+            authorizer: Arc::new(std::sync::Mutex::new(MeshAuthorizer::new())),
         })
+    }
+
+    /// A clone of this node's mesh-write authorizer (identity/RBAC mesh half). The honest
+    /// per-node oracle for grant enforcement: callers `enforce_group`, seed admins, record a
+    /// presented grant, and read back `authorize_write`/`role_of_peer`. Cheap (Arc clone).
+    pub fn authorizer(&self) -> Arc<std::sync::Mutex<MeshAuthorizer>> {
+        self.authorizer.clone()
     }
 
     /// A clone of this node's blob swarm handle (G10). Test-support seam and the engine's
@@ -953,6 +968,7 @@ impl NetworkActor {
             self.topic_network_tx.clone(),
             self.event_tx.clone(),
             self.swarm.clone(),
+            self.authorizer.clone(),
         ).await?;
 
         eprintln!("🚀 [TOPIC-SPAWN-2] ✓ TopicActor spawned, inserting into topics map");

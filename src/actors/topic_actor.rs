@@ -31,6 +31,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use crate::{
     actors::{make_group_topic_id, ActorHandle, ActorMessage, SystemCommand, TopicNetworkCmd, FILE_TRANSFER_ALPN},
     bootstrap_node_id,
+    identity::{MeshAuthorizer, WriteDecision},
     models::{
         commands::NetworkCommand,
         events::{NetworkEvent, SwiftEvent},
@@ -99,6 +100,11 @@ pub struct TopicActor {
     /// Shared blob swarm (G10): incoming i-have/who-has gossip is fed to `swarm.on_message`, and
     /// `AnnounceBlob`/`QueryBlob` commands broadcast the negotiation messages onto this group topic.
     swarm: Arc<BlobSwarm>,
+
+    /// Per-node mesh-write authority (identity/RBAC mesh half), shared with the NetworkActor.
+    /// Inbound writes from a peer are gated by `authorize_write(group, from_peer)`. Fail-open
+    /// unless this group has been enforced — so it does not change behavior for un-enforced groups.
+    authorizer: Arc<std::sync::Mutex<MeshAuthorizer>>,
 }
 
 impl TopicActor {
@@ -113,6 +119,7 @@ impl TopicActor {
         network_tx: UnboundedSender<TopicNetworkCmd>,
         event_tx: UnboundedSender<SwiftEvent>,
         swarm: Arc<BlobSwarm>,
+        authorizer: Arc<std::sync::Mutex<MeshAuthorizer>>,
     ) -> Result<ActorHandle<TopicCommand>> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
@@ -165,6 +172,7 @@ impl TopicActor {
             network_tx,
             event_tx,
             swarm,
+            authorizer,
         };
 
         let join_handle = tokio::spawn(actor.run(cmd_rx, receiver));
@@ -482,7 +490,7 @@ impl TopicActor {
                         &self.group_id[..16.min(self.group_id.len())],
                         std::mem::discriminant(&evt)
                     );
-                    self.handle_network_event(evt).await;
+                    self.handle_network_event(evt, &from).await;
                 }
                 // Try parsing as NetworkCommand (for snapshot requests)
                 else if let Ok(cmd) = serde_json::from_slice::<NetworkCommand>(&msg.content) {
@@ -575,7 +583,7 @@ impl TopicActor {
         }
     }
 
-    async fn handle_network_event(&mut self, evt: NetworkEvent) {
+    async fn handle_network_event(&mut self, evt: NetworkEvent, from_peer: &str) {
         // Check for GroupSnapshotAvailable - this triggers snapshot download
         if let NetworkEvent::GroupSnapshotAvailable { ref source, ref group_id } = evt {
             eprintln!("═══════════════════════════════════════════════════════════════════");
@@ -641,6 +649,37 @@ impl TopicActor {
             &self.group_id[..16.min(self.group_id.len())],
             std::mem::discriminant(&evt)
         );
+
+        // MESH-WRITE ENFORCEMENT (identity/RBAC mesh half). An inbound NetworkEvent is a write to
+        // group state, so it must come from a peer this node has authorized via a valid capability
+        // grant. Fail-open until the group is enforced (`MeshAuthorizer::enforce_group`) — so this
+        // is inert for groups that have not opted into grant enforcement. Decided on the RECEIVER's
+        // own authorizer state; refused writes are NOT persisted or forwarded to Swift.
+        let decision = self
+            .authorizer
+            .lock()
+            .map(|a| a.authorize_write(&self.group_id, from_peer))
+            .unwrap_or(WriteDecision::Allow);
+        if let WriteDecision::Deny(reason) = decision {
+            // Flat obs (tenant = group_id) at the refusal point — never a substitute for the
+            // assertion oracle (tests assert on the authorizer state), just operator visibility.
+            tracing::warn!(
+                target: "obs",
+                tenant = %self.group_id,
+                peer = %from_peer,
+                action = "mesh_write",
+                decision = "deny",
+                reason = ?reason,
+                "refused mesh write from peer without a valid capability grant"
+            );
+            eprintln!(
+                "⛔ [TOPIC] Refused mesh write on group {}... from {}... ({:?})",
+                &self.group_id[..16.min(self.group_id.len())],
+                &from_peer[..16.min(from_peer.len())],
+                reason
+            );
+            return;
+        }
 
         // Persist to DB
         Self::persist_event(&evt);
