@@ -13,7 +13,7 @@
 # - The docker rig (Agent 3) needs Docker running; if it isn't, that step is
 #   SKIPPED (not failed) with a clear note.
 set -uo pipefail
-cd "$(dirname "$0")" || exit 2
+cd "$(dirname "$0")/.." || exit 2   # repo root: harness/ and scripts/ are resolved from here
 
 PASS=(); FAIL=(); SKIP=()
 step() {                      # step "Label" cmd...
