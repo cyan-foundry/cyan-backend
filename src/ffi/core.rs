@@ -1455,6 +1455,19 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
         Err(e) => eprintln!("📤 [FILE-UPLOAD] 🔴 Broadcast FAILED: {}", e),
     }
 
+    // Plugin distribution (G10): a `.cyanplugin` artifact (the files that land in a group's Plugins
+    // workspace) is additionally seeded into this node's content-addressed swarm and announced to the
+    // group, so members distribute it peer-to-peer. Reuses the existing file scope/storage + the
+    // FileAvailable broadcast above — no new client `cyan_*` FFI; normal files are unaffected.
+    if file_name.ends_with(".cyanplugin") {
+        eprintln!("🧩 [FILE-UPLOAD] Plugin detected — seeding into swarm + announcing to group");
+        let _ = sys.network_tx.send(NetworkCommand::SeedAndAnnounceBlob {
+            group_id: gid.clone(),
+            hash: hash.clone(),
+            path: local_path.to_string_lossy().to_string(),
+        });
+    }
+
     // Return success
     let result = serde_json::json!({
         "success": true,
