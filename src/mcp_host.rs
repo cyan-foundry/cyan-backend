@@ -14,13 +14,17 @@
 // The app never sees any of this: plugins are just files in a "Plugins" workspace
 // (see `storage::plugin_bundles_in_group`), so there is NO new `cyan_*` FFI.
 
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
+use anyhow::anyhow;
+use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
 use cyan_mcp::{
-    BackoffPolicy, Clock, Emitter, EventSink, PluginEvent, PluginId, PluginTransport, Supervisor,
-    TenantId,
+    BackoffPolicy, Client, Clock, Emitter, EventSink, Obs, PluginEvent, PluginId, PluginTransport,
+    RecordingSink, Registry, Supervisor, TenantId, ToolBlock,
 };
 
 use crate::models::commands::NetworkCommand;
@@ -156,4 +160,258 @@ impl PluginHost {
             PLUGIN_BUNDLE_SUFFIX,
         )
     }
+
+    /// Resolve a tool name to `(plugin_id, ToolBlock)` by indexing the group's
+    /// installed plugin bundles under `plugins_root` (the file-swarm unpacks each
+    /// `.cyanplugin` into a subdir there) via cyan-mcp's `Registry`. This is the
+    /// "registry = files → tools" wiring: it turns an installed bundle into a tool
+    /// a local pipeline step can dispatch, and surfaces the tool's manifest
+    /// `side_effects` so the dispatcher can gate it. `Ok(None)` = no such tool
+    /// installed; a bad bundle is skipped by the registry, not fatal.
+    pub fn resolve_installed_tool(
+        &self,
+        plugins_root: &Path,
+        tool: &str,
+    ) -> anyhow::Result<Option<(String, ToolBlock)>> {
+        let mut registry = Registry::new();
+        registry
+            .index(plugins_root)
+            .map_err(|e| anyhow!("index plugins registry {}: {e}", plugins_root.display()))?;
+        Ok(registry.lookup_by_tool(tool).and_then(|entry| {
+            entry
+                .manifest
+                .tools
+                .iter()
+                .find(|t| t.name == tool)
+                .map(|tb| (entry.plugin_id.clone(), tb.clone()))
+        }))
+    }
+
+    /// Dispatch one `McpTool` step on-device through the supervised cyan-mcp host
+    /// — the local mirror of the lens cloud `McpTool` path (same contract). The
+    /// plugin runs locally; no cloud round-trip.
+    ///
+    /// `connect` produces a *live* transport for this call (prod: a spawned
+    /// `StdioTransport`; tests: a pre-scripted `ScriptedTransport`). It is a
+    /// closure, not an eager argument, so a GATED tool never opens a transport —
+    /// in prod that means a side-effecting plugin process is never even spawned
+    /// before approval.
+    ///
+    /// Cost isolation (matches lens): the plugin reports its own billing as
+    /// `cost_usd` in the tool result; we record that on the EXTERNAL rail
+    /// (`ledger.record_external_tool`) and NEVER against our LLM token tally.
+    /// cyan-mcp's plugin-internal `tool_called` obs is discarded (a
+    /// `DiscardEmitter`) so cost is counted exactly once, on our rail.
+    pub fn dispatch_mcp_tool<F>(
+        &self,
+        scope: &RunScope,
+        step: &McpTool,
+        side_effects: &[String],
+        approved: bool,
+        ledger: &RunCostLedger,
+        connect: F,
+    ) -> anyhow::Result<McpDispatch>
+    where
+        F: FnOnce() -> anyhow::Result<Box<dyn PluginTransport>>,
+    {
+        // Gate: a side-effecting tool (external_send / delete) is NEVER
+        // auto-executed. Return without opening a transport — the human-approval
+        // path (pipeline.rs::approve_step) flips `approved` before a re-dispatch.
+        if requires_approval(side_effects) && !approved {
+            return Ok(McpDispatch::Gated {
+                side_effects: side_effects.to_vec(),
+            });
+        }
+
+        let transport = connect()?;
+        // Request/response tool call: own transport (cyan-mcp's Supervisor and
+        // Client cannot share one — see `supervise`). Relayed events during the
+        // call go to a throwaway sink; the tool *result* is what threads back.
+        let mut client = Client::new(
+            transport,
+            Arc::new(RecordingSink::new()) as Arc<dyn EventSink>,
+            Arc::new(DiscardEmitter) as Arc<dyn Emitter>,
+            self.clock.clone(),
+            scope.tenant_id.clone(),
+            step.plugin_id.clone(),
+        );
+        client
+            .initialize()
+            .map_err(|e| anyhow!("mcp initialize {}: {e}", step.plugin_id))?;
+
+        let start = self.clock.now();
+        let result = client
+            .call_tool(&step.tool, step.args.clone())
+            .map_err(|e| anyhow!("mcp call_tool {}.{}: {e}", step.plugin_id, step.tool))?;
+        let duration_ms = self.clock.now().saturating_sub(start).as_millis() as u64;
+
+        // Convention (mirrors lens): a partner/plugin tool reports its own billing
+        // as `cost_usd`. EXTERNAL rail only — never our vLLM tokens.
+        let cost_usd = result.get("cost_usd").and_then(Value::as_f64);
+        ledger.record_external_tool(ToolCalledObs {
+            tenant_id: scope.tenant_id.clone(),
+            run_id: scope.run_id.clone(),
+            plugin_id: step.plugin_id.clone(),
+            tool: step.tool.clone(),
+            duration_ms,
+            cost_usd,
+            source: "external".to_string(),
+        });
+
+        Ok(McpDispatch::Ran(McpToolResult {
+            result,
+            duration_ms,
+            cost_usd,
+        }))
+    }
+}
+
+/// Side effect that requires the human-approval gate before a tool runs.
+pub const SIDE_EFFECT_EXTERNAL_SEND: &str = "external_send";
+/// Side effect that requires the human-approval gate before a tool runs.
+pub const SIDE_EFFECT_DELETE: &str = "delete";
+
+/// Whether a tool's declared `side_effects` require human approval before it may
+/// auto-execute. `external_send` / `delete` do; a pure/read-only tool does not.
+pub fn requires_approval(side_effects: &[String]) -> bool {
+    side_effects
+        .iter()
+        .any(|s| s == SIDE_EFFECT_EXTERNAL_SEND || s == SIDE_EFFECT_DELETE)
+}
+
+/// Run scope carried on every external cost obs line: which tenant + pipeline run
+/// a tool call belongs to.
+#[derive(Debug, Clone)]
+pub struct RunScope {
+    /// Tenant that owns the run.
+    pub tenant_id: String,
+    /// Pipeline run id (the `op_id` on the obs rail).
+    pub run_id: String,
+}
+
+/// One `McpTool` pipeline step: dispatch `tool` on `plugin_id` with `args`.
+/// Mirrors the lens cloud contract `McpTool { plugin_id, tool, args }`
+/// (WORKFLOW_MATERIALIZATION §2). The backend uses the canonical field name
+/// `tool` — lens had to call it `tool_name` only because its enum's serde tag
+/// already occupied `tool`; there is no such collision here.
+#[derive(Debug, Clone)]
+pub struct McpTool {
+    /// Plugin that exposes the tool.
+    pub plugin_id: String,
+    /// Tool name to call.
+    pub tool: String,
+    /// JSON arguments for the call.
+    pub args: Value,
+}
+
+/// The result of a non-gated tool dispatch.
+#[derive(Debug, Clone)]
+pub struct McpToolResult {
+    /// The plugin tool's JSON result (threads back into the step output).
+    pub result: Value,
+    /// Wall-clock duration of the call.
+    pub duration_ms: u64,
+    /// External/plugin cost in USD (partner billing pass-through), if reported.
+    pub cost_usd: Option<f64>,
+}
+
+/// Outcome of dispatching an `McpTool` step locally.
+#[derive(Debug, Clone)]
+pub enum McpDispatch {
+    /// The tool ran; its result is threaded into the step output.
+    Ran(McpToolResult),
+    /// The tool is side-effecting and unapproved — it was NOT executed and
+    /// requires the human-approval gate. No transport was opened / process spawned.
+    Gated {
+        /// The declared side effects that triggered the gate.
+        side_effects: Vec<String>,
+    },
+}
+
+/// One flat, tenant-scoped EXTERNAL cost obs line — a plugin/partner tool call.
+/// `source` is always `"external"`: this rail is for THEIR billing
+/// (manifest cost-locality), kept separate from our LLM token tally.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCalledObs {
+    /// Tenant the call is scoped to.
+    pub tenant_id: String,
+    /// Pipeline run the call belongs to.
+    pub run_id: String,
+    /// Plugin that was called.
+    pub plugin_id: String,
+    /// Tool that was called.
+    pub tool: String,
+    /// Wall-clock duration of the call.
+    pub duration_ms: u64,
+    /// External/plugin cost in USD, if the tool reported it.
+    pub cost_usd: Option<f64>,
+    /// Cost rail discriminator — always `"external"`.
+    pub source: String,
+}
+
+/// Per-run cost ledger with two SEPARATE rails: our LLM token tally (our vLLM
+/// reasoning) and external plugin/partner tool costs. The cost-isolation
+/// invariant: an `McpTool` call only ever touches the external rail — it adds
+/// ZERO to the LLM tally (proven by `local_mcp_tool_cost_is_external_not_tokens`).
+#[derive(Default)]
+pub struct RunCostLedger {
+    llm_tokens_in: AtomicU64,
+    llm_tokens_out: AtomicU64,
+    external: Mutex<Vec<ToolCalledObs>>,
+}
+
+impl RunCostLedger {
+    /// A fresh, empty ledger.
+    pub fn new() -> Self {
+        RunCostLedger::default()
+    }
+
+    /// Record tokens our own vLLM reasoning spent this run (the LLM rail).
+    pub fn record_llm(&self, tokens_in: u64, tokens_out: u64) {
+        self.llm_tokens_in.fetch_add(tokens_in, Ordering::Relaxed);
+        self.llm_tokens_out.fetch_add(tokens_out, Ordering::Relaxed);
+    }
+
+    /// Our LLM token tally so far as `(tokens_in, tokens_out)`.
+    pub fn llm_tokens(&self) -> (u64, u64) {
+        (
+            self.llm_tokens_in.load(Ordering::Relaxed),
+            self.llm_tokens_out.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Record one external plugin/partner tool call (the external rail). Also
+    /// emits a flat obs line on the `"obs"` target for prod observability.
+    pub fn record_external_tool(&self, obs: ToolCalledObs) {
+        tracing::info!(
+            target: "obs",
+            event = "tool_called",
+            source = "external",
+            tenant_id = %obs.tenant_id,
+            run_id = %obs.run_id,
+            plugin_id = %obs.plugin_id,
+            tool = %obs.tool,
+            duration_ms = obs.duration_ms,
+            cost_usd = ?obs.cost_usd,
+        );
+        if let Ok(mut g) = self.external.lock() {
+            g.push(obs);
+        }
+    }
+
+    /// Snapshot of every external tool call recorded. Poison-safe (no panic).
+    pub fn external_tool_calls(&self) -> Vec<ToolCalledObs> {
+        self.external.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
+/// A cyan-mcp `Emitter` that drops the plugin-internal obs. The external
+/// cost-isolation obs (`tool_called` / `source=external`) is emitted by the host
+/// on the backend rail (`RunCostLedger`), not from inside cyan-mcp's client — so a
+/// tool call is counted exactly once.
+#[derive(Default)]
+struct DiscardEmitter;
+
+impl Emitter for DiscardEmitter {
+    fn emit(&self, _obs: &Obs) {}
 }

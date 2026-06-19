@@ -448,6 +448,17 @@ pub async fn execute_pipeline_step(
     event_tx: &UnboundedSender<SwiftEvent>,
 ) -> Result<(String, Vec<Finding>)> {
 
+    // ── LOCAL MCP PLUGIN TOOL: run on-device, NO cloud round-trip ───────
+    // A `local` step whose metadata names a plugin tool (`{ "mcp_tool": {
+    // plugin_id, tool, args } }`) is dispatched through the supervised cyan-mcp
+    // host on this device — the local mirror of the lens cloud `McpTool` path.
+    // Guarded: ordinary steps (no `mcp_tool`) fall straight through unchanged.
+    if executor_type == "local"
+        && let Some(step) = metadata.as_ref().and_then(parse_mcp_tool_step)
+    {
+        return execute_local_mcp_tool_step(board_id, step_id, step, event_tx).await;
+    }
+
     // ── DEMO CACHE: Check for cached results first ──────────────────────
     // Remove this block when productionizing. It plays back pre-computed
     // results with realistic delays so the demo doesn't depend on GPU/Lens.
@@ -617,6 +628,182 @@ async fn execute_step_locally(
         let prompt = format!("Execute this pipeline step:\n\n{}", cell_content);
         let response = crate::pipeline::call_vllm_public(&prompt, 800, 0.3).await?;
         Ok((response, vec![]))
+    }
+}
+
+// ============================================================================
+// Local MCP Plugin Tool Dispatch (device host — no cloud round-trip)
+// ============================================================================
+//
+// A `local` pipeline step can name a plugin tool to run ON-DEVICE through the
+// supervised cyan-mcp host (the local mirror of the lens cloud `McpTool` path).
+// The dispatch LOGIC (initialize → call_tool → thread the result, the external
+// cost rail, the approval gate) lives in `mcp_host.rs` and is unit-tested via
+// cyan-mcp's `ScriptedTransport`. THIS is the prod wiring: it resolves the tool
+// in the installed registry, reads the human-approval gate, spawns a real
+// `StdioTransport` from the bundle, and dispatches. (Cred injection at spawn and
+// the runtime→entrypoint mapping are the deferred device lifecycle; today the
+// bundle ships a `run` entrypoint.)
+
+use crate::mcp_host::{McpDispatch, McpTool, PluginHost, RunCostLedger, RunScope};
+use cyan_mcp::PluginTransport as _; // brings `spawn`/`send`/`recv` into scope
+use std::sync::Arc;
+
+/// Parse an optional `McpTool` step from a step's metadata:
+/// `{ "mcp_tool": { "plugin_id": ..., "tool": ..., "args": {...} } }`.
+/// `None` (the common case) means an ordinary step — the caller falls through.
+fn parse_mcp_tool_step(metadata: &serde_json::Value) -> Option<McpTool> {
+    let spec = metadata.get("mcp_tool")?;
+    Some(McpTool {
+        plugin_id: spec.get("plugin_id")?.as_str()?.to_string(),
+        tool: spec.get("tool")?.as_str()?.to_string(),
+        args: spec.get("args").cloned().unwrap_or(serde_json::Value::Null),
+    })
+}
+
+/// The device's installed-plugins root: one subdir per plugin (the unpacked
+/// `.cyanplugin` bundles the file-swarm fetched). Overridable for tests/ops.
+fn plugins_root() -> std::path::PathBuf {
+    if let Ok(root) = std::env::var("CYAN_PLUGINS_ROOT") {
+        return std::path::PathBuf::from(root);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home).join(".cyan").join("plugins")
+}
+
+/// The tenant this device acts as (carried on every external cost obs line).
+fn device_tenant() -> String {
+    std::env::var("CYAN_TENANT_ID").unwrap_or_else(|_| "device".to_string())
+}
+
+/// Whether the human-approval gate is open for this step. Reuses the existing
+/// pipeline approval path, which sets `pipeline.state.status = "human_approved"`
+/// (see `pipeline.rs::approve_step`).
+fn step_is_approved(board_id: &str, step_id: &str) -> bool {
+    let conn = match crate::storage::db().lock() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let mut stmt = match conn.prepare("SELECT metadata_json FROM notebook_cells WHERE board_id = ?1")
+    {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let rows = match stmt.query_map(rusqlite::params![board_id], |row| {
+        row.get::<_, Option<String>>(0)
+    }) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    for meta in rows.flatten().flatten() {
+        let v: serde_json::Value = match serde_json::from_str(&meta) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v["pipeline"]["step_id"] == json!(step_id)
+            && v["pipeline"]["state"]["status"] == json!("human_approved")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Dispatch a `local` plugin-tool step on-device through the cyan-mcp host.
+async fn execute_local_mcp_tool_step(
+    board_id: &str,
+    step_id: &str,
+    step: McpTool,
+    event_tx: &UnboundedSender<SwiftEvent>,
+) -> Result<(String, Vec<Finding>)> {
+    let _ = event_tx.send(SwiftEvent::StatusUpdate {
+        message: format!(
+            "🔌 Step '{}' → local plugin {}.{}",
+            step_id, step.plugin_id, step.tool
+        ),
+    });
+
+    let root = plugins_root();
+    let tenant = device_tenant();
+
+    // Device plugin host. The tool call uses its own throwaway sink (relayed
+    // events are incidental here — the tool *result* threads back into the step).
+    let host = PluginHost::new(
+        Arc::new(cyan_mcp::RecordingSink::new()) as Arc<dyn cyan_mcp::EventSink>,
+        Arc::new(cyan_mcp::LogEmitter::new()) as Arc<dyn cyan_mcp::Emitter>,
+        Arc::new(cyan_mcp::SystemClock::new()) as Arc<dyn cyan_mcp::Clock>,
+        cyan_mcp::BackoffPolicy {
+            base: std::time::Duration::from_millis(500),
+            max: std::time::Duration::from_secs(30),
+            max_restarts: 3,
+        },
+        tenant.clone(),
+    );
+
+    // Resolve the tool in the installed registry → its manifest `side_effects`
+    // (which drive the gate). Not installed = a real, surfaced error.
+    let side_effects = host
+        .resolve_installed_tool(&root, &step.tool)
+        .map_err(|e| anyhow!("resolve plugin tool {}: {}", step.tool, e))?
+        .map(|(_, tb)| tb.side_effects)
+        .ok_or_else(|| {
+            anyhow!(
+                "tool '{}' is not installed (no bundle in {})",
+                step.tool,
+                root.display()
+            )
+        })?;
+
+    let approved = step_is_approved(board_id, step_id);
+    let scope = RunScope {
+        tenant_id: tenant,
+        run_id: step_id.to_string(),
+    };
+    let ledger = RunCostLedger::new();
+
+    // Spawn the plugin process LAZILY: a gated tool is never spawned (the closure
+    // only runs when `dispatch_mcp_tool` decides to execute).
+    let bundle_dir = root.join(&step.plugin_id);
+    let plugin_id = step.plugin_id.clone();
+    let connect = move || -> Result<Box<dyn cyan_mcp::PluginTransport>> {
+        let mut transport = cyan_mcp::StdioTransport::new();
+        let config = cyan_mcp::SpawnConfig {
+            plugin_id: plugin_id.clone(),
+            command: bundle_dir.join("run").to_string_lossy().to_string(),
+            args: vec![],
+            creds: vec![],
+        };
+        transport
+            .spawn(&config)
+            .map_err(|e| anyhow!("spawn plugin {}: {}", plugin_id, e))?;
+        Ok(Box::new(transport))
+    };
+
+    match host
+        .dispatch_mcp_tool(&scope, &step, &side_effects, approved, &ledger, connect)
+        .map_err(|e| anyhow!("local plugin dispatch failed: {}", e))?
+    {
+        McpDispatch::Ran(result) => {
+            let summary = serde_json::to_string(&result.result)
+                .unwrap_or_else(|_| result.result.to_string());
+            let _ = event_tx.send(SwiftEvent::StatusUpdate {
+                message: format!("✅ Step '{}' plugin complete", step_id),
+            });
+            Ok((summary, vec![]))
+        }
+        McpDispatch::Gated { side_effects } => {
+            // Reuse the human-approval path: surface needs_human so the user can
+            // approve the side-effecting call; a re-run then flips `approved`.
+            let effects = side_effects.join(", ");
+            let _ = event_tx.send(SwiftEvent::StatusUpdate {
+                message: format!("⏸️ Step '{}' needs approval (side effects: {})", step_id, effects),
+            });
+            Err(anyhow!(
+                "needs_human: plugin tool '{}' requires approval (side effects: {})",
+                step.tool,
+                effects
+            ))
+        }
     }
 }
 
