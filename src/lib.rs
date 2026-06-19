@@ -104,8 +104,6 @@ pub struct CyanSystem {
     pub board_grid_events: Arc<Mutex<VecDeque<String>>>,
     /// Network/status events (general network status)
     pub network_status_events: Arc<Mutex<VecDeque<String>>>,
-    /// Integration events only - polled by cyan_poll_integration_events
-    pub integration_event_buffer: Arc<Mutex<VecDeque<String>>>,
 
     pub db: Arc<Mutex<Connection>>,
     /// Peers per group, shared with NetworkActor for FFI queries
@@ -237,7 +235,6 @@ impl CyanSystem {
         let whiteboard_events: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
         let board_grid_events: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
         let network_status_events: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let integration_event_buffer: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
         let peers_per_group: Arc<Mutex<HashMap<String, HashSet<PublicKey>>>> = Arc::new(Mutex::new(HashMap::new()));
 
         // Clones for event router task
@@ -246,7 +243,6 @@ impl CyanSystem {
         let whiteboard_events_clone = whiteboard_events.clone();
         let board_grid_events_clone = board_grid_events.clone();
         let network_status_events_clone = network_status_events.clone();
-        let integration_event_buffer_clone = integration_event_buffer.clone();
         let secret_key_clone = secret_key.clone();
         let peers_per_group_clone = peers_per_group.clone();
 
@@ -272,7 +268,6 @@ impl CyanSystem {
             whiteboard_events,
             board_grid_events,
             network_status_events,
-            integration_event_buffer,
             db: db_arc.clone(),
             peers_per_group,
             ai_bridge,
@@ -342,7 +337,6 @@ impl CyanSystem {
                             &whiteboard_events_clone,
                             &board_grid_events_clone,
                             &network_status_events_clone,
-                            &integration_event_buffer_clone,
                         );
                     }
                     Err(e) => {
@@ -983,17 +977,11 @@ impl CommandActor {
                             params![id, scope_type, scope_id, integration_type, config_json, now],
                         );
                     }
-
-                    let _ = self.event_tx.send(SwiftEvent::IntegrationAdded { id });
                 }
 
                 CommandMsg::RemoveIntegration { id } => {
-                    {
-                        let db = self.db.lock().unwrap();
-                        let _ = db.execute("DELETE FROM integration_bindings WHERE id=?1", params![id]);
-                    }
-
-                    let _ = self.event_tx.send(SwiftEvent::IntegrationRemoved { id });
+                    let db = self.db.lock().unwrap();
+                    let _ = db.execute("DELETE FROM integration_bindings WHERE id=?1", params![id]);
                 }
 
                 // Profile commands
@@ -1336,7 +1324,6 @@ fn route_event_to_buffers(
     whiteboard: &Arc<Mutex<VecDeque<String>>>,
     board_grid: &Arc<Mutex<VecDeque<String>>>,
     network_status: &Arc<Mutex<VecDeque<String>>>,
-    integration: &Arc<Mutex<VecDeque<String>>>,
 ) {
     match event {
         // ═══════════════════════════════════════════════════════════════════
@@ -1377,15 +1364,6 @@ fn route_event_to_buffers(
         // ═══════════════════════════════════════════════════════════════════
         SwiftEvent::Network(net_event) => {
             match net_event {
-                NetworkEvent::IntegrationLensEvent { source_kind, payload } => {
-                    // Received integration event via gossip from another peer.
-                    // The originating peer already forwarded to Lens via AIBridge HTTP path.
-                    // TODO: For multi-peer lens, forward payload to local CyanLensClient.send_event()
-                    tracing::debug!(
-                    "📩 Received IntegrationLensEvent via gossip: source={}",
-                    source_kind
-                 );
-                }
                 // Structure changes → FileTree + BoardGrid
                 NetworkEvent::GroupCreated(_) |
                 NetworkEvent::GroupRenamed { .. } |
@@ -1499,17 +1477,6 @@ fn route_event_to_buffers(
         SwiftEvent::StatusUpdate { .. } |
         SwiftEvent::AIInsight { .. } => {
             network_status.lock().unwrap().push_back(event_json.to_string());
-        }
-
-        // ═══════════════════════════════════════════════════════════════════
-        // INTEGRATION EVENTS
-        // ═══════════════════════════════════════════════════════════════════
-        SwiftEvent::IntegrationAdded { .. } |
-        SwiftEvent::IntegrationRemoved { .. } |
-        SwiftEvent::IntegrationEvent { .. } |
-        SwiftEvent::IntegrationStatus { .. } |
-        SwiftEvent::IntegrationGraph { .. } => {
-            integration.lock().unwrap().push_back(event_json.to_string());
         }
     }
 }

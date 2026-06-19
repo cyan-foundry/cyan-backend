@@ -165,15 +165,6 @@ pub enum NetworkEvent {
         display_name: String,
         avatar_hash: Option<String>,
     },
-    // ---- Integration events for Cyan Lens ----
-    /// Integration event forwarded to Cyan Lens via Bootstrap → Iggy
-    /// This is the raw event payload that Lens will enrich (extract asks, decisions, etc.)
-    IntegrationLensEvent {
-        /// Source integration type: "slack", "github", "jira", "confluence", "googledocs"
-        source_kind: String,
-        /// RawEvent JSON payload (see lens_bridge.rs for structure)
-        payload: String,
-    },
     // ---- Anonymous participation events ----
     AnonymousJoined {
         ephemeral_key: String,
@@ -229,32 +220,6 @@ pub enum SwiftEvent {
     FileDownloadFailed { file_id: String, error: String },
     /// Board metadata was updated
     BoardMetadataUpdated { board_id: String },
-    /// Integration added
-    IntegrationAdded { id: String },
-    /// Integration removed
-    IntegrationRemoved { id: String },
-    /// Integration event for console display
-    IntegrationEvent {
-        id: String,
-        scope_id: String,
-        source: String,
-        summary: String,
-        context: String,
-        url: Option<String>,
-        ts: u64,
-    },
-    /// Integration status change
-    IntegrationStatus {
-        scope_id: String,
-        integration_type: String,
-        status: String,
-        message: Option<String>,
-    },
-    /// Integration graph for console tree display
-    IntegrationGraph {
-        scope_id: String,
-        graph_json: String,  // Serialized IntegrationGraph from integration_bridge
-    },
     /// AI proactive insight generated
     AIInsight {
         insight_json: String,
@@ -300,15 +265,3 @@ pub enum SwiftEvent {
     },
 }
 
-impl SwiftEvent {
-    /// Returns true if this is an integration-related event that should go to the integration buffer
-    pub(crate) fn is_integration_event(&self) -> bool {
-        matches!(
-            self,
-            SwiftEvent::IntegrationEvent { .. }
-                | SwiftEvent::AIInsight { .. }
-                | SwiftEvent::IntegrationStatus { .. }
-                | SwiftEvent::IntegrationGraph { .. }
-        )
-    }
-}
