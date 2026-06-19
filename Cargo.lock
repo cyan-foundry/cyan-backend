@@ -726,7 +726,6 @@ dependencies = [
  "chrono",
  "clap",
  "colored",
- "cyan-backend-integrations",
  "dirs",
  "futures",
  "futures-lite",
@@ -755,21 +754,6 @@ dependencies = [
  "urlencoding",
  "uuid",
  "xaeroid",
-]
-
-[[package]]
-name = "cyan-backend-integrations"
-version = "0.0.1"
-dependencies = [
- "blake3",
- "chrono",
- "clap",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
 ]
 
 [[package]]
