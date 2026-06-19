@@ -121,6 +121,10 @@ pub struct Node {
     // nodes so they dial each other without depending on flaky in-process mDNS.
     endpoint: Endpoint,
     static_discovery: StaticProvider,
+    // The spawned actor task. Held so a resilience test can "pull the plug" on a peer
+    // via `shutdown()` — aborting this drops the actor (and the gossip/topic/router it
+    // owns), which is the in-process equivalent of a peer going away.
+    actor_handle: tokio::task::JoinHandle<()>,
 }
 
 impl Node {
@@ -267,6 +271,18 @@ impl Node {
     pub fn db(&self) -> &Path {
         &self.db_path
     }
+
+    /// "Pull the plug" on this peer: abort its actor task (dropping the gossip/topic/router
+    /// it owns) and close its iroh endpoint, then consume the node. After this returns the
+    /// peer is gone from the mesh — its command sink and event stream are dropped with it.
+    /// Bounded: `Endpoint::close` resolves promptly; the abort is immediate. This is the
+    /// in-process model of peer churn used by `tests/substrate_resilience.rs`.
+    pub async fn shutdown(self) {
+        self.actor_handle.abort();
+        // The actor held its own clone of the endpoint; this closes the shared endpoint so
+        // open connections to peers tear down rather than lingering as half-open state.
+        self.endpoint.close().await;
+    }
 }
 
 /// The shared, process-global database path. The engine's `storage` is a global
@@ -407,7 +423,7 @@ pub async fn spawn_node(name: &str, cfg: NodeCfg) -> Result<Node> {
     let endpoint = actor.endpoint();
     let static_discovery = actor.static_discovery();
 
-    tokio::spawn(async move {
+    let actor_handle = tokio::spawn(async move {
         actor.start(cmd_rx).await;
     });
 
@@ -420,6 +436,7 @@ pub async fn spawn_node(name: &str, cfg: NodeCfg) -> Result<Node> {
         db_path,
         endpoint,
         static_discovery,
+        actor_handle,
     })
 }
 
