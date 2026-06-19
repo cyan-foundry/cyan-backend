@@ -1,0 +1,41 @@
+# Infra layer for the relay/WebSocket rungs: just the iroh-relay fixture + the isolation
+# networks. Peers (cyan_node) are launched per-rung by the Rust harness / Makefile with
+# `docker run` onto the right networks, so this one file serves every layout.
+#
+# Networks model the connectivity ladder:
+#   lan      — both peers here  -> a direct peer<->peer route exists (LAN/direct rung)
+#   mesh_a   — peer-a island (no route to mesh_b)        \  split bridges: the ONLY common
+#   mesh_b   — peer-b island (no route to mesh_a)        /  reachability is the relay
+#   relaynet — the relay lives here; peers also join it  -> forces the relay path
+#   airgap   — internal:true (no gateway, no relay)      -> offline rung
+name: cyan-rig
+
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile.relay
+      args:
+        IROH_RELAY_VERSION: ${IROH_RELAY_VERSION:-0.95.1}
+    image: cyan/relay:${IROH_RELAY_VERSION:-0.95.1}
+    container_name: cyan-rig-relay
+    # `--dev` = HTTP relay (no TLS), fine for a loopback rig. Exact flags/ports are
+    # confirmed by the Makefile `relay-info` target against the built binary.
+    command: ["--dev"]
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+    networks: [lan, mesh_a, mesh_b, relaynet]
+    healthcheck:
+      # iroh-relay --dev serves its HTTP relay on 3340; treat "port open" as healthy.
+      test: ["CMD", "sh", "-c", "nc -z localhost 3340 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+networks:
+  lan: {}
+  mesh_a: {}
+  mesh_b: {}
+  relaynet: {}
+  airgap:
+    internal: true   # no gateway -> genuinely offline
