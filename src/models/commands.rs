@@ -1,3 +1,4 @@
+use crate::actors::DmAttachment;
 use crate::models::events::NetworkEvent;
 use serde::{Deserialize, Serialize};
 
@@ -41,12 +42,19 @@ pub enum NetworkCommand {
         peer_id: String,
         workspace_id: String,
     },
-    /// Send a message on an existing direct chat stream
+    /// Send a message on an existing direct chat stream.
+    ///
+    /// `attachment` is **optional and additive**: when present the message carries a file
+    /// reference (id + name + blake3 hash + size) and the receiver fetches that file into the
+    /// message's scope. Absent (the default) ⇒ identical to the original chat-send behavior, so
+    /// the FFI/wire stays drop-in for callers that don't set it.
     SendDirectChat {
         peer_id: String,
         workspace_id: String,
         message: String,
         parent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachment: Option<DmAttachment>,
     },
     /// Request file download from peer (with resume support)
     RequestFileDownload {

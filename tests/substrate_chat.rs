@@ -9,8 +9,13 @@
 
 mod support;
 
-use cyan_backend::models::events::NetworkEvent;
-use support::{meet, serial, spawn_mesh, unique_discovery_key, unique_group_id, NodeCfg, SYNC_TIMEOUT};
+use cyan_backend::actors::DmAttachment;
+use cyan_backend::models::commands::NetworkCommand;
+use cyan_backend::models::events::{NetworkEvent, SwiftEvent};
+use support::{
+    meet, serial, spawn_mesh, stage_file, unique_discovery_key, unique_group_id, NodeCfg,
+    SYNC_TIMEOUT,
+};
 
 fn cfg() -> NodeCfg {
     NodeCfg {
@@ -76,13 +81,65 @@ async fn board_chat_reaches_all_peers() {
 /// G7: a chat carrying an attachment shares the file into the scope, leaving the receiver
 /// with both the message and the fetched file.
 ///
-/// `#[ignore]` — engine-capability finding: there is **no `NetworkCommand` that carries an
-/// attachment**. `SendDirectChat` has only `{peer_id, workspace_id, message, parent_id}`,
-/// and `DmAttachment` (defined on the wire `DirectMessage`) is never constructed anywhere
-/// in the engine. So a chat-with-attachment cannot be driven through the command interface
-/// the substrate exposes; G7 cannot be exercised without first adding that capability.
-#[ignore = "no NetworkCommand carries an attachment; DmAttachment is never wired to a command"]
+/// `SendDirectChat` now takes an optional `attachment: Option<DmAttachment>` (additive). The
+/// host stages a file at workspace scope, then sends a DM carrying that attachment to the
+/// peer. The receiver must end up with BOTH the message (`DirectMessageReceived`) AND the
+/// file fetched into that scope (`FileDownloaded`, bytes blake3-verified) — the engine's DM
+/// receive path now registers the attachment in scope and fetches it from the sender.
 #[tokio::test]
 async fn chat_with_attachment_shares_file_into_scope() {
-    unimplemented!("needs an attachment-carrying command in the engine — see doc comment");
+    let _serial = serial().await;
+    let nodes = spawn_mesh(2, cfg()).await.expect("mesh spawns");
+    let group = unique_group_id();
+    meet(&nodes, &group, SYNC_TIMEOUT).await.expect("nodes meet");
+
+    // Host stages a file at workspace scope so it is servable over the file-transfer protocol.
+    let scope = format!("{group}-ws");
+    let content: Vec<u8> = (0..(32 * 1024 + 17)).map(|i| (i % 251) as u8).collect();
+    let file_id = format!("attach-{}", &group[16..32]);
+    let name = format!("{file_id}.bin");
+    let hash = stage_file(
+        &file_id,
+        &group,
+        Some(&scope),
+        None,
+        &content,
+        &nodes[0].node_id,
+    );
+
+    // Host sends a chat carrying the attachment to the peer (the new optional field).
+    nodes[0].cmd(NetworkCommand::SendDirectChat {
+        peer_id: nodes[1].node_id.clone(),
+        workspace_id: scope.clone(),
+        message: "sharing a file with you".to_string(),
+        parent_id: None,
+        attachment: Some(DmAttachment {
+            file_id: file_id.clone(),
+            name: name.clone(),
+            hash: hash.clone(),
+            size: content.len() as u64,
+        }),
+    });
+
+    // The receiver gets the chat message itself.
+    nodes[1]
+        .wait_for(
+            |e| matches!(e, SwiftEvent::DirectMessageReceived { is_incoming: true, .. }),
+            SYNC_TIMEOUT,
+        )
+        .await
+        .expect("peer received the chat message");
+
+    // …and the attached file is fetched into that scope, bytes intact.
+    let local_path = nodes[1]
+        .wait_file_downloaded(&file_id, SYNC_TIMEOUT)
+        .await
+        .expect("peer fetched the attached file into scope");
+    let got = std::fs::read(&local_path).expect("read downloaded attachment");
+    assert_eq!(got.len(), content.len(), "attachment byte length matches");
+    assert_eq!(
+        blake3::hash(&got).to_hex().to_string(),
+        hash,
+        "attachment blake3 matches the source"
+    );
 }
