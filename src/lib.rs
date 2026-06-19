@@ -1111,6 +1111,7 @@ impl CommandActor {
                         workspace_id,
                         message,
                         parent_id,
+                        attachment: None,
                     });
                 }
 

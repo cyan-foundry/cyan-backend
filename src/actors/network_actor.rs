@@ -106,6 +106,8 @@ impl ProtocolHandler for FileTransferHandler {
 pub struct DmHandler {
     dm_senders: Arc<std::sync::Mutex<HashMap<String, UnboundedSender<DirectMessage>>>>,
     event_tx: UnboundedSender<SwiftEvent>,
+    /// Lets the inbound DM handler fetch an attachment into scope (see `self_cmd_tx`).
+    self_cmd_tx: UnboundedSender<NetworkCommand>,
 }
 
 impl ProtocolHandler for DmHandler {
@@ -114,7 +116,7 @@ impl ProtocolHandler for DmHandler {
         eprintln!("💬 [DM] Incoming connection from {}...", &peer_id[..16]);
         tracing::info!("💬 [DM] Incoming connection from {}", &peer_id[..16]);
 
-        if let Err(e) = handle_dm_stream(conn, peer_id.clone(), self.dm_senders.clone(), self.event_tx.clone()).await {
+        if let Err(e) = handle_dm_stream(conn, peer_id.clone(), self.dm_senders.clone(), self.event_tx.clone(), self.self_cmd_tx.clone()).await {
             eprintln!("🔴 [DM] Connection error with {}: {}", &peer_id[..16], e);
             tracing::error!("🔴 DM connection error: {}", e);
         }
@@ -169,6 +171,13 @@ pub struct NetworkActor {
 
     /// Event channel to Swift
     event_tx: UnboundedSender<SwiftEvent>,
+
+    /// Self-command channel: lets internal handlers (e.g. the DM receive path, when a
+    /// message carries an attachment) enqueue a `NetworkCommand` back into this actor's own
+    /// loop so it runs through the normal command handling (here: `RequestFileDownload`).
+    /// The receiver half is drained in `run_loop` alongside the FFI command channel.
+    self_cmd_tx: UnboundedSender<NetworkCommand>,
+    self_cmd_rx: UnboundedReceiver<NetworkCommand>,
 
     /// Channel to receive commands from DiscoveryActor
     discovery_rx: UnboundedReceiver<DiscoveryNetworkCmd>,
@@ -249,9 +258,14 @@ impl NetworkActor {
             event_tx: event_tx.clone(),
         };
 
+        // Self-command channel (see struct field): the DM acceptor handler gets the sender so
+        // an inbound attachment can enqueue a `RequestFileDownload` back into this actor.
+        let (self_cmd_tx, self_cmd_rx) = mpsc::unbounded_channel();
+
         let dm_handler = DmHandler {
             dm_senders: dm_senders.clone(),
             event_tx: event_tx.clone(),
+            self_cmd_tx: self_cmd_tx.clone(),
         };
 
         // Setup router with ALL protocols
@@ -280,6 +294,8 @@ impl NetworkActor {
             dm_senders,
             peers_per_group,
             event_tx,
+            self_cmd_tx,
+            self_cmd_rx,
             discovery_rx,
             discovery_tx,
             topic_network_rx,
@@ -393,6 +409,19 @@ impl NetworkActor {
                         None => {
                             tracing::info!("🛑 [NET] Command channel closed");
                             break;
+                        }
+                    }
+                }
+
+                // Self-issued commands (e.g. fetch an attachment received over a DM)
+                self_cmd = self.self_cmd_rx.recv() => {
+                    match self_cmd {
+                        Some(network_cmd) => {
+                            self.handle_network_command(network_cmd).await;
+                        }
+                        None => {
+                            // tx is held by self; this arm only resolves to None at shutdown.
+                            tracing::debug!("🛑 [NET] Self-command channel closed");
                         }
                     }
                 }
@@ -603,10 +632,13 @@ impl NetworkActor {
                 }
             }
 
-            NetworkCommand::SendDirectChat { peer_id, workspace_id, message, parent_id } => {
+            NetworkCommand::SendDirectChat { peer_id, workspace_id, message, parent_id, attachment } => {
                 eprintln!("💬 [NET] SendDirectChat:");
                 eprintln!("   peer_id: {}...", &peer_id[..16.min(peer_id.len())]);
                 eprintln!("   message: {}...", &message[..50.min(message.len())]);
+                if let Some(ref att) = attachment {
+                    eprintln!("   📎 attachment: {} ({} bytes)", att.name, att.size);
+                }
                 tracing::info!("💬 [NET] SendDirectChat to {}", &peer_id[..16]);
 
                 let dm = DirectMessage {
@@ -617,7 +649,7 @@ impl NetworkActor {
                     message: message.clone(),
                     parent_id,
                     timestamp: chrono::Utc::now().timestamp(),
-                    attachment: None,
+                    attachment,
                 };
 
                 eprintln!("💬 [NET] Created DM id: {}...", &dm.id[..16]);
@@ -902,6 +934,7 @@ impl NetworkActor {
         // Spawn bidirectional handler for OUTBOUND connection
         let peer_id_clone = peer_id.to_string();
         let event_tx = self.event_tx.clone();
+        let self_cmd_tx = self.self_cmd_tx.clone();
 
         tokio::spawn(async move {
             handle_dm_stream_with_streams(
@@ -910,6 +943,7 @@ impl NetworkActor {
                 recv_stream,
                 rx,
                 event_tx,
+                self_cmd_tx,
             ).await;
         });
 
@@ -954,12 +988,64 @@ impl NetworkActor {
 // DM STREAM HANDLER (called by DmHandler ProtocolHandler)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// On receiving a DM that carries an attachment, share that file into the message's scope and
+/// fetch it from the sender. Registers the file locally (best-effort, so it appears in the
+/// workspace/group the chat was posted to even if we've never seen it) and enqueues a
+/// `RequestFileDownload` from the sending peer. Both DM receive paths funnel through here.
+/// No-op when the message has no attachment.
+fn fetch_attachment_into_scope(
+    dm: &DirectMessage,
+    peer_id: &str,
+    self_cmd_tx: &UnboundedSender<NetworkCommand>,
+) {
+    let Some(attachment) = dm.attachment.clone() else {
+        return;
+    };
+    tracing::info!(
+        "📎 [DM] Message has attachment: {} ({} bytes) — sharing into scope",
+        attachment.name,
+        attachment.size
+    );
+
+    // Make the file locally known in the message's scope if we don't already have it, so it
+    // belongs to the workspace/group the chat was posted to (and `RequestFileDownload` can
+    // route it via the file's group). No-op when the file is already in our DB.
+    if storage::file_get_group_id(&attachment.file_id).is_none() {
+        let group_id = dm
+            .workspace_id
+            .as_deref()
+            .and_then(storage::workspace_get_group_id);
+        let _ = storage::file_insert_simple(
+            &attachment.file_id,
+            group_id.as_deref(),
+            dm.workspace_id.as_deref(),
+            None,
+            &attachment.name,
+            &attachment.hash,
+            attachment.size,
+            Some(peer_id),
+            dm.timestamp,
+        );
+    }
+
+    // Fetch the bytes from the sender into that scope.
+    if let Err(e) = self_cmd_tx.send(NetworkCommand::RequestFileDownload {
+        file_id: attachment.file_id,
+        hash: attachment.hash,
+        source_peer: peer_id.to_string(),
+        resume_offset: 0,
+    }) {
+        tracing::warn!("⚠️ [DM] Failed to enqueue attachment download: {}", e);
+    }
+}
+
 /// Handle incoming DM connection from ProtocolHandler
 async fn handle_dm_stream(
     conn: Connection,
     peer_id: String,
     dm_senders: Arc<std::sync::Mutex<HashMap<String, UnboundedSender<DirectMessage>>>>,
     event_tx: UnboundedSender<SwiftEvent>,
+    self_cmd_tx: UnboundedSender<NetworkCommand>,
 ) -> Result<()> {
     tracing::info!("💬 [DM] Accepting bi-stream from {}", &peer_id[..16]);
 
@@ -991,14 +1077,8 @@ async fn handle_dm_stream(
                             &dm.message[..50.min(dm.message.len())]
                         );
 
-                        // Handle file attachment if present
-                        if let Some(ref attachment) = dm.attachment {
-                            tracing::info!(
-                                "📎 [DM] Message has attachment: {} ({} bytes)",
-                                attachment.name,
-                                attachment.size
-                            );
-                        }
+                        // Share any attachment into the message's scope and fetch it.
+                        fetch_attachment_into_scope(&dm, &peer_id, &self_cmd_tx);
 
                         // Store in DB
                         let _ = storage::dm_insert(
@@ -1058,6 +1138,7 @@ async fn handle_dm_stream_with_streams(
     mut recv: iroh::endpoint::RecvStream,
     mut outbound_rx: UnboundedReceiver<DirectMessage>,
     event_tx: UnboundedSender<SwiftEvent>,
+    self_cmd_tx: UnboundedSender<NetworkCommand>,
 ) {
     tracing::info!("💬 [DM] Outbound stream handler started for {}", &peer_id[..16]);
 
@@ -1073,14 +1154,8 @@ async fn handle_dm_stream_with_streams(
                             &dm.message[..50.min(dm.message.len())]
                         );
 
-                        // Handle file attachment if present
-                        if let Some(ref attachment) = dm.attachment {
-                            tracing::info!(
-                                "📎 [DM] Message has attachment: {} ({} bytes)",
-                                attachment.name,
-                                attachment.size
-                            );
-                        }
+                        // Share any attachment into the message's scope and fetch it.
+                        fetch_attachment_into_scope(&dm, &peer_id, &self_cmd_tx);
 
                         // Store in DB
                         let _ = storage::dm_insert(

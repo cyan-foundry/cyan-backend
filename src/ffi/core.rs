@@ -678,6 +678,7 @@ pub extern "C" fn cyan_send_direct_chat(
         workspace_id: wid,
         message: msg,
         parent_id: parent,
+        attachment: None,
     });
 }
 
