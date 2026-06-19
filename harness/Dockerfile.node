@@ -15,7 +15,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       cmake clang libclang-dev pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 # The assembled context places sibling crates next to cyan-backend so `../xaeroid` resolves.
-COPY xaeroai/        /src/xaeroai/
 COPY xaeroid/        /src/xaeroid/
 COPY cyan-backend-integrations/ /src/cyan-backend-integrations/
 COPY cyan-backend/   /src/cyan-backend/

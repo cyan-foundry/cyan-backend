@@ -33,8 +33,6 @@ copy_crate() { # <src-dir> <dest-name>
 
 echo "[assemble] cyan-backend  <- $REPO_DIR"
 copy_crate "$REPO_DIR" "cyan-backend"
-echo "[assemble] xaeroai       <- $PARENT_DIR/xaeroai"
-copy_crate "$PARENT_DIR/xaeroai" "xaeroai"
 # xaeroID on disk, but the path dep + package name are lowercase `xaeroid`.
 echo "[assemble] xaeroid       <- $PARENT_DIR/xaeroID  (lowercased for Linux)"
 copy_crate "$PARENT_DIR/xaeroID" "xaeroid"
