@@ -128,8 +128,14 @@ impl TopicActor {
             peers.len()
         );
 
-        // Subscribe to topic
-        let topic = gossip.subscribe_and_join(topic_id, peers.clone()).await?;
+        // Subscribe to the topic WITHOUT awaiting `joined()`. `subscribe_and_join` parks
+        // until ≥1 neighbour connects; with only an unreachable bootstrap (the relay-only
+        // default, offline) that never happens, so awaiting it here would block the caller
+        // (`NetworkActor::start`/`handle JoinGroup`) and wedge the command loop. The join
+        // proceeds in the background — `run`'s gossip stream surfaces the first `NeighborUp`
+        // via `handle_gossip_event` exactly like every subsequent one — so startup is
+        // non-blocking and the topic recovers the moment a neighbour appears.
+        let topic = gossip.subscribe(topic_id, peers.clone()).await?;
         let (sender, receiver) = topic.split();
 
         // Signal to NetworkActor that we need a snapshot

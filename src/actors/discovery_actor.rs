@@ -135,10 +135,14 @@ impl DiscoveryActor {
             bootstrap_peers.len()
         );
 
-        // Subscribe to discovery topic
-        let topic = gossip
-            .subscribe_and_join(topic_id, bootstrap_peers.clone())
-            .await?;
+        // Subscribe to the discovery topic WITHOUT awaiting `joined()`. `subscribe_and_join`
+        // parks until ≥1 neighbour connects; offline (MdnsOnly → empty bootstrap, or an
+        // unreachable bootstrap) that never happens, so awaiting it here would block
+        // `NetworkActor::start` before it reaches its command loop. The join proceeds in the
+        // background — `run` broadcasts our groups on startup and again on every `NeighborUp`
+        // (`handle_gossip_event`) — so a cold offline start is non-blocking and discovery
+        // recovers the moment a neighbour appears.
+        let topic = gossip.subscribe(topic_id, bootstrap_peers.clone()).await?;
         let (sender, receiver) = topic.split();
 
         // Load my groups from DB

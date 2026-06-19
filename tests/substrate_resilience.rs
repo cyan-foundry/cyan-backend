@@ -247,17 +247,16 @@ async fn dropped_peer_rejoins_and_meets_again() {
     .expect("the replacement rediscovers the mesh and receives a delta from the seed");
 }
 
-/// ENCODED FINDING (NOT a fix): a node that already has a group in its DB and cold-starts
-/// fully offline (relay disabled, no reachable bootstrap) must start NON-BLOCKING — its
-/// command loop should run so the app stays responsive. Per STATUS_OVERNIGHT §"Engine
-/// finding" it does NOT: `start()` loads the persisted group and awaits
-/// `gossip.subscribe_and_join`, which (with only the unreachable relay-only default
-/// bootstrap as a candidate) parks until a neighbour connects — one never does offline,
-/// so the command loop never runs. This test is the executable spec for that fix; it is
-/// `#[ignore]`d so it does not gate the suite (and so its seeded group row never
-/// contaminates other in-binary tests). Do NOT edit the engine to make it pass.
+/// REGRESSION GUARD (now green — fixed): a node that already has a group in its DB and
+/// cold-starts fully offline (relay disabled, no reachable bootstrap) must start
+/// NON-BLOCKING — its command loop must run so the app stays responsive. The original
+/// finding (STATUS_OVERNIGHT §"Engine finding"): `start()` awaited `gossip.subscribe_and_join`
+/// for the discovery topic and the persisted group's topic, each of which parks until a
+/// neighbour connects — one never does offline, so the command loop never ran. The fix
+/// switches both subscribes to the non-blocking `gossip.subscribe` (the join completes in
+/// the background via each actor's `NeighborUp` handling), so startup no longer blocks.
+/// See STATUS_OFFLINE_FIX.md. This test is the executable spec for that fix.
 #[tokio::test]
-#[ignore = "engine: offline startup blocks on unreachable default bootstrap — see STATUS_OVERNIGHT; fix is babysit"]
 async fn node_with_group_offline_startup_does_not_block() {
     let _serial = serial().await;
 
