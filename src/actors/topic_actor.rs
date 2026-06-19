@@ -37,6 +37,7 @@ use crate::{
         protocol::{FileTransferMsg, SnapshotFrame},
     },
     storage,
+    swarm::{BlobSwarm, Hash, SwarmMessage},
 };
 
 /// ALPN for snapshot transfer protocol
@@ -67,6 +68,10 @@ pub enum TopicCommand {
     },
     /// Mark snapshot as needed or received
     SetNeedSnapshot(bool),
+    /// Announce (over gossip) that this node holds the blob with this Blake3 hash (`IHave`).
+    AnnounceBlob { hash: String },
+    /// Ask the group (over gossip) who holds the blob with this Blake3 hash (`WhoHas`).
+    QueryBlob { hash: String },
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -90,10 +95,15 @@ pub struct TopicActor {
 
     /// Event channel to Swift
     event_tx: UnboundedSender<SwiftEvent>,
+
+    /// Shared blob swarm (G10): incoming i-have/who-has gossip is fed to `swarm.on_message`, and
+    /// `AnnounceBlob`/`QueryBlob` commands broadcast the negotiation messages onto this group topic.
+    swarm: Arc<BlobSwarm>,
 }
 
 impl TopicActor {
     /// Spawn a new TopicActor for a group
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         node_id: String,
         group_id: String,
@@ -102,6 +112,7 @@ impl TopicActor {
         initial_peers: Vec<PublicKey>,
         network_tx: UnboundedSender<TopicNetworkCmd>,
         event_tx: UnboundedSender<SwiftEvent>,
+        swarm: Arc<BlobSwarm>,
     ) -> Result<ActorHandle<TopicCommand>> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
@@ -153,6 +164,7 @@ impl TopicActor {
             need_snapshot: true,  // New groups always need snapshot
             network_tx,
             event_tx,
+            swarm,
         };
 
         let join_handle = tokio::spawn(actor.run(cmd_rx, receiver));
@@ -291,12 +303,52 @@ impl TopicActor {
                 }
             }
 
+            TopicCommand::AnnounceBlob { hash } => {
+                // Broadcast an `IHave` for a blob this node holds onto the group topic (G10).
+                match crate::swarm::Hash::from_str(&hash) {
+                    Ok(h) => self.broadcast_swarm_message(&self.swarm.announce(&h)).await,
+                    Err(e) => tracing::warn!("⚠️ [TOPIC] AnnounceBlob bad hash {}: {}", hash, e),
+                }
+            }
+
+            TopicCommand::QueryBlob { hash } => {
+                // Broadcast a `WhoHas` query onto the group topic; holders reply with `IHave` (G10).
+                match crate::swarm::Hash::from_str(&hash) {
+                    Ok(h) => self.broadcast_swarm_message(&self.swarm.query(&h)).await,
+                    Err(e) => tracing::warn!("⚠️ [TOPIC] QueryBlob bad hash {}: {}", hash, e),
+                }
+            }
+
             TopicCommand::DownloadFile { file_id, hash, source_peer, resume_offset } => {
                 let endpoint = self.endpoint.clone();
                 let event_tx = self.event_tx.clone();
                 let group_id = self.group_id.clone();
 
+                // Content-addressed swarm path (G10): if this node already knows holders for the
+                // blob (learned via `IHave` gossip — e.g. a `.cyanplugin` seeded by the uploader),
+                // fetch it multi-source with churn/resume + Blake3 verify. Falls back to the existing
+                // single-source file transfer when no holders are known, so non-swarm files (and
+                // plugins before any IHave is seen) behave exactly as before.
+                let swarm = self.swarm.clone();
                 tokio::spawn(async move {
+                    let holders = match Hash::from_str(&hash) {
+                        Ok(h) => swarm.holders(&h).await,
+                        Err(_) => Vec::new(),
+                    };
+                    if !holders.is_empty() {
+                        match swarm_download_file(&swarm, &file_id, &hash, &holders, event_tx.clone())
+                            .await
+                        {
+                            Ok(()) => return,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "⚠️ [TOPIC] swarm fetch for {} failed ({}); falling back to direct transfer",
+                                    &file_id[..16.min(file_id.len())],
+                                    e
+                                );
+                            }
+                        }
+                    }
                     if let Err(e) = download_file(
                         endpoint,
                         &file_id,
@@ -410,6 +462,16 @@ impl TopicActor {
 
                 // Ignore our own messages
                 if from == self.node_id {
+                    return;
+                }
+
+                // Try parsing as a blob-swarm negotiation message FIRST (G10): its `{"type":"IHave"
+                // |"WhoHas"}` shape is disjoint from NetworkEvent/NetworkCommand. Record the holder /
+                // answer a WhoHas with our own IHave, broadcast over this same group topic.
+                if let Ok(reply) = self.swarm.on_message(&msg.content).await {
+                    if let Some(reply) = reply {
+                        self.broadcast_swarm_message(&reply).await;
+                    }
                     return;
                 }
 
@@ -645,6 +707,19 @@ impl TopicActor {
         Ok(())
     }
 
+    /// Broadcast a blob-swarm negotiation message (`IHave`/`WhoHas`) onto this group topic (G10).
+    /// Rides the existing gossip channel exactly like `NetworkEvent`/`NetworkCommand` do.
+    async fn broadcast_swarm_message(&self, msg: &SwarmMessage) {
+        match serde_json::to_vec(msg) {
+            Ok(data) => {
+                if let Err(e) = self.sender.broadcast(Bytes::from(data)).await {
+                    tracing::error!("🔴 [TOPIC] swarm message broadcast failed: {}", e);
+                }
+            }
+            Err(e) => tracing::error!("🔴 [TOPIC] swarm message serialize failed: {}", e),
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // DB PERSISTENCE (static - uses storage module)
     // ═══════════════════════════════════════════════════════════════════════
@@ -824,6 +899,52 @@ impl TopicActor {
 // ═══════════════════════════════════════════════════════════════════════════
 // FILE DOWNLOAD CLIENT
 // ═══════════════════════════════════════════════════════════════════════════
+
+/// Content-addressed swarm download (G10): fetch the blob multi-source from `holders` (churn/resume +
+/// Blake3 verify inside `BlobSwarm::fetch`), land it on disk under the downloads dir, record its
+/// `local_path`, and emit `FileDownloaded` — reusing the same storage rows and event as the direct
+/// path so the iOS app sees a plugin land exactly like any other file (no new client FFI).
+async fn swarm_download_file(
+    swarm: &Arc<BlobSwarm>,
+    file_id: &str,
+    hash: &str,
+    holders: &[String],
+    event_tx: UnboundedSender<SwiftEvent>,
+) -> Result<()> {
+    let parsed = Hash::from_str(hash).map_err(|e| anyhow!("bad blob hash {}: {}", hash, e))?;
+
+    let bytes = swarm.fetch(&parsed, holders).await?; // Blake3-verified on completion
+
+    // File name from the existing file row (registered via FileAvailable); fall back to the id.
+    let file_name = storage::file_get_for_transfer(file_id, hash)
+        .map(|(name, _, _)| name)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| file_id.to_string());
+
+    let data_dir = crate::DATA_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let downloads_dir = data_dir.join("downloads");
+    tokio::fs::create_dir_all(&downloads_dir).await?;
+    let final_path = downloads_dir.join(&file_name);
+    tokio::fs::write(&final_path, &bytes).await?;
+
+    let _ = storage::file_set_local_path(file_id, &final_path.to_string_lossy());
+    let _ = storage::transfer_set_status(file_id, "complete");
+
+    tracing::info!(
+        "✅ [FILE] Swarm download complete: {} ({} bytes from {} holders)",
+        file_name,
+        bytes.len(),
+        holders.len()
+    );
+    let _ = event_tx.send(SwiftEvent::FileDownloaded {
+        file_id: file_id.to_string(),
+        local_path: final_path.to_string_lossy().to_string(),
+    });
+    Ok(())
+}
 
 async fn download_file(
     endpoint: Endpoint,

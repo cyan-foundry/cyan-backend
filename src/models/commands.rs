@@ -65,6 +65,17 @@ pub enum NetworkCommand {
     },
     /// Resume all pending file transfers
     ResumePendingTransfers,
+    /// Announce over a group's gossip that this node holds the content-addressed blob `hash`
+    /// (G10 swarm i-have). Engine-internal; not surfaced as a new client `cyan_*` FFI.
+    SwarmAnnounce { group_id: String, hash: String },
+    /// Ask a group (over gossip) which peers hold the content-addressed blob `hash`
+    /// (G10 swarm who-has). Engine-internal; not surfaced as a new client `cyan_*` FFI.
+    SwarmWhoHas { group_id: String, hash: String },
+    /// Seed a content-addressed blob into this node's swarm store from `path`, then announce it
+    /// (`IHave`) to `group_id` so members can swarm-fetch it. The engine's plugin-distribution hook:
+    /// a `.cyanplugin` upload sends this so the file distributes peer-to-peer (G10). Engine-internal —
+    /// emitted by the existing `cyan_upload_file` FFI, NOT a new client `cyan_*` function.
+    SeedAndAnnounceBlob { group_id: String, hash: String, path: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::models::protocol::FileTransferMsg;
+use crate::swarm::{BlobSwarm, BLOB_ALPN};
 use crate::{
     actors::{
         discovery_actor::{DiscoveryActor, DiscoveryCommand, DiscoveryNetworkCmd},
@@ -202,6 +203,10 @@ pub struct NetworkActor {
     /// Out-of-band static address provider (see `new`). Retained so it can be cloned
     /// out via `static_discovery()`; inert unless a caller adds entries.
     static_discovery: StaticProvider,
+
+    /// Content-addressed blob swarm (G10). Shared with each TopicActor so i-have/who-has
+    /// negotiation rides the group gossip, and exposed via `swarm()` for the swarm-fetch path.
+    swarm: Arc<BlobSwarm>,
 }
 
 impl NetworkActor {
@@ -236,6 +241,7 @@ impl NetworkActor {
                 FILE_TRANSFER_ALPN.to_vec(),
                 SNAPSHOT_ALPN.to_vec(),
                 DM_ALPN.to_vec(),
+                BLOB_ALPN.to_vec(),
             ])
             .relay_mode(relay_mode)
             .discovery(MdnsDiscovery::builder())
@@ -247,6 +253,11 @@ impl NetworkActor {
 
         // Create gossip
         let gossip = Arc::new(Gossip::builder().spawn(endpoint.clone()));
+
+        // Content-addressed blob swarm (G10): a per-node store served on the blobs ALPN over THIS
+        // same endpoint/router. Additive and behavior-preserving — holders are addressed by the
+        // node's normal node id, and the gossip/file/dm/snapshot paths are untouched. See `swarm.rs`.
+        let swarm = Arc::new(BlobSwarm::new(endpoint.clone(), node_id.clone()));
 
         // Create protocol handlers
         let snapshot_handler = SnapshotHandler {
@@ -274,9 +285,10 @@ impl NetworkActor {
             .accept(SNAPSHOT_ALPN, snapshot_handler)
             .accept(FILE_TRANSFER_ALPN, file_handler)
             .accept(DM_ALPN, dm_handler)
+            .accept(BLOB_ALPN, swarm.blobs_protocol())
             .spawn();
 
-        tracing::info!("✅ [NET] Router spawned with gossip + snapshot + file + dm");
+        tracing::info!("✅ [NET] Router spawned with gossip + snapshot + file + dm + blob-swarm");
 
         // Create channel for DiscoveryActor → NetworkActor communication
         let (discovery_tx, discovery_rx) = mpsc::unbounded_channel();
@@ -303,7 +315,14 @@ impl NetworkActor {
             groups_needing_snapshot: HashSet::new(),
             cfg,
             static_discovery,
+            swarm,
         })
+    }
+
+    /// A clone of this node's blob swarm handle (G10). Test-support seam and the engine's
+    /// content-addressed multi-source fetch entry point. Cheap (internally reference-counted).
+    pub fn swarm(&self) -> Arc<BlobSwarm> {
+        self.swarm.clone()
     }
 
     /// A clone of this actor's endpoint. Test-support seam: the in-process harness uses
@@ -616,6 +635,62 @@ impl NetworkActor {
                 }
             }
 
+            NetworkCommand::SwarmAnnounce { group_id, hash } => {
+                if let Some(handle) = self.topics.get(&group_id) {
+                    let _ = handle
+                        .cmd_tx
+                        .send(ActorMessage::Domain(TopicCommand::AnnounceBlob { hash }));
+                } else {
+                    tracing::warn!(
+                        "⚠️ [NET] SwarmAnnounce: no TopicActor for group {}",
+                        &group_id[..16.min(group_id.len())]
+                    );
+                }
+            }
+
+            NetworkCommand::SwarmWhoHas { group_id, hash } => {
+                if let Some(handle) = self.topics.get(&group_id) {
+                    let _ = handle
+                        .cmd_tx
+                        .send(ActorMessage::Domain(TopicCommand::QueryBlob { hash }));
+                } else {
+                    tracing::warn!(
+                        "⚠️ [NET] SwarmWhoHas: no TopicActor for group {}",
+                        &group_id[..16.min(group_id.len())]
+                    );
+                }
+            }
+
+            NetworkCommand::SeedAndAnnounceBlob { group_id, hash, path } => {
+                // Plugin distribution (G10): add the file's bytes to this node's content-addressed
+                // swarm store, then announce `IHave` to the group so members can swarm-fetch it.
+                match tokio::fs::read(&path).await {
+                    Ok(bytes) => match self.swarm.add(bytes).await {
+                        Ok(added) => {
+                            if added.to_string() != hash {
+                                tracing::warn!(
+                                    "⚠️ [NET] SeedAndAnnounceBlob: content hash {} != declared {}",
+                                    added,
+                                    hash
+                                );
+                            }
+                            if let Some(handle) = self.topics.get(&group_id) {
+                                let _ = handle.cmd_tx.send(ActorMessage::Domain(
+                                    TopicCommand::AnnounceBlob { hash: added.to_string() },
+                                ));
+                            } else {
+                                tracing::warn!(
+                                    "⚠️ [NET] SeedAndAnnounceBlob: no TopicActor for group {}",
+                                    &group_id[..16.min(group_id.len())]
+                                );
+                            }
+                        }
+                        Err(e) => tracing::error!("🔴 [NET] swarm add for plugin seed failed: {}", e),
+                    },
+                    Err(e) => tracing::error!("🔴 [NET] reading plugin {} to seed failed: {}", path, e),
+                }
+            }
+
             NetworkCommand::StartChatStream { peer_id, workspace_id } => {
                 tracing::info!("💬 [NET] StartChatStream with {}", &peer_id[..16]);
 
@@ -877,6 +952,7 @@ impl NetworkActor {
             initial_peers,
             self.topic_network_tx.clone(),
             self.event_tx.clone(),
+            self.swarm.clone(),
         ).await?;
 
         eprintln!("🚀 [TOPIC-SPAWN-2] ✓ TopicActor spawned, inserting into topics map");
