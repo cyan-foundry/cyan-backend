@@ -23,6 +23,13 @@ path = "tests/snapshot_protocol_test.rs"
 name = "delta_test"
 path = "tests/delta_sync_test.rs"
 
+# Test-only peer binary for the in-process->multi-process substrate snapshot rig
+# (tests/substrate_snapshot_mp.rs). Each instance boots a NetworkActor against its
+# OWN sqlite DB so per-node storage assertions are honest. Uses only the public API.
+[[bin]]
+name = "cyan_node"
+path = "src/bin/cyan_node.rs"
+
 
 [dependencies]
 regex = "1"

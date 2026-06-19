@@ -157,3 +157,28 @@ numbering is independent of the NodeConfig run above. Rules: stay on
   substrate_files 20/20, substrate_offline 20/20.
 - 2026-06-18 — Clippy: new files introduce zero new warnings.
 - 2026-06-18 — END. Gate GREEN. Committing PHASE 1; proceeding to PHASE 2 (multi-process rig).
+
+## PHASE 2 — multi-process rig (per-process DB snapshot truth)
+- 2026-06-19 — START. Added test-only bin `src/bin/cyan_node.rs` (boots a NetworkActor
+  against its OWN sqlite DB via env NODE_DB/DISCOVERY_KEY/RELAY/BOOTSTRAP_NODE_ID/
+  SEED_FIXTURE; driven by a `@@CYAN@@`-tagged stdin/stdout line protocol: node_id, addr,
+  add_peer, seed_fixture, join_group, wait_sync, count, quit; public API only), plus
+  `tests/support/multiprocess.rs` (spawns cyan_node children, exchanges serialized
+  EndpointAddr JSON into each other's StaticProvider, drives the protocol, asserts on each
+  process's own `count`) and `tests/substrate_snapshot_mp.rs` (`late_joiner_gets_full_snapshot`).
+  Added the `[[bin]]` entry to Cargo.toml. ADDITIVE ONLY — no engine/FFI/storage edits.
+- 2026-06-19 — ROOT CAUSE found via iroh tracing: the engine's startup group-load awaits
+  `gossip.subscribe_and_join([default_bootstrap]).await`, which BLOCKS until a neighbor
+  connects; with relay disabled the default bootstrap is unreachable. So a node that has
+  the group in its DB at startup blocks before its command loop. Fix (no engine change):
+  the HOST seeds the fixture BEFORE the actor starts (startup auto-hosts the group topic
+  and waits for the joiner — recovers when it connects); the JOINER starts with an EMPTY
+  db so its command loop processes JoinGroup with the reachable host as a bootstrap peer.
+- 2026-06-19 — GREEN. `late_joiner_gets_full_snapshot` passes (~2.5s): the joiner's OWN
+  process DB ends with workspaces=1, boards=1, elements=5, cells=3, chats=3, files=1 —
+  honest per-node snapshot truth. Stable across 6 consecutive runs. The in-process
+  `substrate_sync::late_joiner_gets_full_snapshot` stays #[ignore]d (shared process-global
+  DB), with this green multi-process version added alongside per the run plan.
+- 2026-06-19 — Clippy: new files introduce zero new warnings (fixed 2 lints in cyan_node).
+  Full `cargo test --no-run` compiles clean; PHASE 1 reliability suite still green (3/3).
+- 2026-06-19 — END. Gate GREEN. Committing PHASE 2.
