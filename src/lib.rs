@@ -26,6 +26,7 @@ mod ffi;
 pub mod actors;
 pub mod storage;
 pub mod lens_commands;
+pub mod mcp_host;
 
 use crate::models::commands::{CommandMsg, NetworkCommand};
 use crate::models::core::{Group, Workspace};
@@ -1441,6 +1442,11 @@ fn route_event_to_buffers(
                 NetworkEvent::GroupSnapshotAvailable { .. } => {
                     network_status.lock().unwrap().push_back(event_json.to_string());
                 }
+
+                // MCP plugin relays are mesh pass-through for the super-peer (Lens
+                // replica) to enrich — a normal device has no local consumer and
+                // surfaces nothing to the app (plugins are files, not events).
+                NetworkEvent::PluginRelay { .. } => {}
             }
         }
 

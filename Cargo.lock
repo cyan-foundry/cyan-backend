@@ -726,6 +726,7 @@ dependencies = [
  "chrono",
  "clap",
  "colored",
+ "cyan-mcp",
  "dirs",
  "futures",
  "futures-lite",
@@ -754,6 +755,14 @@ dependencies = [
  "urlencoding",
  "uuid",
  "xaeroid",
+]
+
+[[package]]
+name = "cyan-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

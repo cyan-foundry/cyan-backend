@@ -576,6 +576,51 @@ pub fn file_list_by_group(group_id: &str) -> Result<Vec<FileDTO>> {
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+/// One installed plugin bundle file discovered in a group's Plugins workspace.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginBundleFile {
+    /// The object (file) id in the file scope.
+    pub file_id: String,
+    /// The bundle file name (e.g. `slack.cyanplugin`).
+    pub name: String,
+    /// On-disk path of the fetched bundle (file-swarm sets this on download).
+    pub local_path: String,
+}
+
+/// List the downloaded plugin bundle files in a group's "Plugins" workspace.
+///
+/// This is the "registry = files" pickup path: a `<suffix>` bundle landing in the
+/// workspace named `workspace_name`, once the file-swarm has fetched it (so
+/// `local_path` is set), is an installed plugin the local MCP host should run.
+/// It reuses the existing files/objects scope — no new tables and no new FFI; the
+/// app just sees a file appear in a workspace.
+pub fn plugin_bundles_in_group(
+    group_id: &str,
+    workspace_name: &str,
+    suffix: &str,
+) -> Result<Vec<PluginBundleFile>> {
+    let conn = db().lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT o.id, o.name, o.local_path
+         FROM objects o
+         JOIN workspaces w ON o.workspace_id = w.id
+         WHERE o.type = 'file'
+           AND w.group_id = ?1
+           AND w.name = ?2
+           AND o.local_path IS NOT NULL
+           AND o.name LIKE '%' || ?3
+         ORDER BY o.name",
+    )?;
+    let rows = stmt.query_map(params![group_id, workspace_name, suffix], |r| {
+        Ok(PluginBundleFile {
+            file_id: r.get(0)?,
+            name: r.get(1)?,
+            local_path: r.get(2)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // FILE TRANSFERS (resumable download state)
 // ═══════════════════════════════════════════════════════════════════════════

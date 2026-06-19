@@ -165,6 +165,19 @@ pub enum NetworkEvent {
         display_name: String,
         avatar_hash: Option<String>,
     },
+    // ---- MCP plugin relay ----
+    /// A relayed event from a locally-hosted MCP plugin, broadcast into the group
+    /// mesh so the super-peer (Lens replica) can pick it off gossip and feed Iggy.
+    /// The device has no local Iggy, so the mesh IS the transport. Normal peer
+    /// devices ignore it (no local consumer); only the super-peer enriches it.
+    PluginRelay {
+        /// Plugin that emitted the relayed event.
+        plugin_id: String,
+        /// JSON-RPC method/notification name the plugin pushed.
+        method: String,
+        /// Event payload as a JSON string (opaque to the mesh; Lens parses it).
+        payload: String,
+    },
     // ---- Anonymous participation events ----
     AnonymousJoined {
         ephemeral_key: String,
