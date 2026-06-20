@@ -511,7 +511,7 @@ impl CommandActor {
                 }
 
                 CommandMsg::CreateWorkspace { group_id, name } => {
-                    let id = blake3::hash(format!("ws:{}-{}", &group_id, name).as_bytes()).to_hex().to_string();
+                    let id = blake3::hash(format!("ws:{}-{}", group_id, name).as_bytes()).to_hex().to_string();
                     let now = chrono::Utc::now().timestamp();
                     let ws = Workspace {
                         id: id.clone(),
@@ -601,7 +601,7 @@ impl CommandActor {
                 }
 
                 CommandMsg::CreateBoard { workspace_id, name } => {
-                    let id = blake3::hash(format!("board:{}-{}", &workspace_id, name).as_bytes()).to_hex().to_string();
+                    let id = blake3::hash(format!("board:{}-{}", workspace_id, name).as_bytes()).to_hex().to_string();
                     let now = chrono::Utc::now().timestamp();
 
                     let group_id = {
@@ -691,7 +691,7 @@ impl CommandActor {
                 }
 
                 CommandMsg::SendChat { workspace_id, message, parent_id } => {
-                    let id = blake3::hash(format!("chat:{}-{}-{}", &workspace_id, &message, chrono::Utc::now()).as_bytes()).to_hex().to_string();
+                    let id = blake3::hash(format!("chat:{}-{}-{}", workspace_id, message, chrono::Utc::now()).as_bytes()).to_hex().to_string();
                     let now = chrono::Utc::now().timestamp();
                     let author = self.node_id.clone();
 
@@ -903,7 +903,7 @@ impl CommandActor {
 
                 // Whiteboard element commands
                 CommandMsg::CreateWhiteboardElement { board_id, element_type, x, y, width, height, z_index, style_json, content_json } => {
-                    let id = blake3::hash(format!("elem:{}-{}", &board_id, chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)).as_bytes()).to_hex().to_string();
+                    let id = blake3::hash(format!("elem:{}-{}", board_id, chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)).as_bytes()).to_hex().to_string();
                     let now = chrono::Utc::now().timestamp();
                     let group_id = self.get_group_id_for_board(&board_id);
 
@@ -1010,7 +1010,7 @@ impl CommandActor {
                 CommandMsg::AddNotebookCell { board_id, cell_type, cell_order, content } => {
                     // §W1: the step is the only authorable kind — collapse legacy kinds.
                     let cell_type = crate::workflow::coerce_authoring_cell_type(&cell_type);
-                    let id = blake3::hash(format!("cell:{}-{}", &board_id, chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)).as_bytes()).to_hex().to_string();
+                    let id = blake3::hash(format!("cell:{}-{}", board_id, chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)).as_bytes()).to_hex().to_string();
                     let now = chrono::Utc::now().timestamp();
                     let group_id = self.get_group_id_for_board(&board_id);
 
@@ -1161,7 +1161,7 @@ impl CommandActor {
 
                 // Integration commands
                 CommandMsg::AddIntegration { scope_type, scope_id, integration_type, config } => {
-                    let id = blake3::hash(format!("integ:{}-{}-{}", &scope_type, &scope_id, chrono::Utc::now()).as_bytes()).to_hex().to_string();
+                    let id = blake3::hash(format!("integ:{}-{}-{}", scope_type, scope_id, chrono::Utc::now()).as_bytes()).to_hex().to_string();
                     let now = chrono::Utc::now().timestamp();
                     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
@@ -1473,6 +1473,7 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
     serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string())
 }
 
+#[allow(dead_code)] // pre-existing demo-seed helper; call site removed, kept for FFI demo path
 fn seed_demo_if_empty(db: &Arc<Mutex<Connection>>) {
     let db_clone = db.clone();
     let count: i64 = db_clone.lock().unwrap().query_row("SELECT COUNT(*) FROM groups", [], |r| r.get(0)).unwrap_or(1);

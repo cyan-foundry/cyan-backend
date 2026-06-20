@@ -330,12 +330,7 @@ pub async fn execute_step_via_lens(
 async fn execute_tool_locally(tool_call: &ToolCall) -> ToolResult {
     let timeout = if tool_call.timeout_seconds > 0 { tool_call.timeout_seconds } else { 60 };
     
-    let binary = match tool_call.tool_id.as_str() {
-        "ffprobe" => "ffprobe",
-        "ffmpeg" => "ffmpeg",
-        "whisper" => "whisper",
-        other => other,
-    };
+    let binary = tool_call.tool_id.as_str();
     
     match tokio::time::timeout(
         std::time::Duration::from_secs(timeout),
@@ -425,7 +420,7 @@ fn publish_pipeline_event(
     event_tx: &UnboundedSender<SwiftEvent>,
     event: PipelineEvent,
 ) {
-    eprintln!("📡 PIPELINE EVENT: {} [{}] step={}", event.event_type, event.board_id[..8].to_string(), event.step_id);
+    eprintln!("📡 PIPELINE EVENT: {} [{}] step={}", event.event_type, &event.board_id[..8], event.step_id);
     
     // Send as SwiftEvent::GenericEvent which gets routed to Iggy via the network actor
     let _ = event_tx.send(SwiftEvent::StatusUpdate { message: format!("📡 pipeline.{}: step={}", event.event_type, event.step_id) });
@@ -549,7 +544,7 @@ async fn execute_step_locally(
     cell_content: &str,
     previous_outputs: Vec<serde_json::Value>,
     command_tx: &UnboundedSender<CommandMsg>,
-    event_tx: &UnboundedSender<SwiftEvent>,
+    _event_tx: &UnboundedSender<SwiftEvent>,
 ) -> Result<(String, Vec<Finding>)> {
     let registry = crate::skills::registry();
     let skill_match = registry.resolve_intent(cell_content);

@@ -27,8 +27,6 @@ use iroh::endpoint::Connection;
 use iroh::{Endpoint, PublicKey};
 use iroh_gossip::api::{Event as GossipEvent, GossipReceiver, GossipSender};
 use iroh_gossip::net::Gossip;
-use iroh_gossip::proto::TopicId;
-use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::{
@@ -157,10 +155,10 @@ impl TopicActor {
 
         // Get bootstrap peer
         let mut peers = initial_peers;
-        if let Ok(bootstrap_pk) = PublicKey::from_str(bootstrap_node_id()) {
-            if !peers.contains(&bootstrap_pk) {
-                peers.push(bootstrap_pk);
-            }
+        if let Ok(bootstrap_pk) = PublicKey::from_str(bootstrap_node_id())
+            && !peers.contains(&bootstrap_pk)
+        {
+            peers.push(bootstrap_pk);
         }
 
         eprintln!("🎯 [TOPIC] ════════════════════════════════════════════════════════");
@@ -750,9 +748,8 @@ impl TopicActor {
         let _ = self.persist_tx.send(evt);
     }
 
-    async fn handle_network_command(&self, cmd: NetworkCommand, from_peer: PublicKey) {
-        match cmd {
-            NetworkCommand::RequestSnapshot { from_peer: requester } => {
+    async fn handle_network_command(&self, cmd: NetworkCommand, _from_peer: PublicKey) {
+        if let NetworkCommand::RequestSnapshot { from_peer: requester } = cmd {
                 // Don't respond to our own requests
                 if requester == self.node_id {
                     return;
@@ -786,8 +783,6 @@ impl TopicActor {
                 } else {
                     eprintln!("   ✓ SnapshotAvailable broadcast sent");
                 }
-            }
-            _ => {}
         }
     }
 
@@ -1227,7 +1222,7 @@ async fn download_file(
     hash: &str,
     source_peer: &str,
     resume_offset: u64,
-    group_id: &str,
+    _group_id: &str,
     event_tx: UnboundedSender<SwiftEvent>,
 ) -> Result<()> {
     let pk = PublicKey::from_str(source_peer)?;

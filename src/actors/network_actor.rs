@@ -32,7 +32,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::identity::MeshAuthorizer;
-use crate::models::protocol::FileTransferMsg;
 use crate::swarm::{BlobSwarm, BLOB_ALPN};
 use crate::{
     actors::{
@@ -362,7 +361,7 @@ impl NetworkActor {
     }
 
     /// Start the network actor - spawns discovery and runs command loop
-    pub async fn start(mut self, mut cmd_rx: UnboundedReceiver<NetworkCommand>) {
+    pub async fn start(mut self, cmd_rx: UnboundedReceiver<NetworkCommand>) {
         eprintln!("🚀 [NET] ════════════════════════════════════════════════════════════");
         eprintln!("🚀 [NET] NetworkActor STARTING - node: {}", &self.node_id[..16]);
         eprintln!("🚀 [NET] ════════════════════════════════════════════════════════════");
@@ -742,7 +741,7 @@ impl NetworkActor {
 
                 let dm = DirectMessage {
                     id: blake3::hash(
-                        format!("dm:{}-{}-{}", &peer_id, &message, chrono::Utc::now()).as_bytes()
+                        format!("dm:{}-{}-{}", peer_id, message, chrono::Utc::now()).as_bytes()
                     ).to_hex().to_string(),
                     workspace_id: Some(workspace_id.clone()),
                     message: message.clone(),
@@ -826,7 +825,7 @@ impl NetworkActor {
                 }
             }
 
-            NetworkCommand::DissolveWorkspace { id, group_id: _ } => {
+            NetworkCommand::DissolveWorkspace { id: _, group_id: _ } => {
                 // Owner dissolved workspace - already broadcast via topic actor
                 // Nothing to do at network level
             }
@@ -836,7 +835,7 @@ impl NetworkActor {
                 // Nothing to do at network level
             }
 
-            NetworkCommand::DissolveBoard { id, group_id: _ } => {
+            NetworkCommand::DissolveBoard { id: _, group_id: _ } => {
                 // Owner dissolved board - already broadcast via topic actor
                 // Nothing to do at network level
             }
@@ -853,17 +852,17 @@ impl NetworkActor {
                 if let Ok(transfers) = storage::transfer_list_pending() {
                     for (file_id, hash, source_peer, bytes_received) in transfers {
                         // Route to appropriate topic actor
-                        if let Some(group_id) = storage::file_get_group_id(&file_id) {
-                            if let Some(handle) = self.topics.get(&group_id) {
-                                let _ = handle.cmd_tx.send(ActorMessage::Domain(
-                                    TopicCommand::DownloadFile {
-                                        file_id,
-                                        hash,
-                                        source_peer,
-                                        resume_offset: bytes_received,
-                                    }
-                                ));
-                            }
+                        if let Some(group_id) = storage::file_get_group_id(&file_id)
+                            && let Some(handle) = self.topics.get(&group_id)
+                        {
+                            let _ = handle.cmd_tx.send(ActorMessage::Domain(
+                                TopicCommand::DownloadFile {
+                                    file_id,
+                                    hash,
+                                    source_peer,
+                                    resume_offset: bytes_received,
+                                },
+                            ));
                         }
                     }
                 }
@@ -1355,7 +1354,7 @@ async fn write_dm_frame(send: &mut iroh::endpoint::SendStream, dm: &DirectMessag
 
 async fn handle_file_transfer_server(
     conn: Connection,
-    event_tx: UnboundedSender<SwiftEvent>,
+    _event_tx: UnboundedSender<SwiftEvent>,
 ) -> Result<()> {
     use crate::models::protocol::FileTransferMsg;
 
@@ -1465,8 +1464,8 @@ async fn handle_file_transfer_server(
 
 async fn handle_snapshot_server(
     conn: Connection,
-    node_id: String,
-    event_tx: UnboundedSender<SwiftEvent>,
+    _node_id: String,
+    _event_tx: UnboundedSender<SwiftEvent>,
     authorizer: Arc<std::sync::Mutex<MeshAuthorizer>>,
 ) -> Result<()> {
     use crate::identity::{Grant, SnapshotDenial};

@@ -4,33 +4,9 @@ use crate::models::core::*;
 use crate::models::dto::*;
 use crate::models::events::*;
 use crate::storage;
-use serde::{Deserialize, Serialize};
 
-pub use crate::ai_bridge::AIBridge;
 use crate::core::*;
-use crate::models::commands::NetworkCommand::RequestSnapshot;
-use bytes::Bytes;
-use futures::StreamExt;
-use iroh::discovery::mdns::MdnsDiscovery;
-use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey};
-use iroh_blobs::store::fs::FsStore as BlobStore;
-use iroh_gossip::{
-    api::{Event as GossipEvent, GossipTopic},
-    proto::state::TopicId,
-    Gossip,
-};
-use once_cell::sync::OnceCell;
-use rand_chacha::rand_core::SeedableRng;
-use rand_chacha::ChaCha8Rng;
-use rusqlite::{Connection, OptionalExtension};
-use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::{
-    collections::HashSet,
-    time::Duration,
-};
-use tokio::sync::{mpsc, mpsc::error::SendError};
+use rusqlite::OptionalExtension;
 // ---------- FFI: lifecycle ----------
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_set_data_dir(path: *const c_char) -> bool {
@@ -205,23 +181,21 @@ pub extern "C" fn cyan_init_with_identity(
     };
 
     // Parse optional relay_url
-    if !relay_url.is_null() {
-        if let Ok(url) = unsafe { CStr::from_ptr(relay_url) }.to_str() {
-            if !url.is_empty() {
-                let _ = RELAY_URL.set(url.to_string());
-                eprintln!("🌐 Relay URL set: {}", url);
-            }
-        }
+    if !relay_url.is_null()
+        && let Ok(url) = unsafe { CStr::from_ptr(relay_url) }.to_str()
+        && !url.is_empty()
+    {
+        let _ = RELAY_URL.set(url.to_string());
+        eprintln!("🌐 Relay URL set: {}", url);
     }
 
     // Parse optional discovery_key
-    if !discovery_key.is_null() {
-        if let Ok(key) = unsafe { CStr::from_ptr(discovery_key) }.to_str() {
-            if !key.is_empty() {
-                let _ = DISCOVERY_KEY.set(key.to_string());
-                eprintln!("🔑 Discovery key set: {}", key);
-            }
-        }
+    if !discovery_key.is_null()
+        && let Ok(key) = unsafe { CStr::from_ptr(discovery_key) }.to_str()
+        && !key.is_empty()
+    {
+        let _ = DISCOVERY_KEY.set(key.to_string());
+        eprintln!("🔑 Discovery key set: {}", key);
     }
 
     let res = std::thread::spawn(move || {
@@ -254,7 +228,7 @@ pub extern "C" fn cyan_init_with_identity(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_xaero_id() -> *const c_char {
-    let id = NODE_ID.get_or_init(|| compute_or_load_node_id());
+    let id = NODE_ID.get_or_init(compute_or_load_node_id);
     to_c_string(id.clone())
 }
 
@@ -309,10 +283,7 @@ pub extern "C" fn cyan_poll_events(component: *const c_char) -> *mut c_char {
         if component.is_null() {
             "unknown"
         } else {
-            match CStr::from_ptr(component).to_str() {
-                Ok(s) => s,
-                Err(_) => "unknown",
-            }
+            CStr::from_ptr(component).to_str().unwrap_or("unknown")
         }
     };
 
@@ -1555,7 +1526,7 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
     };
 
     // Generate file ID
-    let file_id = blake3::hash(format!("file:{}:{}:{}", &gid, &file_name, now).as_bytes())
+    let file_id = blake3::hash(format!("file:{}:{}:{}", gid, file_name, now).as_bytes())
         .to_hex()
         .to_string();
 
@@ -1671,10 +1642,10 @@ pub extern "C" fn cyan_request_file_download(file_id: *const c_char) -> bool {
             .ok()
             .flatten();
 
-        if let Some(path) = local_path {
-            if Path::new(&path).exists() {
-                return true; // Already have it locally
-            }
+        if let Some(path) = local_path
+            && Path::new(&path).exists()
+        {
+            return true; // Already have it locally
         }
     }
 
@@ -3369,6 +3340,7 @@ fn join_from_invite(invite: &serde_json::Value) -> *mut c_char {
 }
 
 // Helper function for error responses
+#[allow(dead_code)] // pre-existing FFI error helper kept for future call sites
 fn json_error_ptr(msg: &str) -> *mut c_char {
     let result = serde_json::json!({
         "error": msg
@@ -3857,7 +3829,7 @@ pub extern "C" fn cyan_pipeline_compile(
     
     let system = match SYSTEM.get() {
         Some(s) => s,
-        None => return json_cstring(&r#"{"error":"System not initialized"}"#),
+        None => return json_cstring(r#"{"error":"System not initialized"}"#),
     };
     
     // Spawn compile as background task — returns immediately
@@ -3867,7 +3839,7 @@ pub extern "C" fn cyan_pipeline_compile(
     
     let rt = match crate::RUNTIME.get() {
         Some(rt) => rt,
-        None => return json_cstring(&r#"{"error":"Runtime not available"}"#),
+        None => return json_cstring(r#"{"error":"Runtime not available"}"#),
     };
     
     rt.spawn(async move {
@@ -3907,7 +3879,7 @@ pub extern "C" fn cyan_run_pipeline(
     
     let system = match SYSTEM.get() {
         Some(s) => s,
-        None => return json_cstring(&r#"{"error":"System not initialized"}"#),
+        None => return json_cstring(r#"{"error":"System not initialized"}"#),
     };
     
     // Spawn pipeline run as background task — returns immediately
@@ -3917,7 +3889,7 @@ pub extern "C" fn cyan_run_pipeline(
     
     let rt = match crate::RUNTIME.get() {
         Some(rt) => rt,
-        None => return json_cstring(&r#"{"error":"Runtime not available"}"#),
+        None => return json_cstring(r#"{"error":"Runtime not available"}"#),
     };
     
     rt.spawn(async move {
