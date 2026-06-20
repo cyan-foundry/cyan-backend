@@ -41,6 +41,8 @@
 //!
 //! ## Stress / chaos fabric verbs (Round 7)
 //! - `post_edits <gid> <n> [board]`       `@@CYAN@@ ok post_edits <n>` (local insert + gossip broadcast)
+//! - `post_chat <gid> <n> [ws]`           `@@CYAN@@ ok post_chat <n>` (local insert + ChatSent broadcast)
+//! - `post_workflow <gid> [steps] [ws]`   `@@CYAN@@ ok post_workflow <board> <steps>` (board+cells+pin broadcast)
 //! - `post_notes <gid> <n> [board]`       `@@CYAN@@ ok post_notes <n>` (local note insert, NO broadcast; digest-converge)
 //! - `set_pin <gid> <0|1> [board]`        `@@CYAN@@ ok set_pin <pinned>` (local pin, NO broadcast; digest-converge)
 //! - `seed_blob <gid> <size> [name]`      `@@CYAN@@ blob <file_id> <hash>` (hold + announce)
@@ -563,6 +565,125 @@ async fn handle_verb(
             };
             storage::pin_upsert(&pin).map_err(|e| anyhow!("pin_upsert: {e}"))?;
             Ok(format!("ok set_pin {}", pinned as i32))
+        }
+
+        // ── Live-harness behaviors (ROUND8 harness) ───────────────────────────────────────
+        // Post `n` live board-chat messages to a group: insert each into THIS node's storage AND
+        // broadcast a `ChatSent` over the group gossip, exactly as the app's send-chat path does
+        // (the receiver persists it via the same `ChatSent` apply arm). Chat ids are namespaced by
+        // this node's id, so concurrent multi-source posting never collides — convergence is then
+        // "every peer ends with the same chat total, no dupes, no loss".
+        // `post_chat <gid> <n> [workspace_id]` → `ok post_chat <n>`.
+        "post_chat" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?;
+            let n: usize = rest
+                .get(1)
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| anyhow!("count required"))?;
+            // Default to the fixture workspace so the chats are countable via `count chats`.
+            let ws = rest
+                .get(2)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{gid}-ws"));
+            let tag = &node_id[..8.min(node_id.len())];
+            let now = chrono::Utc::now().timestamp();
+            for i in 0..n {
+                let id = format!("{gid}-msg-{tag}-{i:06}");
+                let message = format!("msg {i} from {tag}");
+                storage::chat_insert(&id, &ws, &message, node_id, None, now)
+                    .map_err(|e| anyhow!("chat_insert: {e}"))?;
+                let event = NetworkEvent::ChatSent {
+                    id,
+                    workspace_id: ws.clone(),
+                    message,
+                    author: node_id.to_string(),
+                    parent_id: None,
+                    timestamp: now,
+                };
+                cmd_tx
+                    .send(NetworkCommand::Broadcast {
+                        group_id: gid.to_string(),
+                        event,
+                    })
+                    .map_err(|e| anyhow!("send Broadcast: {e}"))?;
+            }
+            Ok(format!("ok post_chat {n}"))
+        }
+
+        // Author a local-placement workflow on THIS node and REPLICATE its authoring over the mesh:
+        // create a workflow board, add `steps` notebook cells (the steps), and PIN it (the gate),
+        // broadcasting `BoardCreated` + `NotebookCellAdded` + `PinSet` so every peer persists them
+        // via the same apply arms. Execution / wave-placement is LOCAL/MCP and out of substrate
+        // scope (CLAUDE.md) — what the MESH carries, and what peers must converge on, is the
+        // authored board + steps + pinned-gate. `post_workflow <gid> [steps] [ws]`
+        // → `ok post_workflow <board_id> <steps>`.
+        "post_workflow" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?;
+            let steps: usize = rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(3);
+            let ws = rest
+                .get(2)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{gid}-ws"));
+            let tag = &node_id[..8.min(node_id.len())];
+            let board = format!("{gid}-wf-{tag}");
+            let now = chrono::Utc::now().timestamp();
+
+            // 1) the workflow board itself.
+            storage::board_insert(&board, &ws, "Workflow", now)
+                .map_err(|e| anyhow!("board_insert: {e}"))?;
+            cmd_tx
+                .send(NetworkCommand::Broadcast {
+                    group_id: gid.to_string(),
+                    event: NetworkEvent::BoardCreated {
+                        id: board.clone(),
+                        workspace_id: ws.clone(),
+                        name: "Workflow".to_string(),
+                        created_at: now,
+                    },
+                })
+                .map_err(|e| anyhow!("send Broadcast BoardCreated: {e}"))?;
+
+            // 2) the steps, as ordered notebook cells.
+            for i in 0..steps {
+                let id = format!("{board}-step-{i:03}");
+                let content = format!("step {i}: local-placement task");
+                storage::cell_insert(&id, &board, "code", i as i32, Some(&content))
+                    .map_err(|e| anyhow!("cell_insert: {e}"))?;
+                cmd_tx
+                    .send(NetworkCommand::Broadcast {
+                        group_id: gid.to_string(),
+                        event: NetworkEvent::NotebookCellAdded {
+                            id,
+                            board_id: board.clone(),
+                            cell_type: "code".to_string(),
+                            cell_order: i as i32,
+                            content: Some(content),
+                        },
+                    })
+                    .map_err(|e| anyhow!("send Broadcast NotebookCellAdded: {e}"))?;
+            }
+
+            // 3) pin it — the workflow's activation gate.
+            let pin = cyan_backend::models::dto::PinDTO {
+                board_id: board.clone(),
+                tenant_id: gid.to_string(),
+                pinned: true,
+                updated_at: now,
+            };
+            storage::pin_upsert(&pin).map_err(|e| anyhow!("pin_upsert: {e}"))?;
+            cmd_tx
+                .send(NetworkCommand::Broadcast {
+                    group_id: gid.to_string(),
+                    event: NetworkEvent::PinSet {
+                        board_id: board.clone(),
+                        tenant_id: gid.to_string(),
+                        pinned: true,
+                        updated_at: now,
+                    },
+                })
+                .map_err(|e| anyhow!("send Broadcast PinSet: {e}"))?;
+
+            Ok(format!("ok post_workflow {board} {steps}"))
         }
 
         // Generate a deterministic blob of <size> bytes, content-address it, hold it in this node's

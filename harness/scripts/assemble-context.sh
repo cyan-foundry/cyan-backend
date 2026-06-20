@@ -38,6 +38,13 @@ echo "[assemble] xaeroid       <- $PARENT_DIR/xaeroID  (lowercased for Linux)"
 copy_crate "$PARENT_DIR/xaeroID" "xaeroid"
 echo "[assemble] integrations  <- $PARENT_DIR/cyan-backend-integrations"
 copy_crate "$PARENT_DIR/cyan-backend-integrations" "cyan-backend-integrations"
+# Sibling path-deps the engine grew (cyan-backend/Cargo.toml: `../cyan-mcp`, `../cyan-identity`).
+# Both are lowercase on disk and have no further path-deps, so a flat copy next to cyan-backend
+# resolves them. (Without these the Linux build fails at `failed to read ../cyan-identity`.)
+echo "[assemble] cyan-mcp      <- $PARENT_DIR/cyan-mcp"
+copy_crate "$PARENT_DIR/cyan-mcp" "cyan-mcp"
+echo "[assemble] cyan-identity <- $PARENT_DIR/cyan-identity"
+copy_crate "$PARENT_DIR/cyan-identity" "cyan-identity"
 
 cp "$HARNESS_DIR/scripts/ws-entrypoint.sh" "$CTX/ws-entrypoint.sh"
 

@@ -345,6 +345,30 @@ impl MpNode {
             .map(|_| ())
     }
 
+    /// Post `n` live board-chat messages to `group_id`: each is inserted into this node's own
+    /// storage AND broadcast over the group gossip (`ChatSent`). Chat ids are node-namespaced, so
+    /// concurrent posting from many peers never collides — convergence is the no-dupes/no-loss proof.
+    pub async fn post_chat(&mut self, group_id: &str, n: usize) -> Result<()> {
+        let timeout = REQ_TIMEOUT + Duration::from_millis(n as u64 * 5);
+        self.request(&format!("post_chat {group_id} {n}"), timeout)
+            .await
+            .map(|_| ())
+    }
+
+    /// Author a local-placement workflow on this node and replicate its authoring over the mesh:
+    /// a workflow board + `steps` notebook cells (the steps) + a pin (the gate), broadcast as
+    /// `BoardCreated` + `NotebookCellAdded` + `PinSet`. Returns the workflow `board_id`.
+    pub async fn post_workflow(&mut self, group_id: &str, steps: usize) -> Result<String> {
+        let resp = self
+            .request(&format!("post_workflow {group_id} {steps}"), REQ_TIMEOUT)
+            .await?;
+        let board = resp
+            .strip_prefix("ok post_workflow ")
+            .and_then(|s| s.split_whitespace().next())
+            .ok_or_else(|| anyhow!("{}: unexpected post_workflow response: {resp}", self.name))?;
+        Ok(board.to_string())
+    }
+
     /// Author `n` notes into THIS node's storage WITHOUT broadcasting them (ROUND8 §W2).
     /// Note ids are node-namespaced, so two peers' note sets are disjoint and only the
     /// anti-entropy digest+snapshot path can reconcile them — the digest-convergence proof.

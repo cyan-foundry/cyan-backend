@@ -17,6 +17,8 @@ WORKDIR /src
 # The assembled context places sibling crates next to cyan-backend so `../xaeroid` resolves.
 COPY xaeroid/        /src/xaeroid/
 COPY cyan-backend-integrations/ /src/cyan-backend-integrations/
+COPY cyan-mcp/       /src/cyan-mcp/
+COPY cyan-identity/  /src/cyan-identity/
 COPY cyan-backend/   /src/cyan-backend/
 WORKDIR /src/cyan-backend
 RUN cargo build --release --bin cyan_node \
