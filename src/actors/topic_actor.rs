@@ -1512,9 +1512,11 @@ async fn download_snapshot(
                     eprintln!("   ⚠️ Group insert: {}", e);
                 }
 
-                // Insert workspaces
+                // Insert workspaces — via the full insert so `created_at` and the
+                // ROUND8 §W3 `system` flag replicate (a joiner must recognize the
+                // per-group Plugins workspace as system / non-deletable too).
                 for w in &workspaces {
-                    if let Err(e) = storage::workspace_insert_simple(&w.id, &w.group_id, &w.name) {
+                    if let Err(e) = storage::workspace_insert(w) {
                         eprintln!("   ⚠️ Workspace insert: {}", e);
                     }
                 }

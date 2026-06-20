@@ -243,11 +243,67 @@ pub fn group_list() -> Result<Vec<Group>> {
 // WORKSPACES
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ROUND8 §W3 — every group is born with these two workspaces (no empty groups):
+//   • a **default** landing workspace (where the user lands), and
+//   • a system **"Plugins"** workspace (per group; holds that group's installed plugin
+//     files; flagged `system` / non-deletable).
+/// Name of the default landing workspace seeded on group creation.
+pub const DEFAULT_WORKSPACE_NAME: &str = "General";
+/// Name of the per-group system workspace that holds installed plugin files.
+pub const PLUGINS_WORKSPACE_NAME: &str = "Plugins";
+
+/// Deterministic id of a group's default (landing) workspace. Deterministic so
+/// provisioning is idempotent and a replayed gossip/snapshot of the seed converges
+/// instead of creating duplicates.
+pub fn default_workspace_id(group_id: &str) -> String {
+    blake3::hash(format!("default-ws:{group_id}").as_bytes()).to_hex().to_string()
+}
+
+/// Deterministic id of a group's system "Plugins" workspace.
+pub fn plugins_workspace_id(group_id: &str) -> String {
+    blake3::hash(format!("plugins-ws:{group_id}").as_bytes()).to_hex().to_string()
+}
+
+/// Auto-seed a group's two workspaces so the group is never empty (ROUND8 §W3): the
+/// default landing workspace and the system "Plugins" workspace. Idempotent (deterministic
+/// ids + `INSERT OR IGNORE`). Returns `(default, plugins)` so the caller can broadcast the
+/// matching `WorkspaceCreated` events. Both ride the existing snapshot/digest replication.
+pub fn provision_group_workspaces(
+    group_id: &str,
+    owner_node_id: Option<&str>,
+) -> Result<(Workspace, Workspace)> {
+    let now = chrono::Utc::now().timestamp();
+    let default = Workspace {
+        id: default_workspace_id(group_id),
+        group_id: group_id.to_string(),
+        name: DEFAULT_WORKSPACE_NAME.to_string(),
+        created_at: now,
+        system: false,
+    };
+    let plugins = Workspace {
+        id: plugins_workspace_id(group_id),
+        group_id: group_id.to_string(),
+        name: PLUGINS_WORKSPACE_NAME.to_string(),
+        created_at: now,
+        system: true,
+    };
+    {
+        let conn = db().lock().unwrap();
+        for ws in [&default, &plugins] {
+            conn.execute(
+                "INSERT OR IGNORE INTO workspaces (id, group_id, name, created_at, is_system, owner_node_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![ws.id, ws.group_id, ws.name, ws.created_at, ws.system as i32, owner_node_id],
+            )?;
+        }
+    }
+    Ok((default, plugins))
+}
+
 pub fn workspace_insert(ws: &Workspace) -> Result<()> {
     let conn = db().lock().unwrap();
     conn.execute(
-        "INSERT OR IGNORE INTO workspaces (id, group_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![ws.id, ws.group_id, ws.name, ws.created_at],
+        "INSERT OR IGNORE INTO workspaces (id, group_id, name, created_at, is_system) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![ws.id, ws.group_id, ws.name, ws.created_at, ws.system as i32],
     )?;
     Ok(())
 }
@@ -258,7 +314,31 @@ pub fn workspace_rename(id: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// ROUND8 §W3: is this a system (non-deletable) workspace — the per-group "Plugins"
+/// workspace? Returns false for unknown ids.
+pub fn workspace_is_system(id: &str) -> bool {
+    let conn = db().lock().unwrap();
+    conn.query_row(
+        "SELECT is_system FROM workspaces WHERE id = ?1",
+        params![id],
+        |r| r.get::<_, i32>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .map(|v| v != 0)
+    .unwrap_or(false)
+}
+
 pub fn workspace_delete(id: &str) -> Result<()> {
+    // ROUND8 §W3: a system workspace (the per-group Plugins workspace) is non-deletable.
+    // Refuse before touching anything so the row — and any installed plugin files it
+    // holds — survive. (Deleting the whole group still cascades; this only guards the
+    // standalone "delete this workspace" path.)
+    if workspace_is_system(id) {
+        return Err(anyhow::anyhow!("workspace {id} is a system workspace and cannot be deleted"));
+    }
+
     let conn = db().lock().unwrap();
 
     // Delete integration_bindings for this workspace
@@ -327,13 +407,14 @@ pub fn board_get_group_id(board_id: &str) -> Option<String> {
 
 pub fn workspace_list_by_group(group_id: &str) -> Result<Vec<Workspace>> {
     let conn = db().lock().unwrap();
-    let mut stmt = conn.prepare("SELECT id, group_id, name, created_at FROM workspaces WHERE group_id=?1 ORDER BY name")?;
+    let mut stmt = conn.prepare("SELECT id, group_id, name, created_at, is_system FROM workspaces WHERE group_id=?1 ORDER BY name")?;
     let rows = stmt.query_map(params![group_id], |r| {
         Ok(Workspace {
             id: r.get(0)?,
             group_id: r.get(1)?,
             name: r.get(2)?,
             created_at: r.get(3)?,
+            system: r.get::<_, i32>(4)? != 0,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1329,6 +1410,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     if conn.prepare("SELECT owner_node_id FROM objects LIMIT 1").is_err() {
         tracing::info!("Migration: adding owner_node_id column to objects");
         let _ = conn.execute("ALTER TABLE objects ADD COLUMN owner_node_id TEXT", []);
+    }
+
+    // ROUND8 §W3: workspaces carry a `is_system` flag — the per-group auto-seeded
+    // "Plugins" workspace is system + non-deletable. Constant default keeps the ALTER
+    // valid on existing rows; idempotent.
+    if conn.prepare("SELECT is_system FROM workspaces LIMIT 1").is_err() {
+        tracing::info!("Migration: adding is_system column to workspaces");
+        let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0", []);
     }
 
     // ROUND8 §W1: collapse the six legacy authoring cell kinds into the single

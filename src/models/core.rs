@@ -23,4 +23,9 @@ pub struct Workspace {
     pub group_id: String,
     pub name: String,
     pub created_at: i64,
+    /// ROUND8 §W3: a system workspace is auto-seeded per group and **non-deletable**
+    /// (the per-group "Plugins" workspace). Defaults to `false` so older peers /
+    /// persisted rows decode as ordinary workspaces.
+    #[serde(default)]
+    pub system: bool,
 }

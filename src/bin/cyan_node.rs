@@ -31,7 +31,7 @@
 //! - `join_group <gid> [bootstrap_hex]`   `@@CYAN@@ ok join_group`
 //! - `wait_sync <gid> <timeout_ms>`       `@@CYAN@@ ok wait_sync` | `@@CYAN@@ timeout wait_sync`
 //! - `count <kind> <gid>`                 `@@CYAN@@ count <kind> <n>`
-//!   kinds: groups|workspaces|boards|elements|cells|chats|notes|files
+//!   kinds: groups|workspaces|system_workspaces|boards|elements|cells|chats|notes|files
 //! - `admin_pubkey`                       `@@CYAN@@ admin_pubkey <hex>`
 //! - `enforce_group <gid>`                `@@CYAN@@ ok enforce_group` (enforce + self=Owner-admin)
 //! - `set_admin <gid> <pubkey> [role]`    `@@CYAN@@ ok set_admin`
@@ -119,6 +119,15 @@ async fn main() -> Result<()> {
         && !gid.is_empty()
     {
         seed_fixture(&gid)?;
+    }
+
+    // ROUND8 §W3: optionally provision a group the way the create path does — a group
+    // record plus its two auto-seeded workspaces (default + system "Plugins") — BEFORE
+    // the actor starts, so the engine auto-hosts the group topic (the host role).
+    if let Ok(gid) = std::env::var("PROVISION_GROUP")
+        && !gid.is_empty()
+    {
+        provision_group(&gid)?;
     }
 
     // Downloads land under DATA_DIR (process-global OnceCell in the engine).
@@ -777,6 +786,13 @@ fn count_kind(kind: &str, group_id: &str) -> Result<usize> {
         "workspaces" => storage::workspace_list_by_group(group_id)
             .map_err(|e| anyhow!("workspace_list_by_group: {e}"))?
             .len(),
+        // ROUND8 §W3: count only the system (Plugins) workspaces — proves the `system`
+        // flag replicated to a joiner, not just the workspace rows.
+        "system_workspaces" => storage::workspace_list_by_group(group_id)
+            .map_err(|e| anyhow!("workspace_list_by_group: {e}"))?
+            .iter()
+            .filter(|w| w.system)
+            .count(),
         "boards" => storage::board_list_by_workspaces(&ws_ids)
             .map_err(|e| anyhow!("board_list_by_workspaces: {e}"))?
             .len(),
@@ -894,6 +910,17 @@ fn seed_fixture(group_id: &str) -> Result<()> {
         .map_err(|e| anyhow!("file_insert_simple: {e}"))?;
     }
 
+    Ok(())
+}
+
+/// ROUND8 §W3: provision a group the way the create path does — a group record plus
+/// its two auto-seeded workspaces (default landing + system "Plugins"). Mirrors what
+/// `CommandActor::CreateGroup` seeds, so the snapshot the host serves carries both.
+fn provision_group(group_id: &str) -> Result<()> {
+    storage::group_insert_simple(group_id, "Provisioned Group", "folder.fill", "#00AEEF")
+        .map_err(|e| anyhow!("group_insert_simple: {e}"))?;
+    storage::provision_group_workspaces(group_id, None)
+        .map_err(|e| anyhow!("provision_group_workspaces: {e}"))?;
     Ok(())
 }
 

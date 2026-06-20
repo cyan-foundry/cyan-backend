@@ -401,6 +401,13 @@ impl CommandActor {
                         );
                     }
 
+                    // ROUND8 §W3: a group is never born empty — auto-seed the default
+                    // landing workspace and the per-group system "Plugins" workspace.
+                    // Both ride the existing snapshot/digest replication; broadcasting
+                    // their WorkspaceCreated events also delivers them to already-live
+                    // peers (the same path a normal CreateWorkspace uses).
+                    let seeded = storage::provision_group_workspaces(&id, Some(&self.node_id));
+
                     let _ = self.network_tx.send(NetworkCommand::JoinGroup {
                         group_id: id.clone(),
                         bootstrap_peer: None,
@@ -412,6 +419,26 @@ impl CommandActor {
                     });
 
                     let _ = self.event_tx.send(SwiftEvent::Network(NetworkEvent::GroupCreated(g)));
+
+                    match seeded {
+                        Ok((default, plugins)) => {
+                            for ws in [default, plugins] {
+                                tracing::info!(
+                                    tenant_id = %id,
+                                    "obs group_provision_ws group={} ws={} system={}",
+                                    id, ws.id, ws.system
+                                );
+                                let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                                    group_id: id.clone(),
+                                    event: NetworkEvent::WorkspaceCreated(ws.clone()),
+                                });
+                                let _ = self.event_tx.send(SwiftEvent::Network(
+                                    NetworkEvent::WorkspaceCreated(ws),
+                                ));
+                            }
+                        }
+                        Err(e) => tracing::error!(tenant_id = %id, "group provisioning failed: {e}"),
+                    }
                 }
 
                 CommandMsg::RenameGroup { id, name } => {
@@ -491,6 +518,7 @@ impl CommandActor {
                         group_id: group_id.clone(),
                         name: name.clone(),
                         created_at: now,
+                        system: false,
                     };
 
                     {
@@ -1258,13 +1286,14 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
     };
 
     let workspaces: Vec<Workspace> = {
-        let mut stmt = db.prepare("SELECT id, group_id, name, created_at FROM workspaces ORDER BY name").unwrap();
+        let mut stmt = db.prepare("SELECT id, group_id, name, created_at, is_system FROM workspaces ORDER BY name").unwrap();
         let rows = stmt.query_map([], |r| {
             Ok(Workspace {
                 id: r.get(0)?,
                 group_id: r.get(1)?,
                 name: r.get(2)?,
                 created_at: r.get(3)?,
+                system: r.get::<_, i32>(4)? != 0,
             })
         }).unwrap();
         rows.filter_map(Result::ok).collect()
