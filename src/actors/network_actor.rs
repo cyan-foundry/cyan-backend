@@ -1604,6 +1604,10 @@ async fn handle_snapshot_server(
         send.finish()?;
         let _ = send.stopped().await;
 
+        // Observability only (stress fabric "snapshot under load / no single-host overload" oracle):
+        // count every snapshot this holder actually served. Behavior-neutral.
+        crate::metrics::record_snapshot_served();
+
         eprintln!("✅ [SNAP] Snapshot SENT for group {}...", &group_id[..16.min(group_id.len())]);
         tracing::info!("📤 [SNAP] Snapshot sent for group {}", &group_id[..16.min(group_id.len())]);
     } else {

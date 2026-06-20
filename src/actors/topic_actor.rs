@@ -13,8 +13,11 @@
 use std::{
     collections::HashSet,
     str::FromStr,
-    sync::Arc,
-    time::Duration,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Result};
@@ -30,6 +33,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::{
     actors::{make_group_topic_id, ActorHandle, ActorMessage, SystemCommand, TopicNetworkCmd, FILE_TRANSFER_ALPN},
+    anti_entropy::{self, AntiEntropyMsg},
     bootstrap_node_id,
     identity::{MeshAuthorizer, WriteDecision},
     models::{
@@ -110,6 +114,25 @@ pub struct TopicActor {
     /// Presented to the snapshot holder so it can authorize the per-group snapshot read when the
     /// group is enforced. `None` for groups created locally or joined without a grant (fail-open).
     grant: Option<String>,
+
+    /// Anti-entropy repair debounce: at most one repair pull in flight per group, so a divergent
+    /// digest seen from several peers in one sweep triggers a single merge, not a thundering pull.
+    /// Shared with the spawned pull task, which clears it on completion. Bounds repair traffic.
+    repairing: Arc<AtomicBool>,
+
+    /// Multi-source snapshot pick: snapshot offers (`GroupSnapshotAvailable` sources) collected for
+    /// a short window before a holder is chosen at random, so concurrent cold-joiners spread across
+    /// holders instead of all hammering the host (the "snapshot under load" fix).
+    snapshot_offers: HashSet<String>,
+
+    /// Deadline at which the collected `snapshot_offers` are resolved into one pick. `None` when no
+    /// pick is pending.
+    snapshot_pick_at: Option<Instant>,
+
+    /// Drain offload: inbound, authorized `NetworkEvent`s are handed to a single FIFO worker that
+    /// does the SQLite write + Swift forward, so the gossip select loop is never blocked on disk I/O
+    /// and drains the receiver promptly (makes `Lagged` rarer). FIFO preserves per-id ordering.
+    persist_tx: UnboundedSender<NetworkEvent>,
 }
 
 impl TopicActor {
@@ -168,6 +191,18 @@ impl TopicActor {
         });
         eprintln!("📤 [TOPIC] Sent NeedSnapshot to NetworkActor");
 
+        // Drain offload: a single FIFO worker persists authorized NetworkEvents off the select loop.
+        // One consumer ⇒ per-id ordering preserved (an add then an update for the same id stay
+        // ordered); same SwiftEvents emitted in the same order, so the FFI event stream is unchanged.
+        let (persist_tx, mut persist_rx) = mpsc::unbounded_channel::<NetworkEvent>();
+        let persist_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            while let Some(evt) = persist_rx.recv().await {
+                Self::persist_event(&evt);
+                let _ = persist_event_tx.send(SwiftEvent::Network(evt));
+            }
+        });
+
         let actor = Self {
             node_id: node_id.clone(),
             group_id: group_id.clone(),
@@ -180,6 +215,10 @@ impl TopicActor {
             swarm,
             authorizer,
             grant,
+            repairing: Arc::new(AtomicBool::new(false)),
+            snapshot_offers: HashSet::new(),
+            snapshot_pick_at: None,
+            persist_tx,
         };
 
         let join_handle = tokio::spawn(actor.run(cmd_rx, receiver));
@@ -204,6 +243,10 @@ impl TopicActor {
             "🎧 [TOPIC] Listener started for group {}",
             &self.group_id[..16.min(self.group_id.len())]
         );
+
+        // Anti-entropy sweep clock: gossip our per-group digest on a bounded, jittered cadence so
+        // peers detect + repair anything live gossip dropped (the convergence guarantee).
+        let mut next_sweep = Instant::now() + anti_entropy::jittered_sweep();
 
         loop {
             tokio::select! {
@@ -239,6 +282,24 @@ impl TopicActor {
                             break;
                         }
                     }
+                }
+
+                // Anti-entropy sweep: broadcast this group's state digest, then re-arm the jittered
+                // clock. The branch never blocks the others — it just fires on its absolute deadline.
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_sweep)) => {
+                    self.do_sweep().await;
+                    next_sweep = Instant::now() + anti_entropy::jittered_sweep();
+                }
+
+                // Multi-source snapshot pick: when the offer-collection window elapses, choose one
+                // holder at random from the offers gathered and start the join-time snapshot pull.
+                _ = async {
+                    match self.snapshot_pick_at {
+                        Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if self.snapshot_pick_at.is_some() => {
+                    self.commit_snapshot_pick().await;
                 }
             }
         }
@@ -433,6 +494,7 @@ impl TopicActor {
                         &group_id,
                         grant.as_deref(),
                         event_tx,
+                        false,
                     ).await {
                         Ok(_) => {
                             eprintln!("✅ [SNAP-DL] Snapshot download SUCCESS");
@@ -493,6 +555,13 @@ impl TopicActor {
                     if let Some(reply) = reply {
                         self.broadcast_swarm_message(&reply).await;
                     }
+                    return;
+                }
+
+                // Anti-entropy digest (`{"type":"Digest"}`) — disjoint from every other gossip
+                // shape. A divergent digest from a peer not behind us triggers a quiet repair pull.
+                if let Ok(ae) = serde_json::from_slice::<AntiEntropyMsg>(&msg.content) {
+                    self.handle_anti_entropy(ae).await;
                     return;
                 }
 
@@ -620,42 +689,16 @@ impl TopicActor {
             eprintln!("📬 [SNAP-AVAIL-3] need_snapshot flag: {}", self.need_snapshot);
 
             if self.need_snapshot {
-                eprintln!("📬 [SNAP-AVAIL-4] ✓ We need snapshot - triggering download");
-
-                // Mark as no longer needing (prevent duplicate downloads)
-                self.need_snapshot = false;
-
-                // Spawn download task
-                let endpoint = self.endpoint.clone();
-                let group_id = self.group_id.clone();
-                let source_peer = source.clone();
-                let event_tx = self.event_tx.clone();
-                let network_tx = self.network_tx.clone();
-                let grant = self.grant.clone();
-
-                tokio::spawn(async move {
-                    eprintln!("📥 [SNAP-DL-SPAWN] Download task started for {}...", &source_peer[..16]);
-                    match download_snapshot(
-                        endpoint,
-                        &source_peer,
-                        &group_id,
-                        grant.as_deref(),
-                        event_tx,
-                    ).await {
-                        Ok(_) => {
-                            eprintln!("✅ [SNAP-DL-SPAWN] Download SUCCESS");
-                            let _ = network_tx.send(TopicNetworkCmd::SnapshotComplete { group_id });
-                        }
-                        Err(e) => {
-                            eprintln!("🔴 [SNAP-DL-SPAWN] Download FAILED: {}", e);
-                            tracing::error!("🔴 [SNAP-DL] Snapshot download failed: {}", e);
-                            let _ = network_tx.send(TopicNetworkCmd::SnapshotFailed {
-                                group_id,
-                                reason: e.to_string(),
-                            });
-                        }
-                    }
-                });
+                // Multi-source snapshot serving (the "snapshot under load" fix): instead of pulling
+                // from whichever holder happens to answer first (always the host → thundering herd),
+                // collect offers over a short jittered window and then pick one holder at random
+                // (`commit_snapshot_pick`). Many concurrent cold-joiners thus spread across all
+                // holders rather than overloading a single host.
+                eprintln!("📬 [SNAP-AVAIL-4] ✓ We need snapshot - recording holder offer");
+                self.snapshot_offers.insert(source.clone());
+                if self.snapshot_pick_at.is_none() {
+                    self.snapshot_pick_at = Some(Instant::now() + anti_entropy::jittered_pick_window());
+                }
             } else {
                 eprintln!("📬 [SNAP-AVAIL-4] ✗ We don't need snapshot - ignoring");
             }
@@ -700,12 +743,11 @@ impl TopicActor {
             return;
         }
 
-        // Persist to DB
-        Self::persist_event(&evt);
-
-        // Forward to Swift
-        eprintln!("📤 [TOPIC→SWIFT] Forwarding event: {:?}", std::mem::discriminant(&evt));
-        let _ = self.event_tx.send(SwiftEvent::Network(evt));
+        // Persist + forward off the select loop (single FIFO worker) so the gossip receiver keeps
+        // draining and `Lagged` stays rare. The worker does the SQLite write then forwards the same
+        // SwiftEvent in order; if the worker is gone (shutdown) we drop, same as a closed channel.
+        eprintln!("📤 [TOPIC→SWIFT] Queuing event for persist+forward: {:?}", std::mem::discriminant(&evt));
+        let _ = self.persist_tx.send(evt);
     }
 
     async fn handle_network_command(&self, cmd: NetworkCommand, from_peer: PublicKey) {
@@ -747,6 +789,130 @@ impl TopicActor {
             }
             _ => {}
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ANTI-ENTROPY (delta repair) + MULTI-SOURCE SNAPSHOT PICK
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// One anti-entropy sweep: gossip this group's compact state digest so peers can detect and
+    /// repair anything live deltas dropped. Skipped when we have no neighbours (nobody to tell) or
+    /// no state yet (nothing to advertise). `O(1)` gossip; the digest is `O(state)` to compute.
+    async fn do_sweep(&self) {
+        if self.known_peers.is_empty() {
+            return;
+        }
+        let (count, hash) = anti_entropy::group_digest(&self.group_id);
+        if count == 0 {
+            return;
+        }
+        let msg = AntiEntropyMsg::Digest {
+            group_id: self.group_id.clone(),
+            node_id: self.node_id.clone(),
+            count,
+            hash,
+        };
+        match serde_json::to_vec(&msg) {
+            Ok(data) => {
+                if self.sender.broadcast(Bytes::from(data)).await.is_ok() {
+                    crate::metrics::record_ae_digest_sent();
+                }
+            }
+            Err(e) => tracing::error!("🔴 [TOPIC] anti-entropy digest serialize failed: {}", e),
+        }
+    }
+
+    /// Handle a peer's state digest. If it matches ours we are in sync; if the sender is strictly
+    /// behind us they will pull from us instead; otherwise the sender holds something we lack, so we
+    /// pull a **quiet** merge snapshot from them (idempotent upsert-by-id ⇒ a union merge). Debounced
+    /// to one repair in flight per group so a digest seen from many peers triggers a single pull.
+    async fn handle_anti_entropy(&mut self, ae: AntiEntropyMsg) {
+        let AntiEntropyMsg::Digest { group_id, node_id, count, hash } = ae;
+        if group_id != self.group_id || node_id == self.node_id {
+            return;
+        }
+        let (my_count, my_hash) = anti_entropy::group_digest(&self.group_id);
+        if hash == my_hash {
+            return; // in sync — nothing to repair
+        }
+        if count < my_count {
+            return; // sender is behind us; they will pull from our digest
+        }
+        // Debounce: claim the single in-flight repair slot for this group.
+        if self.repairing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        crate::metrics::record_ae_repair();
+
+        let endpoint = self.endpoint.clone();
+        let gid = self.group_id.clone();
+        let grant = self.grant.clone();
+        let event_tx = self.event_tx.clone();
+        let repairing = self.repairing.clone();
+        tokio::spawn(async move {
+            // Quiet pull: merge the sender's state into ours WITHOUT re-emitting join-time Sync*
+            // events. Reuses the snapshot serve/apply path — no new transfer protocol.
+            if let Err(e) =
+                download_snapshot(endpoint, &node_id, &gid, grant.as_deref(), event_tx, true).await
+            {
+                tracing::debug!(
+                    "🩹 [TOPIC] anti-entropy repair from {}... failed: {}",
+                    &node_id[..16.min(node_id.len())],
+                    e
+                );
+            }
+            repairing.store(false, Ordering::Release);
+        });
+    }
+
+    /// Resolve the collected snapshot offers into a single holder pick and start the join-time
+    /// snapshot pull. Picks at random so concurrent cold-joiners spread across holders (no single
+    /// host overload). No-op if we no longer need a snapshot or gathered no offers.
+    async fn commit_snapshot_pick(&mut self) {
+        self.snapshot_pick_at = None;
+        if !self.need_snapshot {
+            self.snapshot_offers.clear();
+            return;
+        }
+        let sources: Vec<String> = self.snapshot_offers.drain().collect();
+        if sources.is_empty() {
+            return;
+        }
+        // Random holder among device peers that offered (Lens is an HTTP enrichment leg, not a mesh
+        // peer, so it never appears here; the mesh repairs itself entirely from device holders).
+        let idx = {
+            use rand::Rng;
+            rand::thread_rng().gen_range(0..sources.len())
+        };
+        let source_peer = sources[idx].clone();
+        self.need_snapshot = false;
+
+        eprintln!(
+            "📥 [SNAP-PICK] Picked holder {}... of {} offer(s) for {}...",
+            &source_peer[..16.min(source_peer.len())],
+            sources.len(),
+            &self.group_id[..16.min(self.group_id.len())]
+        );
+
+        let endpoint = self.endpoint.clone();
+        let group_id = self.group_id.clone();
+        let event_tx = self.event_tx.clone();
+        let network_tx = self.network_tx.clone();
+        let grant = self.grant.clone();
+        tokio::spawn(async move {
+            match download_snapshot(endpoint, &source_peer, &group_id, grant.as_deref(), event_tx, false).await {
+                Ok(_) => {
+                    let _ = network_tx.send(TopicNetworkCmd::SnapshotComplete { group_id });
+                }
+                Err(e) => {
+                    tracing::error!("🔴 [SNAP-DL] Snapshot download failed: {}", e);
+                    let _ = network_tx.send(TopicNetworkCmd::SnapshotFailed {
+                        group_id,
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        });
     }
 
     /// Emit the live presence/reachability status for this group off the topic's own peer set
@@ -1194,13 +1360,21 @@ async fn download_file(
 // SNAPSHOT DOWNLOAD
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Download a snapshot from a peer
+/// Download a snapshot from a peer.
+///
+/// `quiet` distinguishes the two callers that share this one transfer path:
+/// - `false` — join-time snapshot: emit the user-facing `Sync*`/`StatusUpdate` events the iOS app
+///   drives its onboarding UI from (unchanged behavior).
+/// - `true`  — anti-entropy repair: silently merge the holder's state into ours (idempotent
+///   upsert-by-id) WITHOUT re-emitting those events, since this is a background reconciliation, not
+///   a join. The storage writes — the actual repair — happen in both modes.
 async fn download_snapshot(
     endpoint: Endpoint,
     source_peer: &str,
     group_id: &str,
     grant: Option<&str>,
     event_tx: UnboundedSender<SwiftEvent>,
+    quiet: bool,
 ) -> Result<()> {
     use crate::models::protocol::SnapshotRequest;
     use tokio::io::AsyncWriteExt;
@@ -1212,9 +1386,11 @@ async fn download_snapshot(
     eprintln!("═══════════════════════════════════════════════════════════════════");
 
     // Emit status update
-    let _ = event_tx.send(SwiftEvent::StatusUpdate {
-        message: "Connecting to peer for sync...".to_string(),
-    });
+    if !quiet {
+        let _ = event_tx.send(SwiftEvent::StatusUpdate {
+            message: "Connecting to peer for sync...".to_string(),
+        });
+    }
 
     // Parse peer public key
     let pk = PublicKey::from_str(source_peer)
@@ -1251,9 +1427,11 @@ async fn download_snapshot(
 
     eprintln!("📥 [SNAP-DL-5] ✓ Request sent. Waiting for snapshot frames...");
 
-    let _ = event_tx.send(SwiftEvent::StatusUpdate {
-        message: "Receiving snapshot data...".to_string(),
-    });
+    if !quiet {
+        let _ = event_tx.send(SwiftEvent::StatusUpdate {
+            message: "Receiving snapshot data...".to_string(),
+        });
+    }
 
     // Receive frames until Complete
     let mut frame_count = 0;
@@ -1296,10 +1474,12 @@ async fn download_snapshot(
                 eprintln!("   boards: {}", boards.len());
 
                 // Emit sync started
-                let _ = event_tx.send(SwiftEvent::SyncStarted {
-                    group_id: group.id.clone(),
-                    group_name: group.name.clone(),
-                });
+                if !quiet {
+                    let _ = event_tx.send(SwiftEvent::SyncStarted {
+                        group_id: group.id.clone(),
+                        group_name: group.name.clone(),
+                    });
+                }
 
                 // Insert structure into DB
                 eprintln!("📥 [SNAP-DL-7a] Inserting structure into DB...");
@@ -1327,11 +1507,13 @@ async fn download_snapshot(
                 structure_received = true;
 
                 // Emit structure received
-                let _ = event_tx.send(SwiftEvent::SyncStructureReceived {
-                    group_id: group_id.to_string(),
-                    workspace_count: workspaces.len() as u32,
-                    board_count: boards.len() as u32,
-                });
+                if !quiet {
+                    let _ = event_tx.send(SwiftEvent::SyncStructureReceived {
+                        group_id: group_id.to_string(),
+                        workspace_count: workspaces.len() as u32,
+                        board_count: boards.len() as u32,
+                    });
+                }
             }
 
             SnapshotFrame::Content { elements, cells } => {
@@ -1366,11 +1548,13 @@ async fn download_snapshot(
                 eprintln!("📥 [SNAP-DL-8a] ✓ Content inserted");
 
                 // Emit board ready
-                let _ = event_tx.send(SwiftEvent::SyncBoardReady {
-                    board_id: "all".to_string(),
-                    element_count: elements.len() as u32,
-                    cell_count: cells.len() as u32,
-                });
+                if !quiet {
+                    let _ = event_tx.send(SwiftEvent::SyncBoardReady {
+                        board_id: "all".to_string(),
+                        element_count: elements.len() as u32,
+                        cell_count: cells.len() as u32,
+                    });
+                }
             }
 
             SnapshotFrame::Metadata { chats, files, integrations, board_metadata } => {
@@ -1425,7 +1609,7 @@ async fn download_snapshot(
                 eprintln!("📥 [SNAP-DL-9a] ✓ Metadata inserted");
 
                 // Emit files received
-                if !files.is_empty() {
+                if !files.is_empty() && !quiet {
                     let _ = event_tx.send(SwiftEvent::SyncFilesReceived {
                         group_id: group_id.to_string(),
                         file_count: files.len() as u32,
@@ -1439,13 +1623,15 @@ async fn download_snapshot(
                 eprintln!("═══════════════════════════════════════════════════════════════════");
 
                 // Emit sync complete (caller will notify NetworkActor)
-                let _ = event_tx.send(SwiftEvent::SyncComplete {
-                    group_id: group_id.to_string(),
-                });
+                if !quiet {
+                    let _ = event_tx.send(SwiftEvent::SyncComplete {
+                        group_id: group_id.to_string(),
+                    });
 
-                let _ = event_tx.send(SwiftEvent::StatusUpdate {
-                    message: "Sync complete!".to_string(),
-                });
+                    let _ = event_tx.send(SwiftEvent::StatusUpdate {
+                        message: "Sync complete!".to_string(),
+                    });
+                }
 
                 break;
             }

@@ -31,6 +31,15 @@ pub struct NodeMetrics {
     pub neighbor_up: u64,
     pub neighbor_down: u64,
     pub gossip_degree: u64,
+    /// Anti-entropy state digests this peer has broadcast (sweep traffic = `O(1)`/tick).
+    #[serde(default)]
+    pub ae_digest_sent: u64,
+    /// Anti-entropy repair pulls this peer has started (debounced; bounded, not per-message).
+    #[serde(default)]
+    pub ae_repair: u64,
+    /// Snapshots this peer has served to others (the "no single-host overload" oracle).
+    #[serde(default)]
+    pub snapshot_served: u64,
 }
 
 /// Default per-request timeout for control verbs (boot/addr/count are fast).
@@ -66,6 +75,19 @@ impl MpNode {
         bootstrap_node_id: Option<&str>,
         seed_fixture_group: Option<&str>,
     ) -> Result<MpNode> {
+        Self::spawn_with_env(name, discovery_key, bootstrap_node_id, seed_fixture_group, &[]).await
+    }
+
+    /// Like [`MpNode::spawn`] but injects extra `(key, value)` environment variables into the child
+    /// (e.g. `CYAN_AE_SWEEP_MS` to drive the anti-entropy sweep fast enough to observe convergence
+    /// inside a bounded test timeout). Each child gets its OWN env — no process-global `set_var`.
+    pub async fn spawn_with_env(
+        name: &str,
+        discovery_key: &str,
+        bootstrap_node_id: Option<&str>,
+        seed_fixture_group: Option<&str>,
+        extra_env: &[(&str, &str)],
+    ) -> Result<MpNode> {
         let tmp = tempfile::tempdir().context("create per-node tempdir")?;
         let db_path = tmp.path().join("node.db");
         let data_dir = tmp.path().join("data");
@@ -97,6 +119,9 @@ impl MpNode {
         }
         if let Some(g) = seed_fixture_group {
             cmd.env("SEED_FIXTURE", g);
+        }
+        for (k, v) in extra_env {
+            cmd.env(k, v);
         }
 
         let mut child = cmd.spawn().with_context(|| format!("spawn cyan_node ({name})"))?;
@@ -306,6 +331,16 @@ impl MpNode {
         // Posting + broadcasting n events can take a moment for large n; scale the timeout.
         let timeout = REQ_TIMEOUT + Duration::from_millis(n as u64 * 5);
         self.request(&format!("post_edits {group_id} {n}"), timeout)
+            .await
+            .map(|_| ())
+    }
+
+    /// Insert `n` edits into THIS node's storage WITHOUT broadcasting them — a deterministic
+    /// stand-in for live deltas whose gossip was dropped, so no other peer ever received them.
+    /// Anti-entropy must detect + repair them on the next sweep.
+    pub async fn post_local(&mut self, group_id: &str, n: usize) -> Result<()> {
+        let timeout = REQ_TIMEOUT + Duration::from_millis(n as u64 * 5);
+        self.request(&format!("post_local {group_id} {n}"), timeout)
             .await
             .map(|_| ())
     }

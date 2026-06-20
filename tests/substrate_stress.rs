@@ -75,17 +75,54 @@ async fn form_group(n: usize, key: &str, group: &str) -> Result<Vec<MpNode>> {
     // Because the mesh is already fully wired, a later joiner can also pull from peers that have
     // already synced, not just the host. One bounded retry absorbs a slow gossip neighbor-up.
     let t = converge_timeout(n);
-    for i in 1..nodes.len() {
+    for node in nodes.iter_mut().skip(1) {
         let mut synced = false;
         for _ in 0..2 {
-            nodes[i].join_group(group, Some(&host_id)).await?;
-            if nodes[i].wait_sync(group, t).await? {
+            node.join_group(group, Some(&host_id)).await?;
+            if node.wait_sync(group, t).await? {
                 synced = true;
                 break;
             }
         }
         if !synced {
-            return Err(anyhow!("{} did not sync group within 2×{t:?}", nodes[i].name));
+            return Err(anyhow!("{} did not sync group within 2×{t:?}", node.name));
+        }
+    }
+    Ok(nodes)
+}
+
+/// Anti-entropy tuning for the convergence tests: drive sweeps + the multi-source snapshot pick
+/// window fast enough to observe convergence inside a bounded timeout. The production defaults
+/// (2 s sweep) are far slower; these only change cadence, never behavior.
+const AE_ENV: &[(&str, &str)] = &[("CYAN_AE_SWEEP_MS", "400"), ("CYAN_AE_PICK_MS", "120")];
+
+/// Like [`form_group`] (sequential cold-join + per-peer `wait_sync`, with one bounded retry — the
+/// pattern proven robust under load by the CI scenarios) but every peer additionally runs the
+/// anti-entropy sweep on the fast test cadence ([`AE_ENV`]). Used by the convergence tests so a
+/// dropped live delta is repaired within the bound.
+async fn form_group_ae(n: usize, key: &str, group: &str) -> Result<Vec<MpNode>> {
+    let host = MpNode::spawn_with_env("host", key, None, Some(group), AE_ENV).await?;
+    let host_id = host.node_id.clone();
+    let mut nodes = vec![host];
+    for i in 1..n {
+        let joiner =
+            MpNode::spawn_with_env(&format!("peer{i}"), key, Some(&host_id), None, AE_ENV).await?;
+        nodes.push(joiner);
+    }
+    wire_mesh(&mut nodes).await?;
+
+    let t = converge_timeout(n);
+    for node in nodes.iter_mut().skip(1) {
+        let mut synced = false;
+        for _ in 0..2 {
+            node.join_group(group, Some(&host_id)).await?;
+            if node.wait_sync(group, t).await? {
+                synced = true;
+                break;
+            }
+        }
+        if !synced {
+            return Err(anyhow!("{} did not sync group within 2×{t:?}", node.name));
         }
     }
     Ok(nodes)
@@ -418,6 +455,239 @@ async fn sustained_chaos_soak() {
         let m = node.metrics().await.expect("metrics");
         assert!(m.rss_kb < 768_000, "{} RSS {}KB ballooned over soak", node.name, m.rss_kb);
     }
+
+    quit_all(nodes).await;
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════
+// F. Anti-entropy: a DROPPED live delta is repaired by the next sweep (the core fix).
+//    Deterministic + light ⇒ runs in CI. Proves the convergence guarantee at its root: an edit
+//    whose gossip was never delivered (simulated exactly via `post_local` — local insert, NO
+//    broadcast) is detected by the digest sweep and pulled to EVERY peer. Before this fix such a
+//    delta was lost forever (the N≈8 divergence ceiling); now the mesh reconciles it.
+// ════════════════════════════════════════════════════════════════════════════════════════
+#[tokio::test]
+async fn dropped_delta_is_repaired_by_next_sweep() {
+    let _serial = serial().await;
+    let key = unique_discovery_key();
+    let group = unique_group_id();
+    let n = 3;
+    const MISSED: usize = 4;
+
+    let mut nodes = form_group_ae(n, &key, &group).await.expect("form group + sync all peers");
+
+    // peer1 makes MISSED edits whose gossip is "dropped": inserted into its OWN storage but NEVER
+    // broadcast. This is precisely what a `Lagged` live delta looks like to the rest of the mesh —
+    // the originator has it, nobody else ever received it.
+    nodes[1].post_local(&group, MISSED).await.expect("post un-broadcast (dropped) edits");
+
+    // The originator has fixture + the missed edits; nobody else can possibly have them yet (no
+    // broadcast happened), so this divergence is real and would be permanent without anti-entropy.
+    assert_eq!(
+        nodes[1].count("elements", &group).await.expect("count originator elements"),
+        FIXTURE_ELEMENTS + MISSED,
+        "originator must hold its own local edits"
+    );
+
+    // The anti-entropy sweep must detect the divergence (digest mismatch) and pull the missed edits
+    // to EVERY peer, converging to the exact total. This is the dropped-delta repair guarantee.
+    let expected = FIXTURE_ELEMENTS + MISSED;
+    converge_count(&mut nodes, "elements", &group, expected, converge_timeout(n))
+        .await
+        .expect("the dropped delta is repaired by the anti-entropy sweep on every peer");
+
+    // It was repaired by the sweep (a bounded, debounced pull), not by a per-message storm: at least
+    // one peer pulled a repair, and repair pulls are a small bounded number — not proportional to
+    // message volume (the "sweep traffic is bounded" oracle).
+    let mut total_repairs = 0u64;
+    for node in nodes.iter_mut() {
+        let m = node.metrics().await.expect("read metrics");
+        total_repairs += m.ae_repair;
+        assert!(
+            m.ae_repair < 50,
+            "{} ran {} repair pulls — debounce should keep this small/bounded",
+            node.name,
+            m.ae_repair
+        );
+    }
+    assert!(total_repairs >= 1, "expected at least one anti-entropy repair pull to carry the delta");
+
+    quit_all(nodes).await;
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════
+// G. Anti-entropy at scale: live deltas from EVERY peer converge under load at the N that
+//    previously PLATEAUED at partial, divergent state (the measured ceiling was N≈8; N=12 was
+//    shown stuck at divergent counts for 100s+ in STATUS_STRESS_FABRIC). With the sweep it now
+//    CONVERGES. Default N=12 (the documented previously-diverging case); override CYAN_STRESS_N
+//    higher on a beefier box / the Docker tier. Heavy (N full iroh processes) ⇒ gated on-demand.
+//
+//    NOTE on the ceiling: this is the loopback tier — N full iroh OS processes on ONE box. The
+//    anti-entropy fix lifts the *divergence* ceiling (peers now reconcile dropped deltas — N=12,
+//    which STATUS_STRESS_FABRIC showed stuck divergent, now converges sub-second). What remains is a
+//    separate, pre-existing *single-box CPU/socket* wall that limits how many real iroh nodes can
+//    even FORM the gossip overlay here (~N=12–14 on this Apple-Silicon dev box; N≥16 starves on
+//    FORMATION, not on the mesh — that belongs on the Docker tier across real hosts). The fix is
+//    orthogonal to that wall: it makes every mesh that forms converge. See STATUS_ANTI_ENTROPY.md.
+// ════════════════════════════════════════════════════════════════════════════════════════
+#[tokio::test]
+#[ignore = "on-demand anti-entropy scale proof: run standalone via CYAN_STRESS_AE=1 (override N \
+            with CYAN_STRESS_N). N full iroh processes ⇒ heaviest scenario, kept out of fast CI"]
+async fn live_deltas_converge_under_load() {
+    if std::env::var("CYAN_STRESS_AE").as_deref() != Ok("1") {
+        eprintln!("live_deltas_converge_under_load: set CYAN_STRESS_AE=1 to run; skipping.");
+        return;
+    }
+    let _serial = serial().await;
+    let key = unique_discovery_key();
+    let group = unique_group_id();
+    let n = stress_n(12);
+    const EDITS_PER_PEER: usize = 5;
+
+    let t0 = Instant::now();
+    let mut nodes = form_group_ae(n, &key, &group).await.expect("form N-peer group + sync");
+    let form_secs = t0.elapsed().as_secs_f64();
+
+    // Every peer posts live edits over best-effort gossip. Under N-node loopback contention some
+    // broadcasts WILL be dropped (`Lagged`) — exactly the condition that used to leave the mesh
+    // permanently divergent past N≈8. Anti-entropy must reconcile every drop.
+    for node in nodes.iter_mut() {
+        node.post_edits(&group, EDITS_PER_PEER).await.expect("post edits");
+    }
+
+    // The proof: every peer converges to the EXACT total despite dropped live deltas.
+    let expected = FIXTURE_ELEMENTS + n * EDITS_PER_PEER;
+    let t1 = Instant::now();
+    converge_count(&mut nodes, "elements", &group, expected, converge_timeout(n) * 2)
+        .await
+        .expect("ALL peers converge to the exact total under load (anti-entropy repairs drops)");
+    let converge_secs = t1.elapsed().as_secs_f64();
+
+    // Bounded-traffic oracles: the sweep must not have created a storm.
+    let mut max_degree = 0u64;
+    let mut max_gossip = 0u64;
+    let mut max_rss = 0u64;
+    let mut max_digests = 0u64;
+    let mut max_repairs = 0u64;
+    for node in nodes.iter_mut() {
+        let m = node.metrics().await.expect("read metrics");
+        max_degree = max_degree.max(m.gossip_degree);
+        max_gossip = max_gossip.max(m.gossip_recv);
+        max_rss = max_rss.max(m.rss_kb);
+        max_digests = max_digests.max(m.ae_digest_sent);
+        max_repairs = max_repairs.max(m.ae_repair);
+    }
+    println!(
+        "[AE-SCALE] N={n} form={form_secs:.1}s converge={converge_secs:.1}s \
+         max_degree={max_degree} max_gossip_recv={max_gossip} max_ae_digest_sent={max_digests} \
+         max_ae_repair={max_repairs} max_rss_kb={max_rss}"
+    );
+
+    // Bounded gossip degree: HyParView keeps active degree ~constant — NOT a full mesh.
+    let degree_ceiling = (n as u64).min(12) + 4;
+    assert!(
+        max_degree <= degree_ceiling,
+        "gossip degree {max_degree} exceeded bound {degree_ceiling} for N={n} (storm risk)"
+    );
+    // Sweep traffic is bounded: digests are O(1)/tick per peer (per-peer rate independent of N),
+    // and repairs are debounced ⇒ a small bounded number, never proportional to message volume.
+    assert!(
+        max_repairs < 200,
+        "per-peer anti-entropy repairs {max_repairs} unexpectedly large (runaway repair loop?)"
+    );
+    // Bounded memory across the run.
+    assert!(max_rss < 512_000, "per-peer RSS {max_rss} KB exceeded 512 MB ceiling (leak?)");
+
+    quit_all(nodes).await;
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════
+// H. Multi-source snapshot serving: many cold-joiners join CONCURRENTLY (the thundering herd) and
+//    each picks a holder at random, so NO single host serves the whole fleet. Heavy ⇒ gated
+//    on-demand via CYAN_STRESS_AE=1. The "snapshot under load / no single-peer overload" fix.
+// ════════════════════════════════════════════════════════════════════════════════════════
+#[tokio::test]
+#[ignore = "on-demand multi-source snapshot proof: run standalone via CYAN_STRESS_AE=1 on a HEALTHY \
+            (idle) box — it spawns holders + a concurrent cold-join fleet (7 full iroh processes); on \
+            a CPU-loaded box the late joiners can't form the gossip overlay (single-box wall, not the \
+            mesh). Kept out of fast CI. See STATUS_ANTI_ENTROPY.md."]
+async fn concurrent_coldjoiners_snapshot_multisource_no_single_host_overload() {
+    if std::env::var("CYAN_STRESS_AE").as_deref() != Ok("1") {
+        eprintln!("concurrent_coldjoiners_snapshot_multisource: set CYAN_STRESS_AE=1 to run; skipping.");
+        return;
+    }
+    let _serial = serial().await;
+    let key = unique_discovery_key();
+    let group = unique_group_id();
+    const HOLDERS: usize = 3; // host (seeded) + 2 peers that sync first → 3 snapshot sources
+    const JOINERS: usize = 4;
+
+    // 1. Form the holder set: host + 2 peers, all synced. These are the multi-source snapshot holders.
+    let mut nodes = form_group_ae(HOLDERS, &key, &group).await.expect("form holder set + sync");
+    let host_id = nodes[0].node_id.clone();
+
+    // Baseline each holder's snapshots-served AFTER holder formation, so the load-spread oracle below
+    // measures only the JOINER phase (holders may have served each other during their own formation).
+    let mut served_before = Vec::new();
+    for node in nodes.iter_mut().take(HOLDERS) {
+        served_before.push(node.metrics().await.expect("metrics").snapshot_served);
+    }
+
+    // 2. Spawn JOINERS cold peers and fold them into ONE full mesh with the holders + each other.
+    for j in 0..JOINERS {
+        let p = MpNode::spawn_with_env(&format!("join{j}"), &key, Some(&host_id), None, AE_ENV)
+            .await
+            .expect("spawn cold joiner");
+        nodes.push(p);
+    }
+    wire_mesh(&mut nodes).await.expect("wire full mesh (holders + joiners)");
+
+    // 3. Fire ALL joins concurrently (the thundering herd): issue every join at once (non-blocking
+    //    — it only sends the command). Every joiner requests a snapshot at ~the same time, so
+    //    without multi-source they would all pile onto the host.
+    let t = converge_timeout(nodes.len());
+    for node in nodes.iter_mut().skip(HOLDERS) {
+        node.join_group(&group, Some(&host_id)).await.expect("issue concurrent join");
+    }
+
+    // 4. Every peer converges to the full fixture (no edits posted — this stresses snapshot serving).
+    //    We gate on convergence of each peer's OWN storage, NOT on `SyncComplete`: under the herd a
+    //    joiner may miss its join-time snapshot and be caught up by the (quiet) anti-entropy sweep,
+    //    which does not emit `SyncComplete` — but it DOES bring the full state, which is what matters.
+    converge_count(&mut nodes, "elements", &group, FIXTURE_ELEMENTS, t)
+        .await
+        .expect("all cold-joiners converge to the full snapshot");
+
+    // 5. Load-spread oracle: each holder's snapshots-served DURING the joiner phase (after − before).
+    //    The host must NOT have served the whole joiner fleet — the random multi-source pick spreads
+    //    the herd across all holders.
+    let mut served = Vec::new();
+    for (i, node) in nodes.iter_mut().take(HOLDERS).enumerate() {
+        let now = node.metrics().await.expect("metrics").snapshot_served;
+        served.push((node.name.clone(), now.saturating_sub(served_before[i])));
+    }
+    let host_served = served[0].1;
+    let non_host_served: u64 = served.iter().skip(1).map(|(_, s)| *s).sum();
+    let total_served: u64 = served.iter().map(|(_, s)| *s).sum();
+    println!(
+        "[AE-MULTISRC] HOLDERS={HOLDERS} JOINERS={JOINERS} served-by-holder(Δjoiner-phase)={served:?} \
+         host={host_served} non_host={non_host_served} total={total_served}"
+    );
+
+    // Load genuinely spread off the host: the host did NOT serve the whole joiner fleet, and at least
+    // one non-host source served a snapshot. (We deliberately do NOT require holders to have served
+    // ALL joiners: with anti-entropy a freshly-synced joiner can serve a later one too — even better
+    // spreading — so some serves legitimately land off the 3 measured holders. The convergence above
+    // already proved every joiner got the full state; this asserts the *distribution*.)
+    let _ = total_served; // printed above for visibility
+    assert!(
+        host_served < JOINERS as u64,
+        "host served {host_served} of {JOINERS} joiners — multi-source did NOT spread the herd"
+    );
+    assert!(
+        non_host_served >= 1,
+        "no non-host holder served any snapshot — load did not spread off the host"
+    );
 
     quit_all(nodes).await;
 }

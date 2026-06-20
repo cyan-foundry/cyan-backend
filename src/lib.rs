@@ -27,6 +27,7 @@ pub mod actors;
 pub mod storage;
 pub mod swarm;
 pub mod metrics;
+pub mod anti_entropy;
 pub mod lens_commands;
 pub mod mcp_host;
 pub mod identity;

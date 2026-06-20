@@ -463,6 +463,37 @@ async fn handle_verb(
             Ok(format!("ok post_edits {n}"))
         }
 
+        // Insert `n` live edits into THIS node's storage but DO NOT broadcast them — a deterministic
+        // stand-in for live deltas whose gossip was dropped (`Lagged`) so no other peer ever saw
+        // them. Without anti-entropy these never reach the rest of the mesh; with the sweep they are
+        // detected (digest mismatch) and pulled. `post_local <gid> <n> [board]` → `ok post_local <n>`.
+        "post_local" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?;
+            let n: usize = rest
+                .get(1)
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| anyhow!("count required"))?;
+            let board = rest
+                .get(2)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{gid}-board"));
+            let tag = &node_id[..8.min(node_id.len())];
+            let now = chrono::Utc::now().timestamp();
+            for i in 0..n {
+                // Distinct id namespace ("le" = local edit) so these never collide with `post_edits`.
+                let id = format!("{gid}-le-{tag}-{i:06}");
+                storage::element_insert_simple(
+                    &id, &board, "rectangle",
+                    (i % 1000) as f64, (i % 700) as f64, 80.0, 40.0, i as i32,
+                    Some("{\"fill\":\"#FF8800\"}"),
+                    Some(&format!("{{\"text\":\"local edit {i} by {tag}\"}}")),
+                    now, now,
+                )
+                .map_err(|e| anyhow!("element_insert_simple: {e}"))?;
+            }
+            Ok(format!("ok post_local {n}"))
+        }
+
         // Generate a deterministic blob of <size> bytes, content-address it, hold it in this node's
         // swarm store, and announce it to the group so peers can swarm-fetch. Also writes a file
         // metadata row + local_path so `count files` and direct transfer both see it.
@@ -594,6 +625,9 @@ async fn handle_verb(
                 "neighbor_up": cyan_backend::metrics::neighbor_up(),
                 "neighbor_down": cyan_backend::metrics::neighbor_down(),
                 "gossip_degree": cyan_backend::metrics::gossip_degree(),
+                "ae_digest_sent": cyan_backend::metrics::ae_digest_sent(),
+                "ae_repair": cyan_backend::metrics::ae_repair(),
+                "snapshot_served": cyan_backend::metrics::snapshot_served(),
             });
             Ok(format!("metrics {}", serde_json::to_string(&json)?))
         }

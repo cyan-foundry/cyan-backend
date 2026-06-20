@@ -37,6 +37,22 @@ static NEIGHBOR_DOWN: AtomicU64 = AtomicU64::new(0);
 /// reordering of up/down can never wrap a u64.
 static GOSSIP_DEGREE: AtomicI64 = AtomicI64::new(0);
 
+/// Anti-entropy state digests this node has broadcast (one per sweep with peers
+/// present). The sweep's cost is `O(1)` gossip per tick, so this grows linearly in
+/// run time — the "sweep traffic is bounded, not a storm" oracle.
+static AE_DIGEST_SENT: AtomicU64 = AtomicU64::new(0);
+
+/// Anti-entropy repair pulls this node has STARTED (a snapshot merge triggered by a
+/// divergent digest). Debounced to one in-flight per group, so this stays small/
+/// bounded and does NOT grow with message volume — the "repair is cheap" oracle.
+static AE_REPAIR: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshots this node has SERVED to other peers (join-time pulls + anti-entropy
+/// repairs both land here, since they share one serve path). The "snapshot under
+/// load" oracle: with concurrent cold-joiners spread multi-source across holders, no
+/// single holder's served count should equal the whole joiner fleet.
+static SNAPSHOT_SERVED: AtomicU64 = AtomicU64::new(0);
+
 /// One inbound gossip message processed. Called once per delivered, non-self
 /// gossip message in `TopicActor::handle_gossip_event`.
 #[inline]
@@ -62,9 +78,42 @@ pub fn record_neighbor_down() {
     }
 }
 
+/// One anti-entropy state digest broadcast onto a group topic.
+#[inline]
+pub fn record_ae_digest_sent() {
+    AE_DIGEST_SENT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One anti-entropy repair pull started (post-debounce).
+#[inline]
+pub fn record_ae_repair() {
+    AE_REPAIR.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One snapshot served to a peer (join-time or anti-entropy repair).
+#[inline]
+pub fn record_snapshot_served() {
+    SNAPSHOT_SERVED.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Total inbound gossip messages processed by this node.
 pub fn gossip_recv() -> u64 {
     GOSSIP_RECV.load(Ordering::Relaxed)
+}
+
+/// Anti-entropy digests this node has broadcast.
+pub fn ae_digest_sent() -> u64 {
+    AE_DIGEST_SENT.load(Ordering::Relaxed)
+}
+
+/// Anti-entropy repair pulls this node has started.
+pub fn ae_repair() -> u64 {
+    AE_REPAIR.load(Ordering::Relaxed)
+}
+
+/// Snapshots this node has served to peers.
+pub fn snapshot_served() -> u64 {
+    SNAPSHOT_SERVED.load(Ordering::Relaxed)
 }
 
 /// Lifetime `NeighborUp` count.
@@ -114,4 +163,7 @@ pub fn reset() {
     NEIGHBOR_UP.store(0, Ordering::Relaxed);
     NEIGHBOR_DOWN.store(0, Ordering::Relaxed);
     GOSSIP_DEGREE.store(0, Ordering::Relaxed);
+    AE_DIGEST_SENT.store(0, Ordering::Relaxed);
+    AE_REPAIR.store(0, Ordering::Relaxed);
+    SNAPSHOT_SERVED.store(0, Ordering::Relaxed);
 }
