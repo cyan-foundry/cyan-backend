@@ -50,6 +50,9 @@ test-all: up build-node ## the green matrix (LAN, relay, WS)
 	@set -e; for t in test-lan test-relay test-ws; do \
 	  echo "### $$t"; $(MAKE) $$t; done; echo "ALL GREEN RUNGS DONE"
 
+stress: ## run a stress scenario: make stress SCENARIO=swarm PEERS=6  (see ./stress.sh help)
+	./stress.sh $(SCENARIO) $(PEERS)
+
 logs:  ## tail the relay
 	$(COMPOSE) logs -f relay
 ps:    ; $(COMPOSE) ps
@@ -60,4 +63,4 @@ clean: down ## stop everything + remove networks/build context
 	$(COMPOSE) down -v --remove-orphans
 	-docker network rm cyan-rig_airgap >/dev/null 2>&1 || true
 	rm -rf .ctx .logs
-.PHONY: help relay-info up build-node test-lan test-relay test-ws test-offline test-all logs ps down clean
+.PHONY: help relay-info up build-node test-lan test-relay test-ws test-offline test-all stress logs ps down clean

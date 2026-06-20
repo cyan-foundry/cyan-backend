@@ -13,11 +13,25 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 /// Response sentinel — must match `src/bin/cyan_node.rs`.
 const SENTINEL: &str = "@@CYAN@@";
+
+/// Process-level state + metrics reported by `cyan_node`'s `metrics` verb (the stress oracles:
+/// "no message storm" = `gossip_recv` bounded vs N; "bounded memory" = `rss_kb` over the run;
+/// "bounded degree" = `gossip_degree`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeMetrics {
+    pub node_id: String,
+    pub rss_kb: u64,
+    pub gossip_recv: u64,
+    pub neighbor_up: u64,
+    pub neighbor_down: u64,
+    pub gossip_degree: u64,
+}
 
 /// Default per-request timeout for control verbs (boot/addr/count are fast).
 pub const REQ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -283,11 +297,104 @@ impl MpNode {
         Ok(n)
     }
 
+    // ── Stress / chaos fabric (Round 7) ───────────────────────────────────────────────────
+
+    /// Post `n` live whiteboard-element edits to `group_id`: each is inserted into this node's
+    /// own storage AND broadcast over the group gossip. Edit ids are namespaced by node id, so
+    /// concurrent posting from many peers never collides.
+    pub async fn post_edits(&mut self, group_id: &str, n: usize) -> Result<()> {
+        // Posting + broadcasting n events can take a moment for large n; scale the timeout.
+        let timeout = REQ_TIMEOUT + Duration::from_millis(n as u64 * 5);
+        self.request(&format!("post_edits {group_id} {n}"), timeout)
+            .await
+            .map(|_| ())
+    }
+
+    /// Seed (hold + announce) a deterministic blob of `size` bytes into `group_id`'s swarm.
+    /// Returns `(file_id, blake3_hex)`.
+    pub async fn seed_blob(&mut self, group_id: &str, size: usize) -> Result<(String, String)> {
+        let timeout = REQ_TIMEOUT + Duration::from_millis((size / 1_000_000) as u64 * 1000);
+        let resp = self
+            .request(&format!("seed_blob {group_id} {size}"), timeout)
+            .await?;
+        let payload = resp
+            .strip_prefix("blob ")
+            .ok_or_else(|| anyhow!("{}: unexpected seed_blob response: {resp}", self.name))?;
+        let (file_id, hash) = payload
+            .split_once(' ')
+            .ok_or_else(|| anyhow!("{}: malformed blob response: {resp}", self.name))?;
+        Ok((file_id.to_string(), hash.to_string()))
+    }
+
+    /// Fetch a blob `source_peer` holds, waiting (bounded) for completion. Returns the local
+    /// path on success, or `None` on timeout.
+    pub async fn fetch_blob(
+        &mut self,
+        group_id: &str,
+        file_id: &str,
+        hash: &str,
+        source_peer: &str,
+        size: u64,
+        timeout: Duration,
+    ) -> Result<Option<String>> {
+        let ms = timeout.as_millis() as u64;
+        let resp = self
+            .request(
+                &format!("fetch_blob {group_id} {file_id} {hash} {source_peer} {size} {ms}"),
+                timeout + Duration::from_secs(5),
+            )
+            .await?;
+        Ok(resp.strip_prefix("fetched ").map(|p| p.to_string()))
+    }
+
+    /// Independently re-verify a downloaded blob's blake3 against `expected_hash`.
+    /// Returns true only on `verify ok`.
+    pub async fn verify_blob(&mut self, file_id: &str, expected_hash: &str) -> Result<bool> {
+        let resp = self
+            .request(&format!("verify_blob {file_id} {expected_hash}"), REQ_TIMEOUT)
+            .await?;
+        Ok(resp == "verify ok")
+    }
+
+    /// This node's connection tier to `peer_id` (`direct`/`relay`/`mixed`/`none`/`unknown`).
+    pub async fn tier(&mut self, peer_id: &str) -> Result<String> {
+        let resp = self.request(&format!("tier {peer_id}"), REQ_TIMEOUT).await?;
+        resp.strip_prefix("tier ")
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("{}: unexpected tier response: {resp}", self.name))
+    }
+
+    /// This node's process-level state + metrics (RSS, gossip counters, degree).
+    pub async fn metrics(&mut self) -> Result<NodeMetrics> {
+        let resp = self.request("metrics", REQ_TIMEOUT).await?;
+        let json = resp
+            .strip_prefix("metrics ")
+            .ok_or_else(|| anyhow!("{}: unexpected metrics response: {resp}", self.name))?;
+        serde_json::from_str(json)
+            .with_context(|| format!("{}: parse metrics json: {json}", self.name))
+    }
+
     /// Ask the child to exit cleanly.
     pub async fn quit(&mut self) -> Result<()> {
         self.stdin.write_all(b"quit\n").await.ok();
         self.stdin.flush().await.ok();
         Ok(())
+    }
+
+    /// Quit AND fully reap the child process, bounded. Critical when many tests run in one binary:
+    /// `quit()`/`Drop` only *start* termination, so without an explicit reap the OS processes pile
+    /// up and starve the next test's nodes. Consumes self so the handle can't be reused after exit.
+    pub async fn shutdown(mut self) {
+        let _ = self.stdin.write_all(b"quit\n").await;
+        let _ = self.stdin.flush().await;
+        // Wait for real exit; if it dawdles, kill_on_drop (set at spawn) finishes the job.
+        if tokio::time::timeout(Duration::from_secs(5), self.child.wait())
+            .await
+            .is_err()
+        {
+            let _ = self.child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
+        }
     }
 }
 
@@ -298,5 +405,25 @@ pub async fn wire_pair(a: &mut MpNode, b: &mut MpNode) -> Result<()> {
     let b_addr = b.addr().await?;
     a.add_peer(&b_addr).await?;
     b.add_peer(&a_addr).await?;
+    Ok(())
+}
+
+/// Full-mesh wiring for the stress fabric: every node learns every other node's loopback
+/// `EndpointAddr`, so any peer can dial any peer and the gossip overlay forms freely among
+/// all N. (Relay is disabled; `StaticProvider` is the only discovery, so peers can dial
+/// only addrs we hand them — full mesh is the in-process stand-in for "everyone reachable".)
+/// Two bounded passes: collect all addrs, then inject each into the others.
+pub async fn wire_mesh(nodes: &mut [MpNode]) -> Result<()> {
+    let mut addrs = Vec::with_capacity(nodes.len());
+    for n in nodes.iter_mut() {
+        addrs.push(n.addr().await?);
+    }
+    for (i, n) in nodes.iter_mut().enumerate() {
+        for (j, addr) in addrs.iter().enumerate() {
+            if i != j {
+                n.add_peer(addr).await?;
+            }
+        }
+    }
     Ok(())
 }

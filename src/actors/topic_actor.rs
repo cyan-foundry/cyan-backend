@@ -482,6 +482,10 @@ impl TopicActor {
                     return;
                 }
 
+                // Observability only (stress fabric "no message storm" oracle): count every
+                // inbound, non-self gossip message this node actually processes. Behavior-neutral.
+                crate::metrics::record_gossip_recv();
+
                 // Try parsing as a blob-swarm negotiation message FIRST (G10): its `{"type":"IHave"
                 // |"WhoHas"}` shape is disjoint from NetworkEvent/NetworkCommand. Record the holder /
                 // answer a WhoHas with our own IHave, broadcast over this same group topic.
@@ -524,6 +528,7 @@ impl TopicActor {
                 );
 
                 self.known_peers.insert(peer);
+                crate::metrics::record_neighbor_up(); // observability only (gossip-degree gauge)
 
                 // CRITICAL: Re-send snapshot request when peer joins
                 // The initial request may have been sent before mesh was ready
@@ -574,6 +579,7 @@ impl TopicActor {
                 );
 
                 self.known_peers.remove(&peer);
+                crate::metrics::record_neighbor_down(); // observability only (gossip-degree gauge)
 
                 let _ = self.event_tx.send(SwiftEvent::PeerLeft {
                     group_id: self.group_id.clone(),

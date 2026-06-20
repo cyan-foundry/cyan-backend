@@ -38,6 +38,14 @@
 //! - `issue_grant <gid> <role> [ttl]`     `@@CYAN@@ grant <nonce> <qr>` (ttl secs; negative ⇒ expired)
 //! - `revoke_grant <gid> <nonce>`         `@@CYAN@@ ok revoke_grant`
 //! - `join_group_grant <gid> <boot|-> <qr>`  `@@CYAN@@ ok join_group_grant`
+//!
+//! ## Stress / chaos fabric verbs (Round 7)
+//! - `post_edits <gid> <n> [board]`       `@@CYAN@@ ok post_edits <n>` (local insert + gossip broadcast)
+//! - `seed_blob <gid> <size> [name]`      `@@CYAN@@ blob <file_id> <hash>` (hold + announce)
+//! - `fetch_blob <gid> <fid> <hash> <src> <size> <to_ms>`  `@@CYAN@@ fetched <path>` | `timeout fetch_blob`
+//! - `verify_blob <fid> <hash>`           `@@CYAN@@ verify ok|mismatch|missing` (blake3 re-check)
+//! - `tier <peer_hex>`                    `@@CYAN@@ tier direct|relay|mixed|none|unknown`
+//! - `metrics`                            `@@CYAN@@ metrics <json>` (rss_kb, gossip_recv, degree…)
 //! - `quit`                               (process exits 0)
 //!
 //! Every wait is bounded; the binary never blocks unboundedly.
@@ -58,7 +66,7 @@ use tokio::sync::Notify;
 use cyan_backend::actors::NetworkActor;
 use cyan_backend::identity::{pubkey_hex, Grant, MeshAuthorizer, Role};
 use cyan_backend::models::commands::NetworkCommand;
-use cyan_backend::models::events::SwiftEvent;
+use cyan_backend::models::events::{NetworkEvent, SwiftEvent};
 use cyan_backend::models::node_config::{DiscoveryPolicy, NodeConfig, RelayPolicy};
 use cyan_backend::storage;
 
@@ -155,20 +163,32 @@ async fn main() -> Result<()> {
         actor.start(cmd_rx).await;
     });
 
-    // Drain events into shared state so `wait_sync` can observe SyncComplete even
-    // if it arrives before the verb is issued.
+    // Drain events into shared state so `wait_sync`/`fetch_blob` can observe the
+    // completion event even if it arrives before the verb is issued.
     let synced: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    // file_id -> local_path for completed downloads (the fetch_blob oracle).
+    let downloaded: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let notify = Arc::new(Notify::new());
     {
         let synced = synced.clone();
+        let downloaded = downloaded.clone();
         let notify = notify.clone();
         tokio::spawn(async move {
             while let Some(ev) = event_rx.recv().await {
-                if let SwiftEvent::SyncComplete { group_id } = ev {
-                    if let Ok(mut s) = synced.lock() {
-                        s.insert(group_id);
+                match ev {
+                    SwiftEvent::SyncComplete { group_id } => {
+                        if let Ok(mut s) = synced.lock() {
+                            s.insert(group_id);
+                        }
+                        notify.notify_waiters();
                     }
-                    notify.notify_waiters();
+                    SwiftEvent::FileDownloaded { file_id, local_path } => {
+                        if let Ok(mut d) = downloaded.lock() {
+                            d.insert(file_id, local_path);
+                        }
+                        notify.notify_waiters();
+                    }
+                    _ => {}
                 }
             }
         });
@@ -200,6 +220,7 @@ async fn main() -> Result<()> {
             &static_discovery,
             &cmd_tx,
             &synced,
+            &downloaded,
             &notify,
             &authorizer,
             &grant_secret,
@@ -226,6 +247,7 @@ async fn handle_verb(
     static_discovery: &iroh::discovery::static_provider::StaticProvider,
     cmd_tx: &UnboundedSender<NetworkCommand>,
     synced: &Arc<Mutex<HashSet<String>>>,
+    downloaded: &Arc<Mutex<HashMap<String, String>>>,
     notify: &Arc<Notify>,
     authorizer: &Arc<std::sync::Mutex<MeshAuthorizer>>,
     grant_secret: &[u8; 32],
@@ -388,6 +410,194 @@ async fn handle_verb(
             Ok(format!("count {kind} {n}"))
         }
 
+        // ── Stress / chaos fabric verbs (Round 7) ─────────────────────────────────────────
+        // Post N live whiteboard-element edits to a group: insert each into THIS node's storage
+        // AND broadcast it over the group gossip, exactly as the app's create-element path does.
+        // Element ids are namespaced by this node's id so concurrent multi-source posting never
+        // collides — convergence is then "every peer ends with the same total, no duplicates".
+        // `post_edits <gid> <n> [board_id]`.
+        "post_edits" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?;
+            let n: usize = rest
+                .get(1)
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| anyhow!("count required"))?;
+            // Default to the fixture board so the elements are countable via `count elements`.
+            let board = rest
+                .get(2)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{gid}-board"));
+            let tag = &node_id[..8.min(node_id.len())];
+            let now = chrono::Utc::now().timestamp();
+            for i in 0..n {
+                let id = format!("{gid}-e-{tag}-{i:06}");
+                storage::element_insert_simple(
+                    &id, &board, "rectangle",
+                    (i % 1000) as f64, (i % 700) as f64, 80.0, 40.0, i as i32,
+                    Some("{\"fill\":\"#00AEEF\"}"),
+                    Some(&format!("{{\"text\":\"edit {i} by {tag}\"}}")),
+                    now, now,
+                )
+                .map_err(|e| anyhow!("element_insert_simple: {e}"))?;
+                let event = NetworkEvent::WhiteboardElementAdded {
+                    id,
+                    board_id: board.clone(),
+                    element_type: "rectangle".to_string(),
+                    x: (i % 1000) as f64,
+                    y: (i % 700) as f64,
+                    width: 80.0,
+                    height: 40.0,
+                    z_index: i as i32,
+                    style_json: Some("{\"fill\":\"#00AEEF\"}".to_string()),
+                    content_json: Some(format!("{{\"text\":\"edit {i} by {tag}\"}}")),
+                    created_at: now,
+                    updated_at: now,
+                };
+                cmd_tx
+                    .send(NetworkCommand::Broadcast {
+                        group_id: gid.to_string(),
+                        event,
+                    })
+                    .map_err(|e| anyhow!("send Broadcast: {e}"))?;
+            }
+            Ok(format!("ok post_edits {n}"))
+        }
+
+        // Generate a deterministic blob of <size> bytes, content-address it, hold it in this node's
+        // swarm store, and announce it to the group so peers can swarm-fetch. Also writes a file
+        // metadata row + local_path so `count files` and direct transfer both see it.
+        // `seed_blob <gid> <size_bytes> [name]` → `blob <file_id> <hash>`.
+        "seed_blob" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?;
+            let size: usize = rest
+                .get(1)
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| anyhow!("size_bytes required"))?;
+            let tag = &node_id[..8.min(node_id.len())];
+            let name = rest.get(2).map(|s| s.to_string()).unwrap_or_else(|| format!("blob-{tag}.bin"));
+            let file_id = format!("{gid}-blob-{tag}-{size}");
+
+            // Deterministic, non-trivially-compressible payload keyed by file_id (so different
+            // seeds differ and integrity checks are meaningful).
+            let bytes = gen_blob(&file_id, size);
+            let hash = blake3::hash(&bytes).to_hex().to_string();
+
+            // Land it on disk and register it.
+            let data_dir = cyan_backend::DATA_DIR
+                .get()
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from("data"));
+            std::fs::create_dir_all(&data_dir).ok();
+            let path = data_dir.join(&file_id);
+            std::fs::write(&path, &bytes).map_err(|e| anyhow!("write blob: {e}"))?;
+
+            let now = chrono::Utc::now().timestamp();
+            storage::file_insert_simple(
+                &file_id, Some(gid), None, None, &name, &hash, size as u64, Some(node_id), now,
+            )
+            .map_err(|e| anyhow!("file_insert_simple: {e}"))?;
+            storage::file_set_local_path(&file_id, path.to_str().unwrap_or_default())
+                .map_err(|e| anyhow!("file_set_local_path: {e}"))?;
+
+            cmd_tx
+                .send(NetworkCommand::SeedAndAnnounceBlob {
+                    group_id: gid.to_string(),
+                    hash: hash.clone(),
+                    path: path.to_string_lossy().to_string(),
+                })
+                .map_err(|e| anyhow!("send SeedAndAnnounceBlob: {e}"))?;
+            Ok(format!("blob {file_id} {hash}"))
+        }
+
+        // Fetch a blob a peer is holding. Registers the file metadata row (so the engine's
+        // local_path update has a row to write), requests the download, and waits — bounded — for
+        // the `FileDownloaded` event. `fetch_blob <gid> <file_id> <hash> <source_peer> <size> <timeout_ms>`
+        // → `fetched <local_path>` | `timeout fetch_blob`.
+        "fetch_blob" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?;
+            let file_id = rest.get(1).ok_or_else(|| anyhow!("file_id required"))?.to_string();
+            let hash = rest.get(2).ok_or_else(|| anyhow!("hash required"))?.to_string();
+            let source = rest.get(3).ok_or_else(|| anyhow!("source_peer required"))?.to_string();
+            let size: u64 = rest.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let timeout_ms: u64 = rest.get(5).and_then(|s| s.parse().ok()).unwrap_or(60_000);
+
+            // Insert the metadata row if absent (a real joiner would learn it via snapshot/FileAvailable).
+            let now = chrono::Utc::now().timestamp();
+            let _ = storage::file_insert_simple(
+                &file_id, Some(gid), None, None,
+                &format!("{file_id}.bin"), &hash, size, Some(&source), now,
+            );
+
+            cmd_tx
+                .send(NetworkCommand::RequestFileDownload {
+                    file_id: file_id.clone(),
+                    hash,
+                    source_peer: source,
+                    resume_offset: 0,
+                })
+                .map_err(|e| anyhow!("send RequestFileDownload: {e}"))?;
+
+            match wait_download(downloaded, notify, &file_id, Duration::from_millis(timeout_ms)).await {
+                Some(path) => Ok(format!("fetched {path}")),
+                None => Ok("timeout fetch_blob".to_string()),
+            }
+        }
+
+        // Recompute the blake3 of a downloaded file and compare to the expected hash — the honest,
+        // independent integrity oracle (the engine verifies too; this proves it on the receiver).
+        // `verify_blob <file_id> <expected_hash>` → `verify ok` | `verify mismatch` | `verify missing`.
+        "verify_blob" => {
+            let file_id = rest.first().ok_or_else(|| anyhow!("file_id required"))?;
+            let expected = rest.get(1).ok_or_else(|| anyhow!("expected_hash required"))?;
+            match storage::file_get_local_path(file_id).filter(|p| !p.is_empty()) {
+                Some(path) => match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        let got = blake3::hash(&bytes).to_hex().to_string();
+                        if &got == expected {
+                            Ok("verify ok".to_string())
+                        } else {
+                            Ok("verify mismatch".to_string())
+                        }
+                    }
+                    Err(_) => Ok("verify missing".to_string()),
+                },
+                None => Ok("verify missing".to_string()),
+            }
+        }
+
+        // This node's connection tier to a peer: Direct / Relay / Mixed / None. The topology-intent
+        // oracle (direct vs relay vs ws). `tier <peer_id_hex>`.
+        "tier" => {
+            let peer = rest.first().ok_or_else(|| anyhow!("peer_id required"))?;
+            let pk: PublicKey = peer.parse().map_err(|e| anyhow!("parse peer id: {e}"))?;
+            let t = match endpoint.conn_type(pk) {
+                Some(mut w) => match iroh::Watcher::get(&mut w) {
+                    iroh::endpoint::ConnectionType::Direct(_) => "direct",
+                    iroh::endpoint::ConnectionType::Relay(_) => "relay",
+                    iroh::endpoint::ConnectionType::Mixed(_, _) => "mixed",
+                    iroh::endpoint::ConnectionType::None => "none",
+                },
+                None => "unknown",
+            };
+            Ok(format!("tier {t}"))
+        }
+
+        // Process-level state + metrics as compact JSON (no spaces ⇒ single token): node id, RSS,
+        // and the gossip counters from the additive `metrics` module. Storage counts stay on `count`
+        // (they are group-scoped). The "no message storm" + "bounded memory" + "bounded degree" oracles.
+        "metrics" => {
+            let rss = cyan_backend::metrics::rss_kb().unwrap_or(0);
+            let json = serde_json::json!({
+                "node_id": node_id,
+                "rss_kb": rss,
+                "gossip_recv": cyan_backend::metrics::gossip_recv(),
+                "neighbor_up": cyan_backend::metrics::neighbor_up(),
+                "neighbor_down": cyan_backend::metrics::neighbor_down(),
+                "gossip_degree": cyan_backend::metrics::gossip_degree(),
+            });
+            Ok(format!("metrics {}", serde_json::to_string(&json)?))
+        }
+
         other => Err(anyhow!("unknown verb '{other}'")),
     }
 }
@@ -441,6 +651,49 @@ async fn wait_sync(
     })
     .await
     .is_ok()
+}
+
+/// Deterministic pseudo-random blob of `size` bytes keyed by `seed`. A tiny xorshift keeps the
+/// payload incompressible-ish and unique per seed, so blake3 integrity assertions are meaningful
+/// without pulling in an RNG dependency or `Math.random`-style nondeterminism.
+fn gen_blob(seed: &str, size: usize) -> Vec<u8> {
+    let mut state: u64 = 0xcbf29ce484222325;
+    for b in seed.as_bytes() {
+        state ^= *b as u64;
+        state = state.wrapping_mul(0x100000001b3); // FNV-1a mix for the seed.
+    }
+    let mut out = Vec::with_capacity(size);
+    for _ in 0..size {
+        // xorshift64
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.push((state & 0xff) as u8);
+    }
+    out
+}
+
+/// Bounded wait for a `FileDownloaded` of `file_id`, returning its local_path. Same lost-wakeup
+/// guard as `wait_sync`: the shared map is the truth, the whole wait is bounded by `timeout`.
+async fn wait_download(
+    downloaded: &Arc<Mutex<HashMap<String, String>>>,
+    notify: &Arc<Notify>,
+    file_id: &str,
+    timeout: Duration,
+) -> Option<String> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if let Some(p) = downloaded.lock().ok().and_then(|d| d.get(file_id).cloned()) {
+                return p;
+            }
+            tokio::select! {
+                _ = notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    })
+    .await
+    .ok()
 }
 
 /// Count rows of `kind` scoped to `group_id`, reading THIS process's storage.
