@@ -11,6 +11,26 @@ use crate::models::dto::{
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SNAPSHOT REQUEST - the joiner's opening message on SNAPSHOT_ALPN
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// What a joining peer sends (length-prefixed JSON) to ask a holder for a group's
+/// snapshot. `grant` is the signed capability-grant QR payload the joiner scanned
+/// (`identity::Grant::to_qr_payload`); the holder verifies it before serving when the
+/// group is enforced.
+///
+/// **Backward-compatible wire:** older peers sent the raw `group_id` bytes with no JSON
+/// envelope. The server first tries to parse these bytes as a `SnapshotRequest`; if that
+/// fails it falls back to treating the whole payload as a bare `group_id` (grant `None`).
+/// So an un-enforced group keeps serving legacy clients unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotRequest {
+    pub group_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // SNAPSHOT FRAME - Used for peer-to-peer state sync
 // ═══════════════════════════════════════════════════════════════════════════
 

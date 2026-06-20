@@ -3128,6 +3128,14 @@ pub extern "C" fn xaero_join_group_from_invite(invite_json: *const c_char) -> *m
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // Optional signed capability-grant QR payload (additive). When present, it is forwarded
+    // with the JoinGroup so the snapshot holder can authorize the per-group snapshot read for
+    // an enforced group. Absent ⇒ unchanged behavior (fail-open / un-enforced groups).
+    let grant = invite
+        .get("grant")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     // Get system
     let sys = match SYSTEM.get() {
         Some(s) => s,
@@ -3170,6 +3178,7 @@ pub extern "C" fn xaero_join_group_from_invite(invite_json: *const c_char) -> *m
     let _ = sys.network_tx.send(NetworkCommand::JoinGroup {
         group_id: group_id.clone(),
         bootstrap_peer: inviter_node_id,
+        grant,
     });
     println!("🔵 [SYNC-4] JoinGroup command sent");
 

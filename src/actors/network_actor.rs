@@ -65,6 +65,8 @@ pub const DM_ALPN: &[u8] = b"cyan-dm-v1";
 pub struct SnapshotHandler {
     node_id: String,
     event_tx: UnboundedSender<SwiftEvent>,
+    /// Shared per-node authority — gates the join-time snapshot read for enforced groups.
+    authorizer: Arc<std::sync::Mutex<MeshAuthorizer>>,
 }
 
 impl ProtocolHandler for SnapshotHandler {
@@ -75,7 +77,7 @@ impl ProtocolHandler for SnapshotHandler {
         eprintln!("═══════════════════════════════════════════════════════════════════");
         tracing::info!("📥 [SNAPSHOT] Incoming snapshot request from {}", &peer_id[..16]);
 
-        if let Err(e) = handle_snapshot_server(conn, self.node_id.clone(), self.event_tx.clone()).await {
+        if let Err(e) = handle_snapshot_server(conn, self.node_id.clone(), self.event_tx.clone(), self.authorizer.clone()).await {
             eprintln!("🔴 [SNAPSHOT] Transfer error: {}", e);
             tracing::error!("🔴 Snapshot transfer error: {}", e);
         }
@@ -266,10 +268,16 @@ impl NetworkActor {
         // node's normal node id, and the gossip/file/dm/snapshot paths are untouched. See `swarm.rs`.
         let swarm = Arc::new(BlobSwarm::new(endpoint.clone(), node_id.clone()));
 
+        // Per-node mesh-write authority (identity/RBAC mesh half). Created here so the snapshot
+        // server handler can share it: the join-time snapshot read is gated by the same authorizer
+        // that gates inbound writes (fail-open until a group is enforced).
+        let authorizer = Arc::new(std::sync::Mutex::new(MeshAuthorizer::new()));
+
         // Create protocol handlers
         let snapshot_handler = SnapshotHandler {
             node_id: node_id.clone(),
             event_tx: event_tx.clone(),
+            authorizer: authorizer.clone(),
         };
 
         let file_handler = FileTransferHandler {
@@ -323,7 +331,7 @@ impl NetworkActor {
             cfg,
             static_discovery,
             swarm,
-            authorizer: Arc::new(std::sync::Mutex::new(MeshAuthorizer::new())),
+            authorizer,
         })
     }
 
@@ -407,7 +415,7 @@ impl NetworkActor {
         eprintln!("📂 [NET] Loading {} existing groups from DB", existing_groups.len());
         for group_id in existing_groups {
             eprintln!("   → Spawning TopicActor for group: {}...", &group_id[..16.min(group_id.len())]);
-            if let Err(e) = self.spawn_topic_actor(&group_id, vec![]).await {
+            if let Err(e) = self.spawn_topic_actor(&group_id, vec![], None).await {
                 eprintln!("🔴 [NET] FAILED to spawn TopicActor for {}: {}", &group_id[..16.min(group_id.len())], e);
                 tracing::error!(
                     "🔴 [NET] Failed to spawn TopicActor for {}: {}",
@@ -515,7 +523,7 @@ impl NetworkActor {
         eprintln!("📥 [NET] handle_network_command: {:?}", std::mem::discriminant(&cmd));
 
         match cmd {
-            NetworkCommand::JoinGroup { group_id, bootstrap_peer } => {
+            NetworkCommand::JoinGroup { group_id, bootstrap_peer, grant } => {
                 // SIGNPOST: JoinGroup received from FFI
                 eprintln!("═══════════════════════════════════════════════════════════════════");
                 eprintln!("🔗 [NET-JOIN-1] NetworkActor received JoinGroup command");
@@ -555,8 +563,9 @@ impl NetworkActor {
 
                 eprintln!("🔗 [NET-JOIN-4] Spawning TopicActor with {} initial peers", initial_peers.len());
 
-                // Spawn topic actor
-                match self.spawn_topic_actor(&group_id, initial_peers).await {
+                // Spawn topic actor (carrying the scanned grant, if any, so the snapshot
+                // download presents it to the holder)
+                match self.spawn_topic_actor(&group_id, initial_peers, grant).await {
                     Ok(_) => {
                         eprintln!("🔗 [NET-JOIN-5] ✓ TopicActor spawned successfully");
                         tracing::info!("🔗 [NET-JOIN-5] TopicActor spawned for {}", &group_id[..16.min(group_id.len())]);
@@ -916,7 +925,7 @@ impl NetworkActor {
 
             DiscoveryNetworkCmd::EnsureTopicExists { group_id } => {
                 if !self.topics.contains_key(&group_id) {
-                    let _ = self.spawn_topic_actor(&group_id, vec![]).await;
+                    let _ = self.spawn_topic_actor(&group_id, vec![], None).await;
                 }
             }
 
@@ -939,6 +948,7 @@ impl NetworkActor {
         &mut self,
         group_id: &str,
         initial_peers: Vec<PublicKey>,
+        grant: Option<String>,
     ) -> Result<()> {
         // Don't spawn duplicate
         if self.topics.contains_key(group_id) {
@@ -969,6 +979,7 @@ impl NetworkActor {
             self.event_tx.clone(),
             self.swarm.clone(),
             self.authorizer.clone(),
+            grant,
         ).await?;
 
         eprintln!("🚀 [TOPIC-SPAWN-2] ✓ TopicActor spawned, inserting into topics map");
@@ -1456,8 +1467,10 @@ async fn handle_snapshot_server(
     conn: Connection,
     node_id: String,
     event_tx: UnboundedSender<SwiftEvent>,
+    authorizer: Arc<std::sync::Mutex<MeshAuthorizer>>,
 ) -> Result<()> {
-    use crate::models::protocol::SnapshotFrame;
+    use crate::identity::{Grant, SnapshotDenial};
+    use crate::models::protocol::{SnapshotFrame, SnapshotRequest};
 
     let peer_id = conn.remote_id().to_string();
     eprintln!("📤 [SNAP] ════════════════════════════════════════════════════════");
@@ -1467,17 +1480,53 @@ async fn handle_snapshot_server(
     let (mut send, mut recv) = conn.accept_bi().await?;
     eprintln!("   ✓ Bidirectional stream opened");
 
-    // Read group_id request
+    // Read the request frame (length-prefixed). New peers send a JSON `SnapshotRequest`;
+    // legacy peers send the raw group_id bytes — fall back to that if JSON parse fails.
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
 
-    let mut group_id_bytes = vec![0u8; len];
-    recv.read_exact(&mut group_id_bytes).await?;
-    let group_id = String::from_utf8(group_id_bytes)?;
+    let mut req_bytes = vec![0u8; len];
+    recv.read_exact(&mut req_bytes).await?;
+
+    let (group_id, grant_qr): (String, Option<String>) =
+        match serde_json::from_slice::<SnapshotRequest>(&req_bytes) {
+            Ok(req) => (req.group_id, req.grant),
+            Err(_) => (String::from_utf8(req_bytes)?, None),
+        };
 
     eprintln!("   → Requested group: {}...", &group_id[..16.min(group_id.len())]);
     tracing::info!("📤 [SNAP] Sending snapshot for group {}", &group_id[..16.min(group_id.len())]);
+
+    // ── Join-time read gate ──────────────────────────────────────────────────────────────
+    // Fail-open unless the group is enforced. For an enforced group the joiner must present a
+    // valid grant FOR THIS group; otherwise we serve NOTHING (finish the stream with no frames),
+    // which the client reads as a refused snapshot. This — together with the per-group snapshot
+    // build below — is the "zero leakage of the holder's other groups" property.
+    let decision = {
+        let grant = grant_qr.as_deref().and_then(|qr| Grant::from_qr_payload(qr).ok());
+        let mut auth = authorizer
+            .lock()
+            .map_err(|_| anyhow!("authorizer mutex poisoned"))?;
+        auth.authorize_snapshot(&peer_id, &group_id, grant.as_ref())
+    };
+    if let Err(reason) = decision {
+        // obs only — assertions are on the receiver's storage, never on log lines.
+        eprintln!(
+            "⛔ [SNAP] target=obs tenant={} peer={}... action=snapshot decision=deny reason={:?}",
+            &group_id[..16.min(group_id.len())],
+            &peer_id[..16.min(peer_id.len())],
+            match &reason {
+                SnapshotDenial::NoGrant => "no_grant".to_string(),
+                SnapshotDenial::WrongGroup => "wrong_group".to_string(),
+                SnapshotDenial::Verify(e) => format!("verify:{:?}", e),
+            }
+        );
+        tracing::warn!("⛔ [SNAP] Refused snapshot for enforced group (denied)");
+        send.finish()?;
+        let _ = send.stopped().await;
+        return Ok(());
+    }
 
     // Build snapshot from storage
     if let Some(group) = storage::group_get(&group_id)? {

@@ -150,6 +150,23 @@ impl Node {
         self.cmd(NetworkCommand::JoinGroup {
             group_id: group_id.to_string(),
             bootstrap_peer,
+            grant: None,
+        });
+    }
+
+    /// Join `group_id` presenting a signed capability-grant QR payload (the invite). Used to
+    /// drive the grant-gated snapshot path: the holder verifies this before serving an enforced
+    /// group's snapshot.
+    pub fn join_group_with_grant(
+        &self,
+        group_id: &str,
+        bootstrap_peer: Option<String>,
+        grant: Option<String>,
+    ) {
+        self.cmd(NetworkCommand::JoinGroup {
+            group_id: group_id.to_string(),
+            bootstrap_peer,
+            grant,
         });
     }
 

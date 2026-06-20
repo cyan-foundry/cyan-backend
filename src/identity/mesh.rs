@@ -39,6 +39,17 @@ pub enum DenyReason {
     InsufficientRole,
 }
 
+/// Why a snapshot request was refused (the join-time read gate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotDenial {
+    /// The group is enforced but the joiner presented no grant.
+    NoGrant,
+    /// The grant was for a different group than the one requested.
+    WrongGroup,
+    /// The grant failed verification (signature · issuer-admin · expiry · replay · revocation).
+    Verify(VerifyError),
+}
+
 /// A recorded authorization for one peer in one group.
 #[derive(Debug, Clone)]
 struct Authorization {
@@ -134,6 +145,34 @@ impl MeshAuthorizer {
                 },
             );
         Ok(role)
+    }
+
+    /// Decide whether to serve `group_id`'s snapshot to a joining `peer_id`. This is the
+    /// **join-time read gate** — the security property is "a peer only pulls a group it holds a
+    /// valid grant for", which together with the per-group snapshot build means zero leakage of
+    /// the holder's other groups.
+    ///
+    /// Fail-open if the group is not enforced (un-enforced groups serve snapshots exactly as
+    /// before). If enforced, the joiner must present a grant FOR THIS group that verifies; on
+    /// success the grant's nonce is consumed (so a replay of the same QR is rejected) and the
+    /// peer is recorded as authorized at its granted role (so its subsequent mesh writes pass
+    /// `authorize_write` without re-presenting). Any role — including read-only Viewer/Guest —
+    /// is allowed to read a snapshot.
+    pub fn authorize_snapshot(
+        &mut self,
+        peer_id: &str,
+        group_id: &str,
+        grant: Option<&Grant>,
+    ) -> Result<Role, SnapshotDenial> {
+        if !self.is_enforced(group_id) {
+            return Ok(Role::Member);
+        }
+        let grant = grant.ok_or(SnapshotDenial::NoGrant)?;
+        if grant.group_id != group_id {
+            return Err(SnapshotDenial::WrongGroup);
+        }
+        self.present_grant(peer_id, grant)
+            .map_err(SnapshotDenial::Verify)
     }
 
     /// Revoke a grant by `(group_id, nonce)` — tombstones it in the verifier AND drops any peer

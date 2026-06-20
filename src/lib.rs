@@ -391,6 +391,7 @@ impl CommandActor {
                     let _ = self.network_tx.send(NetworkCommand::JoinGroup {
                         group_id: id.clone(),
                         bootstrap_peer: None,
+                        grant: None,
                     });
                     let _ = self.network_tx.send(NetworkCommand::Broadcast {
                         group_id: id.clone(),
@@ -1483,7 +1484,10 @@ fn route_event_to_buffers(
         // STATUS EVENTS
         // ═══════════════════════════════════════════════════════════════════
         SwiftEvent::StatusUpdate { .. } |
-        SwiftEvent::AIInsight { .. } => {
+        SwiftEvent::AIInsight { .. } |
+        // Live presence/reachability for the honest status bar (additive, receive-only).
+        SwiftEvent::PeerCountChanged { .. } |
+        SwiftEvent::MeshReachability { .. } => {
             network_status.lock().unwrap().push_back(event_json.to_string());
         }
     }

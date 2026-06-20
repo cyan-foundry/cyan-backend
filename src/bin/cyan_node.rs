@@ -29,9 +29,15 @@
 //! - `seed_empty_group <gid>`             `@@CYAN@@ ok seed_empty_group`
 //! - `seed_fixture <gid>`                 `@@CYAN@@ ok seed_fixture`
 //! - `join_group <gid> [bootstrap_hex]`   `@@CYAN@@ ok join_group`
-//! - `wait_sync <gid> <timeout_ms>`       `@@CYAN@@ ok wait_sync` | `@@CYAN@@ err wait_sync timeout`
+//! - `wait_sync <gid> <timeout_ms>`       `@@CYAN@@ ok wait_sync` | `@@CYAN@@ timeout wait_sync`
 //! - `count <kind> <gid>`                 `@@CYAN@@ count <kind> <n>`
 //!   kinds: groups|workspaces|boards|elements|cells|chats|files
+//! - `admin_pubkey`                       `@@CYAN@@ admin_pubkey <hex>`
+//! - `enforce_group <gid>`                `@@CYAN@@ ok enforce_group` (enforce + self=Owner-admin)
+//! - `set_admin <gid> <pubkey> [role]`    `@@CYAN@@ ok set_admin`
+//! - `issue_grant <gid> <role> [ttl]`     `@@CYAN@@ grant <nonce> <qr>` (ttl secs; negative ⇒ expired)
+//! - `revoke_grant <gid> <nonce>`         `@@CYAN@@ ok revoke_grant`
+//! - `join_group_grant <gid> <boot|-> <qr>`  `@@CYAN@@ ok join_group_grant`
 //! - `quit`                               (process exits 0)
 //!
 //! Every wait is bounded; the binary never blocks unboundedly.
@@ -50,6 +56,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::Notify;
 
 use cyan_backend::actors::NetworkActor;
+use cyan_backend::identity::{pubkey_hex, Grant, MeshAuthorizer, Role};
 use cyan_backend::models::commands::NetworkCommand;
 use cyan_backend::models::events::SwiftEvent;
 use cyan_backend::models::node_config::{DiscoveryPolicy, NodeConfig, RelayPolicy};
@@ -120,6 +127,12 @@ async fn main() -> Result<()> {
     let secret_key = SecretKey::generate(&mut rng);
     let node_id = secret_key.public().to_string();
 
+    // Grant (capability) keypair for this node — a distinct Ed25519 keypair seeded from the
+    // same 32-byte secret, used to sign/verify capability grants in the multi-process identity
+    // tests. The node's `MeshAuthorizer` (grabbed below) is the honest per-process oracle.
+    let grant_secret: [u8; 32] = secret_key.to_bytes();
+    let admin_pubkey = pubkey_hex(&grant_secret);
+
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SwiftEvent>();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<NetworkCommand>();
     let peers_per_group = Arc::new(Mutex::new(HashMap::<String, HashSet<PublicKey>>::new()));
@@ -136,6 +149,7 @@ async fn main() -> Result<()> {
     // Test-support seams grabbed before the actor moves into its task.
     let endpoint = actor.endpoint();
     let static_discovery = actor.static_discovery();
+    let authorizer = actor.authorizer();
 
     tokio::spawn(async move {
         actor.start(cmd_rx).await;
@@ -187,6 +201,9 @@ async fn main() -> Result<()> {
             &cmd_tx,
             &synced,
             &notify,
+            &authorizer,
+            &grant_secret,
+            &admin_pubkey,
         )
         .await
         .unwrap_or_else(|e| format!("err {verb} {e}"));
@@ -210,9 +227,94 @@ async fn handle_verb(
     cmd_tx: &UnboundedSender<NetworkCommand>,
     synced: &Arc<Mutex<HashSet<String>>>,
     notify: &Arc<Notify>,
+    authorizer: &Arc<std::sync::Mutex<MeshAuthorizer>>,
+    grant_secret: &[u8; 32],
+    admin_pubkey: &str,
 ) -> Result<String> {
     match verb {
         "node_id" => Ok(format!("node_id {node_id}")),
+
+        // ── Identity / RBAC verbs (multi-process grant tests) ─────────────────────────────
+        // This node's capability-grant (admin) Ed25519 pubkey hex.
+        "admin_pubkey" => Ok(format!("admin_pubkey {admin_pubkey}")),
+
+        // Turn ON grant enforcement for a group AND register this node as its Owner-admin, so
+        // it can both issue grants and verify presented grants against itself.
+        "enforce_group" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?;
+            let mut auth = authorizer.lock().map_err(|_| anyhow!("authorizer poisoned"))?;
+            auth.enforce_group(gid);
+            auth.set_admin(gid, admin_pubkey, Role::Owner);
+            Ok("ok enforce_group".to_string())
+        }
+
+        // Register an external admin pubkey for a group in this node's roster.
+        // `set_admin <gid> <pubkey_hex> [role]` (role default: owner).
+        "set_admin" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?;
+            let pk = rest.get(1).ok_or_else(|| anyhow!("pubkey required"))?;
+            let role = rest
+                .get(2)
+                .and_then(|s| Role::parse(s))
+                .unwrap_or(Role::Owner);
+            authorizer
+                .lock()
+                .map_err(|_| anyhow!("authorizer poisoned"))?
+                .set_admin(gid, pk, role);
+            Ok("ok set_admin".to_string())
+        }
+
+        // Issue (sign) a capability grant for a group, signed by THIS node's admin key.
+        // `issue_grant <gid> <role> [ttl_secs]`; ttl_secs may be negative to mint an already
+        // expired grant for negative tests (default 3600). Replies `grant <nonce> <qr>` — the
+        // qr is compact JSON (no spaces), so it travels as a single token.
+        "issue_grant" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?;
+            let role = rest
+                .get(1)
+                .and_then(|s| Role::parse(s))
+                .unwrap_or(Role::Member);
+            let ttl: i64 = rest.get(2).and_then(|s| s.parse().ok()).unwrap_or(3600);
+            let now = unix_now();
+            let expiry = (now as i64 + ttl).max(0) as u64;
+            // Unique nonce per issue (no Math.random in scripts; mix node + gid + time).
+            let nonce = format!("{}-{}-{}", &admin_pubkey[..8], gid, now.wrapping_add(ttl as u64));
+            // `issue_unchecked`: this node legitimately is the group admin (registered via
+            // `enforce_group`); the receiving holder re-checks issuer-is-admin against its own
+            // roster at verify time, so authority is still enforced where it matters.
+            let grant = Grant::issue_unchecked(gid, role, grant_secret, now, expiry, &nonce);
+            Ok(format!("grant {} {}", grant.nonce, grant.to_qr_payload()))
+        }
+
+        // Revoke a grant by (group_id, nonce) in this node's authorizer.
+        "revoke_grant" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?;
+            let nonce = rest.get(1).ok_or_else(|| anyhow!("nonce required"))?;
+            authorizer
+                .lock()
+                .map_err(|_| anyhow!("authorizer poisoned"))?
+                .revoke(gid, nonce);
+            Ok("ok revoke_grant".to_string())
+        }
+
+        // Join a group presenting a signed grant QR. `join_group_grant <gid> <bootstrap_hex> <qr>`.
+        "join_group_grant" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?.to_string();
+            // `-` is the explicit "no bootstrap" sentinel (see MpNode::join_group_with_grant).
+            let bootstrap_peer = rest
+                .get(1)
+                .filter(|s| **s != "-")
+                .map(|s| s.to_string());
+            let grant = rest.get(2).map(|s| s.to_string());
+            cmd_tx
+                .send(NetworkCommand::JoinGroup {
+                    group_id: gid,
+                    bootstrap_peer,
+                    grant,
+                })
+                .map_err(|e| anyhow!("send JoinGroup: {e}"))?;
+            Ok("ok join_group_grant".to_string())
+        }
 
         "addr" => {
             let addr = await_direct_addr(endpoint, Duration::from_secs(10)).await?;
@@ -253,6 +355,7 @@ async fn handle_verb(
                 .send(NetworkCommand::JoinGroup {
                     group_id: gid,
                     bootstrap_peer,
+                    grant: None,
                 })
                 .map_err(|e| anyhow!("send JoinGroup: {e}"))?;
             Ok("ok join_group".to_string())
@@ -271,7 +374,10 @@ async fn handle_verb(
             if ok {
                 Ok("ok wait_sync".to_string())
             } else {
-                Ok("err wait_sync timeout".to_string())
+                // NOT an `err ` response: a timeout is an expected, non-error outcome the rig
+                // maps to `Ok(false)` (e.g. grant-refused-snapshot tests). An `err ` prefix
+                // would be read as a hard control error instead.
+                Ok("timeout wait_sync".to_string())
             }
         }
 
@@ -287,6 +393,14 @@ async fn handle_verb(
 }
 
 /// Poll the endpoint until it has at least one direct (loopback) address. Bounded.
+/// Current unix time in seconds (for grant issued_at/expiry).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 async fn await_direct_addr(endpoint: &iroh::Endpoint, timeout: Duration) -> Result<EndpointAddr> {
     tokio::time::timeout(timeout, async {
         loop {

@@ -105,6 +105,11 @@ pub struct TopicActor {
     /// Inbound writes from a peer are gated by `authorize_write(group, from_peer)`. Fail-open
     /// unless this group has been enforced — so it does not change behavior for un-enforced groups.
     authorizer: Arc<std::sync::Mutex<MeshAuthorizer>>,
+
+    /// The signed capability-grant QR payload this node scanned to join the group (if any).
+    /// Presented to the snapshot holder so it can authorize the per-group snapshot read when the
+    /// group is enforced. `None` for groups created locally or joined without a grant (fail-open).
+    grant: Option<String>,
 }
 
 impl TopicActor {
@@ -120,6 +125,7 @@ impl TopicActor {
         event_tx: UnboundedSender<SwiftEvent>,
         swarm: Arc<BlobSwarm>,
         authorizer: Arc<std::sync::Mutex<MeshAuthorizer>>,
+        grant: Option<String>,
     ) -> Result<ActorHandle<TopicCommand>> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
@@ -173,6 +179,7 @@ impl TopicActor {
             event_tx,
             swarm,
             authorizer,
+            grant,
         };
 
         let join_handle = tokio::spawn(actor.run(cmd_rx, receiver));
@@ -417,12 +424,14 @@ impl TopicActor {
                 let group_id = self.group_id.clone();
                 let event_tx = self.event_tx.clone();
                 let network_tx = self.network_tx.clone();
+                let grant = self.grant.clone();
 
                 tokio::spawn(async move {
                     match download_snapshot(
                         endpoint,
                         &source_peer,
                         &group_id,
+                        grant.as_deref(),
                         event_tx,
                     ).await {
                         Ok(_) => {
@@ -549,6 +558,7 @@ impl TopicActor {
                     group_id: self.group_id.clone(),
                     peer_id: peer_str,
                 });
+                self.emit_presence();
             }
 
             GossipEvent::NeighborDown(peer) => {
@@ -569,6 +579,7 @@ impl TopicActor {
                     group_id: self.group_id.clone(),
                     peer_id: peer_str,
                 });
+                self.emit_presence();
             }
 
             GossipEvent::Lagged => {
@@ -614,6 +625,7 @@ impl TopicActor {
                 let source_peer = source.clone();
                 let event_tx = self.event_tx.clone();
                 let network_tx = self.network_tx.clone();
+                let grant = self.grant.clone();
 
                 tokio::spawn(async move {
                     eprintln!("📥 [SNAP-DL-SPAWN] Download task started for {}...", &source_peer[..16]);
@@ -621,6 +633,7 @@ impl TopicActor {
                         endpoint,
                         &source_peer,
                         &group_id,
+                        grant.as_deref(),
                         event_tx,
                     ).await {
                         Ok(_) => {
@@ -728,6 +741,23 @@ impl TopicActor {
             }
             _ => {}
         }
+    }
+
+    /// Emit the live presence/reachability status for this group off the topic's own peer set
+    /// (the honest oracle). Called after every NeighborUp/NeighborDown so the app's status bar
+    /// reflects the real connected-peer count and whether the group is reachable on the mesh
+    /// (`online`) or working against just this device's copy (`local_only`). Additive, receive-only.
+    fn emit_presence(&self) {
+        let count = self.known_peers.len() as u32;
+        let _ = self.event_tx.send(SwiftEvent::PeerCountChanged {
+            group_id: self.group_id.clone(),
+            count,
+        });
+        let state = if count == 0 { "local_only" } else { "online" };
+        let _ = self.event_tx.send(SwiftEvent::MeshReachability {
+            group_id: self.group_id.clone(),
+            state: state.to_string(),
+        });
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1163,8 +1193,10 @@ async fn download_snapshot(
     endpoint: Endpoint,
     source_peer: &str,
     group_id: &str,
+    grant: Option<&str>,
     event_tx: UnboundedSender<SwiftEvent>,
 ) -> Result<()> {
+    use crate::models::protocol::SnapshotRequest;
     use tokio::io::AsyncWriteExt;
 
     eprintln!("═══════════════════════════════════════════════════════════════════");
@@ -1198,11 +1230,17 @@ async fn download_snapshot(
 
     eprintln!("📥 [SNAP-DL-4] Sending group_id request...");
 
-    // Send group_id request
-    let group_id_bytes = group_id.as_bytes();
-    let len = (group_id_bytes.len() as u32).to_be_bytes();
+    // Send the request frame: JSON {group_id, grant?}. The holder verifies the grant before
+    // serving an enforced group; un-enforced groups ignore it (the holder also accepts a bare
+    // legacy group_id payload, so this stays interoperable).
+    let request = SnapshotRequest {
+        group_id: group_id.to_string(),
+        grant: grant.map(|g| g.to_string()),
+    };
+    let req_bytes = serde_json::to_vec(&request)?;
+    let len = (req_bytes.len() as u32).to_be_bytes();
     send.write_all(&len).await?;
-    send.write_all(group_id_bytes).await?;
+    send.write_all(&req_bytes).await?;
     send.flush().await?;
 
     eprintln!("📥 [SNAP-DL-5] ✓ Request sent. Waiting for snapshot frames...");

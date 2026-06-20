@@ -188,6 +188,75 @@ impl MpNode {
         self.request(&line, REQ_TIMEOUT).await.map(|_| ())
     }
 
+    // ── Identity / RBAC (grant-gated snapshot tests) ──────────────────────────────────────
+
+    /// This node's capability-grant (admin) Ed25519 pubkey hex.
+    pub async fn admin_pubkey(&mut self) -> Result<String> {
+        let resp = self.request("admin_pubkey", REQ_TIMEOUT).await?;
+        resp.strip_prefix("admin_pubkey ")
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("{}: unexpected admin_pubkey response: {resp}", self.name))
+    }
+
+    /// Turn ON grant enforcement for `group_id` and register this node as its Owner-admin.
+    pub async fn enforce_group(&mut self, group_id: &str) -> Result<()> {
+        self.request(&format!("enforce_group {group_id}"), REQ_TIMEOUT)
+            .await
+            .map(|_| ())
+    }
+
+    /// Register an external admin `pubkey_hex` (Owner) for `group_id` in this node's roster.
+    pub async fn set_admin(&mut self, group_id: &str, pubkey_hex: &str) -> Result<()> {
+        self.request(&format!("set_admin {group_id} {pubkey_hex}"), REQ_TIMEOUT)
+            .await
+            .map(|_| ())
+    }
+
+    /// Issue (sign) a grant for `group_id` at `role`, valid for `ttl_secs` (may be negative for an
+    /// already-expired grant). Returns `(nonce, qr_payload)`.
+    pub async fn issue_grant(
+        &mut self,
+        group_id: &str,
+        role: &str,
+        ttl_secs: i64,
+    ) -> Result<(String, String)> {
+        let resp = self
+            .request(&format!("issue_grant {group_id} {role} {ttl_secs}"), REQ_TIMEOUT)
+            .await?;
+        let payload = resp
+            .strip_prefix("grant ")
+            .ok_or_else(|| anyhow!("{}: unexpected issue_grant response: {resp}", self.name))?;
+        let (nonce, qr) = payload
+            .split_once(' ')
+            .ok_or_else(|| anyhow!("{}: malformed grant response: {resp}", self.name))?;
+        Ok((nonce.to_string(), qr.to_string()))
+    }
+
+    /// Revoke a grant by `(group_id, nonce)` in this node's authorizer.
+    pub async fn revoke_grant(&mut self, group_id: &str, nonce: &str) -> Result<()> {
+        self.request(&format!("revoke_grant {group_id} {nonce}"), REQ_TIMEOUT)
+            .await
+            .map(|_| ())
+    }
+
+    /// Join `group_id` presenting a signed grant QR payload (the invite). `bootstrap` is the
+    /// holder's node id; `grant` is `None` to deliberately join with no grant (rejection tests).
+    pub async fn join_group_with_grant(
+        &mut self,
+        group_id: &str,
+        bootstrap: Option<&str>,
+        grant: Option<&str>,
+    ) -> Result<()> {
+        // `-` is the explicit "no bootstrap" sentinel so the grant token never slides into the
+        // bootstrap slot when bootstrap is absent (whitespace is collapsed child-side).
+        let b = bootstrap.unwrap_or("-");
+        let line = match grant {
+            Some(g) => format!("join_group_grant {group_id} {b} {g}"),
+            None => format!("join_group_grant {group_id} {b}"),
+        };
+        self.request(&line, REQ_TIMEOUT).await.map(|_| ())
+    }
+
     /// Wait (in the child) for `SyncComplete` of `group_id`, bounded by `timeout`.
     pub async fn wait_sync(&mut self, group_id: &str, timeout: Duration) -> Result<bool> {
         // Give the control read a little slack beyond the child's own wait.

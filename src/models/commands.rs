@@ -11,6 +11,13 @@ pub enum NetworkCommand {
     JoinGroup {
         group_id: String,
         bootstrap_peer: Option<String>,  // Node ID of peer to bootstrap from (e.g., inviter)
+        /// Signed capability-grant QR payload the joiner scanned to authorize this join
+        /// (see `identity::Grant::to_qr_payload`). Additive and optional: absent ⇒ identical
+        /// to the original join behavior. When the snapshot holder enforces the group, this
+        /// grant is what unlocks the per-group snapshot; an enforced group with no grant is
+        /// refused. Un-enforced groups ignore it (fail-open), so the FFI stays drop-in.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant: Option<String>,
     },
     Broadcast {
         group_id: String,

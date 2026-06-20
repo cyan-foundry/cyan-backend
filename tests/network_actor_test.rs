@@ -383,6 +383,7 @@ async fn run_join() -> Result<()> {
     cmd_tx.send(NetworkCommand::JoinGroup {
         group_id: TEST_GROUP_ID.to_string(),
         bootstrap_peer: None,  // Rely on discovery!
+        grant: None,
     })?;
 
     // Wait for SyncComplete event

@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use xaeroid::XaeroID;
 
 pub mod mesh;
-pub use mesh::{DenyReason, MeshAuthorizer, WriteDecision};
+pub use mesh::{DenyReason, MeshAuthorizer, SnapshotDenial, WriteDecision};
 
 /// Current grant wire/QR version. Bumped only on a breaking payload change.
 const GRANT_VERSION: u8 = 1;

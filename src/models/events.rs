@@ -223,6 +223,14 @@ pub enum SwiftEvent {
     PeerJoined { group_id: String, peer_id: String },
     /// Peer left a group topic
     PeerLeft { group_id: String, peer_id: String },
+    /// Live count of connected mesh peers in a group, emitted on every join/leave. Additive and
+    /// receive-only — feeds the app's honest status bar (the live peer count).
+    PeerCountChanged { group_id: String, count: u32 },
+    /// Mesh reachability for a group, emitted on every join/leave. `state` is `"online"`
+    /// (≥1 connected peer) or `"local_only"` (0 connected peers — working offline against just
+    /// this device's own copy). Lets the status bar distinguish "0 peers → local-only" from
+    /// "≥1 peer, caught up → synced". Additive, receive-only.
+    MeshReachability { group_id: String, state: String },
     /// Status update for UI (syncing, downloading, etc.)
     StatusUpdate { message: String },
     /// File download progress (0.0 to 1.0)
