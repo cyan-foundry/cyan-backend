@@ -32,6 +32,7 @@ pub mod lens_commands;
 pub mod mcp_host;
 pub mod identity;
 pub mod licensing;
+pub mod sso_grant;
 
 use crate::models::commands::{CommandMsg, NetworkCommand};
 use crate::models::core::{Group, Workspace};
