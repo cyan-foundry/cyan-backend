@@ -373,7 +373,21 @@ pub async fn run_pipeline(
             dependency_outputs.iter().map(|d| format!("{}({}B)", d["step_id"].as_str().unwrap_or("?"), d["output"].as_str().map(|s| s.len()).unwrap_or(0))).collect::<Vec<_>>()
         );
 
-        let metadata = crate::pipeline_executor::find_asset_metadata(board_id);
+        // Asset metadata for ordinary steps, PLUS the cell's own `mcp_tool` spec
+        // (if any) threaded through so the local MCP-tool path can fire. The
+        // executor reads `metadata.mcp_tool` to decide whether a `local` step is a
+        // plugin-tool dispatch — without this merge the on-device MCP path can
+        // never trigger from a real run (it was only reachable by calling
+        // `execute_pipeline_step` directly in unit tests). See `parse_mcp_tool_step`.
+        let mut metadata = crate::pipeline_executor::find_asset_metadata(board_id)
+            .unwrap_or_else(|| json!({}));
+        if let Some(mcp_tool) = cell.metadata_json.as_ref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .and_then(|m| m.get("mcp_tool").cloned())
+        {
+            metadata["mcp_tool"] = mcp_tool;
+        }
+        let metadata = Some(metadata);
 
         // ── Build step execution context ──
         let _model_endpoint = config.model_config.as_ref()

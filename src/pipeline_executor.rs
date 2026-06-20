@@ -456,7 +456,7 @@ pub async fn execute_pipeline_step(
     if executor_type == "local"
         && let Some(step) = metadata.as_ref().and_then(parse_mcp_tool_step)
     {
-        return execute_local_mcp_tool_step(board_id, step_id, step, event_tx).await;
+        return execute_local_mcp_tool_step(board_id, step_id, step, command_tx, event_tx).await;
     }
 
     // ── DEMO CACHE: Check for cached results first ──────────────────────
@@ -710,17 +710,40 @@ fn step_is_approved(board_id: &str, step_id: &str) -> bool {
 }
 
 /// Dispatch a `local` plugin-tool step on-device through the cyan-mcp host.
+///
+/// Emits the same dashboard exec events the cloud (lens) path emits
+/// (`step_started` / `step_completed` / `finding_created`, or `step_needs_human`
+/// when gated) so the dashboard read-model lights up for on-device plugin steps
+/// exactly as it does for cloud steps (DASHBOARD_CONTRACT §A/§C). The plugin's
+/// JSON result becomes a finding so the step produces a reviewable result.
 async fn execute_local_mcp_tool_step(
     board_id: &str,
     step_id: &str,
     step: McpTool,
+    command_tx: &UnboundedSender<CommandMsg>,
     event_tx: &UnboundedSender<SwiftEvent>,
 ) -> Result<(String, Vec<Finding>)> {
+    let run_id = format!(
+        "run_{}_{}",
+        &step_id[..step_id.len().min(8)],
+        chrono::Utc::now().timestamp() % 10000
+    );
+
     let _ = event_tx.send(SwiftEvent::StatusUpdate {
         message: format!(
             "🔌 Step '{}' → local plugin {}.{}",
             step_id, step.plugin_id, step.tool
         ),
+    });
+
+    // Dashboard exec event: the step started (on-device, plugin actor).
+    publish_pipeline_event(event_tx, PipelineEvent {
+        event_type: "step_started".into(),
+        board_id: board_id.into(),
+        step_id: step_id.into(),
+        run_id: run_id.clone(),
+        timestamp: chrono::Utc::now().timestamp(),
+        data: json!({ "executor_type": "local", "plugin_id": step.plugin_id, "tool": step.tool }),
     });
 
     let root = plugins_root();
@@ -786,10 +809,76 @@ async fn execute_local_mcp_tool_step(
         McpDispatch::Ran(result) => {
             let summary = serde_json::to_string(&result.result)
                 .unwrap_or_else(|_| result.result.to_string());
+
+            // The plugin's JSON result becomes a finding so the step produces a
+            // reviewable result (and a timecoded note, like every other step).
+            let finding = Finding {
+                timecode_seconds: 0.0,
+                content: summary.clone(),
+                finding_type: "plugin_result".to_string(),
+                severity: "info".to_string(),
+                suggested_action: None,
+            };
+            let note = crate::timecode_notes::TimecodeNote {
+                id: uuid::Uuid::new_v4().to_string(),
+                board_id: board_id.to_string(),
+                timecode_seconds: finding.timecode_seconds,
+                content: finding.content.clone(),
+                note_type: finding.finding_type.clone(),
+                author: format!("plugin/{}", step.plugin_id),
+                created_at: chrono::Utc::now().timestamp() as f64,
+                pipeline_step_id: Some(step_id.to_string()),
+                pipeline_phase: Some("during".to_string()),
+                ai_reviewed: true,
+                human_approved: false,
+                action_skill: None,
+                action_status: Some("complete".to_string()),
+                action_result: None,
+                action_model: Some(format!("{}.{}", step.plugin_id, step.tool)),
+                ai_flags_nearby: vec![],
+                reply_to: None,
+                thread_count: 0,
+            };
+            let _ = crate::timecode_notes::save_note(&note, command_tx);
+
             let _ = event_tx.send(SwiftEvent::StatusUpdate {
                 message: format!("✅ Step '{}' plugin complete", step_id),
             });
-            Ok((summary, vec![]))
+
+            // Dashboard exec events: step completed + the finding it produced.
+            // `cost_usd` rides on the completion event so the cost rail can
+            // attribute the external (plugin) bill to this run/plugin.
+            publish_pipeline_event(event_tx, PipelineEvent {
+                event_type: "step_completed".into(),
+                board_id: board_id.into(),
+                step_id: step_id.into(),
+                run_id: run_id.clone(),
+                timestamp: chrono::Utc::now().timestamp(),
+                data: json!({
+                    "summary": summary,
+                    "findings_count": 1,
+                    "plugin_id": step.plugin_id,
+                    "tool": step.tool,
+                    "duration_ms": result.duration_ms,
+                    "cost_usd": result.cost_usd,
+                    "source": "external",
+                }),
+            });
+            publish_pipeline_event(event_tx, PipelineEvent {
+                event_type: "finding_created".into(),
+                board_id: board_id.into(),
+                step_id: step_id.into(),
+                run_id: run_id.clone(),
+                timestamp: chrono::Utc::now().timestamp(),
+                data: json!({
+                    "timecode_seconds": finding.timecode_seconds,
+                    "content": finding.content,
+                    "finding_type": finding.finding_type,
+                    "severity": finding.severity,
+                }),
+            });
+
+            Ok((summary, vec![finding]))
         }
         McpDispatch::Gated { side_effects } => {
             // Reuse the human-approval path: surface needs_human so the user can
@@ -797,6 +886,14 @@ async fn execute_local_mcp_tool_step(
             let effects = side_effects.join(", ");
             let _ = event_tx.send(SwiftEvent::StatusUpdate {
                 message: format!("⏸️ Step '{}' needs approval (side effects: {})", step_id, effects),
+            });
+            publish_pipeline_event(event_tx, PipelineEvent {
+                event_type: "step_needs_human".into(),
+                board_id: board_id.into(),
+                step_id: step_id.into(),
+                run_id: run_id.clone(),
+                timestamp: chrono::Utc::now().timestamp(),
+                data: json!({ "side_effects": side_effects }),
             });
             Err(anyhow!(
                 "needs_human: plugin tool '{}' requires approval (side effects: {})",
