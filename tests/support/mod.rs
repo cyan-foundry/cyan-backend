@@ -282,12 +282,36 @@ impl Node {
             .unwrap_or(false)
     }
 
-    /// Number of peers this node currently tracks in `group_id` (secondary oracle for
-    /// discovery — populated by the discovery `groups_exchange` → `JoinPeerToTopic` path).
+    /// Number of peers this node currently tracks in `group_id`. Mirrors the FFI
+    /// `cyan_get_group_peer_count` (both read this same per-node `peers_per_group`). Now
+    /// populated off the **live gossip neighbor set** (TopicActor NeighborUp/NeighborDown) —
+    /// the same channel that carries the group's data — so it is honest presence truth.
     pub fn peers_in_group(&self, group_id: &str) -> usize {
         self.peers_per_group
             .lock()
             .map(|m| m.get(group_id).map(|s| s.len()).unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// The peer ids this node currently tracks in `group_id`, as hex strings. Mirrors the FFI
+    /// `cyan_get_group_peers` (same `peers_per_group` source) — the roster oracle.
+    pub fn group_peers(&self, group_id: &str) -> Vec<String> {
+        self.peers_per_group
+            .lock()
+            .map(|m| {
+                m.get(group_id)
+                    .map(|s| s.iter().map(|pk| pk.to_string()).collect())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Total peers across every group this node tracks. Mirrors the FFI
+    /// `cyan_get_total_peer_count` — a node in N groups with a neighbor counts it per group.
+    pub fn total_peers(&self) -> usize {
+        self.peers_per_group
+            .lock()
+            .map(|m| m.values().map(|s| s.len()).sum())
             .unwrap_or(0)
     }
 

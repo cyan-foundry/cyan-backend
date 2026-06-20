@@ -979,6 +979,7 @@ impl NetworkActor {
             self.swarm.clone(),
             self.authorizer.clone(),
             grant,
+            self.peers_per_group.clone(),
         ).await?;
 
         eprintln!("🚀 [TOPIC-SPAWN-2] ✓ TopicActor spawned, inserting into topics map");

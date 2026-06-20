@@ -11,11 +11,11 @@
 // - Handle snapshot requests AND downloads
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     str::FromStr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -90,6 +90,13 @@ pub struct TopicActor {
     /// Known peers in this topic
     known_peers: HashSet<PublicKey>,
 
+    /// The shared, FFI-visible presence map (`group_id → set of connected peers`), read by
+    /// `cyan_get_group_peers` / `cyan_get_*_peer_count`. We keep THIS group's entry in lock-step
+    /// with the live gossip neighbor set: a `NeighborUp` adds the peer, a `NeighborDown` removes it.
+    /// That makes presence honest — it reflects the same gossip channel that carries the group's
+    /// data, instead of only the (best-effort) discovery peer-intro layer. Additive, receive-only.
+    peers_per_group: Arc<Mutex<HashMap<String, HashSet<PublicKey>>>>,
+
     /// Local flag: do we need a snapshot for this group?
     need_snapshot: bool,
 
@@ -147,6 +154,7 @@ impl TopicActor {
         swarm: Arc<BlobSwarm>,
         authorizer: Arc<std::sync::Mutex<MeshAuthorizer>>,
         grant: Option<String>,
+        peers_per_group: Arc<Mutex<HashMap<String, HashSet<PublicKey>>>>,
     ) -> Result<ActorHandle<TopicCommand>> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
@@ -207,6 +215,7 @@ impl TopicActor {
             endpoint,
             sender,
             known_peers: peers.into_iter().collect(),
+            peers_per_group,
             need_snapshot: true,  // New groups always need snapshot
             network_tx,
             event_tx,
@@ -597,6 +606,13 @@ impl TopicActor {
                 self.known_peers.insert(peer);
                 crate::metrics::record_neighbor_up(); // observability only (gossip-degree gauge)
 
+                // Honest presence: reflect this REAL gossip neighbor in the FFI-visible map for
+                // THIS group (dedup via the set). `cyan_get_group_peers` / `cyan_get_*_peer_count`
+                // now report live mesh connectivity, not just the discovery peer-intro layer.
+                if let Ok(mut map) = self.peers_per_group.lock() {
+                    map.entry(self.group_id.clone()).or_default().insert(peer);
+                }
+
                 // CRITICAL: Re-send snapshot request when peer joins
                 // The initial request may have been sent before mesh was ready
                 if self.need_snapshot {
@@ -647,6 +663,14 @@ impl TopicActor {
 
                 self.known_peers.remove(&peer);
                 crate::metrics::record_neighbor_down(); // observability only (gossip-degree gauge)
+
+                // Honest presence: drop this peer from THIS group's FFI-visible set as its gossip
+                // connection goes away, so the count falls back toward 0 (the leave half).
+                if let Ok(mut map) = self.peers_per_group.lock()
+                    && let Some(set) = map.get_mut(&self.group_id)
+                {
+                    set.remove(&peer);
+                }
 
                 let _ = self.event_tx.send(SwiftEvent::PeerLeft {
                     group_id: self.group_id.clone(),
