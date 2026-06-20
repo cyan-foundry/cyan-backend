@@ -454,6 +454,22 @@ pub async fn execute_pipeline_step(
         return execute_local_mcp_tool_step(board_id, step_id, step, command_tx, event_tx).await;
     }
 
+    // ── LICENSE GATE: a genuinely-cloud (Lens) run is a paid surface ────
+    // Round 8 / W11. Local-placement steps (handled above and below) run
+    // unconditionally offline; only a cloud/Lens run consults the installed
+    // license. With NO gate installed this is a no-op, so existing behavior and
+    // the local test rigs are unchanged. A denied tenant gets a clear "needs a
+    // license" state without blocking the local steps.
+    if matches!(executor_type, "cloud" | "lens")
+        && let Err(reason) =
+            crate::licensing::gate_cloud_action(crate::licensing::CloudAction::RunWorkflow)
+    {
+        let _ = event_tx.send(SwiftEvent::StatusUpdate {
+            message: format!("🔒 Step '{step_id}' needs a license: {reason}"),
+        });
+        return Err(anyhow!("cloud step gated: {reason}"));
+    }
+
     // ── DEMO CACHE: Check for cached results first ──────────────────────
     // Remove this block when productionizing. It plays back pre-computed
     // results with realistic delays so the demo doesn't depend on GPU/Lens.
