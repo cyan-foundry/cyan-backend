@@ -1085,7 +1085,9 @@ fn provision_group(group_id: &str) -> Result<()> {
 /// Create the base tables the migrations assume exist (mirrors the in-process
 /// harness's `init_base_schema` and the multi-process bins' `init_test_schema`).
 fn init_base_schema(db_path: &str) -> Result<()> {
-    let conn = rusqlite::Connection::open(db_path)?;
+    // Share the engine's hardened open path: creates the parent dir and returns a
+    // typed error instead of panicking when the data dir does not exist yet.
+    let conn = storage::open_db(std::path::Path::new(db_path))?;
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS groups (

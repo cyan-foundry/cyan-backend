@@ -234,8 +234,13 @@ impl CyanSystem {
         let node_id = secret_key.public().to_string();
         eprintln!("🔑 Step 1: Node ID: {} (persistent={})", &node_id[..16], provided_secret_key.is_some());
 
-        let db_path_clone = db_path.clone();
-        let db = Connection::open(db_path).expect("Failed to open database");
+        // Resolve once so the primary connection and storage::init_db open the
+        // SAME file, and create the parent dir / surface a typed error instead of
+        // panicking when the data dir does not exist yet.
+        let resolved_db_path = storage::resolve_db_path(&db_path);
+        eprintln!("🔵 Step 2: resolved DB path: {}", resolved_db_path.display());
+        let db_path_clone = resolved_db_path.to_string_lossy().to_string();
+        let db = storage::open_db(&resolved_db_path)?;
         ensure_schema(&db)?;
         run_migrations(&db)?;
         eprintln!("🔵 Step 2: DB opened, schema ready");

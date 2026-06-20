@@ -3,9 +3,10 @@
 // Unified storage layer for Cyan
 // All database operations go through this module
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use crate::models::core::{Group, Workspace};
@@ -13,8 +14,55 @@ use crate::models::dto::*;
 
 static DB: OnceLock<Mutex<Connection>> = OnceLock::new();
 
+/// Resolve the on-disk path of the cyan SQLite database.
+///
+/// The FFI/app contract passes an explicit db path; that always wins so shipping
+/// behavior is unchanged. When no explicit path is given we fall back to
+/// `$CYAN_DATA_DIR/cyan.db` (the env `run_multi` / the app set per instance), and
+/// finally to `./cyan.db`. Resolution is pure and deterministic, so a relaunch
+/// with the same inputs always resolves to the SAME database file — which is what
+/// lets identity and groups persist across launches.
+pub fn resolve_db_path(requested: &str) -> PathBuf {
+    if !requested.trim().is_empty() {
+        return PathBuf::from(requested);
+    }
+    let dir = std::env::var("CYAN_DATA_DIR").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(dir).join("cyan.db")
+}
+
+/// Open a SQLite connection at `db_path`, creating the parent directory first.
+///
+/// A fresh instance whose data dir does not exist yet (e.g. a brand new
+/// `CYAN_DATA_DIR`) used to panic with `CannotOpen` and take storage down for the
+/// whole engine. We now `create_dir_all` the parent and return a typed error on
+/// failure instead of panicking — a bad data dir degrades gracefully.
+pub fn open_db(db_path: &Path) -> Result<Connection> {
+    if let Some(parent) = db_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                tracing::error!(
+                    "Failed to create data dir {}: {} (os error)",
+                    parent.display(),
+                    e
+                );
+                anyhow!("create data dir {}: {e}", parent.display())
+            })?;
+        }
+    }
+    tracing::info!("Opening cyan database at {}", db_path.display());
+    Connection::open(db_path).map_err(|e| {
+        tracing::error!(
+            "Failed to open database {}: {} (os error)",
+            db_path.display(),
+            e
+        );
+        anyhow!("open database {}: {e}", db_path.display())
+    })
+}
+
 pub fn init_db(path: &str) -> Result<()> {
-    let conn = Connection::open(path)?;
+    let resolved = resolve_db_path(path);
+    let conn = open_db(&resolved)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
     run_migrations(&conn)?;
     DB.set(Mutex::new(conn)).map_err(|_| anyhow::anyhow!("DB already initialized"))?;
@@ -1875,4 +1923,100 @@ pub fn anonymous_session_delete(scope_id: &str) -> Result<()> {
         params![scope_id],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod open_db_tests {
+    use super::*;
+
+    /// Unique scratch dir under the OS temp dir; auto-removed on drop.
+    fn scratch() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("cyan-open-db-")
+            .tempdir()
+            .expect("create temp dir")
+    }
+
+    #[test]
+    fn open_db_creates_missing_parent_dir() {
+        let root = scratch();
+        // A nested path whose parent dirs do NOT exist yet — the run_multi repro.
+        let db_path = root.path().join("nested").join("deeper").join("cyan.db");
+        assert!(!db_path.parent().expect("has parent").exists());
+
+        let conn = open_db(&db_path).expect("open should create parent and succeed");
+        assert!(db_path.parent().expect("has parent").exists(), "parent dir created");
+        // Connection is usable.
+        conn.execute_batch("CREATE TABLE t (x INTEGER);")
+            .expect("usable connection");
+    }
+
+    #[test]
+    fn open_db_failure_returns_error_not_panic() {
+        let root = scratch();
+        // Make an ancestor a *file*, so create_dir_all of the parent must fail
+        // (NotADirectory) — exercises the graceful error path with no panic.
+        let blocker = root.path().join("iamafile");
+        std::fs::write(&blocker, b"not a dir").expect("write blocker file");
+        let db_path = blocker.join("sub").join("cyan.db");
+
+        let err = open_db(&db_path);
+        assert!(err.is_err(), "bad path must return Err, not panic");
+    }
+
+    #[test]
+    fn same_datadir_reopens_same_db() {
+        let root = scratch();
+        let db_path = root.path().join("data").join("cyan.db");
+
+        {
+            let conn = open_db(&db_path).expect("first open");
+            conn.execute_batch(
+                "CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT);
+                 INSERT INTO kv (k, v) VALUES ('hello', 'world');",
+            )
+            .expect("write row");
+        } // drop/close
+
+        // Reopen the SAME resolved path — the row must still be there.
+        let conn = open_db(&db_path).expect("reopen");
+        let v: String = conn
+            .query_row("SELECT v FROM kv WHERE k = 'hello'", [], |r| r.get(0))
+            .expect("row persisted across reopen");
+        assert_eq!(v, "world");
+    }
+
+    #[test]
+    fn distinct_datadirs_are_isolated() {
+        let a = scratch();
+        let b = scratch();
+        let db_a = a.path().join("cyan.db");
+        let db_b = b.path().join("cyan.db");
+
+        let conn_a = open_db(&db_a).expect("open a");
+        conn_a
+            .execute_batch("CREATE TABLE kv (k TEXT PRIMARY KEY); INSERT INTO kv VALUES ('a');")
+            .expect("write a");
+
+        let conn_b = open_db(&db_b).expect("open b");
+        // b is a separate database file — table from a must not exist here.
+        let count: i64 = conn_b
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='kv'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query b schema");
+        assert_eq!(count, 0, "distinct data dirs share no tables");
+    }
+
+    #[test]
+    fn resolve_db_path_honors_explicit_then_env() {
+        // Explicit path wins verbatim (the FFI/app contract).
+        assert_eq!(resolve_db_path("/tmp/x/cyan.db"), PathBuf::from("/tmp/x/cyan.db"));
+        // Empty falls back to ./cyan.db when no env is set.
+        // (We avoid mutating CYAN_DATA_DIR here to keep the test free of global env races.)
+        let fallback = resolve_db_path("");
+        assert_eq!(fallback.file_name().expect("has file name"), "cyan.db");
+    }
 }
