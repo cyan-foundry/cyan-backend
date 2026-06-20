@@ -284,5 +284,92 @@ pub enum SwiftEvent {
     ChatHistoryComplete {
         workspace_id: String,
     },
+
+    // ── Workflow dashboard events (DASHBOARD_CONTRACT §A) ──────────────────
+    // Additive, RECEIVE-ONLY: the app stays a pure event-receiver and renders a
+    // read-model of a running workflow. Emitted from the REAL run path
+    // (`pipeline::run_pipeline`). Every variant carries `tenant_id` + the scoping
+    // keys (`run_id`/`board_id`/`workflow_id`); per-step variants also carry the
+    // `stage`/`actor`/`plugin?` slicing dimensions. No new client COMMAND FFI —
+    // these ride the existing event poll. Do NOT rename/repurpose existing events.
+    /// A workflow run started: the compiled DAG begins executing.
+    WorkflowRunStarted {
+        tenant_id: String,
+        run_id: String,
+        board_id: String,
+        workflow_id: String,
+        workflow_label: String,
+        total_steps: u32,
+        started_at: i64,
+    },
+    /// A step changed lifecycle state.
+    /// `state` ∈ pending | running | awaiting_approval | approved | done | failed.
+    /// `actor` ∈ human | ai.
+    StepStateChanged {
+        tenant_id: String,
+        run_id: String,
+        board_id: String,
+        workflow_id: String,
+        step_id: String,
+        name: String,
+        stage: String,
+        state: String,
+        actor: String,
+        plugin: Option<String>,
+        at: i64,
+    },
+    /// Progress through the run (items/steps processed).
+    StepProgress {
+        tenant_id: String,
+        run_id: String,
+        board_id: String,
+        workflow_id: String,
+        step_id: String,
+        stage: String,
+        processed: u64,
+        total: u64,
+        current_item: Option<String>,
+        detail: Option<String>,
+    },
+    /// A gate opened — the UI shows an approve/reject affordance.
+    ApprovalRequested {
+        tenant_id: String,
+        run_id: String,
+        board_id: String,
+        workflow_id: String,
+        step_id: String,
+        name: String,
+        stage: String,
+        requested_at: i64,
+    },
+    /// A gate was resolved. `decision` ∈ approved | rejected.
+    ApprovalResolved {
+        tenant_id: String,
+        run_id: String,
+        board_id: String,
+        workflow_id: String,
+        step_id: String,
+        stage: String,
+        decision: String,
+        by: String,
+        at: i64,
+    },
+    /// A workflow run finished. `state` ∈ done | failed | cancelled.
+    WorkflowRunFinished {
+        tenant_id: String,
+        run_id: String,
+        board_id: String,
+        workflow_id: String,
+        state: String,
+        finished_at: i64,
+    },
+    /// The rolled-up read-model (the producer aggregates obs → one snapshot).
+    WorkflowStatsUpdated {
+        tenant_id: String,
+        run_id: String,
+        board_id: String,
+        workflow_id: String,
+        snapshot: crate::dashboard::DashboardSnapshot,
+    },
 }
 

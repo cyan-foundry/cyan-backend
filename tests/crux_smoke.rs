@@ -116,6 +116,7 @@ async fn crux_pipeline_runs_live_mcp_tool_end_to_end() {
     let config = PipelineStepConfig {
         step_id: "probe".to_string(),
         depends_on: vec![],
+        stage: None,
         executor: "local".to_string(),
         model: None,
         model_config: None,

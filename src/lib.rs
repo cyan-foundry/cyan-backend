@@ -1489,7 +1489,16 @@ fn route_event_to_buffers(
         SwiftEvent::AIInsight { .. } |
         // Live presence/reachability for the honest status bar (additive, receive-only).
         SwiftEvent::PeerCountChanged { .. } |
-        SwiftEvent::MeshReachability { .. } => {
+        SwiftEvent::MeshReachability { .. } |
+        // Workflow dashboard events (DASHBOARD_CONTRACT §A) — receive-only, ride the
+        // existing event poll on the "status"/"network" component, like any live update.
+        SwiftEvent::WorkflowRunStarted { .. } |
+        SwiftEvent::StepStateChanged { .. } |
+        SwiftEvent::StepProgress { .. } |
+        SwiftEvent::ApprovalRequested { .. } |
+        SwiftEvent::ApprovalResolved { .. } |
+        SwiftEvent::WorkflowRunFinished { .. } |
+        SwiftEvent::WorkflowStatsUpdated { .. } => {
             network_status.lock().unwrap().push_back(event_json.to_string());
         }
     }
@@ -1515,3 +1524,4 @@ pub mod pipeline;
 pub mod timecode_notes;
 pub mod skills;
 pub mod pipeline_executor;
+pub mod dashboard;

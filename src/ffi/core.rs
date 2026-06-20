@@ -3099,6 +3099,15 @@ pub extern "C" fn xaero_join_group_from_invite(invite_json: *const c_char) -> *m
         Err(e) => return json_result_ptr(false, None, None, Some(&format!("Parse error: {}", e))),
     };
 
+    join_from_invite(&invite)
+}
+
+/// Shared join-from-invite worker, used by `xaero_join_group_from_invite` and the
+/// signed-grant `cyan_scan_grant_qr`. Behavior is identical to the original extern
+/// fn body — extracting a seam, not a rewrite. The optional `grant` field (signed
+/// capability-grant QR payload) is forwarded to the snapshot holder for the
+/// per-group snapshot read gate (unchanged from before).
+fn join_from_invite(invite: &serde_json::Value) -> *mut c_char {
     // Extract required fields
     let group_id = match invite.get("group_id").and_then(|v| v.as_str()) {
         Some(id) => id.to_string(),
@@ -3223,6 +3232,127 @@ fn json_result_ptr(success: bool, group_id: Option<&str>, group_name: Option<&st
     };
     CString::new(result.to_string()).unwrap().into_raw()
 }
+
+// ============================================================================
+// Signed-grant QR FFI (the mesh-half capability grant, surfaced to iOS)
+// ============================================================================
+//
+// ADDITIVE client verbs over the existing `identity::Grant` primitive (signed,
+// expiring, revocable — STATUS_IDENTITY_GRANTS). They light up the app's
+// `issueGrantQR` / `scanGrantQR` seam (cyan-iOS STATUS_IOS_LOGIN_PRESENCE), which
+// returned "unavailable" until this verb shipped. The signed grant is the only
+// secret here (it is not a credential); nothing sensitive is logged.
+
+/// Issue a signed, role-carrying grant QR for a group — **Admin/Owner only**.
+/// iOS: `issueGrantQR`. Returns `{"success":true,"qr":"<payload>","nonce":...,
+/// "expiry":...,"role":...}` or `{"success":false,"error":...}`. The QR encodes a
+/// `GrantInvite` (signed grant + group identity + this node as bootstrap peer) that
+/// `cyan_scan_grant_qr` joins from.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_issue_grant_qr(
+    group_id: *const c_char,
+    role: *const c_char,
+    ttl_seconds: u64,
+) -> *mut c_char {
+    use crate::identity::{issue_grant_qr, pubkey_hex, GroupRoster, Role};
+
+    let Some(gid) = (unsafe { cstr_arg(group_id) }) else {
+        return json_result_ptr(false, None, None, Some("Invalid group_id"));
+    };
+    let role_str = (unsafe { cstr_arg(role) }).unwrap_or_else(|| "member".into());
+    let Some(role) = Role::parse(&role_str) else {
+        return json_result_ptr(false, None, None, Some("Unknown role (owner|admin|member|viewer|guest)"));
+    };
+    let Some(sys) = SYSTEM.get() else {
+        return json_result_ptr(false, None, None, Some("System not initialized"));
+    };
+
+    // Authority gate: only the group's Owner/Admin may mint a grant. The persisted
+    // mesh authority is group ownership (`group_is_owner`), which maps to Owner.
+    if !storage::group_is_owner(&gid, &sys.node_id) {
+        return json_result_ptr(false, None, None, Some("Only the group Owner/Admin may issue a grant"));
+    }
+
+    // Group display fields for the invite envelope (best-effort).
+    let (group_name, group_icon, group_color) = match storage::group_get(&gid) {
+        Ok(Some(g)) => (g.name, g.icon, g.color),
+        _ => (gid.clone(), "folder.fill".to_string(), "#00AEEF".to_string()),
+    };
+
+    // Sign with this node's identity; trust its own pubkey as Owner so the grant is
+    // self-consistent (the FFI authority gate above is the real check).
+    let secret = sys.secret_key.to_bytes();
+    let issuer_pk = pubkey_hex(&secret);
+    let mut roster = GroupRoster::new();
+    roster.set_role(&gid, &issuer_pk, Role::Owner);
+
+    let now = chrono::Utc::now().timestamp() as u64;
+    let ttl = if ttl_seconds == 0 { 24 * 3600 } else { ttl_seconds };
+    let expiry = now + ttl;
+    let nonce = uuid::Uuid::new_v4().to_string();
+
+    match issue_grant_qr(
+        &gid,
+        &group_name,
+        Some(&group_icon),
+        Some(&group_color),
+        role,
+        &secret,
+        &sys.node_id,
+        now,
+        expiry,
+        &nonce,
+        &roster,
+    ) {
+        Ok(qr) => {
+            // Build the success body without `json!` (its expansion trips the
+            // workspace `unwrap` lint) — a plain map → string is panic-free.
+            let mut out = serde_json::Map::new();
+            out.insert("success".to_string(), serde_json::Value::Bool(true));
+            out.insert("qr".to_string(), serde_json::Value::String(qr));
+            out.insert("nonce".to_string(), serde_json::Value::String(nonce));
+            out.insert("expiry".to_string(), serde_json::Value::Number(expiry.into()));
+            out.insert("role".to_string(), serde_json::Value::String(role_str));
+            match CString::new(serde_json::Value::Object(out).to_string()) {
+                Ok(c) => c.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+        Err(e) => json_result_ptr(false, None, None, Some(&format!("Failed to issue grant: {}", e))),
+    }
+}
+
+/// Scan a signed grant QR: pre-verify (signature · expiry · group) locally, then JOIN
+/// the group (the snapshot holder runs the authoritative issuer-admin / revocation /
+/// replay checks and serves the per-group snapshot). iOS: `scanGrantQR`. Returns the
+/// same JSON shape as `xaero_join_group_from_invite` on success, or
+/// `{"success":false,"error":...}` for a malformed / forged / expired QR.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_scan_grant_qr(qr_payload: *const c_char) -> *mut c_char {
+    use crate::identity::scan_grant_qr_at;
+
+    let Some(payload) = (unsafe { cstr_arg(qr_payload) }) else {
+        return json_result_ptr(false, None, None, Some("Invalid QR payload"));
+    };
+    let now = chrono::Utc::now().timestamp() as u64;
+    let invite = match scan_grant_qr_at(&payload, now) {
+        Ok(inv) => inv,
+        Err(e) => return json_result_ptr(false, None, None, Some(&format!("Grant rejected: {}", e))),
+    };
+
+    // Build the invite the join path consumes, carrying the signed grant so the
+    // holder can authorize the per-group snapshot read. Plain map (no `json!`).
+    let mut invite_json = serde_json::Map::new();
+    let s = serde_json::Value::String;
+    invite_json.insert("group_id".to_string(), s(invite.group_id));
+    invite_json.insert("group_name".to_string(), s(invite.group_name));
+    invite_json.insert("group_icon".to_string(), s(invite.group_icon.unwrap_or_else(|| "folder.fill".to_string())));
+    invite_json.insert("group_color".to_string(), s(invite.group_color.unwrap_or_else(|| "#00AEEF".to_string())));
+    invite_json.insert("inviter_node_id".to_string(), s(invite.inviter_node_id));
+    invite_json.insert("grant".to_string(), s(invite.grant.to_qr_payload()));
+    join_from_invite(&serde_json::Value::Object(invite_json))
+}
+
 // ============================================================================
 // Lens Commands FFI
 // ============================================================================
@@ -3674,7 +3804,14 @@ pub extern "C" fn cyan_pipeline_approve(
         None => return false,
     };
     
-    crate::pipeline::approve_step(board_id_str, step_id_str, None, &system.command_tx).is_ok()
+    crate::pipeline::approve_step(
+        board_id_str,
+        step_id_str,
+        None,
+        &system.command_tx,
+        Some(&system.event_tx),
+    )
+    .is_ok()
 }
 
 

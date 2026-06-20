@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::dashboard::{Actor, RunObs, StepCost, StepObs, StepState};
 use crate::models::commands::CommandMsg;
 use crate::models::events::SwiftEvent;
 use crate::storage;
@@ -32,6 +33,11 @@ use crate::storage;
 pub struct PipelineStepConfig {
     pub step_id: String,
     pub depends_on: Vec<String>,
+    /// Optional stage this step belongs to (the dashboard `stage` slicing key,
+    /// DASHBOARD_CONTRACT §A). Additive + `serde(default)`: absent ⇒ the step is
+    /// its own stage (`step_id`). iOS Codable ignores it when not present.
+    #[serde(default)]
+    pub stage: Option<String>,
     pub executor: String,           // "local", "cloud", "manual", "lens"
     pub model: Option<String>,      // AI model to use (legacy, prefer model_config)
     #[serde(default)]
@@ -224,6 +230,7 @@ pub fn apply_compiled_configs(
             depends_on: step["depends_on"].as_array()
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default(),
+            stage: step["stage"].as_str().map(String::from),
             executor: step["executor"].as_str().unwrap_or("local").to_string(),
             model: step["model"].as_str().map(String::from).or(Some("cyan-lens".to_string())),
             model_config: None,
@@ -268,6 +275,151 @@ pub fn apply_compiled_configs(
 // ============================================================================
 // Run: Execute Pipeline DAG
 // ============================================================================
+
+// ============================================================================
+// Dashboard producer (DASHBOARD_CONTRACT §A/§C) — additive, receive-only events
+// emitted from the REAL run path, tagged with tenant/run/board/workflow/stage/plugin.
+// ============================================================================
+
+/// The scoping keys carried on every dashboard event of a run.
+struct RunTags {
+    tenant_id: String,
+    run_id: String,
+    board_id: String,
+    workflow_id: String,
+}
+
+impl RunTags {
+    fn run_started(&self, workflow_label: String, total_steps: u32, started_at: i64) -> SwiftEvent {
+        SwiftEvent::WorkflowRunStarted {
+            tenant_id: self.tenant_id.clone(),
+            run_id: self.run_id.clone(),
+            board_id: self.board_id.clone(),
+            workflow_id: self.workflow_id.clone(),
+            workflow_label,
+            total_steps,
+            started_at,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step_state(
+        &self,
+        step_id: &str,
+        name: &str,
+        stage: &str,
+        state: StepState,
+        actor: Actor,
+        plugin: Option<String>,
+        at: i64,
+    ) -> SwiftEvent {
+        SwiftEvent::StepStateChanged {
+            tenant_id: self.tenant_id.clone(),
+            run_id: self.run_id.clone(),
+            board_id: self.board_id.clone(),
+            workflow_id: self.workflow_id.clone(),
+            step_id: step_id.to_string(),
+            name: name.to_string(),
+            stage: stage.to_string(),
+            state: state.as_str().to_string(),
+            actor: actor.as_str().to_string(),
+            plugin,
+            at,
+        }
+    }
+
+    fn step_progress(&self, step_id: &str, stage: &str, processed: u64, total: u64, current_item: &str) -> SwiftEvent {
+        SwiftEvent::StepProgress {
+            tenant_id: self.tenant_id.clone(),
+            run_id: self.run_id.clone(),
+            board_id: self.board_id.clone(),
+            workflow_id: self.workflow_id.clone(),
+            step_id: step_id.to_string(),
+            stage: stage.to_string(),
+            processed,
+            total,
+            current_item: Some(current_item.to_string()),
+            detail: None,
+        }
+    }
+
+    fn approval_requested(&self, step_id: &str, name: &str, stage: &str, requested_at: i64) -> SwiftEvent {
+        SwiftEvent::ApprovalRequested {
+            tenant_id: self.tenant_id.clone(),
+            run_id: self.run_id.clone(),
+            board_id: self.board_id.clone(),
+            workflow_id: self.workflow_id.clone(),
+            step_id: step_id.to_string(),
+            name: name.to_string(),
+            stage: stage.to_string(),
+            requested_at,
+        }
+    }
+
+    fn run_finished(&self, state: &str, finished_at: i64) -> SwiftEvent {
+        SwiftEvent::WorkflowRunFinished {
+            tenant_id: self.tenant_id.clone(),
+            run_id: self.run_id.clone(),
+            board_id: self.board_id.clone(),
+            workflow_id: self.workflow_id.clone(),
+            state: state.to_string(),
+            finished_at,
+        }
+    }
+
+    fn stats(&self, snapshot: crate::dashboard::DashboardSnapshot) -> SwiftEvent {
+        SwiftEvent::WorkflowStatsUpdated {
+            tenant_id: self.tenant_id.clone(),
+            run_id: self.run_id.clone(),
+            board_id: self.board_id.clone(),
+            workflow_id: self.workflow_id.clone(),
+            snapshot,
+        }
+    }
+}
+
+/// The tenant a workflow run is billed to: the board's group (matches mesh
+/// `tenant=group_id`), falling back to `CYAN_TENANT_ID` / `"device"`.
+fn workflow_tenant(board_id: &str) -> String {
+    storage::board_get_group_id(board_id)
+        .filter(|g| !g.is_empty())
+        .or_else(|| std::env::var("CYAN_TENANT_ID").ok())
+        .unwrap_or_else(|| "device".to_string())
+}
+
+/// Human label for the workflow surface (the board name).
+fn workflow_label(board_id: &str) -> String {
+    storage::db()
+        .lock()
+        .ok()
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT name FROM objects WHERE id = ?1 AND type = 'whiteboard' LIMIT 1",
+                rusqlite::params![board_id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        })
+        .unwrap_or_else(|| board_id.to_string())
+}
+
+/// The stage a step belongs to (explicit `stage`, else the step is its own stage).
+fn step_stage(config: &PipelineStepConfig) -> String {
+    config.stage.clone().unwrap_or_else(|| config.step_id.clone())
+}
+
+/// The plugin a step dispatches to on-device, if it is an `mcp_tool` step.
+fn step_plugin(cell: &PipelineCell) -> Option<String> {
+    cell.metadata_json
+        .as_ref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|m| {
+            m.get("mcp_tool")
+                .and_then(|t| t.get("plugin_id"))
+                .and_then(|p| p.as_str())
+                .map(String::from)
+        })
+}
 
 /// Execute a pipeline by reading cell configs, building DAG, and running steps
 pub async fn run_pipeline(
@@ -320,6 +472,29 @@ pub async fn run_pipeline(
 
     tracing::info!("Pipeline run {} started: {} steps in DAG order", run_id, order.len());
 
+    // ── Dashboard producer: tag this run and announce it (DASHBOARD_CONTRACT §A). ──
+    let total_steps = order.len() as u32;
+    let tags = RunTags {
+        tenant_id: workflow_tenant(board_id),
+        run_id: run_id.clone(),
+        board_id: board_id.to_string(),
+        workflow_id: board_id.to_string(), // the board IS the workflow surface
+    };
+    let label = workflow_label(board_id);
+    let _ = event_tx.send(tags.run_started(label.clone(), total_steps, chrono::Utc::now().timestamp()));
+    let mut obs = RunObs::new(
+        tags.tenant_id.clone(),
+        board_id,
+        run_id.clone(),
+        board_id,
+        label,
+        total_steps as u64,
+    );
+    let mut processed: u64 = 0;
+    let mut current_stage: Option<String> = None;
+    let mut current_item: Option<String> = None;
+    let mut any_failed = false;
+
     // Execute in topological order
     for node_idx in order {
         let step_id = &graph[node_idx];
@@ -332,10 +507,32 @@ pub async fn run_pipeline(
             continue;
         }
 
-        // Skip manual steps (need human action)
+        let stage = step_stage(config);
+        let name = first_line(&cell.content);
+        let plugin = step_plugin(cell);
+
+        // Skip manual steps (need human action) — surface them as a gate.
         if config.executor == "manual" {
             tracing::info!("Step {} is manual, skipping execution", step_id);
             update_step_state(board_id, &cell.cell_id, cell, "scheduled", None, None, &run_id, command_tx)?;
+            let now = chrono::Utc::now().timestamp();
+            let _ = event_tx.send(tags.step_state(
+                step_id, &name, &stage, StepState::AwaitingApproval, Actor::Human, plugin.clone(), now,
+            ));
+            let _ = event_tx.send(tags.approval_requested(step_id, &name, &stage, now));
+            obs.record(StepObs {
+                step_id: step_id.clone(),
+                name: name.clone(),
+                stage: stage.clone(),
+                actor: Actor::Human,
+                plugin,
+                state: StepState::AwaitingApproval,
+                wall_ms: 0,
+                gate_ms: 0,
+                cost: StepCost::default(),
+            });
+            current_stage = Some(stage);
+            current_item = Some(name);
             continue;
         }
 
@@ -350,6 +547,20 @@ pub async fn run_pipeline(
         if !deps_met {
             tracing::info!("Step {} dependencies not met, marking scheduled", step_id);
             update_step_state(board_id, &cell.cell_id, cell, "scheduled", None, None, &run_id, command_tx)?;
+            let _ = event_tx.send(tags.step_state(
+                step_id, &name, &stage, StepState::Pending, Actor::Ai, plugin.clone(), chrono::Utc::now().timestamp(),
+            ));
+            obs.record(StepObs {
+                step_id: step_id.clone(),
+                name: name.clone(),
+                stage: stage.clone(),
+                actor: Actor::Ai,
+                plugin,
+                state: StepState::Pending,
+                wall_ms: 0,
+                gate_ms: 0,
+                cost: StepCost::default(),
+            });
             results.push(json!({ "step_id": step_id, "status": "scheduled", "reason": "dependencies_pending" }));
             continue;
         }
@@ -362,6 +573,16 @@ pub async fn run_pipeline(
         let _ = event_tx.send(SwiftEvent::StatusUpdate {
             message: format!("Pipeline: step '{}' running", step_id),
         });
+
+        // Dashboard: step → running + progress through the DAG. Executed steps are
+        // agentic/compute work (`ai`); plugin steps are AI-actor with a `plugin` tag.
+        let actor = Actor::Ai;
+        current_stage = Some(stage.clone());
+        current_item = Some(name.clone());
+        let _ = event_tx.send(tags.step_state(
+            step_id, &name, &stage, StepState::Running, actor, plugin.clone(), chrono::Utc::now().timestamp(),
+        ));
+        let _ = event_tx.send(tags.step_progress(step_id, &stage, processed, total_steps as u64, &name));
 
         let start = std::time::Instant::now();
 
@@ -407,6 +628,12 @@ pub async fn run_pipeline(
         };
 
         let duration = start.elapsed().as_secs_f64();
+        let wall_ms = (duration * 1000.0) as u64;
+        // Cost rail: a step's compute wall time is a GPU-time proxy on the cost rail
+        // (DASHBOARD_CONTRACT §C `gpu_ms`). External (plugin) USD is attributed on the
+        // executor's own obs and is not threaded back here yet (noted in STATUS).
+        let cost = StepCost { gpu_ms: wall_ms, ..StepCost::default() };
+        processed += 1;
 
         match result {
             Ok(output) => {
@@ -419,6 +646,22 @@ pub async fn run_pipeline(
                 // Send notification
                 let _ = event_tx.send(SwiftEvent::StatusUpdate {
                     message: format!("Pipeline: step '{}' complete ({:.1}s)", step_id, duration),
+                });
+
+                // Dashboard: step → done.
+                let _ = event_tx.send(tags.step_state(
+                    step_id, &name, &stage, StepState::Done, actor, plugin.clone(), chrono::Utc::now().timestamp(),
+                ));
+                obs.record(StepObs {
+                    step_id: step_id.clone(),
+                    name: name.clone(),
+                    stage: stage.clone(),
+                    actor,
+                    plugin: plugin.clone(),
+                    state: StepState::Done,
+                    wall_ms,
+                    gate_ms: 0,
+                    cost: cost.clone(),
                 });
 
                 // Process notifications for this step
@@ -437,6 +680,23 @@ pub async fn run_pipeline(
                     board_id, &cell.cell_id, cell, "failed",
                     None, Some(&e.to_string()), &run_id, command_tx,
                 )?;
+
+                // Dashboard: step → failed.
+                any_failed = true;
+                let _ = event_tx.send(tags.step_state(
+                    step_id, &name, &stage, StepState::Failed, actor, plugin.clone(), chrono::Utc::now().timestamp(),
+                ));
+                obs.record(StepObs {
+                    step_id: step_id.clone(),
+                    name: name.clone(),
+                    stage: stage.clone(),
+                    actor,
+                    plugin: plugin.clone(),
+                    state: StepState::Failed,
+                    wall_ms,
+                    gate_ms: 0,
+                    cost: cost.clone(),
+                });
 
                 fire_notifications(config, "failed", board_id, step_id, event_tx);
 
@@ -462,6 +722,13 @@ pub async fn run_pipeline(
             fire_notifications(config, "pipeline_complete", board_id, &config.step_id, event_tx);
         }
     }
+
+    // ── Dashboard producer: the rolled-up read-model + the run-finished marker. ──
+    let finished_at = chrono::Utc::now().timestamp();
+    let snapshot = obs.snapshot(finished_at, current_item, current_stage);
+    let _ = event_tx.send(tags.stats(snapshot));
+    let run_state = if any_failed { "failed" } else { "done" };
+    let _ = event_tx.send(tags.run_finished(run_state, finished_at));
 
     Ok(json!({
         "run_id": run_id,
@@ -647,6 +914,7 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
             depends_on: config_val["depends_on"].as_array()
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default(),
+            stage: config_val["stage"].as_str().map(String::from),
             executor: config_val["executor"].as_str().unwrap_or("lens").to_string(),
             model: Some("cyan-lens".to_string()),
             model_config: None,
@@ -773,12 +1041,15 @@ pub fn approve_step(
     step_id: &str,
     reviewer: Option<&str>,
     command_tx: &UnboundedSender<CommandMsg>,
+    event_tx: Option<&UnboundedSender<SwiftEvent>>,
 ) -> Result<()> {
     let cells = load_pipeline_cells(board_id)?;
 
     let cell = cells.iter()
         .find(|c| c.pipeline_config.as_ref().map(|p| p.step_id.as_str()) == Some(step_id))
         .ok_or_else(|| anyhow!("Step {} not found", step_id))?;
+    let stage = cell.pipeline_config.as_ref().map(step_stage).unwrap_or_else(|| step_id.to_string());
+    let name = first_line(&cell.content);
 
     // CRITICAL: Re-read cell from DB to get latest metadata
     let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
@@ -814,6 +1085,34 @@ pub fn approve_step(
     });
 
     tracing::info!("Step {} approved by {}", step_id, reviewer.unwrap_or("anonymous"));
+
+    // Dashboard: resolve the gate (approved) + flip the step to approved
+    // (DASHBOARD_CONTRACT §A `ApprovalResolved`/`StepStateChanged`). Additive,
+    // receive-only; tagged with tenant/run/board/workflow. `run_id` is unknown at
+    // approval time (a separate FFI call), so it is empty — the snapshot recomputes
+    // on the next run; the dashboard keys the gate by step_id.
+    if let Some(tx) = event_tx {
+        let by = reviewer.unwrap_or("anonymous").to_string();
+        let now = chrono::Utc::now().timestamp();
+        let tags = RunTags {
+            tenant_id: workflow_tenant(board_id),
+            run_id: String::new(),
+            board_id: board_id.to_string(),
+            workflow_id: board_id.to_string(),
+        };
+        let _ = tx.send(SwiftEvent::ApprovalResolved {
+            tenant_id: tags.tenant_id.clone(),
+            run_id: tags.run_id.clone(),
+            board_id: tags.board_id.clone(),
+            workflow_id: tags.workflow_id.clone(),
+            step_id: step_id.to_string(),
+            stage: stage.clone(),
+            decision: "approved".to_string(),
+            by,
+            at: now,
+        });
+        let _ = tx.send(tags.step_state(step_id, &name, &stage, StepState::Approved, Actor::Human, None, now));
+    }
     Ok(())
 }
 
