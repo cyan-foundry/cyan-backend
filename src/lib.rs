@@ -835,6 +835,72 @@ impl CommandActor {
                     let _ = self.event_tx.send(SwiftEvent::Network(NetworkEvent::NoteDeleted { id }));
                 }
 
+                // ── Template + pin commands (ROUND8 §W4) ──
+                CommandMsg::WorkflowFromTemplate { template_id, board_id, tenant_id } => {
+                    let group_id = self.get_group_id_for_board(&board_id);
+                    // Tenant: explicit, else the board's group (group == tenant).
+                    let tenant = tenant_id
+                        .or_else(|| group_id.clone())
+                        .unwrap_or_else(|| board_id.clone());
+
+                    match crate::templates::clone_to_board(&template_id, &board_id, &tenant) {
+                        Ok(cells) => {
+                            tracing::info!(
+                                tenant_id = %tenant,
+                                "obs workflow_from_template template={template_id} board={board_id} steps={}",
+                                cells.len()
+                            );
+                            // Broadcast each cloned step so already-live peers converge
+                            // immediately (cold joiners get them via the snapshot too).
+                            for c in cells {
+                                let event = NetworkEvent::NotebookCellAdded {
+                                    id: c.id,
+                                    board_id: c.board_id,
+                                    cell_type: c.cell_type,
+                                    cell_order: c.cell_order,
+                                    content: c.content,
+                                };
+                                if let Some(gid) = group_id.clone() {
+                                    let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                                        group_id: gid,
+                                        event: event.clone(),
+                                    });
+                                }
+                                let _ = self.event_tx.send(SwiftEvent::Network(event));
+                            }
+                        }
+                        Err(e) => eprintln!("📋 [TEMPLATE] 🔴 clone_to_board failed: {e}"),
+                    }
+                }
+
+                CommandMsg::SetPin { board_id, pinned } => {
+                    let now = chrono::Utc::now().timestamp();
+                    let group_id = self.get_group_id_for_board(&board_id);
+                    let tenant = group_id.clone().unwrap_or_else(|| board_id.clone());
+
+                    let pin = crate::models::dto::PinDTO {
+                        board_id: board_id.clone(),
+                        tenant_id: tenant.clone(),
+                        pinned,
+                        updated_at: now,
+                    };
+                    match storage::pin_upsert(&pin) {
+                        Ok(_) => tracing::info!(tenant_id = %tenant, "obs pin_set board={board_id} pinned={pinned}"),
+                        Err(e) => eprintln!("📌 [PIN] 🔴 pin_upsert failed: {e}"),
+                    }
+
+                    let event = NetworkEvent::PinSet {
+                        board_id, tenant_id: tenant, pinned, updated_at: now,
+                    };
+                    if let Some(gid) = group_id {
+                        let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                            group_id: gid,
+                            event: event.clone(),
+                        });
+                    }
+                    let _ = self.event_tx.send(SwiftEvent::Network(event));
+                }
+
                 // Whiteboard element commands
                 CommandMsg::CreateWhiteboardElement { board_id, element_type, x, y, width, height, z_index, style_json, content_json } => {
                     let id = blake3::hash(format!("elem:{}-{}", &board_id, chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)).as_bytes()).to_hex().to_string();
@@ -1549,6 +1615,13 @@ fn route_event_to_buffers(
                     whiteboard.lock().unwrap().push_back(event_json.to_string());
                 }
 
+                // Pin event → Whiteboard buffer (board-level pinned-workflow state; the
+                // app reads the authoritative pin via storage and treats this as a
+                // change signal). ROUND8 §W4.
+                NetworkEvent::PinSet { .. } => {
+                    whiteboard.lock().unwrap().push_back(event_json.to_string());
+                }
+
                 // Whiteboard element events → Whiteboard
                 NetworkEvent::WhiteboardElementAdded { .. } |
                 NetworkEvent::WhiteboardElementUpdated { .. } |
@@ -1655,6 +1728,7 @@ pub mod tests {
 
 pub mod pipeline;
 pub mod workflow;
+pub mod templates;
 pub mod timecode_notes;
 pub mod skills;
 pub mod pipeline_executor;

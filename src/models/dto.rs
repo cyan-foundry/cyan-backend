@@ -134,6 +134,56 @@ pub struct NoteDTO {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// TEMPLATE (ROUND8 §W4 — a pre-written English workflow cloned into a board)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// One pre-written workflow step inside a template: the plain-English step `text`
+/// (the W1 authoring primitive) plus an optional **bound plugin** (the `@plugin` the
+/// step runs on). Cloning a template materializes one real `step` cell per step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplateStep {
+    pub text: String,
+    /// The plugin bound to this step (e.g. `"contido"`), if any. `None` ⇒ unbound.
+    #[serde(default)]
+    pub plugin: Option<String>,
+}
+
+/// A workflow **template** — a pre-written English workflow (steps + bound plugins)
+/// you clone into a board. Two sources: built-in **media seeds** (`source =
+/// "builtin"`, tenant-agnostic) and user **save-as-template** results (`source =
+/// "user"`, tenant-scoped). Cloning never mutates the template.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Template {
+    pub id: String,
+    /// The tenant (group) that owns a user template. Empty for built-in seeds, which
+    /// are global defaults surfaced to every tenant.
+    pub tenant_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// `"builtin"` (seed) or `"user"` (save-as-template).
+    pub source: String,
+    pub steps: Vec<TemplateStep>,
+    pub created_at: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PIN (ROUND8 §W4 — board-level pinned-workflow state; replicated, LWW)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Pinned-workflow state for a board: a pinned workflow surfaces for fast cloning.
+/// Its own store (NOT board_metadata), so it rides the existing anti-entropy digest +
+/// snapshot path exactly like a note. Replicated team state; conflict resolution is
+/// **LWW on `updated_at`**, idempotent upsert-by-`board_id`, so unpin/pin converge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PinDTO {
+    pub board_id: String,
+    pub tenant_id: String,
+    pub pinned: bool,
+    pub updated_at: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // WHITEBOARD ELEMENT
 // ═══════════════════════════════════════════════════════════════════════════
 

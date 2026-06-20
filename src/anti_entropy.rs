@@ -152,6 +152,12 @@ pub fn group_digest(group_id: &str) -> (u64, String) {
     for nt in storage::note_list_by_boards(&board_ids).unwrap_or_default() {
         entries.push(format!("n{SEP}{}{SEP}{}", nt.id, nt.updated_at));
     }
+    // ROUND8 §W4: pinned-workflow state is board-level + mutable (LWW) — version on
+    // `updated_at`, so a pin/unpin flips the hash and the sweep pulls the latest,
+    // exactly like a note. The snapshot Metadata frame carries the `pinned` bool.
+    for p in storage::pin_list_by_boards(&board_ids).unwrap_or_default() {
+        entries.push(format!("p{SEP}{}{SEP}{}", p.board_id, p.updated_at));
+    }
     for f in storage::file_list_by_group(group_id).unwrap_or_default() {
         entries.push(format!("f{SEP}{}{SEP}{}", f.id, f.hash));
     }

@@ -1079,6 +1079,17 @@ impl TopicActor {
             NetworkEvent::NoteDeleted { id } => {
                 let _ = storage::note_delete(id);
             }
+            // ROUND8 §W4 pin — apply via idempotent LWW upsert-by-board_id, so a stale
+            // PinSet is dropped and the latest pinned state wins.
+            NetworkEvent::PinSet { board_id, tenant_id, pinned, updated_at } => {
+                let pin = crate::models::dto::PinDTO {
+                    board_id: board_id.clone(),
+                    tenant_id: tenant_id.clone(),
+                    pinned: *pinned,
+                    updated_at: *updated_at,
+                };
+                let _ = storage::pin_upsert(&pin);
+            }
             NetworkEvent::WhiteboardElementAdded {
                 id, board_id, element_type, x, y, width, height, z_index,
                 style_json, content_json, created_at, updated_at,
@@ -1582,13 +1593,14 @@ async fn download_snapshot(
                 }
             }
 
-            SnapshotFrame::Metadata { chats, files, integrations, board_metadata, notes } => {
+            SnapshotFrame::Metadata { chats, files, integrations, board_metadata, notes, pins } => {
                 eprintln!("📥 [SNAP-DL-9] METADATA frame received:");
                 eprintln!("   chats: {}", chats.len());
                 eprintln!("   files: {}", files.len());
                 eprintln!("   integrations: {}", integrations.len());
                 eprintln!("   board_metadata: {}", board_metadata.len());
                 eprintln!("   notes: {}", notes.len());
+                eprintln!("   pins: {}", pins.len());
 
                 // Insert chats
                 for chat in &chats {
@@ -1637,6 +1649,14 @@ async fn download_snapshot(
                 for nt in &notes {
                     if let Err(e) = storage::note_upsert(nt) {
                         eprintln!("   ⚠️ Note insert: {}", e);
+                    }
+                }
+
+                // Insert pins (ROUND8 §W4) — idempotent LWW upsert-by-board_id, so the
+                // pinned-workflow state converges through the anti-entropy merge too.
+                for p in &pins {
+                    if let Err(e) = storage::pin_upsert(p) {
+                        eprintln!("   ⚠️ Pin insert: {}", e);
                     }
                 }
 

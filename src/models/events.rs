@@ -105,6 +105,15 @@ pub enum NetworkEvent {
     NoteDeleted {
         id: String,
     },
+    // ---- Pin event (ROUND8 §W4 — board-level pinned-workflow state, replicated LWW) ----
+    /// A board's pinned-workflow state changed. The receiver applies it via the
+    /// idempotent LWW upsert-by-`board_id`, so a stale `PinSet` is dropped on apply.
+    PinSet {
+        board_id: String,
+        tenant_id: String,
+        pinned: bool,
+        updated_at: i64,
+    },
     // ---- Whiteboard element events ----
     WhiteboardElementAdded {
         id: String,

@@ -687,6 +687,98 @@ pub extern "C" fn cyan_note_delete(id: *const c_char) {
     let _ = sys.command_tx.send(CommandMsg::DeleteNote { id });
 }
 
+// ---------- FFI: templates + pinned workflows (ROUND8 §W4) ----------
+/// List the templates visible to a tenant as a JSON array of `Template`: the built-in
+/// media seeds (always) plus the tenant's own save-as-template results. `tenant_id`
+/// null ⇒ seeds only. Caller owns the returned string; free with `cyan_free_string`.
+/// Additive verb — never replaces any existing FFI.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_template_list(tenant_id: *const c_char) -> *mut c_char {
+    let tenant = unsafe { cstr_arg(tenant_id) }.unwrap_or_default();
+    let templates = crate::templates::list_templates(&tenant);
+    let json = serde_json::to_string(&templates).unwrap_or_else(|_| "[]".to_string());
+    match CString::new(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Clone a template into a board as real W1 step cells (the cloned steps are authorable
+/// workflow steps that compile + sync like any cell). `tenant_id` null ⇒ derive from the
+/// board's group. Runs through the command actor so each cloned step broadcasts.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_workflow_from_template(
+    template_id: *const c_char,
+    board_id: *const c_char,
+    tenant_id: *const c_char,
+) {
+    let Some(template_id) = (unsafe { cstr_arg(template_id) }) else {
+        return;
+    };
+    let Some(board_id) = (unsafe { cstr_arg(board_id) }) else {
+        return;
+    };
+    let tenant_id = unsafe { cstr_arg(tenant_id) }; // null ⇒ derive from board's group
+
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let _ = sys.command_tx.send(CommandMsg::WorkflowFromTemplate {
+        template_id,
+        board_id,
+        tenant_id,
+    });
+}
+
+/// Save a board's steps as a reusable user template, tenant-scoped. `steps_json` is a
+/// JSON array of `TemplateStep` (`{ "text": ..., "plugin": ... }`). Returns the created
+/// `Template` as JSON (caller frees with `cyan_free_string`), or null on bad input.
+/// Additive verb the iOS save-as-template flow consumes.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_template_save(
+    tenant_id: *const c_char,
+    name: *const c_char,
+    description: *const c_char,
+    steps_json: *const c_char,
+) -> *mut c_char {
+    let Some(tenant) = (unsafe { cstr_arg(tenant_id) }) else {
+        return std::ptr::null_mut();
+    };
+    let Some(name) = (unsafe { cstr_arg(name) }) else {
+        return std::ptr::null_mut();
+    };
+    let description = unsafe { cstr_arg(description) }.unwrap_or_default();
+    let Some(steps_json) = (unsafe { cstr_arg(steps_json) }) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(steps) = serde_json::from_str::<Vec<crate::models::dto::TemplateStep>>(&steps_json) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(template) = crate::templates::save_as_template(&tenant, &name, &description, steps) else {
+        return std::ptr::null_mut();
+    };
+    let json = serde_json::to_string(&template).unwrap_or_else(|_| "{}".to_string());
+    match CString::new(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Set a board's pinned-workflow state (a pinned workflow surfaces for fast cloning).
+/// Replicated team state (LWW); runs through the command actor so it broadcasts.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_pin_set(board_id: *const c_char, pinned: bool) {
+    let Some(board_id) = (unsafe { cstr_arg(board_id) }) else {
+        return;
+    };
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let _ = sys.command_tx.send(CommandMsg::SetPin { board_id, pinned });
+}
+
 // ---------- FFI: direct chats ----------
 /// Start a direct QUIC chat stream with a peer
 #[unsafe(no_mangle)]

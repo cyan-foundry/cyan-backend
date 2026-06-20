@@ -355,6 +355,16 @@ impl MpNode {
             .map(|_| ())
     }
 
+    /// Set the fixture board's pinned-workflow state into THIS node's storage WITHOUT
+    /// broadcasting it (ROUND8 §W4) — only the anti-entropy digest+snapshot path can
+    /// carry it to the peer, so convergence is the pin-sync proof.
+    pub async fn set_pin(&mut self, group_id: &str, pinned: bool) -> Result<()> {
+        let flag = if pinned { 1 } else { 0 };
+        self.request(&format!("set_pin {group_id} {flag}"), REQ_TIMEOUT)
+            .await
+            .map(|_| ())
+    }
+
     /// Seed (hold + announce) a deterministic blob of `size` bytes into `group_id`'s swarm.
     /// Returns `(file_id, blake3_hex)`.
     pub async fn seed_blob(&mut self, group_id: &str, size: usize) -> Result<(String, String)> {

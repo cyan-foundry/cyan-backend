@@ -680,6 +680,125 @@ fn note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteDTO> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// TEMPLATES (ROUND8 §W4 — user-saved workflow templates; seeds live in code)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Persist a user template (idempotent upsert-by-id). Steps are stored as JSON. Only
+/// `source = "user"` templates are persisted — built-in seeds are code constants
+/// (see `templates::seed_templates`) and are never written to the DB.
+pub fn template_insert(t: &Template) -> Result<()> {
+    let steps_json = serde_json::to_string(&t.steps)?;
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO templates (id, tenant_id, name, description, source, steps_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![t.id, t.tenant_id, t.name, t.description, t.source, steps_json, t.created_at],
+    )?;
+    Ok(())
+}
+
+/// List the user templates owned by `tenant_id` (tenant-scoped — a user template never
+/// crosses the tenant boundary). Built-in seeds are merged in by `templates::list_templates`.
+pub fn template_list_by_tenant(tenant_id: &str) -> Result<Vec<Template>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    let mut stmt = conn.prepare(
+        "SELECT id, tenant_id, name, description, source, steps_json, created_at
+         FROM templates WHERE tenant_id = ?1 ORDER BY created_at",
+    )?;
+    let rows = stmt.query_map(params![tenant_id], template_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Fetch a single user template by id, **tenant-scoped** — returns `None` if the id is
+/// unknown OR belongs to a different tenant (no cross-tenant read).
+pub fn template_get(id: &str, tenant_id: &str) -> Result<Option<Template>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    let mut stmt = conn.prepare(
+        "SELECT id, tenant_id, name, description, source, steps_json, created_at
+         FROM templates WHERE id = ?1 AND tenant_id = ?2",
+    )?;
+    stmt.query_row(params![id, tenant_id], template_from_row)
+        .optional()
+        .map_err(Into::into)
+}
+
+fn template_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Template> {
+    let steps_json: String = r.get(5)?;
+    let steps = serde_json::from_str(&steps_json).unwrap_or_default();
+    Ok(Template {
+        id: r.get(0)?,
+        tenant_id: r.get(1)?,
+        name: r.get(2)?,
+        description: r.get(3)?,
+        source: r.get(4)?,
+        steps,
+        created_at: r.get(6)?,
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PINS (ROUND8 §W4 — board-level pinned-workflow state; replicated, LWW)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Idempotent **upsert-by-board_id** with **LWW on `updated_at`**: set a board's pin
+/// state, or, on an existing row, replace it ONLY IF the incoming `updated_at` is
+/// strictly newer. Older OR equal writes are no-ops (so snapshot apply / anti-entropy
+/// repair re-apply the same state without churn). Returns `true` iff state changed.
+pub fn pin_upsert(p: &PinDTO) -> Result<bool> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    let changed = conn.execute(
+        "INSERT INTO pins (board_id, tenant_id, pinned, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(board_id) DO UPDATE SET
+            tenant_id  = excluded.tenant_id,
+            pinned     = excluded.pinned,
+            updated_at = excluded.updated_at
+         WHERE excluded.updated_at > pins.updated_at",
+        params![p.board_id, p.tenant_id, p.pinned as i32, p.updated_at],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Fetch a single board's pin state, if any.
+pub fn pin_get(board_id: &str) -> Result<Option<PinDTO>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    let mut stmt = conn.prepare(
+        "SELECT board_id, tenant_id, pinned, updated_at FROM pins WHERE board_id = ?1",
+    )?;
+    stmt.query_row(params![board_id], pin_from_row)
+        .optional()
+        .map_err(Into::into)
+}
+
+/// List all pin rows attached to the given boards (for the digest + snapshot serializer).
+/// A group is a single tenant, so this is naturally tenant-scoped by the board set.
+pub fn pin_list_by_boards(board_ids: &[String]) -> Result<Vec<PinDTO>> {
+    if board_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    let placeholders: String = board_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT board_id, tenant_id, pinned, updated_at FROM pins WHERE board_id IN ({}) ORDER BY board_id",
+        placeholders
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> =
+        board_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let rows = stmt.query_map(params.as_slice(), pin_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn pin_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PinDTO> {
+    Ok(PinDTO {
+        board_id: r.get(0)?,
+        tenant_id: r.get(1)?,
+        pinned: r.get::<_, i32>(2)? != 0,
+        updated_at: r.get(3)?,
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // FILES
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1444,6 +1563,42 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
             [],
         );
         let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_board ON notes(board_id)", []);
+    }
+
+    // ROUND8 §W4: templates — a pre-written English workflow (steps + bound plugins)
+    // cloned into a board. Own store; user templates are tenant-scoped (built-in seeds
+    // live in code, never persisted). Created here for DBs that predate it; idempotent.
+    if conn.prepare("SELECT id FROM templates LIMIT 1").is_err() {
+        tracing::info!("Migration: creating templates table");
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS templates (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'user',
+                steps_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            [],
+        );
+        let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_templates_tenant ON templates(tenant_id)", []);
+    }
+
+    // ROUND8 §W4: pins — board-level pinned-workflow state (a pinned workflow surfaces
+    // for fast cloning). Own store keyed by board_id; LWW on updated_at; rides the
+    // existing anti-entropy digest + snapshot path like notes. Idempotent migration.
+    if conn.prepare("SELECT board_id FROM pins LIMIT 1").is_err() {
+        tracing::info!("Migration: creating pins table");
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS pins (
+                board_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                pinned INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )",
+            [],
+        );
     }
 
     Ok(())

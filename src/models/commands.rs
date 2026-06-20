@@ -181,6 +181,24 @@ pub enum CommandMsg {
     },
 
     // ═══════════════════════════════════════════════════════════════════════
+    // TEMPLATE + PIN COMMANDS (ROUND8 §W4)
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Clone a template into a board as real W1 step cells, broadcasting each new
+    /// cell so peers converge. `tenant_id = None` derives the tenant from the board's
+    /// group.
+    WorkflowFromTemplate {
+        template_id: String,
+        board_id: String,
+        tenant_id: Option<String>,
+    },
+    /// Set a board's pinned-workflow state. Replicated (LWW on `updated_at`); the
+    /// tenant is derived from the board's group.
+    SetPin {
+        board_id: String,
+        pinned: bool,
+    },
+
+    // ═══════════════════════════════════════════════════════════════════════
     // DIRECT MESSAGE COMMANDS
     // ═══════════════════════════════════════════════════════════════════════
     StartDirectChat {

@@ -42,6 +42,7 @@
 //! ## Stress / chaos fabric verbs (Round 7)
 //! - `post_edits <gid> <n> [board]`       `@@CYAN@@ ok post_edits <n>` (local insert + gossip broadcast)
 //! - `post_notes <gid> <n> [board]`       `@@CYAN@@ ok post_notes <n>` (local note insert, NO broadcast; digest-converge)
+//! - `set_pin <gid> <0|1> [board]`        `@@CYAN@@ ok set_pin <pinned>` (local pin, NO broadcast; digest-converge)
 //! - `seed_blob <gid> <size> [name]`      `@@CYAN@@ blob <file_id> <hash>` (hold + announce)
 //! - `fetch_blob <gid> <fid> <hash> <src> <size> <to_ms>`  `@@CYAN@@ fetched <path>` | `timeout fetch_blob`
 //! - `verify_blob <fid> <hash>`           `@@CYAN@@ verify ok|mismatch|missing` (blake3 re-check)
@@ -538,6 +539,32 @@ async fn handle_verb(
             Ok(format!("ok post_notes {n}"))
         }
 
+        // Set the fixture board's pinned-workflow state (ROUND8 §W4) into THIS node's
+        // storage WITHOUT broadcasting — the deterministic stand-in for "the live
+        // PinSet never reached the peer". With pins in the digest + snapshot, ONLY the
+        // anti-entropy sweep can reconcile it, so "the joiner ends pinned too" is the
+        // convergence proof. `set_pin <gid> <0|1> [board]` → `ok set_pin <pinned>`.
+        "set_pin" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?;
+            let pinned = rest
+                .get(1)
+                .map(|s| *s == "1" || s.eq_ignore_ascii_case("true"))
+                .ok_or_else(|| anyhow!("pinned flag required"))?;
+            let board = rest
+                .get(2)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{gid}-board"));
+            let now = chrono::Utc::now().timestamp();
+            let pin = cyan_backend::models::dto::PinDTO {
+                board_id: board,
+                tenant_id: gid.to_string(),
+                pinned,
+                updated_at: now,
+            };
+            storage::pin_upsert(&pin).map_err(|e| anyhow!("pin_upsert: {e}"))?;
+            Ok(format!("ok set_pin {}", pinned as i32))
+        }
+
         // Generate a deterministic blob of <size> bytes, content-address it, hold it in this node's
         // swarm store, and announce it to the group so peers can swarm-fetch. Also writes a file
         // metadata row + local_path so `count files` and direct transfer both see it.
@@ -816,6 +843,16 @@ fn count_kind(kind: &str, group_id: &str) -> Result<usize> {
             storage::note_list_by_boards(&board_ids)
                 .map_err(|e| anyhow!("note_list_by_boards: {e}"))?
                 .len()
+        }
+        // ROUND8 §W4: count only the PINNED boards — proves the pinned state (not just
+        // a pin row) replicated to a joiner via the digest + snapshot.
+        "pins" => {
+            let board_ids = board_ids(&ws_ids)?;
+            storage::pin_list_by_boards(&board_ids)
+                .map_err(|e| anyhow!("pin_list_by_boards: {e}"))?
+                .iter()
+                .filter(|p| p.pinned)
+                .count()
         }
         "files" => storage::file_list_by_group(group_id)
             .map_err(|e| anyhow!("file_list_by_group: {e}"))?

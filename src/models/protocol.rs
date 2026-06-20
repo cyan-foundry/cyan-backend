@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::models::core::{Group, Workspace};
 use crate::models::dto::{
     BoardMetadataDTO, ChatDTO, FileDTO, IntegrationBindingDTO,
-    NotebookCellDTO, NoteDTO, WhiteboardDTO, WhiteboardElementDTO,
+    NotebookCellDTO, NoteDTO, PinDTO, WhiteboardDTO, WhiteboardElementDTO,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -66,6 +66,9 @@ pub enum SnapshotFrame {
         /// with an empty vec; a newer holder's extra field is ignored by older peers.
         #[serde(default)]
         notes: Vec<NoteDTO>,
+        /// ROUND8 §W4 pinned-workflow state. Same wire-compat contract as `notes`.
+        #[serde(default)]
+        pins: Vec<PinDTO>,
     },
     /// Signals transfer complete
     Complete,
