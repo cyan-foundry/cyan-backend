@@ -421,15 +421,102 @@ fn step_plugin(cell: &PipelineCell) -> Option<String> {
         })
 }
 
-/// Execute a pipeline by reading cell configs, building DAG, and running steps
+// ============================================================================
+// Wave-concurrent executor (Round 7)
+//
+// One executor, two entry conditions (WORKFLOW_MATERIALIZATION §1):
+//   • A Lens `PhysicalPlan` is present  → run its waves WAVE-CONCURRENTLY
+//     (independent steps in a wave run in parallel; gates are branch barriers;
+//      cache hits reuse the prior artifact; batching caps in-flight concurrency).
+//   • No plan (Lens unreachable / not compiled) → the existing SEQUENTIAL
+//     toposort — the offline fallback, byte-for-byte the prior behavior.
+// Both paths emit the SAME dashboard exec events (DASHBOARD_CONTRACT §A) so the
+// dashboard lights up identically either way.
+// ============================================================================
+
+/// An owned, `'static` snapshot of one step — everything a (possibly spawned)
+/// execution task needs, with no borrow back into the cell/config tables.
+#[derive(Debug, Clone)]
+struct ExecStep {
+    step_id: String,
+    cell_id: String,
+    content: String,
+    stage: String,
+    name: String,
+    plugin: Option<String>,
+    executor: String,
+    depends_on: Vec<String>,
+    /// The cell's `mcp_tool` spec, threaded into the executor so the on-device
+    /// MCP-tool path can fire from a real run (see `parse_mcp_tool_step`).
+    mcp_tool: Option<serde_json::Value>,
+    status: String,
+    auto_advance: bool,
+    notifications: Vec<StepNotification>,
+}
+
+/// What running one step produced — folded into the run's accumulator. `result`
+/// is `None` for a gate (no result line, matching the prior sequential output).
+struct StepOutcome {
+    obs: StepObs,
+    result: Option<serde_json::Value>,
+    failed: bool,
+    stage: String,
+    name: String,
+}
+
+/// Mutable run-wide accumulator (the snapshot inputs + the result lines). Lives in
+/// the run task; spawned step tasks return `StepOutcome`s that get folded in here —
+/// so there are no locks on this hot state.
+struct RunAccum {
+    obs: RunObs,
+    results: Vec<serde_json::Value>,
+    any_failed: bool,
+    processed: u64,
+    current_stage: Option<String>,
+    current_item: Option<String>,
+}
+
+impl RunAccum {
+    fn fold(&mut self, o: StepOutcome) {
+        self.current_stage = Some(o.stage);
+        self.current_item = Some(o.name);
+        if o.failed {
+            self.any_failed = true;
+        }
+        self.obs.record(o.obs);
+        if let Some(r) = o.result {
+            self.results.push(r);
+        }
+    }
+}
+
+fn now_ts() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// Execute a pipeline: load a Lens physical plan if the board has one, else run
+/// sequentially. Signature unchanged (FFI/tests call this); plan loading is internal.
 pub async fn run_pipeline(
     board_id: &str,
     command_tx: &UnboundedSender<CommandMsg>,
     event_tx: &UnboundedSender<SwiftEvent>,
 ) -> Result<serde_json::Value> {
+    let plan = load_physical_plan(board_id);
+    run_pipeline_with_plan(board_id, plan, command_tx, event_tx).await
+}
+
+/// The executor core. `plan = Some(..)` ⇒ wave-concurrent; `None` ⇒ sequential
+/// toposort fallback. Exposed so tests (and a future compile path) can hand the
+/// plan in directly without the storage round-trip.
+pub async fn run_pipeline_with_plan(
+    board_id: &str,
+    plan: Option<crate::exec_plan::PhysicalPlan>,
+    command_tx: &UnboundedSender<CommandMsg>,
+    event_tx: &UnboundedSender<SwiftEvent>,
+) -> Result<serde_json::Value> {
     let cells = load_pipeline_cells(board_id)?;
 
-    // Collect steps with pipeline configs
+    // Collect steps with pipeline configs.
     let steps: Vec<_> = cells.iter()
         .filter_map(|c| c.pipeline_config.as_ref().map(|p| (c, p)))
         .collect();
@@ -438,21 +525,33 @@ pub async fn run_pipeline(
         return Err(anyhow!("No pipeline steps configured. Run /pipeline compile first."));
     }
 
-    // Build DAG with petgraph
+    // Build the DAG with petgraph — used by the sequential path and, either way, to
+    // validate the graph is acyclic before we run anything.
     let mut graph = DiGraph::<String, ()>::new();
     let mut node_map: HashMap<String, NodeIndex> = HashMap::new();
-    let mut cell_map: HashMap<String, &PipelineCell> = HashMap::new();
-    let mut config_map: HashMap<String, &PipelineStepConfig> = HashMap::new();
+    let mut exec_steps: HashMap<String, ExecStep> = HashMap::new();
 
-    // Add nodes
     for (cell, config) in &steps {
         let idx = graph.add_node(config.step_id.clone());
         node_map.insert(config.step_id.clone(), idx);
-        cell_map.insert(config.step_id.clone(), cell);
-        config_map.insert(config.step_id.clone(), config);
+        exec_steps.insert(config.step_id.clone(), ExecStep {
+            step_id: config.step_id.clone(),
+            cell_id: cell.cell_id.clone(),
+            content: cell.content.clone(),
+            stage: step_stage(config),
+            name: first_line(&cell.content),
+            plugin: step_plugin(cell),
+            executor: config.executor.clone(),
+            depends_on: config.depends_on.clone(),
+            mcp_tool: cell.metadata_json.as_ref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .and_then(|m| m.get("mcp_tool").cloned()),
+            status: config.state.status.clone(),
+            auto_advance: config.auto_advance,
+            notifications: config.notifications.clone(),
+        });
     }
 
-    // Add edges (dependencies)
     for (_cell, config) in &steps {
         if let Some(&to_idx) = node_map.get(&config.step_id) {
             for dep in &config.depends_on {
@@ -463,279 +562,420 @@ pub async fn run_pipeline(
         }
     }
 
-    // Topological sort
     let order = toposort(&graph, None)
         .map_err(|_| anyhow!("Pipeline has circular dependencies"))?;
 
     let run_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-    let mut results = Vec::new();
-
-    tracing::info!("Pipeline run {} started: {} steps in DAG order", run_id, order.len());
+    let total_steps = order.len() as u32;
 
     // ── Dashboard producer: tag this run and announce it (DASHBOARD_CONTRACT §A). ──
-    let total_steps = order.len() as u32;
-    let tags = RunTags {
+    let tags = std::sync::Arc::new(RunTags {
         tenant_id: workflow_tenant(board_id),
         run_id: run_id.clone(),
         board_id: board_id.to_string(),
         workflow_id: board_id.to_string(), // the board IS the workflow surface
-    };
-    let label = workflow_label(board_id);
-    let _ = event_tx.send(tags.run_started(label.clone(), total_steps, chrono::Utc::now().timestamp()));
-    let mut obs = RunObs::new(
-        tags.tenant_id.clone(),
-        board_id,
-        run_id.clone(),
-        board_id,
-        label,
-        total_steps as u64,
-    );
-    let mut processed: u64 = 0;
-    let mut current_stage: Option<String> = None;
-    let mut current_item: Option<String> = None;
-    let mut any_failed = false;
-
-    // Execute in topological order
-    for node_idx in order {
-        let step_id = &graph[node_idx];
-        let cell = cell_map[step_id];
-        let config = config_map[step_id];
-
-        // Skip already completed steps
-        if config.state.status == "human_approved" || config.state.status == "skipped" {
-            tracing::info!("Step {} already {}, skipping", step_id, config.state.status);
-            continue;
-        }
-
-        let stage = step_stage(config);
-        let name = first_line(&cell.content);
-        let plugin = step_plugin(cell);
-
-        // Skip manual steps (need human action) — surface them as a gate.
-        if config.executor == "manual" {
-            tracing::info!("Step {} is manual, skipping execution", step_id);
-            update_step_state(board_id, &cell.cell_id, cell, "scheduled", None, None, &run_id, command_tx)?;
-            let now = chrono::Utc::now().timestamp();
-            let _ = event_tx.send(tags.step_state(
-                step_id, &name, &stage, StepState::AwaitingApproval, Actor::Human, plugin.clone(), now,
-            ));
-            let _ = event_tx.send(tags.approval_requested(step_id, &name, &stage, now));
-            obs.record(StepObs {
-                step_id: step_id.clone(),
-                name: name.clone(),
-                stage: stage.clone(),
-                actor: Actor::Human,
-                plugin,
-                state: StepState::AwaitingApproval,
-                wall_ms: 0,
-                gate_ms: 0,
-                cost: StepCost::default(),
-            });
-            current_stage = Some(stage);
-            current_item = Some(name);
-            continue;
-        }
-
-        // Check if dependencies are met
-        let deps_met = config.depends_on.iter().all(|dep| {
-            config_map.get(dep)
-                .map(|c| c.state.status == "human_approved" ||
-                    (c.auto_advance && c.state.status == "ai_complete"))
-                .unwrap_or(true) // unknown deps are considered met
-        });
-
-        if !deps_met {
-            tracing::info!("Step {} dependencies not met, marking scheduled", step_id);
-            update_step_state(board_id, &cell.cell_id, cell, "scheduled", None, None, &run_id, command_tx)?;
-            let _ = event_tx.send(tags.step_state(
-                step_id, &name, &stage, StepState::Pending, Actor::Ai, plugin.clone(), chrono::Utc::now().timestamp(),
-            ));
-            obs.record(StepObs {
-                step_id: step_id.clone(),
-                name: name.clone(),
-                stage: stage.clone(),
-                actor: Actor::Ai,
-                plugin,
-                state: StepState::Pending,
-                wall_ms: 0,
-                gate_ms: 0,
-                cost: StepCost::default(),
-            });
-            results.push(json!({ "step_id": step_id, "status": "scheduled", "reason": "dependencies_pending" }));
-            continue;
-        }
-
-        // Execute step
-        tracing::info!("Executing step: {} (executor: {})", step_id, config.executor);
-        update_step_state(board_id, &cell.cell_id, cell, "running", None, None, &run_id, command_tx)?;
-
-        // Notify UI that step is running
-        let _ = event_tx.send(SwiftEvent::StatusUpdate {
-            message: format!("Pipeline: step '{}' running", step_id),
-        });
-
-        // Dashboard: step → running + progress through the DAG. Executed steps are
-        // agentic/compute work (`ai`); plugin steps are AI-actor with a `plugin` tag.
-        let actor = Actor::Ai;
-        current_stage = Some(stage.clone());
-        current_item = Some(name.clone());
-        let _ = event_tx.send(tags.step_state(
-            step_id, &name, &stage, StepState::Running, actor, plugin.clone(), chrono::Utc::now().timestamp(),
-        ));
-        let _ = event_tx.send(tags.step_progress(step_id, &stage, processed, total_steps as u64, &name));
-
-        let start = std::time::Instant::now();
-
-        // ── Gather inputs from dependency cells (DB reads, not in-memory) ──
-        let dependency_outputs = gather_dependency_outputs(board_id, &config.depends_on);
-        eprintln!("📺 PIPELINE: Step {} has {} dependency outputs: {:?}",
-            step_id,
-            dependency_outputs.len(),
-            dependency_outputs.iter().map(|d| format!("{}({}B)", d["step_id"].as_str().unwrap_or("?"), d["output"].as_str().map(|s| s.len()).unwrap_or(0))).collect::<Vec<_>>()
-        );
-
-        // Asset metadata for ordinary steps, PLUS the cell's own `mcp_tool` spec
-        // (if any) threaded through so the local MCP-tool path can fire. The
-        // executor reads `metadata.mcp_tool` to decide whether a `local` step is a
-        // plugin-tool dispatch — without this merge the on-device MCP path can
-        // never trigger from a real run (it was only reachable by calling
-        // `execute_pipeline_step` directly in unit tests). See `parse_mcp_tool_step`.
-        let mut metadata = crate::pipeline_executor::find_asset_metadata(board_id)
-            .unwrap_or_else(|| json!({}));
-        if let Some(mcp_tool) = cell.metadata_json.as_ref()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-            .and_then(|m| m.get("mcp_tool").cloned())
-        {
-            metadata["mcp_tool"] = mcp_tool;
-        }
-        let metadata = Some(metadata);
-
-        // ── Build step execution context ──
-        let _model_endpoint = config.model_config.as_ref()
-            .and_then(|m| m.endpoint.clone());
-        let _model_id = config.model_config.as_ref()
-            .map(|m| m.id.clone())
-            .or_else(|| config.model.clone());
-
-        let result = match crate::pipeline_executor::execute_pipeline_step(
-            board_id, step_id, &cell.content, &config.executor,
-            metadata, dependency_outputs, command_tx, event_tx,
-        ).await {
-            Ok((summary, findings)) => {
-                Ok(summary)
-            }
-            Err(e) => Err(e),
-        };
-
-        let duration = start.elapsed().as_secs_f64();
-        let wall_ms = (duration * 1000.0) as u64;
-        // Cost rail: a step's compute wall time is a GPU-time proxy on the cost rail
-        // (DASHBOARD_CONTRACT §C `gpu_ms`). External (plugin) USD is attributed on the
-        // executor's own obs and is not threaded back here yet (noted in STATUS).
-        let cost = StepCost { gpu_ms: wall_ms, ..StepCost::default() };
-        processed += 1;
-
-        match result {
-            Ok(output) => {
-                tracing::info!("Step {} completed in {:.1}s", step_id, duration);
-                update_step_state_full(
-                    board_id, &cell.cell_id, cell, "ai_complete",
-                    Some(&output), None, &run_id, Some(duration), command_tx,
-                )?;
-
-                // Send notification
-                let _ = event_tx.send(SwiftEvent::StatusUpdate {
-                    message: format!("Pipeline: step '{}' complete ({:.1}s)", step_id, duration),
-                });
-
-                // Dashboard: step → done.
-                let _ = event_tx.send(tags.step_state(
-                    step_id, &name, &stage, StepState::Done, actor, plugin.clone(), chrono::Utc::now().timestamp(),
-                ));
-                obs.record(StepObs {
-                    step_id: step_id.clone(),
-                    name: name.clone(),
-                    stage: stage.clone(),
-                    actor,
-                    plugin: plugin.clone(),
-                    state: StepState::Done,
-                    wall_ms,
-                    gate_ms: 0,
-                    cost: cost.clone(),
-                });
-
-                // Process notifications for this step
-                fire_notifications(config, "ai_complete", board_id, step_id, event_tx);
-
-                results.push(json!({
-                    "step_id": step_id,
-                    "status": "ai_complete",
-                    "duration": duration,
-                    "output_length": output.len()
-                }));
-            }
-            Err(e) => {
-                tracing::error!("Step {} failed: {}", step_id, e);
-                update_step_state(
-                    board_id, &cell.cell_id, cell, "failed",
-                    None, Some(&e.to_string()), &run_id, command_tx,
-                )?;
-
-                // Dashboard: step → failed.
-                any_failed = true;
-                let _ = event_tx.send(tags.step_state(
-                    step_id, &name, &stage, StepState::Failed, actor, plugin.clone(), chrono::Utc::now().timestamp(),
-                ));
-                obs.record(StepObs {
-                    step_id: step_id.clone(),
-                    name: name.clone(),
-                    stage: stage.clone(),
-                    actor,
-                    plugin: plugin.clone(),
-                    state: StepState::Failed,
-                    wall_ms,
-                    gate_ms: 0,
-                    cost: cost.clone(),
-                });
-
-                fire_notifications(config, "failed", board_id, step_id, event_tx);
-
-                results.push(json!({
-                    "step_id": step_id,
-                    "status": "failed",
-                    "error": e.to_string()
-                }));
-
-                // Don't break — continue with independent steps
-            }
-        }
-    }
-
-    // Check if pipeline is complete
-    let all_done = steps.iter().all(|(_, config)| {
-        config.state.status == "human_approved" || config.state.status == "skipped"
     });
+    let label = workflow_label(board_id);
+    let _ = event_tx.send(tags.run_started(label.clone(), total_steps, now_ts()));
 
+    let mut acc = RunAccum {
+        obs: RunObs::new(tags.tenant_id.clone(), board_id, run_id.clone(), board_id, label, total_steps as u64),
+        results: Vec::new(),
+        any_failed: false,
+        processed: 0,
+        current_stage: None,
+        current_item: None,
+    };
+
+    let (mode, peak) = match plan {
+        Some(plan) => {
+            tracing::info!("Pipeline run {} started: {} steps, WAVE-CONCURRENT (plan: {} waves)", run_id, total_steps, plan.waves.len());
+            let peak = execute_waves(&plan, &exec_steps, board_id, &tags, total_steps as u64, command_tx, event_tx, &mut acc).await;
+            ("wave", peak)
+        }
+        None => {
+            tracing::info!("Pipeline run {} started: {} steps in DAG order (sequential)", run_id, total_steps);
+            let peak = execute_sequential(&order, &graph, &exec_steps, board_id, &tags, total_steps as u64, command_tx, event_tx, &mut acc).await;
+            ("sequential", peak)
+        }
+    };
+
+    // Fire pipeline_complete notifications iff every step was already terminal
+    // before the run (preserves the prior behavior, computed on original state).
+    let all_done = exec_steps.values().all(|s| s.status == "human_approved" || s.status == "skipped");
     if all_done {
-        // Fire pipeline_complete notifications
-        for (_, config) in &steps {
-            fire_notifications(config, "pipeline_complete", board_id, &config.step_id, event_tx);
+        for s in exec_steps.values() {
+            fire_notifications(&s.notifications, "pipeline_complete", board_id, &s.step_id, event_tx);
         }
     }
 
     // ── Dashboard producer: the rolled-up read-model + the run-finished marker. ──
-    let finished_at = chrono::Utc::now().timestamp();
-    let snapshot = obs.snapshot(finished_at, current_item, current_stage);
+    let finished_at = now_ts();
+    let snapshot = acc.obs.snapshot(finished_at, acc.current_item.clone(), acc.current_stage.clone());
     let _ = event_tx.send(tags.stats(snapshot));
-    let run_state = if any_failed { "failed" } else { "done" };
+    let run_state = if acc.any_failed { "failed" } else { "done" };
     let _ = event_tx.send(tags.run_finished(run_state, finished_at));
 
     Ok(json!({
         "run_id": run_id,
         "board_id": board_id,
-        "steps_executed": results.len(),
-        "results": results
+        "mode": mode,
+        "peak_concurrency": peak,
+        "steps_executed": acc.results.len(),
+        "results": acc.results
     }))
+}
+
+/// SEQUENTIAL fallback — the prior toposort loop, run one step at a time. This is
+/// the offline path (no Lens plan); behavior is unchanged from before Round 7.
+/// Returns peak in-flight concurrency = 1 (sequential).
+#[allow(clippy::too_many_arguments)]
+async fn execute_sequential(
+    order: &[NodeIndex],
+    graph: &DiGraph<String, ()>,
+    exec_steps: &HashMap<String, ExecStep>,
+    board_id: &str,
+    tags: &std::sync::Arc<RunTags>,
+    total_steps: u64,
+    command_tx: &UnboundedSender<CommandMsg>,
+    event_tx: &UnboundedSender<SwiftEvent>,
+    acc: &mut RunAccum,
+) -> usize {
+    for node_idx in order {
+        let step_id = &graph[*node_idx];
+        let Some(step) = exec_steps.get(step_id) else { continue };
+
+        if step.status == "human_approved" || step.status == "skipped" {
+            tracing::info!("Step {} already {}, skipping", step_id, step.status);
+            continue;
+        }
+
+        // Manual steps surface as a gate (awaiting human approval).
+        if step.executor == "manual" {
+            acc.fold(gate_outcome(board_id, tags, step, command_tx, event_tx));
+            continue;
+        }
+
+        // Dependency gate (the prior semantics): a dep is "met" if approved, or
+        // auto-advancing and AI-complete; unknown deps are considered met.
+        let deps_met = step.depends_on.iter().all(|dep| {
+            exec_steps.get(dep)
+                .map(|c| c.status == "human_approved" || (c.auto_advance && c.status == "ai_complete"))
+                .unwrap_or(true)
+        });
+        if !deps_met {
+            acc.fold(pending_outcome(board_id, tags, step, "dependencies_pending", command_tx, event_tx));
+            continue;
+        }
+
+        let snapshot = acc.processed;
+        let outcome = exec_one_step(
+            board_id.to_string(), tags.clone(), total_steps, snapshot,
+            step.clone(), command_tx.clone(), event_tx.clone(),
+        ).await;
+        acc.processed += 1;
+        acc.fold(outcome);
+    }
+    1
+}
+
+/// WAVE-CONCURRENT executor — runs the Lens physical plan. Waves run in `index`
+/// order; within a wave, batches run one after another and each batch's steps run
+/// concurrently (a `JoinSet` task per step). Cache hits reuse the prior artifact;
+/// gate barriers stall only their own branch. Returns the peak in-flight degree
+/// (the largest batch the executor launched concurrently).
+#[allow(clippy::too_many_arguments)]
+async fn execute_waves(
+    plan: &crate::exec_plan::PhysicalPlan,
+    exec_steps: &HashMap<String, ExecStep>,
+    board_id: &str,
+    tags: &std::sync::Arc<RunTags>,
+    total_steps: u64,
+    command_tx: &UnboundedSender<CommandMsg>,
+    event_tx: &UnboundedSender<SwiftEvent>,
+    acc: &mut RunAccum,
+) -> usize {
+    let mut peak = 0usize;
+
+    for wave in plan.ordered_waves() {
+        for batch in wave.ordered_batches() {
+            // Classify each step: skip / cache-hit / gate / stalled-behind-gate /
+            // execute. Only "execute" steps are spawned concurrently.
+            let mut sync_outcomes: Vec<StepOutcome> = Vec::new();
+            let mut to_exec: Vec<ExecStep> = Vec::new();
+
+            for sid in &batch {
+                let Some(step) = exec_steps.get(sid) else {
+                    tracing::warn!("Plan references step {} not in board; skipping", sid);
+                    continue;
+                };
+                if step.status == "human_approved" || step.status == "skipped" {
+                    continue;
+                }
+                let planned = wave.step(sid);
+
+                // Cache hit → reuse the prior artifact, skip execution.
+                if planned.map(|p| p.cache_hit).unwrap_or(false) {
+                    sync_outcomes.push(cache_hit_outcome(board_id, tags, step, command_tx, event_tx));
+                    continue;
+                }
+
+                // A human-approval gate (manual step or plan `is_gate`) surfaces as
+                // awaiting-approval; it does not block independent branches.
+                if step.executor == "manual" || planned.map(|p| p.is_gate).unwrap_or(false) {
+                    sync_outcomes.push(gate_outcome(board_id, tags, step, command_tx, event_tx));
+                    continue;
+                }
+
+                // Branch barrier: a step behind an unapproved gate stalls (only its
+                // branch). A gate counts as satisfied once it is `human_approved`
+                // (e.g. on a re-run after approval).
+                if let Some(gate) = planned.and_then(|p| p.gate_barrier.clone())
+                    && !gate_satisfied(exec_steps, &gate)
+                {
+                    sync_outcomes.push(pending_outcome(board_id, tags, step, "gate_pending", command_tx, event_tx));
+                    continue;
+                }
+
+                to_exec.push(step.clone());
+            }
+
+            for o in sync_outcomes {
+                acc.fold(o);
+            }
+
+            if to_exec.is_empty() {
+                continue;
+            }
+
+            // Launch the batch concurrently. The batch size IS the in-flight degree
+            // (we spawn all, then await all) — bounded by the plan's concurrency cap.
+            peak = peak.max(to_exec.len());
+            let snapshot = acc.processed;
+            let mut js: tokio::task::JoinSet<StepOutcome> = tokio::task::JoinSet::new();
+            for step in to_exec {
+                js.spawn(exec_one_step(
+                    board_id.to_string(), tags.clone(), total_steps, snapshot,
+                    step, command_tx.clone(), event_tx.clone(),
+                ));
+            }
+            while let Some(joined) = js.join_next().await {
+                match joined {
+                    Ok(outcome) => {
+                        acc.processed += 1;
+                        acc.fold(outcome);
+                    }
+                    Err(e) => tracing::error!("wave step task failed to join: {}", e),
+                }
+            }
+        }
+    }
+
+    peak
+}
+
+/// A gate is satisfied (its branch may proceed) once it is `human_approved`.
+fn gate_satisfied(exec_steps: &HashMap<String, ExecStep>, gate_id: &str) -> bool {
+    exec_steps.get(gate_id).map(|s| s.status == "human_approved").unwrap_or(false)
+}
+
+/// Run ONE step: emit running → progress, execute it, emit the terminal state, and
+/// build its obs/result. Owned args so it can be spawned. Shared by both paths.
+async fn exec_one_step(
+    board_id: String,
+    tags: std::sync::Arc<RunTags>,
+    total_steps: u64,
+    processed_snapshot: u64,
+    step: ExecStep,
+    command_tx: UnboundedSender<CommandMsg>,
+    event_tx: UnboundedSender<SwiftEvent>,
+) -> StepOutcome {
+    let actor = Actor::Ai;
+    tracing::info!("Executing step: {} (executor: {})", step.step_id, step.executor);
+
+    if let Err(e) = update_step_state(&board_id, &step.cell_id, "running", None, None, &tags.run_id, &command_tx) {
+        tracing::error!("step {} running-state write failed: {}", step.step_id, e);
+    }
+    let _ = event_tx.send(SwiftEvent::StatusUpdate {
+        message: format!("Pipeline: step '{}' running", step.step_id),
+    });
+    let _ = event_tx.send(tags.step_state(&step.step_id, &step.name, &step.stage, StepState::Running, actor, step.plugin.clone(), now_ts()));
+    let _ = event_tx.send(tags.step_progress(&step.step_id, &step.stage, processed_snapshot, total_steps, &step.name));
+
+    let start = std::time::Instant::now();
+
+    let dependency_outputs = gather_dependency_outputs(&board_id, &step.depends_on);
+    eprintln!("📺 PIPELINE: Step {} has {} dependency outputs", step.step_id, dependency_outputs.len());
+
+    let mut metadata = crate::pipeline_executor::find_asset_metadata(&board_id).unwrap_or_else(|| json!({}));
+    if let Some(mcp_tool) = step.mcp_tool.clone() {
+        metadata["mcp_tool"] = mcp_tool;
+    }
+    let metadata = Some(metadata);
+
+    let result = crate::pipeline_executor::execute_pipeline_step(
+        &board_id, &step.step_id, &step.content, &step.executor,
+        metadata, dependency_outputs, &command_tx, &event_tx,
+    ).await.map(|(summary, _findings)| summary);
+
+    let duration = start.elapsed().as_secs_f64();
+    let wall_ms = (duration * 1000.0) as u64;
+    // Cost rail: compute wall time is a GPU-time proxy (DASHBOARD_CONTRACT §C).
+    let cost = StepCost { gpu_ms: wall_ms, ..StepCost::default() };
+
+    match result {
+        Ok(output) => {
+            tracing::info!("Step {} completed in {:.1}s", step.step_id, duration);
+            if let Err(e) = update_step_state_full(&board_id, &step.cell_id, "ai_complete", Some(&output), None, &tags.run_id, Some(duration), &command_tx) {
+                tracing::error!("step {} done-state write failed: {}", step.step_id, e);
+            }
+            let _ = event_tx.send(SwiftEvent::StatusUpdate {
+                message: format!("Pipeline: step '{}' complete ({:.1}s)", step.step_id, duration),
+            });
+            let _ = event_tx.send(tags.step_state(&step.step_id, &step.name, &step.stage, StepState::Done, actor, step.plugin.clone(), now_ts()));
+            fire_notifications(&step.notifications, "ai_complete", &board_id, &step.step_id, &event_tx);
+            StepOutcome {
+                obs: StepObs {
+                    step_id: step.step_id.clone(), name: step.name.clone(), stage: step.stage.clone(),
+                    actor, plugin: step.plugin.clone(), state: StepState::Done, wall_ms, gate_ms: 0, cost,
+                },
+                result: Some(json!({ "step_id": step.step_id, "status": "ai_complete", "duration": duration, "output_length": output.len() })),
+                failed: false,
+                stage: step.stage,
+                name: step.name,
+            }
+        }
+        Err(e) => {
+            tracing::error!("Step {} failed: {}", step.step_id, e);
+            if let Err(we) = update_step_state(&board_id, &step.cell_id, "failed", None, Some(&e.to_string()), &tags.run_id, &command_tx) {
+                tracing::error!("step {} failed-state write failed: {}", step.step_id, we);
+            }
+            let _ = event_tx.send(tags.step_state(&step.step_id, &step.name, &step.stage, StepState::Failed, actor, step.plugin.clone(), now_ts()));
+            fire_notifications(&step.notifications, "failed", &board_id, &step.step_id, &event_tx);
+            StepOutcome {
+                obs: StepObs {
+                    step_id: step.step_id.clone(), name: step.name.clone(), stage: step.stage.clone(),
+                    actor, plugin: step.plugin.clone(), state: StepState::Failed, wall_ms, gate_ms: 0, cost,
+                },
+                result: Some(json!({ "step_id": step.step_id, "status": "failed", "error": e.to_string() })),
+                failed: true,
+                stage: step.stage,
+                name: step.name,
+            }
+        }
+    }
+}
+
+/// A manual/gate step → awaiting-approval (DASHBOARD_CONTRACT §A). No execution.
+fn gate_outcome(
+    board_id: &str,
+    tags: &RunTags,
+    step: &ExecStep,
+    command_tx: &UnboundedSender<CommandMsg>,
+    event_tx: &UnboundedSender<SwiftEvent>,
+) -> StepOutcome {
+    tracing::info!("Step {} is a gate, awaiting approval", step.step_id);
+    if let Err(e) = update_step_state(board_id, &step.cell_id, "scheduled", None, None, &tags.run_id, command_tx) {
+        tracing::error!("step {} gate-state write failed: {}", step.step_id, e);
+    }
+    let now = now_ts();
+    let _ = event_tx.send(tags.step_state(&step.step_id, &step.name, &step.stage, StepState::AwaitingApproval, Actor::Human, step.plugin.clone(), now));
+    let _ = event_tx.send(tags.approval_requested(&step.step_id, &step.name, &step.stage, now));
+    StepOutcome {
+        obs: StepObs {
+            step_id: step.step_id.clone(), name: step.name.clone(), stage: step.stage.clone(),
+            actor: Actor::Human, plugin: step.plugin.clone(), state: StepState::AwaitingApproval,
+            wall_ms: 0, gate_ms: 0, cost: StepCost::default(),
+        },
+        result: None,
+        failed: false,
+        stage: step.stage.clone(),
+        name: step.name.clone(),
+    }
+}
+
+/// A step whose deps/gate aren't met → pending (scheduled). No execution.
+fn pending_outcome(
+    board_id: &str,
+    tags: &RunTags,
+    step: &ExecStep,
+    reason: &str,
+    command_tx: &UnboundedSender<CommandMsg>,
+    event_tx: &UnboundedSender<SwiftEvent>,
+) -> StepOutcome {
+    tracing::info!("Step {} pending ({})", step.step_id, reason);
+    if let Err(e) = update_step_state(board_id, &step.cell_id, "scheduled", None, None, &tags.run_id, command_tx) {
+        tracing::error!("step {} pending-state write failed: {}", step.step_id, e);
+    }
+    let _ = event_tx.send(tags.step_state(&step.step_id, &step.name, &step.stage, StepState::Pending, Actor::Ai, step.plugin.clone(), now_ts()));
+    StepOutcome {
+        obs: StepObs {
+            step_id: step.step_id.clone(), name: step.name.clone(), stage: step.stage.clone(),
+            actor: Actor::Ai, plugin: step.plugin.clone(), state: StepState::Pending,
+            wall_ms: 0, gate_ms: 0, cost: StepCost::default(),
+        },
+        result: Some(json!({ "step_id": step.step_id, "status": "scheduled", "reason": reason })),
+        failed: false,
+        stage: step.stage.clone(),
+        name: step.name.clone(),
+    }
+}
+
+/// A cache-hit step → reuse the prior persisted artifact (the cell's existing
+/// output), mark done, NO execution (DASHBOARD_CONTRACT §A; plan `cache_hit`).
+fn cache_hit_outcome(
+    board_id: &str,
+    tags: &RunTags,
+    step: &ExecStep,
+    command_tx: &UnboundedSender<CommandMsg>,
+    event_tx: &UnboundedSender<SwiftEvent>,
+) -> StepOutcome {
+    tracing::info!("Step {} cache hit — reusing prior artifact", step.step_id);
+    let prior = read_cell_output(board_id, &step.cell_id);
+    if let Err(e) = update_step_state_full(board_id, &step.cell_id, "ai_complete", prior.as_deref(), None, &tags.run_id, Some(0.0), command_tx) {
+        tracing::error!("step {} cache-state write failed: {}", step.step_id, e);
+    }
+    let _ = event_tx.send(SwiftEvent::StatusUpdate {
+        message: format!("Pipeline: step '{}' cache hit (reused artifact)", step.step_id),
+    });
+    let _ = event_tx.send(tags.step_state(&step.step_id, &step.name, &step.stage, StepState::Done, Actor::Ai, step.plugin.clone(), now_ts()));
+    StepOutcome {
+        obs: StepObs {
+            step_id: step.step_id.clone(), name: step.name.clone(), stage: step.stage.clone(),
+            actor: Actor::Ai, plugin: step.plugin.clone(), state: StepState::Done,
+            wall_ms: 0, gate_ms: 0, cost: StepCost::default(), // reuse = no compute cost
+        },
+        result: Some(json!({ "step_id": step.step_id, "status": "cache_hit" })),
+        failed: false,
+        stage: step.stage.clone(),
+        name: step.name.clone(),
+    }
+}
+
+/// Read a cell's current persisted `output` (the reusable artifact for a cache hit).
+fn read_cell_output(_board_id: &str, cell_id: &str) -> Option<String> {
+    let conn = storage::db().lock().ok()?;
+    conn.query_row(
+        "SELECT output FROM notebook_cells WHERE id = ?1",
+        rusqlite::params![cell_id],
+        |row| row.get::<_, Option<String>>(0),
+    ).ok().flatten()
+}
+
+/// Load the board's Lens physical plan, if one has been persisted (the compile path
+/// stores it on the board `objects.data` as `{"physical_plan": {...}}`). Today the
+/// Lens compile→backend wiring is deferred, so this is normally `None` ⇒ sequential.
+/// A malformed plan degrades to `None` (the run still proceeds, sequentially).
+fn load_physical_plan(board_id: &str) -> Option<crate::exec_plan::PhysicalPlan> {
+    let conn = storage::db().lock().ok()?;
+    let data: Option<String> = conn.query_row(
+        "SELECT data FROM objects WHERE id = ?1 AND type = 'whiteboard' LIMIT 1",
+        rusqlite::params![board_id],
+        |row| row.get::<_, Option<String>>(0),
+    ).ok().flatten();
+    drop(conn);
+    let v: serde_json::Value = serde_json::from_str(&data?).ok()?;
+    serde_json::from_value(v.get("physical_plan")?.clone()).ok()
 }
 
 // ============================================================================
@@ -1408,20 +1648,18 @@ fn load_pipeline_cells(board_id: &str) -> Result<Vec<PipelineCell>> {
 fn update_step_state(
     board_id: &str,
     cell_id: &str,
-    cell: &PipelineCell,
     status: &str,
     ai_result: Option<&str>,
     error: Option<&str>,
     run_id: &str,
     command_tx: &UnboundedSender<CommandMsg>,
 ) -> Result<()> {
-    update_step_state_full(board_id, cell_id, cell, status, ai_result, error, run_id, None, command_tx)
+    update_step_state_full(board_id, cell_id, status, ai_result, error, run_id, None, command_tx)
 }
 
 fn update_step_state_full(
     board_id: &str,
     cell_id: &str,
-    _cell: &PipelineCell, // kept for signature compat, but we re-read from DB
     status: &str,
     ai_result: Option<&str>,
     error: Option<&str>,
@@ -1486,13 +1724,13 @@ fn update_step_state_full(
 
 /// Fire notifications for a step event
 fn fire_notifications(
-    config: &PipelineStepConfig,
+    notifications: &[StepNotification],
     trigger: &str,
     board_id: &str,
     step_id: &str,
     event_tx: &UnboundedSender<SwiftEvent>,
 ) {
-    for notif in &config.notifications {
+    for notif in notifications {
         if notif.trigger == trigger {
             let message = notif.message.as_deref().unwrap_or("Pipeline step update");
 

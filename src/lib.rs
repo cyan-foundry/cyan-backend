@@ -1525,3 +1525,4 @@ pub mod timecode_notes;
 pub mod skills;
 pub mod pipeline_executor;
 pub mod dashboard;
+pub mod exec_plan;
