@@ -624,6 +624,69 @@ pub extern "C" fn cyan_delete_chat(id: *const c_char) {
     let _ = sys.command_tx.send(CommandMsg::DeleteChat { id });
 }
 
+// ---------- FFI: notes (ROUND8 §W2 — board-level authored LWW ledger) ----------
+/// Author or edit a note on a board. `note_id` null ⇒ create a new note; non-null ⇒
+/// edit that note (LWW on `updated_at`). `tenant_id` null ⇒ derive from the board's
+/// group. Additive verb — never replaces any existing FFI.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_note_put(
+    board_id: *const c_char,
+    note_id: *const c_char,
+    tenant_id: *const c_char,
+    text: *const c_char,
+) {
+    let Some(board) = (unsafe { cstr_arg(board_id) }) else {
+        return;
+    };
+    let Some(text) = (unsafe { cstr_arg(text) }) else {
+        return;
+    };
+    let note_id = unsafe { cstr_arg(note_id) }; // null ⇒ new note
+    let tenant_id = unsafe { cstr_arg(tenant_id) }; // null ⇒ derive from board's group
+
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let _ = sys.command_tx.send(CommandMsg::PutNote {
+        board_id: board,
+        note_id,
+        tenant_id,
+        text,
+    });
+}
+
+/// List a board's notes as a JSON array of `NoteDTO`, tenant-scoped to the board's
+/// group. Caller owns the returned string and must free it with `cyan_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_note_list(board_id: *const c_char) -> *mut c_char {
+    let Some(board) = (unsafe { cstr_arg(board_id) }) else {
+        return std::ptr::null_mut();
+    };
+    // Tenant is the board's group (group == tenant); fall back to the board id so an
+    // un-grouped board still returns its own notes rather than nothing.
+    let tenant = storage::board_get_group_id(&board).unwrap_or_else(|| board.clone());
+    let notes = storage::note_list_by_board(&board, &tenant).unwrap_or_default();
+    let json = serde_json::to_string(&notes).unwrap_or_else(|_| "[]".to_string());
+    match CString::new(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Delete a note by id.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_note_delete(id: *const c_char) {
+    let Some(id) = (unsafe { cstr_arg(id) }) else {
+        return;
+    };
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let _ = sys.command_tx.send(CommandMsg::DeleteNote { id });
+}
+
 // ---------- FFI: direct chats ----------
 /// Start a direct QUIC chat stream with a peer
 #[unsafe(no_mangle)]

@@ -31,7 +31,7 @@
 //! - `join_group <gid> [bootstrap_hex]`   `@@CYAN@@ ok join_group`
 //! - `wait_sync <gid> <timeout_ms>`       `@@CYAN@@ ok wait_sync` | `@@CYAN@@ timeout wait_sync`
 //! - `count <kind> <gid>`                 `@@CYAN@@ count <kind> <n>`
-//!   kinds: groups|workspaces|boards|elements|cells|chats|files
+//!   kinds: groups|workspaces|boards|elements|cells|chats|notes|files
 //! - `admin_pubkey`                       `@@CYAN@@ admin_pubkey <hex>`
 //! - `enforce_group <gid>`                `@@CYAN@@ ok enforce_group` (enforce + self=Owner-admin)
 //! - `set_admin <gid> <pubkey> [role]`    `@@CYAN@@ ok set_admin`
@@ -41,6 +41,7 @@
 //!
 //! ## Stress / chaos fabric verbs (Round 7)
 //! - `post_edits <gid> <n> [board]`       `@@CYAN@@ ok post_edits <n>` (local insert + gossip broadcast)
+//! - `post_notes <gid> <n> [board]`       `@@CYAN@@ ok post_notes <n>` (local note insert, NO broadcast; digest-converge)
 //! - `seed_blob <gid> <size> [name]`      `@@CYAN@@ blob <file_id> <hash>` (hold + announce)
 //! - `fetch_blob <gid> <fid> <hash> <src> <size> <to_ms>`  `@@CYAN@@ fetched <path>` | `timeout fetch_blob`
 //! - `verify_blob <fid> <hash>`           `@@CYAN@@ verify ok|mismatch|missing` (blake3 re-check)
@@ -494,6 +495,40 @@ async fn handle_verb(
             Ok(format!("ok post_local {n}"))
         }
 
+        // Author `n` notes (ROUND8 §W2) into THIS node's storage WITHOUT broadcasting —
+        // the deterministic stand-in for "the live NoteAdded never reached the peer".
+        // Note ids are namespaced by this node's id so concurrent multi-source posting
+        // never collides; with notes in the digest + snapshot, ONLY the anti-entropy
+        // sweep can reconcile them, so "every peer ends with the exact union" is the
+        // digest-convergence proof. `post_notes <gid> <n> [board]` → `ok post_notes <n>`.
+        "post_notes" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?;
+            let n: usize = rest
+                .get(1)
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| anyhow!("count required"))?;
+            let board = rest
+                .get(2)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{gid}-board"));
+            let tag = &node_id[..8.min(node_id.len())];
+            let now = chrono::Utc::now().timestamp();
+            for i in 0..n {
+                let note = cyan_backend::models::dto::NoteDTO {
+                    id: format!("{gid}-n-{tag}-{i:06}"),
+                    board_id: board.clone(),
+                    tenant_id: gid.to_string(),
+                    author_id: node_id.to_string(),
+                    author_name: format!("peer-{tag}"),
+                    text: format!("note {i} by {tag}"),
+                    created_at: now,
+                    updated_at: now,
+                };
+                storage::note_upsert(&note).map_err(|e| anyhow!("note_upsert: {e}"))?;
+            }
+            Ok(format!("ok post_notes {n}"))
+        }
+
         // Generate a deterministic blob of <size> bytes, content-address it, hold it in this node's
         // swarm store, and announce it to the group so peers can swarm-fetch. Also writes a file
         // metadata row + local_path so `count files` and direct transfer both see it.
@@ -760,6 +795,12 @@ fn count_kind(kind: &str, group_id: &str) -> Result<usize> {
         "chats" => storage::chat_list_by_workspaces(&ws_ids)
             .map_err(|e| anyhow!("chat_list_by_workspaces: {e}"))?
             .len(),
+        "notes" => {
+            let board_ids = board_ids(&ws_ids)?;
+            storage::note_list_by_boards(&board_ids)
+                .map_err(|e| anyhow!("note_list_by_boards: {e}"))?
+                .len()
+        }
         "files" => storage::file_list_by_group(group_id)
             .map_err(|e| anyhow!("file_list_by_group: {e}"))?
             .len(),

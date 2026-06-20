@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::models::core::{Group, Workspace};
 use crate::models::dto::{
     BoardMetadataDTO, ChatDTO, FileDTO, IntegrationBindingDTO,
-    NotebookCellDTO, WhiteboardDTO, WhiteboardElementDTO,
+    NotebookCellDTO, NoteDTO, WhiteboardDTO, WhiteboardElementDTO,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -55,12 +55,17 @@ pub enum SnapshotFrame {
         elements: Vec<WhiteboardElementDTO>,
         cells: Vec<NotebookCellDTO>,
     },
-    /// All metadata - chats, files, integrations, board metadata
+    /// All metadata - chats, files, integrations, board metadata, notes
     Metadata {
         chats: Vec<ChatDTO>,
         files: Vec<FileDTO>,
         integrations: Vec<IntegrationBindingDTO>,
         board_metadata: Vec<BoardMetadataDTO>,
+        /// ROUND8 §W2 notes. `#[serde(default)]` keeps the frame wire-compatible: an
+        /// older holder serializes Metadata without this field, a newer peer fills it
+        /// with an empty vec; a newer holder's extra field is ignored by older peers.
+        #[serde(default)]
+        notes: Vec<NoteDTO>,
     },
     /// Signals transfer complete
     Complete,

@@ -114,6 +114,26 @@ pub struct ChatDTO {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// NOTE (ROUND8 §W2 — board-level, authored, LWW ledger)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A board-level, authored note. Its own store + own sync stream — NOT a notebook
+/// cell. Editable; conflict resolution is LWW on `updated_at`; the store upserts by
+/// `id` (idempotent, so snapshot apply / anti-entropy repair converge without churn).
+/// `author_name` is resolved from the author's XaeroID profile at authoring time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteDTO {
+    pub id: String,
+    pub board_id: String,
+    pub tenant_id: String,
+    pub author_id: String,
+    pub author_name: String,
+    pub text: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // WHITEBOARD ELEMENT
 // ═══════════════════════════════════════════════════════════════════════════
 

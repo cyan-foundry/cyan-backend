@@ -1574,17 +1574,20 @@ async fn handle_snapshot_server(
         let files = storage::file_list_by_group(&group_id)?;
         let integrations = storage::integration_list_by_group(&group_id)?;
         let board_metadata = storage::board_metadata_list_by_boards(&board_ids)?;
+        let notes = storage::note_list_by_boards(&board_ids)?;
 
         eprintln!("      - chats: {}", chats.len());
         eprintln!("      - files: {}", files.len());
         eprintln!("      - integrations: {}", integrations.len());
         eprintln!("      - board_metadata: {}", board_metadata.len());
+        eprintln!("      - notes: {}", notes.len());
 
         let metadata = SnapshotFrame::Metadata {
             chats,
             files,
             integrations,
             board_metadata,
+            notes,
         };
         let data = serde_json::to_vec(&metadata)?;
         eprintln!("   → Sending Metadata frame ({} bytes)", data.len());

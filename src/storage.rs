@@ -504,6 +504,101 @@ pub fn chat_list_by_workspace(workspace_id: &str) -> Result<Vec<ChatDTO>> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// NOTES (ROUND8 §W2 — board-level, authored, LWW ledger; own store, not cells)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Idempotent **upsert-by-id** with **LWW on `updated_at`**: insert a new note, or, on
+/// an existing id, replace its mutable fields ONLY IF the incoming `updated_at` is
+/// strictly newer. Older OR equal writes are no-ops (so snapshot apply / anti-entropy
+/// repair re-apply the same state without churn). `created_at` is preserved across
+/// edits. Returns `true` iff a row was inserted or updated (i.e. state changed).
+pub fn note_upsert(n: &NoteDTO) -> Result<bool> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    let changed = conn.execute(
+        "INSERT INTO notes (id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(id) DO UPDATE SET
+            board_id    = excluded.board_id,
+            tenant_id   = excluded.tenant_id,
+            author_id   = excluded.author_id,
+            author_name = excluded.author_name,
+            text        = excluded.text,
+            updated_at  = excluded.updated_at
+         WHERE excluded.updated_at > notes.updated_at",
+        params![
+            n.id, n.board_id, n.tenant_id, n.author_id, n.author_name, n.text,
+            n.created_at, n.updated_at
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+/// List a board's notes, **tenant-scoped** — a note never crosses the tenant boundary
+/// even when the board id is known. Ordered by creation time.
+pub fn note_list_by_board(board_id: &str, tenant_id: &str) -> Result<Vec<NoteDTO>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    let mut stmt = conn.prepare(
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at
+         FROM notes WHERE board_id = ?1 AND tenant_id = ?2 ORDER BY created_at",
+    )?;
+    let rows = stmt.query_map(params![board_id, tenant_id], note_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// List all notes attached to the given boards (for the digest + snapshot serializer).
+/// A group is a single tenant, so this is naturally tenant-scoped by the board set.
+pub fn note_list_by_boards(board_ids: &[String]) -> Result<Vec<NoteDTO>> {
+    if board_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    let placeholders: String = board_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at
+         FROM notes WHERE board_id IN ({}) ORDER BY created_at",
+        placeholders
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> =
+        board_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let rows = stmt.query_map(params.as_slice(), note_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Fetch a single note by id (used to resolve its board/group for broadcast + to
+/// preserve `created_at` across edits).
+pub fn note_get(id: &str) -> Result<Option<NoteDTO>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    let mut stmt = conn.prepare(
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at
+         FROM notes WHERE id = ?1",
+    )?;
+    stmt.query_row(params![id], note_from_row)
+        .optional()
+        .map_err(Into::into)
+}
+
+/// Delete a note by id (hard delete, mirrors `chat_delete`).
+pub fn note_delete(id: &str) -> Result<()> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+fn note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteDTO> {
+    Ok(NoteDTO {
+        id: r.get(0)?,
+        board_id: r.get(1)?,
+        tenant_id: r.get(2)?,
+        author_id: r.get(3)?,
+        author_name: r.get(4)?,
+        text: r.get(5)?,
+        created_at: r.get(6)?,
+        updated_at: r.get(7)?,
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // FILES
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1241,6 +1336,26 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     // it stays invisible to the anti-entropy digest (each peer reaches the same
     // migrated state deterministically — no spurious repair churn).
     let _ = migrate_legacy_authoring_cells_conn(conn);
+
+    // ROUND8 §W2: notes — a board-level authored LWW ledger with its OWN store (NOT
+    // notebook cells). Created here for DBs that predate the table; idempotent.
+    if conn.prepare("SELECT id FROM notes LIMIT 1").is_err() {
+        tracing::info!("Migration: creating notes table");
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS notes (
+                id TEXT PRIMARY KEY,
+                board_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                author_id TEXT NOT NULL,
+                author_name TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )",
+            [],
+        );
+        let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_board ON notes(board_id)", []);
+    }
 
     Ok(())
 }

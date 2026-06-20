@@ -1056,6 +1056,29 @@ impl TopicActor {
             NetworkEvent::ChatDeleted { id } => {
                 let _ = storage::chat_delete(id);
             }
+            // ROUND8 §W2 notes — apply via idempotent LWW upsert-by-id; Added/Updated
+            // are handled identically (the split is informational for the UI).
+            NetworkEvent::NoteAdded {
+                id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at,
+            }
+            | NetworkEvent::NoteUpdated {
+                id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at,
+            } => {
+                let note = crate::models::dto::NoteDTO {
+                    id: id.clone(),
+                    board_id: board_id.clone(),
+                    tenant_id: tenant_id.clone(),
+                    author_id: author_id.clone(),
+                    author_name: author_name.clone(),
+                    text: text.clone(),
+                    created_at: *created_at,
+                    updated_at: *updated_at,
+                };
+                let _ = storage::note_upsert(&note);
+            }
+            NetworkEvent::NoteDeleted { id } => {
+                let _ = storage::note_delete(id);
+            }
             NetworkEvent::WhiteboardElementAdded {
                 id, board_id, element_type, x, y, width, height, z_index,
                 style_json, content_json, created_at, updated_at,
@@ -1557,12 +1580,13 @@ async fn download_snapshot(
                 }
             }
 
-            SnapshotFrame::Metadata { chats, files, integrations, board_metadata } => {
+            SnapshotFrame::Metadata { chats, files, integrations, board_metadata, notes } => {
                 eprintln!("📥 [SNAP-DL-9] METADATA frame received:");
                 eprintln!("   chats: {}", chats.len());
                 eprintln!("   files: {}", files.len());
                 eprintln!("   integrations: {}", integrations.len());
                 eprintln!("   board_metadata: {}", board_metadata.len());
+                eprintln!("   notes: {}", notes.len());
 
                 // Insert chats
                 for chat in &chats {
@@ -1603,6 +1627,14 @@ async fn download_snapshot(
                         Some(&meta.board_type), meta.last_accessed, meta.is_pinned,
                     ) {
                         eprintln!("   ⚠️ Board metadata insert: {}", e);
+                    }
+                }
+
+                // Insert notes — idempotent LWW upsert-by-id, so a merge snapshot
+                // (anti-entropy repair) converges to the latest value without churn.
+                for nt in &notes {
+                    if let Err(e) = storage::note_upsert(nt) {
+                        eprintln!("   ⚠️ Note insert: {}", e);
                     }
                 }
 

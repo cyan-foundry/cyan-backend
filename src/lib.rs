@@ -196,6 +196,17 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             FOREIGN KEY (board_id) REFERENCES objects(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_board_rating ON board_metadata(rating DESC);
+        CREATE TABLE IF NOT EXISTS notes (
+            id TEXT PRIMARY KEY,
+            board_id TEXT NOT NULL,
+            tenant_id TEXT NOT NULL,
+            author_id TEXT NOT NULL,
+            author_name TEXT NOT NULL,
+            text TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_notes_board ON notes(board_id);
         "#,
     )?;
 
@@ -714,6 +725,86 @@ impl CommandActor {
                     }
 
                     let _ = self.event_tx.send(SwiftEvent::Network(NetworkEvent::ChatDeleted { id }));
+                }
+
+                // ── Note commands (ROUND8 §W2) — board-level authored LWW ledger ──
+                CommandMsg::PutNote { board_id, note_id, tenant_id, text } => {
+                    let now = chrono::Utc::now().timestamp();
+                    let author_id = self.node_id.clone();
+                    // author_name resolves from the author's XaeroID profile (same path
+                    // presence/chat use); fall back to the raw id if no profile yet.
+                    let author_name = storage::profile_get(&author_id)
+                        .map(|(name, _)| name)
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or_else(|| author_id.clone());
+
+                    // Tenant: explicit, else the board's group (group == tenant).
+                    let group_id = self.get_group_id_for_board(&board_id);
+                    let tenant = tenant_id
+                        .or_else(|| group_id.clone())
+                        .unwrap_or_else(|| author_id.clone());
+
+                    // Editing an existing note preserves its original created_at; a new
+                    // note gets a generated id + created_at = now. An id that resolves to
+                    // an existing row is an edit (NoteUpdated); otherwise it's an add.
+                    let id = note_id.unwrap_or_else(|| {
+                        blake3::hash(format!("note:{board_id}-{text}-{now}").as_bytes())
+                            .to_hex()
+                            .to_string()
+                    });
+                    let existing = storage::note_get(&id).ok().flatten();
+                    let is_new = existing.is_none();
+                    let created_at = existing.map(|n| n.created_at).unwrap_or(now);
+
+                    let note = crate::models::dto::NoteDTO {
+                        id: id.clone(),
+                        board_id: board_id.clone(),
+                        tenant_id: tenant.clone(),
+                        author_id: author_id.clone(),
+                        author_name: author_name.clone(),
+                        text: text.clone(),
+                        created_at,
+                        updated_at: now,
+                    };
+                    match storage::note_upsert(&note) {
+                        Ok(_) => tracing::info!(tenant_id = %tenant, "obs note_put board={board_id} id={id}"),
+                        Err(e) => eprintln!("📝 [NOTE] 🔴 note_upsert failed: {e}"),
+                    }
+
+                    let event = if is_new {
+                        NetworkEvent::NoteAdded {
+                            id, board_id, tenant_id: tenant, author_id, author_name,
+                            text, created_at, updated_at: now,
+                        }
+                    } else {
+                        NetworkEvent::NoteUpdated {
+                            id, board_id, tenant_id: tenant, author_id, author_name,
+                            text, created_at, updated_at: now,
+                        }
+                    };
+
+                    if let Some(gid) = group_id {
+                        let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                            group_id: gid,
+                            event: event.clone(),
+                        });
+                    }
+                    let _ = self.event_tx.send(SwiftEvent::Network(event));
+                }
+
+                CommandMsg::DeleteNote { id } => {
+                    let group_id = storage::note_get(&id)
+                        .ok()
+                        .flatten()
+                        .and_then(|n| self.get_group_id_for_board(&n.board_id));
+                    let _ = storage::note_delete(&id);
+                    if let Some(gid) = group_id {
+                        let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                            group_id: gid,
+                            event: NetworkEvent::NoteDeleted { id: id.clone() },
+                        });
+                    }
+                    let _ = self.event_tx.send(SwiftEvent::Network(NetworkEvent::NoteDeleted { id }));
                 }
 
                 // Whiteboard element commands
@@ -1418,6 +1509,15 @@ fn route_event_to_buffers(
                 }
                 NetworkEvent::ChatDeleted { .. } => {
                     chat_panel.lock().unwrap().push_back(event_json.to_string());
+                }
+
+                // Note events → Whiteboard buffer (notes are board-level content; the
+                // app reads the authoritative list via cyan_note_list and treats these
+                // as change signals). ROUND8 §W2.
+                NetworkEvent::NoteAdded { .. } |
+                NetworkEvent::NoteUpdated { .. } |
+                NetworkEvent::NoteDeleted { .. } => {
+                    whiteboard.lock().unwrap().push_back(event_json.to_string());
                 }
 
                 // Whiteboard element events → Whiteboard

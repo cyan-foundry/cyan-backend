@@ -77,6 +77,34 @@ pub enum NetworkEvent {
     ChatDeleted {
         id: String,
     },
+    // ---- Note events (ROUND8 §W2 — board-level, authored, LWW ledger) ----
+    /// A note was authored. The receiver applies it via the idempotent LWW
+    /// upsert-by-id, so `NoteAdded`/`NoteUpdated` are handled identically on apply —
+    /// the split is purely informational for the UI.
+    NoteAdded {
+        id: String,
+        board_id: String,
+        tenant_id: String,
+        author_id: String,
+        author_name: String,
+        text: String,
+        created_at: i64,
+        updated_at: i64,
+    },
+    /// A note was edited. Conflict resolution is LWW on `updated_at` (older edits drop).
+    NoteUpdated {
+        id: String,
+        board_id: String,
+        tenant_id: String,
+        author_id: String,
+        author_name: String,
+        text: String,
+        created_at: i64,
+        updated_at: i64,
+    },
+    NoteDeleted {
+        id: String,
+    },
     // ---- Whiteboard element events ----
     WhiteboardElementAdded {
         id: String,

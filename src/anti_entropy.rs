@@ -111,7 +111,7 @@ pub enum AntiEntropyMsg {
 /// `(item_count, blake3_hex)` over the sorted per-item `(kind, id, version)` lines.
 ///
 /// Version columns: `created_at` for immutable rows (group/workspace/board),
-/// `updated_at` for mutable rows (elements/cells), `timestamp` for chats, and the
+/// `updated_at` for mutable rows (elements/cells/notes), `timestamp` for chats, and the
 /// content `hash` for files (files are immutable by hash). Two peers with identical
 /// state produce identical `(count, hash)`; any divergence flips the hash.
 ///
@@ -146,6 +146,11 @@ pub fn group_digest(group_id: &str) -> (u64, String) {
     }
     for ch in storage::chat_list_by_workspaces(&ws_ids).unwrap_or_default() {
         entries.push(format!("h{SEP}{}{SEP}{}", ch.id, ch.timestamp));
+    }
+    // ROUND8 §W2: notes are board-level + mutable (LWW) — version on `updated_at`, so an
+    // edit flips the hash and the sweep pulls the latest, exactly like a mutable cell.
+    for nt in storage::note_list_by_boards(&board_ids).unwrap_or_default() {
+        entries.push(format!("n{SEP}{}{SEP}{}", nt.id, nt.updated_at));
     }
     for f in storage::file_list_by_group(group_id).unwrap_or_default() {
         entries.push(format!("f{SEP}{}{SEP}{}", f.id, f.hash));

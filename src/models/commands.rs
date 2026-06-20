@@ -165,6 +165,22 @@ pub enum CommandMsg {
     },
 
     // ═══════════════════════════════════════════════════════════════════════
+    // NOTE COMMANDS (ROUND8 §W2 — board-level, authored, LWW ledger)
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Author or edit a note. `note_id = None` creates a new note (id generated);
+    /// `Some(id)` edits that note (LWW bump of `updated_at`). `tenant_id = None`
+    /// derives the tenant from the board's group.
+    PutNote {
+        board_id: String,
+        note_id: Option<String>,
+        tenant_id: Option<String>,
+        text: String,
+    },
+    DeleteNote {
+        id: String,
+    },
+
+    // ═══════════════════════════════════════════════════════════════════════
     // DIRECT MESSAGE COMMANDS
     // ═══════════════════════════════════════════════════════════════════════
     StartDirectChat {

@@ -309,8 +309,8 @@ impl MpNode {
         Ok(resp == "ok wait_sync")
     }
 
-    /// Count rows of `kind` (groups|workspaces|boards|elements|cells|chats|files) in
-    /// THIS process's storage, scoped to `group_id`.
+    /// Count rows of `kind` (groups|workspaces|boards|elements|cells|chats|notes|files)
+    /// in THIS process's storage, scoped to `group_id`.
     pub async fn count(&mut self, kind: &str, group_id: &str) -> Result<usize> {
         let resp = self
             .request(&format!("count {kind} {group_id}"), REQ_TIMEOUT)
@@ -341,6 +341,16 @@ impl MpNode {
     pub async fn post_local(&mut self, group_id: &str, n: usize) -> Result<()> {
         let timeout = REQ_TIMEOUT + Duration::from_millis(n as u64 * 5);
         self.request(&format!("post_local {group_id} {n}"), timeout)
+            .await
+            .map(|_| ())
+    }
+
+    /// Author `n` notes into THIS node's storage WITHOUT broadcasting them (ROUND8 §W2).
+    /// Note ids are node-namespaced, so two peers' note sets are disjoint and only the
+    /// anti-entropy digest+snapshot path can reconcile them — the digest-convergence proof.
+    pub async fn post_notes(&mut self, group_id: &str, n: usize) -> Result<()> {
+        let timeout = REQ_TIMEOUT + Duration::from_millis(n as u64 * 5);
+        self.request(&format!("post_notes {group_id} {n}"), timeout)
             .await
             .map(|_| ())
     }
