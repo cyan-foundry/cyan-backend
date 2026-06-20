@@ -1235,7 +1235,73 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         tracing::info!("Migration: adding owner_node_id column to objects");
         let _ = conn.execute("ALTER TABLE objects ADD COLUMN owner_node_id TEXT", []);
     }
+
+    // ROUND8 §W1: collapse the six legacy authoring cell kinds into the single
+    // step primitive. Idempotent + data-loss-free; preserves the version column so
+    // it stays invisible to the anti-entropy digest (each peer reaches the same
+    // migrated state deterministically — no spurious repair churn).
+    let _ = migrate_legacy_authoring_cells_conn(conn);
+
     Ok(())
+}
+
+/// Collapse legacy authorable cells (`markdown`/`mermaid`/`canvas`/`image`/`code`/
+/// `model`) into the ROUND8 §W1 step model. Returns the number of rows migrated.
+///
+/// Text-bearing kinds (`markdown`, `code`) become **steps** (their text is the step
+/// text). Non-text kinds (`mermaid`, `canvas`, `image`, `model`) are **archived**
+/// (kept, never authorable; original kind stashed in `metadata_json.original_cell_type`
+/// so nothing is dropped). `created_at`/`updated_at` are left untouched so the
+/// migration does not perturb the convergence digest.
+pub fn migrate_legacy_authoring_cells() -> Result<usize> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    migrate_legacy_authoring_cells_conn(&conn)
+}
+
+fn migrate_legacy_authoring_cells_conn(conn: &Connection) -> Result<usize> {
+    // Text kinds become steps; the rest are archived (content + original kind kept).
+    const TEXT_KINDS: &[&str] = &["markdown", "code"];
+
+    let mut stmt = conn.prepare(
+        "SELECT id, cell_type, metadata_json FROM notebook_cells \
+         WHERE cell_type IN ('markdown','mermaid','canvas','image','code','model')",
+    )?;
+    let rows: Vec<(String, String, Option<String>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
+
+    let mut migrated = 0usize;
+    for (id, old_kind, metadata_json) in rows {
+        if TEXT_KINDS.contains(&old_kind.as_str()) {
+            conn.execute(
+                "UPDATE notebook_cells SET cell_type='step' WHERE id=?1",
+                params![id],
+            )?;
+        } else {
+            // Stash the original kind so the archive is reversible (no data loss).
+            let mut meta: serde_json::Value = metadata_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            if !meta.is_object() {
+                meta = serde_json::json!({});
+            }
+            meta["archived"] = serde_json::Value::Bool(true);
+            meta["original_cell_type"] = serde_json::Value::String(old_kind.clone());
+            conn.execute(
+                "UPDATE notebook_cells SET cell_type='archived', metadata_json=?2 WHERE id=?1",
+                params![id, meta.to_string()],
+            )?;
+        }
+        migrated += 1;
+    }
+
+    if migrated > 0 {
+        tracing::info!("Migration: collapsed {} legacy cells into the step model", migrated);
+    }
+    Ok(migrated)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

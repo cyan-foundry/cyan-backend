@@ -823,6 +823,8 @@ impl CommandActor {
 
                 // Notebook cell commands
                 CommandMsg::AddNotebookCell { board_id, cell_type, cell_order, content } => {
+                    // §W1: the step is the only authorable kind — collapse legacy kinds.
+                    let cell_type = crate::workflow::coerce_authoring_cell_type(&cell_type);
                     let id = blake3::hash(format!("cell:{}-{}", &board_id, chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)).as_bytes()).to_hex().to_string();
                     let now = chrono::Utc::now().timestamp();
                     let group_id = self.get_group_id_for_board(&board_id);
@@ -854,6 +856,8 @@ impl CommandActor {
                 }
 
                 CommandMsg::UpdateNotebookCell { id, board_id, cell_type, cell_order, content, output, collapsed, height, metadata_json } => {
+                    // §W1: keep authoring writes on the single step primitive.
+                    let cell_type = crate::workflow::coerce_authoring_cell_type(&cell_type);
                     let now = chrono::Utc::now().timestamp();
                     let group_id = self.get_group_id_for_board(&board_id);
 
@@ -1521,6 +1525,7 @@ pub mod tests {
 }
 
 pub mod pipeline;
+pub mod workflow;
 pub mod timecode_notes;
 pub mod skills;
 pub mod pipeline_executor;

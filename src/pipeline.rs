@@ -1610,9 +1610,11 @@ fn gather_dependency_outputs(board_id: &str, depends_on: &[String]) -> Vec<serde
 fn load_pipeline_cells(board_id: &str) -> Result<Vec<PipelineCell>> {
     let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
 
+    // Archived cells (legacy non-text kinds collapsed by the §W1 migration) are kept
+    // for no-data-loss but are NOT authorable steps — exclude them from the plan.
     let mut stmt = conn.prepare(
         "SELECT id, board_id, cell_order, content, metadata_json \
-         FROM notebook_cells WHERE board_id = ?1 ORDER BY cell_order"
+         FROM notebook_cells WHERE board_id = ?1 AND cell_type != 'archived' ORDER BY cell_order"
     )?;
 
     let cells = stmt.query_map(rusqlite::params![board_id], |row| {

@@ -1750,7 +1750,12 @@ pub extern "C" fn cyan_save_notebook_cell(cell_json: *const c_char) -> bool {
 
     let id = cell["id"].as_str().unwrap_or("").to_string();
     let board_id = cell["board_id"].as_str().unwrap_or("").to_string();
-    let cell_type = cell["cell_type"].as_str().unwrap_or("markdown").to_string();
+    // ROUND8 §W1: the step is the only authorable kind. Collapse any (legacy) kind
+    // an older client still sends into the single step primitive; system kinds pass
+    // through. Default missing kind to step.
+    let cell_type = crate::workflow::coerce_authoring_cell_type(
+        cell["cell_type"].as_str().unwrap_or(crate::workflow::STEP_KIND),
+    );
     let cell_order = cell["cell_order"].as_i64().unwrap_or(0) as i32;
     let content = cell["content"].as_str().map(|s| s.to_string());
     let output = cell["output"].as_str().map(|s| s.to_string());
