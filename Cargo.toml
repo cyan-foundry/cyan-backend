@@ -3,6 +3,14 @@ name = "cyan-backend"
 version = "0.1.0"
 edition = "2024"
 
+# Ban `unwrap`/`expect`-style panics in engine + FFI code. `unwrap_used` is the
+# purpose-built lint (it skips external-macro unwraps like `serde_json::json!` and
+# honors `allow-unwrap-in-tests` in clippy.toml), replacing the old
+# `disallowed-methods` approach which spuriously flagged ~970 `json!` sites. See
+# clippy.toml and STATUS_MESH_LINT.md.
+[lints.clippy]
+unwrap_used = "warn"
+
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
 

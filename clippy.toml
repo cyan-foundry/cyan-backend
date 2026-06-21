@@ -1,11 +1,15 @@
 # Clippy configuration for a robust Rust open source project
 
-# Disallow use of `unwrap` to prevent potential runtime panics
-# Setting to "true" will trigger the lint for all unwrap() calls
-disallowed-methods = [
-    "std::option::Option::unwrap",
-    "std::result::Result::unwrap"
-]
+# Ban `unwrap` to prevent runtime panics (a panic crossing the FFI boundary
+# crashes the iOS app). This is enforced by `clippy::unwrap_used`, configured in
+# Cargo.toml's `[lints.clippy]` table — NOT via `disallowed-methods`. Reason:
+# `disallowed-methods` lints *through* external macro expansions, so it spuriously
+# flagged ~970 `serde_json::json!` sites (the macro expands to an internal
+# `to_value(&x).unwrap()` at macros.rs:279), and it ignores `allow-unwrap-in-tests`
+# below. `clippy::unwrap_used` is the purpose-built lint: it skips external-macro
+# unwraps and honors the test allowance, while still catching our hand-written
+# unwraps. Same intent, correct tool. See STATUS_MESH_LINT.md.
+disallowed-methods = []
 
 # Error on `todo!()` macros in code to prevent shipping incomplete code
 # To allow these during development, comment this line out
