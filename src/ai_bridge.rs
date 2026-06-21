@@ -542,7 +542,7 @@ Output the Mermaid code in a ```mermaid code block."#.to_string(),
                         success: false,
                         mermaid: None,
                         error: Some(format!("Claude API error {}: {}", status, error_text)),
-                    }).unwrap());
+                    }).unwrap_or_default());
                 }
 
                 match resp.json::<ClaudeResponse>().await {
@@ -570,20 +570,20 @@ Output the Mermaid code in a ```mermaid code block."#.to_string(),
                             success: true,
                             mermaid: Some(mermaid),
                             error: None,
-                        }).unwrap())
+                        }).unwrap_or_default())
                     }
                     Err(e) => CommandResponse::ok_with_data(serde_json::to_value(MermaidResult {
                         success: false,
                         mermaid: None,
                         error: Some(format!("Failed to parse Claude response: {}", e)),
-                    }).unwrap()),
+                    }).unwrap_or_default()),
                 }
             }
             Err(e) => CommandResponse::ok_with_data(serde_json::to_value(MermaidResult {
                 success: false,
                 mermaid: None,
                 error: Some(format!("Request failed: {}", e)),
-            }).unwrap()),
+            }).unwrap_or_default()),
         }
     }
 
@@ -658,7 +658,7 @@ Output the Mermaid code in a ```mermaid code block."#.to_string(),
             peer_id,
         ).await;
 
-        CommandResponse::ok_with_data(serde_json::to_value(result).unwrap())
+        CommandResponse::ok_with_data(serde_json::to_value(result).unwrap_or_default())
     }
 
     // ========================================================================
@@ -784,7 +784,7 @@ Output the Mermaid code in a ```mermaid code block."#.to_string(),
         let client = self.cloud_client.read().await;
         match client.as_ref() {
             Some(c) => match c.get_nudges().await {
-                Ok(report) => CommandResponse::ok_with_data(serde_json::to_value(report).unwrap()),
+                Ok(report) => CommandResponse::ok_with_data(serde_json::to_value(report).unwrap_or_default()),
                 Err(e) => CommandResponse::err(format!("Failed to get nudges: {}", e)),
             },
             None => CommandResponse::err("Cloud client not initialized"),
@@ -828,7 +828,7 @@ Output the Mermaid code in a ```mermaid code block."#.to_string(),
         };
 
         match result {
-            Ok(summary) => CommandResponse::ok_with_data(serde_json::to_value(summary).unwrap()),
+            Ok(summary) => CommandResponse::ok_with_data(serde_json::to_value(summary).unwrap_or_default()),
             Err(e) => CommandResponse::err(format!("Summary failed: {}", e)),
         }
     }

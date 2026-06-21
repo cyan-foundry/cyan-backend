@@ -114,7 +114,7 @@ pub fn parse_command(input: &str) -> LensCommand {
             
             // Check if it's a file summarize: /summarize file g\...\report.pdf
             if args.starts_with("file ") || args.starts_with("file\t") {
-                let file_path = args.strip_prefix("file").unwrap().trim();
+                let file_path = args.strip_prefix("file").unwrap_or("").trim();
                 match parse_path(file_path) {
                     Ok(path) => LensCommand::SummarizeFile { path },
                     Err(_) => LensCommand::NaturalLanguage { text: trimmed.to_string() },
