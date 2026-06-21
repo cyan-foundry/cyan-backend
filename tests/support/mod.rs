@@ -342,6 +342,9 @@ impl Node {
     /// The persistent roster for `group_id` as `(peer_id, name, avatar, online, last_seen)` — the
     /// exact shape `cyan_get_group_members` returns (MESH_HARDENING §3). Members come from the shared
     /// `storage::group_members` table; `online` is overlaid from THIS node's live `peers_per_group`.
+    // Tuple mirrors the exact shape `cyan_get_group_members` returns; kept inline
+    // (not a type alias) to preserve the spec'd signature verbatim.
+    #[allow(clippy::type_complexity)]
     pub fn members(&self, group_id: &str) -> Vec<(String, Option<String>, Option<String>, bool, i64)> {
         let online: HashSet<String> = self
             .peers_per_group

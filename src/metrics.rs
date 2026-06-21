@@ -182,14 +182,12 @@ pub fn gossip_degree() -> u64 {
 /// samples it before/after load and asserts no unbounded growth.
 pub fn rss_kb() -> Option<u64> {
     // Linux: /proc/self/statm — second field is resident pages.
-    if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
-        if let Some(pages) = statm.split_whitespace().nth(1) {
-            if let Ok(pages) = pages.parse::<u64>() {
+    if let Ok(statm) = std::fs::read_to_string("/proc/self/statm")
+        && let Some(pages) = statm.split_whitespace().nth(1)
+            && let Ok(pages) = pages.parse::<u64>() {
                 let page_kb = 4; // 4 KiB pages on every platform we ship to.
                 return Some(pages * page_kb);
             }
-        }
-    }
     // macOS / BSD: ask `ps` for this pid's RSS (already in KiB).
     let pid = std::process::id();
     let out = std::process::Command::new("ps")

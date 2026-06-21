@@ -38,8 +38,8 @@ pub fn resolve_db_path(requested: &str) -> PathBuf {
 /// whole engine. We now `create_dir_all` the parent and return a typed error on
 /// failure instead of panicking — a bad data dir degrades gracefully.
 pub fn open_db(db_path: &Path) -> Result<Connection> {
-    if let Some(parent) = db_path.parent() {
-        if !parent.as_os_str().is_empty() {
+    if let Some(parent) = db_path.parent()
+        && !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 tracing::error!(
                     "Failed to create data dir {}: {} (os error)",
@@ -49,7 +49,6 @@ pub fn open_db(db_path: &Path) -> Result<Connection> {
                 anyhow!("create data dir {}: {e}", parent.display())
             })?;
         }
-    }
     tracing::info!("Opening cyan database at {}", db_path.display());
     Connection::open(db_path).map_err(|e| {
         tracing::error!(

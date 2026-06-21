@@ -12,6 +12,8 @@
 // Prompt genesis: every diagram stores its origin prompt + source for
 // collaborative refinement. Peers can view/edit/regenerate.
 
+#![allow(dead_code)] // Canvas diagram-generation scaffolding (SVG/Mermaid extractors, serde response shape) not all wired up yet; see CLAUDE.md 'Out of scope'.
+
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
@@ -265,14 +267,13 @@ async fn parse_tree_response(
             let is_mod = path.contains("mod.rs") || path.contains("lib.rs") || path.contains("main.rs")
                 || path.contains("index.ts") || path.contains("__init__.py");
             
-            if (is_source && is_mod) || is_config {
-                if source_files.len() < 10 {
+            if ((is_source && is_mod) || is_config)
+                && source_files.len() < 10 {
                     // Fetch file content
                     if let Ok(content) = fetch_file_content(client, owner, repo, path).await {
                         source_files.push((path.to_string(), content));
                     }
                 }
-            }
         }
     }
     
@@ -414,7 +415,7 @@ pub async fn generate_diagram(
                         .join("\n");
                     
                     // Parse JSON response
-                    parse_diagram_response(&text, &request, peer_id, latency_ms)
+                    parse_diagram_response(&text, request, peer_id, latency_ms)
                 }
                 Err(e) => DiagramResult {
                     success: false,
@@ -591,11 +592,10 @@ fn build_genesis(request: &DiagramRequest, peer_id: &str) -> PromptGenesis {
 }
 
 fn extract_svg(text: &str) -> Option<String> {
-    if let Some(start) = text.find("<svg") {
-        if let Some(end) = text.find("</svg>") {
+    if let Some(start) = text.find("<svg")
+        && let Some(end) = text.find("</svg>") {
             return Some(text[start..end + 6].to_string());
         }
-    }
     None
 }
 

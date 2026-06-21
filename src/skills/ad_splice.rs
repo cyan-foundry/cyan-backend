@@ -177,7 +177,7 @@ impl SkillExecutor for AdSplice {
         }
 
         // Final segment (after last break point to end)
-        let final_seg_path = format!("/tmp/norm_seg_final.mp4");
+        let final_seg_path = "/tmp/norm_seg_final.mp4".to_string();
         emit(step_id, "ffmpeg", "processing", 
             &format!("Encoding final segment ({:.0}s to end)...", prev_point));
         normalize_segment(video_uri, &final_seg_path, prev_point, -1.0,

@@ -13,6 +13,8 @@
 //! and never logged. This is the SSO session grant — distinct from the mesh-half
 //! Ed25519 capability grant exercised in `tests/grant_test.rs`.
 
+#![allow(clippy::unwrap_used)] // Mutex unwraps live in the RecordingJoiner test mock's impl methods (not #[test] fns), so clippy.toml's allow-unwrap-in-tests doesn't reach them; this is test-support code.
+
 use std::sync::Mutex;
 
 use async_trait::async_trait;

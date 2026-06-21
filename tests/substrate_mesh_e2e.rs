@@ -31,6 +31,8 @@
 //! Every scenario is `#[ignore]` so a plain `cargo test` stays green AND Docker-free, and each
 //! returns early unless `CYAN_RIG=1` (set by `make -C harness mesh-e2e`). iroh 0.95. Bounded waits.
 
+#![allow(clippy::unwrap_used)] // unwraps are inside assert_eq! assertion helpers (non-#[test] async fns), which clippy.toml's allow-unwrap-in-tests does not reach; a failed unwrap here IS the test assertion failing.
+
 #![allow(unused)]
 
 #[path = "support/dockernode.rs"]

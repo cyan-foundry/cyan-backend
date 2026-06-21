@@ -16,6 +16,8 @@
 //
 // No NODE_ID passing needed - both discover via production bootstrap!
 
+#![allow(clippy::unwrap_used, unused_imports, unused_variables, unused_assignments)] // dual-built as the `snapshot_test` [[bin]] where allow-unwrap-in-tests doesn't apply; test code, unwrap == assertion.
+
 use anyhow::Result;
 use bytes::Bytes;
 use futures_lite::StreamExt;

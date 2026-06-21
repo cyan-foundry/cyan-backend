@@ -1,5 +1,7 @@
 // cyan-backend/src/skills/github.rs
 
+#![allow(dead_code)] // Skills scaffolding moving to the MCP/workflow model; see CLAUDE.md 'Out of scope'.
+
 use anyhow::{anyhow, Result};
 use serde_json::json;
 
@@ -165,7 +167,7 @@ struct GithubCommit {
 }
 
 /// Load GitHub PR data from imported PR boards
-fn load_github_prs(scope_id: &str) -> Result<Vec<GithubPr>> {
+fn load_github_prs(_scope_id: &str) -> Result<Vec<GithubPr>> {
     let conn = crate::storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
     
     // Find PR board content — imported boards have names like "org/repo — Pull Requests"
@@ -219,7 +221,7 @@ fn load_github_prs(scope_id: &str) -> Result<Vec<GithubPr>> {
 }
 
 /// Load GitHub commit data from imported Activity Dashboard boards
-fn load_github_commits(scope_id: &str, _hours: u64) -> Result<Vec<GithubCommit>> {
+fn load_github_commits(_scope_id: &str, _hours: u64) -> Result<Vec<GithubCommit>> {
     let conn = crate::storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
     
     let mut stmt = conn.prepare(

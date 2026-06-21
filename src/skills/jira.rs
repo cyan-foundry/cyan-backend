@@ -36,7 +36,7 @@ pub struct TicketScan;
 impl SkillExecutor for MyBoard {
     async fn execute(&self, ctx: &SkillContext) -> Result<SkillResult> {
         tracing::info!("🔧 [jira_my_board] Executing");
-        let scope_id = ctx.scope_id.as_deref().unwrap_or("").to_string();
+        let _scope_id = ctx.scope_id.as_deref().unwrap_or("").to_string();
         
         // Load Jira data from imported Kanban/Scrum boards
         let tickets: Vec<serde_json::Value> = {

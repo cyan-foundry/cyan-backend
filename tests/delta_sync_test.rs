@@ -19,6 +19,8 @@
 //   4. Host prints received element
 //   5. Both confirm bidirectional delta sync works
 
+#![allow(clippy::unwrap_used, clippy::collapsible_match, clippy::single_match, clippy::collapsible_if, clippy::format_in_format_args, unused_variables, unused_assignments)] // dual-built as the `delta_test` [[bin]] where clippy.toml's allow-unwrap-in-tests doesn't apply; this is test code (unwrap == assertion) and we don't churn test bodies for style lints.
+
 use anyhow::Result;
 use iroh::{PublicKey, SecretKey};
 use rand_chacha::rand_core::SeedableRng;

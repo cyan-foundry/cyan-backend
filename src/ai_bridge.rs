@@ -11,9 +11,11 @@
 // - RegisterModel/InferModel → Local P2P model registry experiment
 //
 // HARDWIRED CLOUD URL - change this for deployment:
+#![allow(dead_code)] // AI/Lens enrichment scaffolding (analysis/inference/feedback types) for the in-progress MCP/workflow migration; see CLAUDE.md 'Out of scope'. Some types/fields are not yet wired up but are kept for shape parity.
+
 const CYAN_LENS_CLOUD_URL: &str = "http://localhost:8080";
 
-use crate::cyan_lens_client::{CyanLensClient, CyanLensConfig, CyanLensError};
+use crate::cyan_lens_client::{CyanLensClient, CyanLensConfig};
 use crate::SwiftEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -481,11 +483,10 @@ impl AIBridge {
             None => return CommandResponse::err("Claude API key not configured. Set your API key in Settings."),
         };
 
-        // Detect media type from base64 header or default to png
+        // Detect media type from base64 header (JPEG magic), else default to png
+        // (covers the PNG "iVBOR" header and anything else).
         let media_type = if image_base64.starts_with("/9j/") {
             "image/jpeg"
-        } else if image_base64.starts_with("iVBOR") {
-            "image/png"
         } else {
             "image/png"
         };
@@ -631,7 +632,7 @@ Output the Mermaid code in a ```mermaid code block."#.to_string(),
                     instruction: prompt.unwrap_or_default(),
                 }
             }
-            _ => return CommandResponse::err(&format!("Unknown source type: {}", source_type)),
+            _ => return CommandResponse::err(format!("Unknown source type: {}", source_type)),
         };
 
         let dt = match diagram_type.as_str() {

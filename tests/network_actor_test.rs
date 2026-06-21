@@ -13,6 +13,8 @@
 //   Machine B: ./target/release/network_test join <NODE_ID>
 //   Local:     ./target/release/network_test local (both in same process)
 
+#![allow(clippy::unwrap_used, unused_variables)] // dual-built as the `network_test` [[bin]] where allow-unwrap-in-tests doesn't apply; test code, unwrap == assertion.
+
 use anyhow::Result;
 use iroh::{PublicKey, SecretKey};
 use rand_chacha::rand_core::SeedableRng;

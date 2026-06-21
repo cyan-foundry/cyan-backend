@@ -195,7 +195,7 @@ pub fn parse_command(input: &str) -> LensCommand {
         
         "/help" | "/h" | "/?" => LensCommand::Help,
         
-        "/pipeline" | "/pipe" | "/pl" => {
+        "/pipeline" | "/pipe" => {
             
             if args.is_empty() {
                 return LensCommand::Pipeline { action: "help".to_string(), step_id: None, path: None };
@@ -249,7 +249,7 @@ pub fn parse_path(input: &str) -> Result<CyanPath> {
     
     // Split on backslash (also accept forward slash for convenience)
     let parts: Vec<&str> = trimmed[2..] // skip "g\"
-        .split(|c| c == '\\' || c == '/')
+        .split(['\\', '/'])
         .filter(|s| !s.is_empty())
         .collect();
     
@@ -293,11 +293,11 @@ pub fn parse_path(input: &str) -> Result<CyanPath> {
 fn parse_grep_args(input: &str) -> Result<(String, CyanPath)> {
     let trimmed = input.trim();
     
-    if trimmed.starts_with('"') {
+    if let Some(after) = trimmed.strip_prefix('"') {
         // Quoted term: "OAuth implementation" g\Engineering
-        if let Some(end_quote) = trimmed[1..].find('"') {
-            let term = trimmed[1..=end_quote].to_string();
-            let rest = trimmed[end_quote + 2..].trim();
+        if let Some(end_quote) = after.find('"') {
+            let term = after[..end_quote].to_string();
+            let rest = after[end_quote + 1..].trim();
             let path = parse_path(rest)?;
             return Ok((term, path));
         }
@@ -403,17 +403,15 @@ fn resolve_board_by_name(conn: &Connection, workspace_id: &str, name: &str) -> R
 
 fn resolve_file_by_name(conn: &Connection, workspace_id: &str, board_id: &str, name: &str) -> Result<String> {
     // Try board-scoped first
-    if !board_id.is_empty() {
-        if let Ok(path) = conn.query_row(
+    if !board_id.is_empty()
+        && let Ok(path) = conn.query_row(
             "SELECT local_path FROM objects WHERE board_id = ?1 AND name = ?2 COLLATE NOCASE AND type = 'file'",
             rusqlite::params![board_id, name],
             |row| row.get::<_, Option<String>>(0),
-        ) {
-            if let Some(p) = path {
+        )
+            && let Some(p) = path {
                 return Ok(p);
             }
-        }
-    }
     
     // Fallback: workspace-scoped
     conn.query_row(

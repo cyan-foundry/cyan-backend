@@ -210,7 +210,7 @@ impl SkillExecutor for LoudnessScan {
         Ok(SkillResult {
             skill_id: "loudness_scan".into(),
             output_type: OutputType::Json,
-            summary: format!("Loudness: {}", loudness.to_string()),
+            summary: format!("Loudness: {}", loudness),
             data: loudness,
             timecoded_findings: None, action_taken: None, artifacts: vec![],
         })
@@ -324,14 +324,13 @@ async fn run_loudness_scan(video_uri: &str) -> Result<serde_json::Value> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     
     // Extract JSON from stderr (it's embedded in log output)
-    if let Some(json_start) = stderr.rfind('{') {
-        if let Some(json_end) = stderr.rfind('}') {
+    if let Some(json_start) = stderr.rfind('{')
+        && let Some(json_end) = stderr.rfind('}') {
             let json_str = &stderr[json_start..=json_end];
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
                 return Ok(val);
             }
         }
-    }
     
     Ok(json!({"error": "Could not parse loudness data"}))
 }
@@ -351,11 +350,10 @@ async fn run_scene_detect(video_uri: &str) -> Result<serde_json::Value> {
     let mut scenes = Vec::new();
     
     for line in stderr.lines() {
-        if line.contains("pts_time:") {
-            if let Some(tc) = extract_float_after(line, "pts_time:") {
+        if line.contains("pts_time:")
+            && let Some(tc) = extract_float_after(line, "pts_time:") {
                 scenes.push(json!({"timecode": tc}));
             }
-        }
     }
     
     Ok(json!(scenes))
@@ -376,12 +374,7 @@ fn extract_float_after(text: &str, prefix: &str) -> Option<f64> {
 
 fn extract_url_from_content(content: &str) -> Option<&str> {
     // Find first http URL in cell content
-    for word in content.split_whitespace() {
-        if word.starts_with("http://") || word.starts_with("https://") || word.starts_with("s3://") {
-            return Some(word);
-        }
-    }
-    None
+    content.split_whitespace().find(|&word| word.starts_with("http://") || word.starts_with("https://") || word.starts_with("s3://")).map(|v| v as _)
 }
 
 fn summarize_ffprobe(metadata: &serde_json::Value) -> String {

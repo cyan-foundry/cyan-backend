@@ -20,7 +20,6 @@ use futures_lite::StreamExt;
 use iroh::PublicKey;
 use iroh_gossip::api::{Event as GossipEvent, GossipReceiver, GossipSender};
 use iroh_gossip::net::Gossip;
-use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -90,6 +89,9 @@ pub enum DiscoveryNetworkCmd {
 
 pub struct DiscoveryActor {
     node_id: String,
+    /// Discovery namespace this actor was constructed with. Retained for parity
+    /// with the seed/config path; not read on the gossip hot path.
+    #[allow(dead_code)]
     discovery_key: String,
     sender: GossipSender,
 
@@ -176,11 +178,10 @@ impl DiscoveryActor {
         mut receiver: GossipReceiver,
     ) {
         // Initial broadcast of our groups
-        if !self.my_groups.is_empty() {
-            if let Err(e) = self.broadcast_groups_exchange().await {
+        if !self.my_groups.is_empty()
+            && let Err(e) = self.broadcast_groups_exchange().await {
                 tracing::error!("🔴 [DISCOVERY] Initial broadcast failed: {}", e);
             }
-        }
 
         loop {
             tokio::select! {

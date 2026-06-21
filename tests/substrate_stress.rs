@@ -429,7 +429,7 @@ async fn sustained_chaos_soak() {
             total_edits += 2;
         }
         // Churn: kill the last peer and replace it with a fresh one (if we have spares).
-        if nodes.len() > 2 && round % 2 == 0 {
+        if nodes.len() > 2 && round.is_multiple_of(2) {
             nodes.pop().expect("victim").shutdown().await; // reap before respawn
             let host_id = nodes[0].node_id.clone();
             let mut fresh = MpNode::spawn(&format!("chaos{round}"), &key, Some(&host_id), None)

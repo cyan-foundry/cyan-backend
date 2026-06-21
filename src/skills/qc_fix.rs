@@ -17,7 +17,6 @@
 //   - All outputs: libx264 preset medium, crf 20, aac 44100hz stereo
 
 use anyhow::{anyhow, Result};
-use serde_json::json;
 use crate::skills::{SkillExecutor, SkillDef, SkillContext, SkillResult, OutputType, Finding, InferenceStatus};
 
 pub fn register() -> Vec<SkillDef> {
@@ -140,7 +139,7 @@ Return null for filters that don't apply. If the issue requires only audio or on
         if video_filter.is_none() && audio_filter.is_none() {
             return Ok(SkillResult {
                 skill_id: "qc_fix".into(),
-                summary: format!("No corrective filters needed. Diagnosis: {}", &diagnosis),
+                summary: format!("No corrective filters needed. Diagnosis: {}", diagnosis),
                 output_type: OutputType::Summary,
                 data: fix_plan.clone(),
                 timecoded_findings: None,
@@ -151,7 +150,7 @@ Return null for filters that don't apply. If the issue requires only audio or on
 
         // ── Step 2: Build and execute ffmpeg command ─────────
         emit(step_id, "ffmpeg", "processing", 
-            &format!("Applying fix: {}", &diagnosis));
+            &format!("Applying fix: {}", diagnosis));
 
         let output_path = "/tmp/pipeline_qc_fixed.mp4";
         let mut cmd_args: Vec<String> = vec![

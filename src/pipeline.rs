@@ -11,6 +11,8 @@
 //   /pipeline approve  → Human approves a step
 //   /pipeline export   → Generate Airflow DAG Python file
 
+#![allow(dead_code)] // Pipeline-step executors are scaffolding moving to the MCP/workflow model; see CLAUDE.md 'Out of scope'.
+
 use anyhow::{anyhow, Result};
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
@@ -1051,7 +1053,7 @@ async fn call_vllm(prompt: &str, max_tokens: u32, temperature: f32) -> Result<St
 pub async fn call_claude_fallback(prompt: &str, max_tokens: u32) -> anyhow::Result<String> {
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .or_else(|_| {
-            let home = std::env::var("HOME").map_err(|e| e)?;
+            let home = std::env::var("HOME")?;
             let env_str = std::fs::read_to_string(format!("{}/Documents/.env", home))
                 .map_err(|_| std::env::VarError::NotPresent)?;
             env_str.lines()
@@ -1198,7 +1200,7 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
 }
 
 /// Execute a step via vLLM (for AI analysis tasks)
-async fn execute_lens_step(config: &PipelineStepConfig, cell_content: &str) -> Result<String> {
+async fn execute_lens_step(_config: &PipelineStepConfig, cell_content: &str) -> Result<String> {
     let prompt = format!(
         "Execute this pipeline step and provide the result. Be specific and structured.\n\n\
          Step: {}\n\n\
