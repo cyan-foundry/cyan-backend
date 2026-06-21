@@ -521,6 +521,7 @@ fn create_test_data() -> Result<()> {
     for i in 0..3 {
         storage::chat_insert_simple(
             &format!("chat-{:03}", i),
+            TEST_BOARD_ID,
             TEST_WORKSPACE_ID,
             &format!("Test message {}", i),
             "test-author",

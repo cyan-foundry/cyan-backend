@@ -646,6 +646,7 @@ pub fn seed_group_fixture(group_id: &str, elements: usize, chats: usize) -> (Str
     for i in 0..chats {
         let _ = storage::chat_insert_simple(
             &format!("{group_id}-chat-{i}"),
+            &board,
             &ws,
             &format!("message {i}"),
             "author",

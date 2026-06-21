@@ -756,10 +756,15 @@ async fn handle_verb(
             for i in 0..n {
                 let id = format!("{gid}-msg-{tag}-{i:06}");
                 let message = format!("msg {i} from {tag}");
-                storage::chat_insert(&id, &ws, &message, node_id, None, now)
+                // R11 §1: chat is board-scoped. This dev bin keys its load-gen chats to a
+                // deterministic board id derived from the workspace (the workspace's default
+                // board), kept consistent between sender and receiver assertions.
+                let board = format!("{ws}-board");
+                storage::chat_insert(&id, &board, &ws, &message, node_id, None, now)
                     .map_err(|e| anyhow!("chat_insert: {e}"))?;
                 let event = NetworkEvent::ChatSent {
                     id,
+                    board_id: board,
                     workspace_id: ws.clone(),
                     message,
                     author: node_id.to_string(),
@@ -1604,6 +1609,7 @@ fn seed_fixture(group_id: &str) -> Result<()> {
     for i in 0..FIXTURE_CHATS {
         storage::chat_insert_simple(
             &format!("{group_id}-chat-{i:03}"),
+            &board,
             &ws,
             &format!("Test message {i}"),
             "test-author",

@@ -94,6 +94,7 @@ async fn offline_chat_all_levels() {
             &group,
             NetworkEvent::ChatSent {
                 id: id.clone(),
+                board_id: format!("{group}-{level}"),
                 workspace_id: format!("{group}-{level}"),
                 message: format!("offline {level} msg"),
                 author: "a".to_string(),

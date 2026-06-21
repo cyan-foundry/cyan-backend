@@ -254,8 +254,12 @@ pub fn apply_snapshot_frame(frame: &SnapshotFrame) -> Result<()> {
             pins,
         } => {
             for ch in chats {
+                // R11 §1: chat is board-scoped. A pre-R11 frame may omit board_id; fall back
+                // to the workspace so the row is never dropped (the migration re-keys it).
+                let board_key = if ch.board_id.is_empty() { &ch.workspace_id } else { &ch.board_id };
                 storage::chat_insert_simple(
                     &ch.id,
+                    board_key,
                     &ch.workspace_id,
                     &ch.message,
                     &ch.author,
@@ -297,6 +301,8 @@ pub fn apply_snapshot_frame(frame: &SnapshotFrame) -> Result<()> {
                     Some(&m.board_type),
                     m.last_accessed,
                     m.is_pinned,
+                    m.meta_updated_at,
+                    m.pin_updated_at,
                 )?;
             }
             for n in notes {

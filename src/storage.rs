@@ -559,11 +559,14 @@ pub fn board_list_by_workspaces(workspace_ids: &[String]) -> Result<Vec<Whiteboa
 // CHATS
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub fn chat_insert(id: &str, workspace_id: &str, message: &str, author: &str, parent_id: Option<&str>, timestamp: i64) -> Result<()> {
+/// Insert a chat keyed to a **board** (R11 §1). Chat is board-scoped: the row carries both
+/// `board_id` (the scope key chat is listed by) and `workspace_id` (kept so the existing
+/// workspace→group snapshot scoping and group gossip resolution are unchanged).
+pub fn chat_insert(id: &str, board_id: &str, workspace_id: &str, message: &str, author: &str, parent_id: Option<&str>, timestamp: i64) -> Result<()> {
     let conn = db().lock_safe();
     conn.execute(
-        "INSERT OR IGNORE INTO objects (id, workspace_id, type, name, hash, data, created_at) VALUES (?1, ?2, 'chat', ?3, ?4, ?5, ?6)",
-        params![id, workspace_id, message, author, parent_id.map(|s| s.as_bytes()), timestamp],
+        "INSERT OR IGNORE INTO objects (id, board_id, workspace_id, type, name, hash, data, created_at) VALUES (?1, ?2, ?3, 'chat', ?4, ?5, ?6, ?7)",
+        params![id, board_id, workspace_id, message, author, parent_id.map(|s| s.as_bytes()), timestamp],
     )?;
     Ok(())
 }
@@ -580,59 +583,99 @@ pub fn chat_get_workspace_id(chat_id: &str) -> Option<String> {
     stmt.query_row(params![chat_id], |r| r.get(0)).optional().ok()?
 }
 
-/// List chats by workspace IDs (for snapshot)
+/// Map a `ChatDTO` out of an `objects` chat row selected as
+/// `(id, board_id, workspace_id, name, hash, data, created_at)`.
+fn chat_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChatDTO> {
+    let parent_bytes: Option<Vec<u8>> = r.get(5)?;
+    let parent_id = parent_bytes.and_then(|b| String::from_utf8(b).ok());
+    Ok(ChatDTO {
+        id: r.get(0)?,
+        board_id: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+        workspace_id: r.get(2)?,
+        message: r.get(3)?,
+        author: r.get(4)?,
+        parent_id,
+        timestamp: r.get(6)?,
+    })
+}
+
+/// List chats by workspace IDs (for snapshot). Each `ChatDTO` carries its `board_id` so the
+/// receiver re-keys it to the right board (chat is board-scoped, R11 §1).
 pub fn chat_list_by_workspaces(workspace_ids: &[String]) -> Result<Vec<ChatDTO>> {
     if workspace_ids.is_empty() { return Ok(vec![]); }
 
     let conn = db().lock_safe();
     let placeholders: String = workspace_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT id, workspace_id, name, hash, data, created_at
+        "SELECT id, board_id, workspace_id, name, hash, data, created_at
          FROM objects WHERE type = 'chat' AND workspace_id IN ({}) ORDER BY created_at",
         placeholders
     );
 
     let mut stmt = conn.prepare(&sql)?;
     let params: Vec<&dyn rusqlite::ToSql> = workspace_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-
-    let rows = stmt.query_map(params.as_slice(), |r| {
-        let parent_bytes: Option<Vec<u8>> = r.get(4)?;
-        let parent_id = parent_bytes.and_then(|b| String::from_utf8(b).ok());
-        Ok(ChatDTO {
-            id: r.get(0)?,
-            workspace_id: r.get(1)?,
-            message: r.get(2)?,
-            author: r.get(3)?,
-            parent_id,
-            timestamp: r.get(5)?,
-        })
-    })?;
-
+    let rows = stmt.query_map(params.as_slice(), chat_from_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
-/// Get chats for a single workspace
+/// Get chats for a single **board** (R11 §1 — chat is board-scoped). This is the read the
+/// chat panel opens with; two boards in one workspace no longer share a thread.
+pub fn chat_list_by_board(board_id: &str) -> Result<Vec<ChatDTO>> {
+    let conn = db().lock_safe();
+    let mut stmt = conn.prepare(
+        "SELECT id, board_id, workspace_id, name, hash, data, created_at
+         FROM objects WHERE type = 'chat' AND board_id = ?1 ORDER BY created_at"
+    )?;
+    let rows = stmt.query_map(params![board_id], chat_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Get chats for a single workspace (legacy/snapshot helper; chat reads now go through
+/// [`chat_list_by_board`]). Retained for the workspace→group snapshot scoping.
 pub fn chat_list_by_workspace(workspace_id: &str) -> Result<Vec<ChatDTO>> {
     let conn = db().lock_safe();
     let mut stmt = conn.prepare(
-        "SELECT id, workspace_id, name, hash, data, created_at
+        "SELECT id, board_id, workspace_id, name, hash, data, created_at
          FROM objects WHERE type = 'chat' AND workspace_id = ?1 ORDER BY created_at"
     )?;
-
-    let rows = stmt.query_map(params![workspace_id], |r| {
-        let parent_bytes: Option<Vec<u8>> = r.get(4)?;
-        let parent_id = parent_bytes.and_then(|b| String::from_utf8(b).ok());
-        Ok(ChatDTO {
-            id: r.get(0)?,
-            workspace_id: r.get(1)?,
-            message: r.get(2)?,
-            author: r.get(3)?,
-            parent_id,
-            timestamp: r.get(5)?,
-        })
-    })?;
-
+    let rows = stmt.query_map(params![workspace_id], chat_from_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// R11 §1 migration — assign every legacy (workspace-scoped) chat row a `board_id`. Chat used
+/// to be keyed only by `workspace_id`, so all boards in a workspace shared one thread. Each
+/// legacy chat is assigned the workspace's **deterministic default board** (its earliest board
+/// by `created_at, id`). A chat whose workspace has NO board is kept on a deterministic default
+/// board id equal to its `workspace_id` (so it is never dropped and the assignment is stable).
+/// Idempotent: only rows with a missing `board_id` are touched. Returns the rows migrated.
+pub fn migrate_chats_to_boards() -> Result<usize> {
+    let conn = db().lock_safe();
+    migrate_chats_to_boards_conn(&conn)
+}
+
+/// The chat re-key migration on a given connection — usable both from [`run_migrations`]
+/// (which runs before the global DB handle is set) and the public [`migrate_chats_to_boards`].
+fn migrate_chats_to_boards_conn(conn: &Connection) -> Result<usize> {
+    // First: the workspace's earliest board (the deterministic default thread).
+    let by_board = conn.execute(
+        "UPDATE objects SET board_id = (
+             SELECT b.id FROM objects b
+             WHERE b.type = 'whiteboard' AND b.workspace_id = objects.workspace_id
+             ORDER BY b.created_at, b.id LIMIT 1
+         )
+         WHERE type = 'chat' AND (board_id IS NULL OR board_id = '')
+           AND workspace_id IS NOT NULL",
+        [],
+    )?;
+    // Fallback: workspaces with no board at all — keep the chat on a stable default board
+    // id (the workspace id itself), noted so it is never lost.
+    let by_ws = conn.execute(
+        "UPDATE objects SET board_id = workspace_id
+         WHERE type = 'chat' AND (board_id IS NULL OR board_id = '')
+           AND workspace_id IS NOT NULL",
+        [],
+    )?;
+    Ok(by_board + by_ws)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1104,16 +1147,71 @@ fn unique_file_name(name: &str, taken: &HashSet<&str>) -> String {
 // BOARD PINNED (R10FB §B3 — synced board property)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Set a board's pinned flag (`board_metadata.is_pinned`), upserting the metadata row so
-/// the flag lands even on a peer that has no metadata row yet (R10FB §B3).
-pub fn board_meta_set_pinned(board_id: &str, is_pinned: bool) -> Result<()> {
+/// Set a board's pinned flag (`board_metadata.is_pinned`) as a **per-board convergent LWW
+/// flag** (R11 §9b). Upserts only the pin lane, applying the new value only when
+/// `updated_at` is strictly newer — so pins from multiple peers MERGE and a stale `BoardPinned`
+/// (or snapshot row) never clobbers a newer pin. The descriptive fields are untouched.
+pub fn board_meta_set_pinned(board_id: &str, is_pinned: bool, updated_at: i64) -> Result<()> {
     let conn = db().lock_safe();
     conn.execute(
-        "INSERT INTO board_metadata (board_id, is_pinned) VALUES (?1, ?2)
-         ON CONFLICT(board_id) DO UPDATE SET is_pinned = excluded.is_pinned",
-        params![board_id, is_pinned as i32],
+        "INSERT INTO board_metadata (board_id, is_pinned, pin_updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(board_id) DO UPDATE SET
+            is_pinned      = CASE WHEN excluded.pin_updated_at > board_metadata.pin_updated_at THEN excluded.is_pinned ELSE board_metadata.is_pinned END,
+            pin_updated_at = MAX(excluded.pin_updated_at, board_metadata.pin_updated_at)",
+        params![board_id, is_pinned as i32, updated_at],
     )?;
     Ok(())
+}
+
+/// Build a board's **preview** for the live board-changed signal (R11 §9): its display name
+/// plus a short content snippet (latest notebook cell text, then latest note text), truncated.
+/// Returns `(name, preview)`; either may be empty for an empty/unknown board.
+pub fn board_preview(board_id: &str) -> (String, String) {
+    let conn = db().lock_safe();
+    let name: String = conn
+        .query_row(
+            "SELECT name FROM objects WHERE id = ?1 AND type = 'whiteboard' LIMIT 1",
+            params![board_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    // Latest non-empty content snippet: prefer a notebook cell, else a note.
+    let snippet: Option<String> = conn
+        .query_row(
+            "SELECT content FROM notebook_cells
+             WHERE board_id = ?1 AND content IS NOT NULL AND content <> ''
+             ORDER BY updated_at DESC LIMIT 1",
+            params![board_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .or_else(|| {
+            conn.query_row(
+                "SELECT text FROM notes
+                 WHERE board_id = ?1 AND text IS NOT NULL AND text <> ''
+                 ORDER BY updated_at DESC LIMIT 1",
+                params![board_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        });
+
+    let preview = match snippet {
+        Some(s) => {
+            let trimmed = s.trim();
+            trimmed.chars().take(140).collect::<String>()
+        }
+        None => name.clone(),
+    };
+    (name, preview)
 }
 
 /// Whether a board is pinned.
@@ -1134,65 +1232,57 @@ pub fn board_is_pinned(board_id: &str) -> bool {
 // UNREAD (R10FB §N — per-reader unread, idempotent by message_id)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Record a message as unread for this reader. Idempotent by `message_id`: a message
-/// counts once, ever — re-delivery (gossip echo, re-sync) never re-increments, and opening
-/// a chat (a read) never calls this. Returns `true` iff this is the first time the message
-/// is recorded (so the caller can emit an `UnreadChanged` only on a real change).
-///
-/// `kind` is the notification type ('chat' now; the seam for nudges/asks/decisions, §N5).
-/// The scope columns drive the board→workspace→group rollup in [`unread_counts`].
+/// Record a message as unread for this reader, **board-scoped** (R11 §2/§3). Idempotent by
+/// `message_id`: a message counts once, ever — re-delivery (gossip echo, re-sync) never
+/// re-increments, and opening a chat (a read) never calls this. Returns `true` iff this is
+/// the first time the message is recorded (so the caller emits `UnreadChanged` only on a real
+/// change). The dot/count lives on the **board** only — there is no workspace/group rollup
+/// (dropping it killed the doubled `1→2 / 2→4` counts where one message rolled up to several
+/// scopes). `kind` is the notification-type seam ('chat' now; nudges/asks/decisions later).
 pub fn unread_record(
     message_id: &str,
     kind: &str,
-    group_id: Option<&str>,
-    workspace_id: Option<&str>,
-    board_id: Option<&str>,
+    board_id: &str,
     created_at: i64,
 ) -> Result<bool> {
     let conn = db().lock_safe();
     let changed = conn.execute(
-        "INSERT OR IGNORE INTO unread (message_id, kind, group_id, workspace_id, board_id, read, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
-        params![message_id, kind, group_id, workspace_id, board_id, created_at],
+        "INSERT OR IGNORE INTO unread (message_id, kind, board_id, read, created_at)
+         VALUES (?1, ?2, ?3, 0, ?4)",
+        params![message_id, kind, board_id, created_at],
     )?;
     Ok(changed > 0)
 }
 
-/// The live `{scope_id: count}` map of unread counts (R10FB §N). Each open (unread) item
-/// contributes +1 to each of its non-null board, workspace and group ids, so the same map
-/// answers the board card, the workspace and the group at once.
+/// The live `{board_id: count}` map of unread counts (R11 §3 — **board-level only**). Each
+/// open (unread) item contributes +1 to its board id; the dock badge total is the sum of the
+/// map. No workspace/group rollup — that doubling is the bug this kills.
 pub fn unread_counts() -> Result<std::collections::HashMap<String, i64>> {
     let conn = db().lock_safe();
     let mut stmt = conn.prepare(
-        "SELECT group_id, workspace_id, board_id FROM unread WHERE read = 0",
+        "SELECT board_id, COUNT(*) FROM unread
+         WHERE read = 0 AND board_id IS NOT NULL AND board_id <> ''
+         GROUP BY board_id",
     )?;
     let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, Option<String>>(0)?,
-            r.get::<_, Option<String>>(1)?,
-            r.get::<_, Option<String>>(2)?,
-        ))
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
     })?;
     let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for row in rows {
-        let (g, w, b) = row?;
-        for id in [g, w, b].into_iter().flatten() {
-            *counts.entry(id).or_insert(0) += 1;
-        }
+        let (b, c) = row?;
+        counts.insert(b, c);
     }
     Ok(counts)
 }
 
-/// Mark every unread item under `scope_id` as read — `scope_id` may be a board, workspace
-/// or group id, so opening at any level clears it and the rollups drop automatically
-/// (R10FB §N). Returns the number of items cleared. Read state is sticky (the row stays,
-/// so the message stays counted-once and never re-increments on re-delivery).
-pub fn unread_mark_read(scope_id: &str) -> Result<usize> {
+/// Mark a **board's** unread items read (R11 §3/§5) — `board_id` is a board scope. Opening the
+/// board's chat clears its dot/count. Returns the number of items cleared. Read state is sticky
+/// (the row stays, so the message stays counted-once and never re-increments on re-delivery).
+pub fn unread_mark_read(board_id: &str) -> Result<usize> {
     let conn = db().lock_safe();
     let n = conn.execute(
-        "UPDATE unread SET read = 1
-         WHERE read = 0 AND (board_id = ?1 OR workspace_id = ?1 OR group_id = ?1)",
-        params![scope_id],
+        "UPDATE unread SET read = 1 WHERE read = 0 AND board_id = ?1",
+        params![board_id],
     )?;
     Ok(n)
 }
@@ -1474,7 +1564,7 @@ pub fn board_metadata_list_by_boards(board_ids: &[String]) -> Result<Vec<BoardMe
     let conn = db().lock_safe();
     let placeholders: String = board_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT board_id, labels, rating, view_count, contains_model, contains_skills, board_type, last_accessed, COALESCE(is_pinned, 0)
+        "SELECT board_id, labels, rating, view_count, contains_model, contains_skills, board_type, last_accessed, COALESCE(is_pinned, 0), COALESCE(meta_updated_at, 0), COALESCE(pin_updated_at, 0)
          FROM board_metadata WHERE board_id IN ({})",
         placeholders
     );
@@ -1495,6 +1585,8 @@ pub fn board_metadata_list_by_boards(board_ids: &[String]) -> Result<Vec<BoardMe
             board_type: r.get(6)?,
             last_accessed: r.get(7)?,
             is_pinned: r.get::<_, i32>(8)? != 0,
+            meta_updated_at: r.get(9)?,
+            pin_updated_at: r.get(10)?,
         })
     })?;
 
@@ -1833,8 +1925,8 @@ pub fn snapshot_insert_chats(chats: &[ChatDTO]) -> Result<()> {
 
     for c in chats {
         conn.execute(
-            "INSERT OR REPLACE INTO objects (id, workspace_id, type, name, hash, data, created_at) VALUES (?1, ?2, 'chat', ?3, ?4, ?5, ?6)",
-            params![c.id, c.workspace_id, c.message, c.author, c.parent_id.as_ref().map(|s| s.as_bytes()), c.timestamp],
+            "INSERT OR REPLACE INTO objects (id, board_id, workspace_id, type, name, hash, data, created_at) VALUES (?1, ?2, ?3, 'chat', ?4, ?5, ?6, ?7)",
+            params![c.id, c.board_id, c.workspace_id, c.message, c.author, c.parent_id.as_ref().map(|s| s.as_bytes()), c.timestamp],
         )?;
     }
 
@@ -1842,21 +1934,24 @@ pub fn snapshot_insert_chats(chats: &[ChatDTO]) -> Result<()> {
     Ok(())
 }
 
-/// Batch insert board metadata (for snapshot)
+/// Batch insert board metadata (for snapshot). Routes each row through the per-field LWW
+/// merge ([`board_metadata_upsert`]) — never a whole-record replace (R11 §9/PATTERN).
 pub fn snapshot_insert_metadata(metadata: &[BoardMetadataDTO]) -> Result<()> {
-    let conn = db().lock_safe();
-    conn.execute_batch("BEGIN TRANSACTION")?;
-
     for m in metadata {
-        let labels_json = serde_json::to_string(&m.labels)?;
-        let skills_json = serde_json::to_string(&m.contains_skills)?;
-        conn.execute(
-            "INSERT OR REPLACE INTO board_metadata (board_id, labels, rating, view_count, contains_model, contains_skills, board_type, last_accessed, is_pinned) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![m.board_id, labels_json, m.rating, m.view_count, m.contains_model, skills_json, m.board_type, m.last_accessed, m.is_pinned as i32],
+        board_metadata_upsert(
+            &m.board_id,
+            &m.labels,
+            m.rating,
+            m.view_count,
+            m.contains_model.as_deref(),
+            &m.contains_skills,
+            Some(&m.board_type),
+            m.last_accessed,
+            m.is_pinned,
+            m.meta_updated_at,
+            m.pin_updated_at,
         )?;
     }
-
-    conn.execute_batch("COMMIT")?;
     Ok(())
 }
 
@@ -2192,6 +2287,23 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         );
     }
 
+    // R11 §9/§9b: per-field LWW clocks for board_metadata (descriptive lane + pin lane), so
+    // a snapshot merge converges per-field instead of whole-record clobbering. Idempotent.
+    if conn.prepare("SELECT meta_updated_at FROM board_metadata LIMIT 1").is_err() {
+        tracing::info!("Migration: adding per-field LWW clocks to board_metadata");
+        let _ = conn.execute("ALTER TABLE board_metadata ADD COLUMN meta_updated_at INTEGER DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE board_metadata ADD COLUMN pin_updated_at INTEGER DEFAULT 0", []);
+    }
+
+    // R11 §1: re-key legacy workspace-scoped chats onto a board (idempotent — only touches
+    // rows missing a board_id). Runs on the init connection (the global DB handle is not set
+    // until init_db finishes), so it operates on `conn` directly.
+    match migrate_chats_to_boards_conn(conn) {
+        Ok(n) if n > 0 => tracing::info!("Migration: re-keyed {n} legacy chat rows to a board"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("Migration: chat re-key failed: {e}"),
+    }
+
     Ok(())
 }
 
@@ -2320,15 +2432,16 @@ pub fn cell_insert_simple(
     Ok(())
 }
 
-/// Insert a chat by individual fields (for snapshot sync)
+/// Insert a chat by individual fields (for snapshot sync). Carries `board_id` so a synced
+/// chat lands on the right board thread (R11 §1).
 pub fn chat_insert_simple(
-    id: &str, workspace_id: &str, message: &str,
+    id: &str, board_id: &str, workspace_id: &str, message: &str,
     author: &str, parent_id: Option<&str>, timestamp: i64,
 ) -> Result<()> {
     let conn = db().lock_safe();
     conn.execute(
-        "INSERT OR IGNORE INTO objects (id, workspace_id, type, name, hash, data, created_at) VALUES (?1, ?2, 'chat', ?3, ?4, ?5, ?6)",
-        params![id, workspace_id, message, author, parent_id.map(|s| s.as_bytes()), timestamp],
+        "INSERT OR IGNORE INTO objects (id, board_id, workspace_id, type, name, hash, data, created_at) VALUES (?1, ?2, ?3, 'chat', ?4, ?5, ?6, ?7)",
+        params![id, board_id, workspace_id, message, author, parent_id.map(|s| s.as_bytes()), timestamp],
     )?;
     Ok(())
 }
@@ -2346,7 +2459,19 @@ pub fn file_insert_simple(
     Ok(())
 }
 
-/// Upsert board metadata (for snapshot sync and updates)
+/// Upsert board metadata as a **per-field convergent LWW merge** — never a whole-record
+/// replace (R11 §9/§9b/PATTERN). Three independent lanes converge so concurrent edits from
+/// different peers merge instead of clobbering:
+///
+/// - **descriptive** (labels/rating/contains_model/contains_skills/board_type) — applied only
+///   when `meta_updated_at` is strictly newer (these move together via `UpdateBoardMetadata`);
+/// - **pin** (`is_pinned`) — applied only when `pin_updated_at` is strictly newer, so a stale
+///   snapshot row never un-pins a board another peer just pinned;
+/// - **activity counters** (`view_count`, `last_accessed`) — merged with `MAX` (monotonic, so
+///   they never decrease and need no clock).
+///
+/// Every lane is independent, so a snapshot re-applying the full board_metadata set is safe.
+#[allow(clippy::too_many_arguments)]
 pub fn board_metadata_upsert(
     board_id: &str,
     labels: &[String],
@@ -2357,6 +2482,8 @@ pub fn board_metadata_upsert(
     board_type: Option<&str>,
     last_accessed: i64,
     is_pinned: bool,
+    meta_updated_at: i64,
+    pin_updated_at: i64,
 ) -> Result<()> {
     let conn = db().lock_safe();
     let labels_json = serde_json::to_string(labels).unwrap_or_else(|_| "[]".to_string());
@@ -2364,12 +2491,21 @@ pub fn board_metadata_upsert(
     let board_type = board_type.unwrap_or("canvas");
 
     conn.execute(
-        "INSERT INTO board_metadata (board_id, labels, rating, view_count, contains_model, contains_skills, board_type, last_accessed, is_pinned)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO board_metadata
+            (board_id, labels, rating, view_count, contains_model, contains_skills, board_type, last_accessed, is_pinned, meta_updated_at, pin_updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(board_id) DO UPDATE SET
-            labels = ?2, rating = ?3, view_count = ?4, contains_model = ?5,
-            contains_skills = ?6, board_type = ?7, last_accessed = ?8, is_pinned = ?9",
-        params![board_id, labels_json, rating, view_count, contains_model, skills_json, board_type, last_accessed, is_pinned as i32],
+            labels          = CASE WHEN excluded.meta_updated_at > board_metadata.meta_updated_at THEN excluded.labels          ELSE board_metadata.labels          END,
+            rating          = CASE WHEN excluded.meta_updated_at > board_metadata.meta_updated_at THEN excluded.rating          ELSE board_metadata.rating          END,
+            contains_model  = CASE WHEN excluded.meta_updated_at > board_metadata.meta_updated_at THEN excluded.contains_model  ELSE board_metadata.contains_model  END,
+            contains_skills = CASE WHEN excluded.meta_updated_at > board_metadata.meta_updated_at THEN excluded.contains_skills ELSE board_metadata.contains_skills END,
+            board_type      = CASE WHEN excluded.meta_updated_at > board_metadata.meta_updated_at THEN excluded.board_type      ELSE board_metadata.board_type      END,
+            is_pinned       = CASE WHEN excluded.pin_updated_at  > board_metadata.pin_updated_at  THEN excluded.is_pinned       ELSE board_metadata.is_pinned       END,
+            view_count      = MAX(excluded.view_count,    board_metadata.view_count),
+            last_accessed   = MAX(excluded.last_accessed, board_metadata.last_accessed),
+            meta_updated_at = MAX(excluded.meta_updated_at, board_metadata.meta_updated_at),
+            pin_updated_at  = MAX(excluded.pin_updated_at,  board_metadata.pin_updated_at)",
+        params![board_id, labels_json, rating, view_count, contains_model, skills_json, board_type, last_accessed, is_pinned as i32, meta_updated_at, pin_updated_at],
     )?;
     Ok(())
 }

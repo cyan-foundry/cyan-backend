@@ -589,13 +589,16 @@ pub extern "C" fn cyan_is_board_owner(id: *const c_char) -> bool {
 }
 
 // ---------- FFI: chats ----------
+/// Send a chat to a **board** (R11 §1 — chat is board-scoped). The first argument is now a
+/// `board_id` (was `workspace_id`); the C ABI is unchanged (same arity/types), so iOS only
+/// changes which id it passes. The engine derives the board's workspace + group internally.
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_send_chat(
-    workspace_id: *const c_char,
+    board_id: *const c_char,
     message: *const c_char,
     parent_id: *const c_char,
 ) {
-    let Some(wid) = (unsafe { cstr_arg(workspace_id) }) else {
+    let Some(bid) = (unsafe { cstr_arg(board_id) }) else {
         return;
     };
     let Some(msg) = (unsafe { cstr_arg(message) }) else {
@@ -608,10 +611,23 @@ pub extern "C" fn cyan_send_chat(
         None => return,
     };
     let _ = sys.command_tx.send(CommandMsg::SendChat {
-        workspace_id: wid,
+        board_id: bid,
         message: msg,
         parent_id: parent,
     });
+}
+
+/// Load a **board's** chat history (R11 §1). Replays each stored message as a `ChatSent`
+/// onto the chat-panel event buffer, then emits `ChatHistoryComplete { board_id, .. }`.
+/// Additive FFI — iOS calls this on opening a board's chat panel.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_load_chat_history(board_id: *const c_char) {
+    let Some(bid) = (unsafe { cstr_arg(board_id) }) else {
+        return;
+    };
+    if let Some(sys) = SYSTEM.get() {
+        let _ = sys.command_tx.send(CommandMsg::LoadChatHistory { board_id: bid });
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -885,10 +901,10 @@ pub extern "C" fn cyan_seed_demo_if_empty() {
 
 // ---------- FFI: unread / notifications (R10FB §N) ----------
 
-/// Unread counts as a JSON object `{scope_id: count}` covering board, workspace and group
-/// ids (a single message rolls up to all three). The app looks up its board-card, workspace
-/// and group ids in this one map; sum it for the dock badge total. Caller frees with
-/// `cyan_free_string`.
+/// Unread counts as a JSON object `{board_id: count}` — **board-level only** (R11 §3). One
+/// message counts once on its board (no workspace/group rollup, which killed the doubled
+/// counts). The app looks up its board-card id in this map; sum the map for the dock badge
+/// total. Caller frees with `cyan_free_string`.
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_unread_counts() -> *mut c_char {
     let counts = storage::unread_counts().unwrap_or_default();
@@ -899,9 +915,9 @@ pub extern "C" fn cyan_unread_counts() -> *mut c_char {
     }
 }
 
-/// Mark a scope read — `scope_id` may be a board, workspace or group id. Clears that scope's
-/// unread items and the rollups, then emits `UnreadChanged` so badges update live. Opening a
-/// chat is a READ (this), never a write that increments.
+/// Mark a **board** read (R11 §3/§5) — `scope_id` is a board id. Clears that board's unread
+/// items, then emits `UnreadChanged` so iOS + the dock badge update live. Opening a chat is a
+/// READ (this), never a write that increments.
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_mark_read(scope_id: *const c_char) {
     let Some(scope_id) = (unsafe { cstr_arg(scope_id) }) else {
@@ -2482,7 +2498,8 @@ pub extern "C" fn cyan_get_board_metadata(board_id: *const c_char) -> *mut c_cha
 
         db.query_row(
             "SELECT board_id, labels, rating, view_count, contains_model,
-                    contains_skills, board_type, last_accessed, COALESCE(is_pinned, 0)
+                    contains_skills, board_type, last_accessed, COALESCE(is_pinned, 0),
+                    COALESCE(meta_updated_at, 0), COALESCE(pin_updated_at, 0)
              FROM board_metadata WHERE board_id = ?1",
             params![&bid],
             |row| {
@@ -2499,6 +2516,8 @@ pub extern "C" fn cyan_get_board_metadata(board_id: *const c_char) -> *mut c_cha
                     board_type: row.get(6)?,
                     last_accessed: row.get(7)?,
                     is_pinned: row.get::<_, i32>(8)? != 0,
+                    meta_updated_at: row.get(9)?,
+                    pin_updated_at: row.get(10)?,
                 })
             }
         ).ok()
@@ -2596,6 +2615,10 @@ pub extern "C" fn cyan_get_boards_metadata(scope_type: *const c_char, scope_id: 
                 board_type: row.get(6)?,
                 last_accessed: row.get(7)?,
                 is_pinned: row.get::<_, i32>(8)? != 0,
+                // UI list read — the LWW clocks aren't surfaced here (sync uses the
+                // board_metadata_list_by_boards path which carries them).
+                meta_updated_at: 0,
+                pin_updated_at: 0,
             })
         }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     };

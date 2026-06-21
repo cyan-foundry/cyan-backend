@@ -1158,12 +1158,15 @@ impl TopicActor {
                     Err(e) => eprintln!("💾 [PERSIST] 🔴 File insert FAILED: {}", e),
                 }
             }
-            NetworkEvent::ChatSent { id, workspace_id, message, author, parent_id, timestamp } => {
+            NetworkEvent::ChatSent { id, board_id, workspace_id, message, author, parent_id, timestamp } => {
                 eprintln!("💾 [PERSIST] ChatSent:");
                 eprintln!("   chat_id: {}...", &id[..16.min(id.len())]);
-                eprintln!("   workspace_id: {}...", &workspace_id[..16.min(workspace_id.len())]);
+                eprintln!("   board_id: {}...", &board_id[..16.min(board_id.len())]);
                 eprintln!("   author: {}...", &author[..16.min(author.len())]);
-                match storage::chat_insert(id, workspace_id, message, author, parent_id.as_deref(), *timestamp) {
+                // R11 §1: chat is board-scoped. If a pre-R11 peer omits board_id, fall back to
+                // the message's workspace so the row is never dropped.
+                let board_key = if board_id.is_empty() { workspace_id.as_str() } else { board_id.as_str() };
+                match storage::chat_insert(id, board_key, workspace_id, message, author, parent_id.as_deref(), *timestamp) {
                     Ok(_) => eprintln!("💾 [PERSIST] ✓ Chat inserted to DB"),
                     Err(e) => eprintln!("💾 [PERSIST] 🔴 Chat insert FAILED: {}", e),
                 }
@@ -1283,8 +1286,9 @@ impl TopicActor {
             }
             // R10FB §B3: pin sync — apply the synced board pinned flag (upsert, LWW by
             // arrival; the single-FIFO persist worker preserves per-board order).
-            NetworkEvent::BoardPinned { board_id, is_pinned, .. } => {
-                let _ = storage::board_meta_set_pinned(board_id, *is_pinned);
+            NetworkEvent::BoardPinned { board_id, is_pinned, updated_at } => {
+                // R11 §9b: per-board convergent LWW — a stale pin never clobbers a newer one.
+                let _ = storage::board_meta_set_pinned(board_id, *is_pinned, *updated_at);
             }
             // R10FB §F4: file delete — apply the tombstone so the deletion converges.
             NetworkEvent::FileDeleted { id, deleted_at } => {
@@ -1298,30 +1302,24 @@ impl TopicActor {
         }
     }
 
-    /// R10FB §N — unread accounting for an inbound gossip event, run by the persist worker.
-    /// An incoming chat from a **non-author** reader counts once, ever (idempotent by
-    /// message_id; gossip echoes and re-syncs never re-increment). Opening a chat is a read,
-    /// never this write, so it cannot inflate the count. Chat is workspace-scoped in this
-    /// engine, so the unread rolls up under workspace + group (the board dimension is the
-    /// seam for board-scoped types — nudges/asks/decisions, §N5). Returns `UnreadChanged`
-    /// (carrying the fresh counts map) only on a real first-time increment.
+    /// R11 §2/§3 — **board-level** unread accounting for an inbound gossip event, run by the
+    /// persist worker. An incoming chat from a **non-author** reader counts once, ever
+    /// (idempotent by message_id; gossip echoes and re-syncs never re-increment). Opening a
+    /// chat is a read, never this write, so it cannot inflate the count. Chat is board-scoped
+    /// (R11 §1), so the unread dot/count lives on the **board only** — no workspace/group
+    /// rollup (that doubling was the bug). Returns `UnreadChanged` (the fresh counts map) only
+    /// on a real first-time increment.
     fn account_unread(evt: &NetworkEvent, local_node_id: &str) -> Option<SwiftEvent> {
-        let NetworkEvent::ChatSent { id, workspace_id, author, timestamp, .. } = evt else {
+        let NetworkEvent::ChatSent { id, board_id, workspace_id, author, timestamp, .. } = evt else {
             return None;
         };
         if author == local_node_id {
             return None; // our own message is never unread for us
         }
-        let group_id = storage::workspace_get_group_id(workspace_id);
-        let newly = storage::unread_record(
-            id,
-            "chat",
-            group_id.as_deref(),
-            Some(workspace_id),
-            None,
-            *timestamp,
-        )
-        .unwrap_or(false);
+        // Board is the scope. A pre-R11 peer may omit board_id; fall back to the workspace so
+        // the message still counts somewhere (it re-keys on the next snapshot/migration).
+        let board_key = if board_id.is_empty() { workspace_id.as_str() } else { board_id.as_str() };
+        let newly = storage::unread_record(id, "chat", board_key, *timestamp).unwrap_or(false);
         if !newly {
             return None;
         }

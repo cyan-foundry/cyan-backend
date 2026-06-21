@@ -232,6 +232,9 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             board_type TEXT DEFAULT 'canvas',
             last_accessed INTEGER DEFAULT 0,
             is_pinned INTEGER DEFAULT 0,
+            -- R11 §9/§9b: per-field LWW clocks (descriptive lane + pin lane).
+            meta_updated_at INTEGER DEFAULT 0,
+            pin_updated_at INTEGER DEFAULT 0,
             FOREIGN KEY (board_id) REFERENCES objects(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_board_rating ON board_metadata(rating DESC);
@@ -735,22 +738,20 @@ impl CommandActor {
                     let _ = self.event_tx.send(SwiftEvent::BoardLeft { id });
                 }
 
-                CommandMsg::SendChat { workspace_id, message, parent_id } => {
-                    let id = blake3::hash(format!("chat:{}-{}-{}", workspace_id, message, chrono::Utc::now()).as_bytes()).to_hex().to_string();
+                CommandMsg::SendChat { board_id, message, parent_id } => {
+                    let id = blake3::hash(format!("chat:{}-{}-{}", board_id, message, chrono::Utc::now()).as_bytes()).to_hex().to_string();
                     let now = chrono::Utc::now().timestamp();
                     let author = self.node_id.clone();
 
-                    eprintln!("💬 [CHAT] SendChat command received:");
-                    eprintln!("   workspace_id: {}...", &workspace_id[..16.min(workspace_id.len())]);
-                    eprintln!("   author: {}...", &author[..16.min(author.len())]);
+                    // R11 §1: chat is board-scoped. Derive the board's workspace (for storage
+                    // scoping) and group (for gossip) — a board belongs to exactly one of each.
+                    let workspace_id = storage::board_get_workspace_id(&board_id).unwrap_or_default();
+                    let group_id = storage::board_get_group_id(&board_id);
 
-                    // Use storage module for consistent DB access
-                    let group_id = storage::workspace_get_group_id(&workspace_id);
+                    eprintln!("💬 [CHAT] SendChat board={}... author={}...",
+                        &board_id[..16.min(board_id.len())], &author[..16.min(author.len())]);
 
-                    eprintln!("   group_id: {:?}", group_id.as_ref().map(|g| &g[..16.min(g.len())]));
-
-                    // Use storage module for consistency with LoadChatHistory
-                    match storage::chat_insert(&id, &workspace_id, &message, &author, parent_id.as_deref(), now) {
+                    match storage::chat_insert(&id, &board_id, &workspace_id, &message, &author, parent_id.as_deref(), now) {
                         Ok(_) => eprintln!("💬 [CHAT] ✓ Chat inserted to DB via storage module"),
                         Err(e) => eprintln!("💬 [CHAT] 🔴 DB INSERT FAILED: {}", e),
                     }
@@ -761,6 +762,7 @@ impl CommandActor {
                             group_id: gid,
                             event: NetworkEvent::ChatSent {
                                 id: id.clone(),
+                                board_id: board_id.clone(),
                                 workspace_id: workspace_id.clone(),
                                 message: message.clone(),
                                 author: author.clone(),
@@ -769,11 +771,12 @@ impl CommandActor {
                             },
                         });
                     } else {
-                        eprintln!("💬 [CHAT] ⚠️ No group_id found for workspace, skipping broadcast");
+                        eprintln!("💬 [CHAT] ⚠️ No group_id found for board, skipping broadcast");
                     }
 
                     let _ = self.event_tx.send(SwiftEvent::Network(NetworkEvent::ChatSent {
                         id,
+                        board_id,
                         workspace_id,
                         message,
                         author,
@@ -1176,16 +1179,24 @@ impl CommandActor {
 
                 // Board metadata commands
                 CommandMsg::UpdateBoardMetadata { board_id, labels, rating, view_count, contains_model, contains_skills, board_type, last_accessed, is_pinned } => {
-                    let labels_json = serde_json::to_string(&labels).unwrap_or_else(|_| "[]".to_string());
-                    let skills_json = serde_json::to_string(&contains_skills).unwrap_or_else(|_| "[]".to_string());
-
-                    {
-                        let db = self.db.lock_safe();
-                        let _ = db.execute(
-                            "INSERT OR REPLACE INTO board_metadata (board_id, labels, rating, view_count, contains_model, contains_skills, board_type, last_accessed, is_pinned) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                            params![board_id, labels_json, rating, view_count, contains_model, skills_json, board_type, last_accessed, is_pinned as i32],
-                        );
-                    }
+                    // R11 §9/PATTERN: per-field convergent LWW upsert — never a whole-record
+                    // replace. The descriptive + pin lanes are both stamped `now` (a local edit
+                    // is the newest writer); the snapshot merge then resolves cross-peer races
+                    // per-field instead of clobbering.
+                    let now = chrono::Utc::now().timestamp();
+                    let _ = storage::board_metadata_upsert(
+                        &board_id,
+                        &labels,
+                        rating,
+                        view_count,
+                        contains_model.as_deref(),
+                        &contains_skills,
+                        board_type.as_deref(),
+                        last_accessed.unwrap_or(0),
+                        is_pinned,
+                        now,
+                        now,
+                    );
 
                     let _ = self.event_tx.send(SwiftEvent::BoardMetadataUpdated { board_id });
                 }
@@ -1206,7 +1217,7 @@ impl CommandActor {
                     // then gossip `BoardPinned` so the pin appears on peers (the previous
                     // local-only UPDATE was the "pin didn't show on peer 2" bug).
                     let now = chrono::Utc::now().timestamp();
-                    let _ = storage::board_meta_set_pinned(&board_id, is_pinned);
+                    let _ = storage::board_meta_set_pinned(&board_id, is_pinned, now);
                     let group_id = self.get_group_id_for_board(&board_id);
                     let event = NetworkEvent::BoardPinned {
                         board_id: board_id.clone(),
@@ -1225,7 +1236,9 @@ impl CommandActor {
                 }
 
                 CommandMsg::MarkRead { scope_id } => {
-                    // R10FB §N: opening clears unread at this scope; rollups drop automatically.
+                    // R11 §3/§5: `scope_id` is a board id — opening the board's chat clears its
+                    // dot/count (board-level only, no rollup). Emit UnreadChanged so iOS + the
+                    // dock badge update live.
                     let _ = storage::unread_mark_read(&scope_id);
                     if let Ok(counts) = storage::unread_counts() {
                         let _ = self.event_tx.send(SwiftEvent::UnreadChanged { counts });
@@ -1310,12 +1323,12 @@ impl CommandActor {
                     }));
                 }
 
-                // ---- Chat History ----
-                CommandMsg::LoadChatHistory { workspace_id } => {
-                    eprintln!("💬 [CHAT] LoadChatHistory for workspace {}...", &workspace_id[..16.min(workspace_id.len())]);
+                // ---- Chat History (R11 §1 — board-scoped) ----
+                CommandMsg::LoadChatHistory { board_id } => {
+                    eprintln!("💬 [CHAT] LoadChatHistory for board {}...", &board_id[..16.min(board_id.len())]);
+                    let workspace_id = storage::board_get_workspace_id(&board_id).unwrap_or_default();
 
-                    // Query chats from DB
-                    match storage::chat_list_by_workspace(&workspace_id) {
+                    match storage::chat_list_by_board(&board_id) {
                         Ok(chats) => {
                             let chat_count = chats.len();
                             eprintln!("💬 [CHAT] Found {} chats in DB", chat_count);
@@ -1324,6 +1337,7 @@ impl CommandActor {
                             for chat in chats {
                                 let event = SwiftEvent::Network(NetworkEvent::ChatSent {
                                     id: chat.id,
+                                    board_id: chat.board_id.clone(),
                                     workspace_id: chat.workspace_id.clone(),
                                     message: chat.message,
                                     author: chat.author,
@@ -1332,10 +1346,11 @@ impl CommandActor {
                                 });
                                 let _ = self.event_tx.send(event);
                             }
-                            
-                            // Signal history loading complete
+
+                            // Signal history loading complete (board-scoped; workspace kept for back-compat).
                             let _ = self.event_tx.send(SwiftEvent::ChatHistoryComplete {
-                                workspace_id: workspace_id.clone(),
+                                board_id: board_id.clone(),
+                                workspace_id,
                             });
                             eprintln!("💬 [CHAT] ChatHistoryComplete ({} msgs)", chat_count);
                         }
@@ -1424,10 +1439,16 @@ impl CommandActor {
     /// the board has a group) and surfaced locally as `SwiftEvent::Network(BoardChanged)`.
     /// `group_id` is the board's group, already resolved by the caller (avoid a re-lookup).
     fn note_board_activity(&self, board_id: &str, group_id: Option<&str>) {
+        // R11 §9: carry the board's current name + a short content preview so a peer can
+        // refresh that board's preview card live (it used to stay blank — the signal carried
+        // no content). Receive-only on the peer (no storage write).
+        let (name, preview) = storage::board_preview(board_id);
         let event = NetworkEvent::BoardChanged {
             board_id: board_id.to_string(),
             editor: self.node_id.clone(),
             ts: chrono::Utc::now().timestamp(),
+            name,
+            preview,
         };
         if let Some(gid) = group_id {
             let _ = self.network_tx.send(NetworkCommand::Broadcast {
@@ -1511,17 +1532,18 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
     .unwrap_or_default();
 
     let chats: Vec<ChatDTO> = (|| -> rusqlite::Result<Vec<ChatDTO>> {
-        let mut stmt = db.prepare("SELECT id, workspace_id, name, hash, data, created_at FROM objects WHERE type='chat' ORDER BY created_at")?;
+        let mut stmt = db.prepare("SELECT id, board_id, workspace_id, name, hash, data, created_at FROM objects WHERE type='chat' ORDER BY created_at")?;
         let rows = stmt.query_map([], |r| {
-            let parent_bytes: Option<Vec<u8>> = r.get(4)?;
+            let parent_bytes: Option<Vec<u8>> = r.get(5)?;
             let parent_id = parent_bytes.and_then(|b| String::from_utf8(b).ok());
             Ok(ChatDTO {
                 id: r.get(0)?,
-                workspace_id: r.get(1)?,
-                message: r.get(2)?,
-                author: r.get(3)?,
+                board_id: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                workspace_id: r.get(2)?,
+                message: r.get(3)?,
+                author: r.get(4)?,
                 parent_id,
-                timestamp: r.get(5)?,
+                timestamp: r.get(6)?,
             })
         })?;
         Ok(rows.filter_map(Result::ok).collect())
@@ -1550,7 +1572,7 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
     };
 
     let board_metadata: Vec<BoardMetadataDTO> = {
-        match db.prepare("SELECT board_id, labels, rating, view_count, contains_model, contains_skills, board_type, last_accessed, COALESCE(is_pinned, 0) FROM board_metadata") {
+        match db.prepare("SELECT board_id, labels, rating, view_count, contains_model, contains_skills, board_type, last_accessed, COALESCE(is_pinned, 0), COALESCE(meta_updated_at, 0), COALESCE(pin_updated_at, 0) FROM board_metadata") {
             Ok(mut stmt) => {
                 stmt.query_map([], |row| {
                     let labels_json: String = row.get(1)?;
@@ -1565,6 +1587,8 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
                         board_type: row.get(6)?,
                         last_accessed: row.get(7)?,
                         is_pinned: row.get::<_, i32>(8)? != 0,
+                        meta_updated_at: row.get(9)?,
+                        pin_updated_at: row.get(10)?,
                     })
                 }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
             }

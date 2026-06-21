@@ -48,6 +48,16 @@ pub struct BoardMetadataDTO {
     pub last_accessed: i64,
     #[serde(default)]
     pub is_pinned: bool,
+    /// LWW clock for the **descriptive** lane (labels/rating/contains_model/contains_skills/
+    /// board_type) — the fields edited together by `UpdateBoardMetadata`. The merge applies
+    /// these only when this is strictly newer, so a stale snapshot never clobbers them
+    /// (R11 §9/PATTERN — per-field convergent LWW, never whole-record replace).
+    #[serde(default)]
+    pub meta_updated_at: i64,
+    /// LWW clock for the **pin** lane (`is_pinned`) — set independently of the descriptive
+    /// fields, so pins from multiple peers MERGE rather than clobber (R11 §9b).
+    #[serde(default)]
+    pub pin_updated_at: i64,
 }
 
 fn default_board_type() -> String {
@@ -106,6 +116,11 @@ pub struct FileDTO {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatDTO {
     pub id: String,
+    /// The board this chat belongs to (R11 §1 — chat is board-scoped). `#[serde(default)]`
+    /// so a snapshot from a pre-R11 peer (no `board_id`) still deserializes; the migration
+    /// and apply path back-fill it.
+    #[serde(default)]
+    pub board_id: String,
     pub workspace_id: String,
     pub message: String,
     pub author: String,

@@ -68,6 +68,10 @@ pub enum NetworkEvent {
     // ---- Chat events ----
     ChatSent {
         id: String,
+        /// The board this chat belongs to (R11 §1 — chat is board-scoped). `#[serde(default)]`
+        /// keeps the gossip wire backward-compatible with a pre-R11 peer.
+        #[serde(default)]
+        board_id: String,
         workspace_id: String,
         message: String,
         author: String,
@@ -242,6 +246,14 @@ pub enum NetworkEvent {
         /// Node id of the peer that made the edit.
         editor: String,
         ts: i64,
+        /// R11 §9 — the board's current display name, so a peer can refresh that board's
+        /// preview card live (previously the peer's preview stayed blank on edit because the
+        /// signal carried no content). `#[serde(default)]` keeps the wire back-compatible.
+        #[serde(default)]
+        name: String,
+        /// R11 §9 — a short content preview (latest cell/note text, truncated) for the card.
+        #[serde(default)]
+        preview: String,
     },
     // ---- Pin sync (R10FB §B3) ----
     /// A board's pinned flag (`board_metadata.is_pinned`) changed. Pinning is now a
@@ -343,8 +355,12 @@ pub enum SwiftEvent {
     SyncComplete {
         group_id: String,
     },
-    /// Chat history finished loading for a workspace
+    /// Chat history finished loading for a board (R11 §1 — board-scoped). `workspace_id` is
+    /// kept (back-compat); iOS correlates the completion to the board's chat panel via
+    /// `board_id`. `#[serde(default)]` keeps the JSON additive for an older client.
     ChatHistoryComplete {
+        #[serde(default)]
+        board_id: String,
         workspace_id: String,
     },
 

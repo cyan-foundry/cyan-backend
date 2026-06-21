@@ -42,6 +42,7 @@ fn cfg() -> NodeCfg {
 fn chat(id: &str, scope: &str, message: &str) -> NetworkEvent {
     NetworkEvent::ChatSent {
         id: id.to_string(),
+        board_id: scope.to_string(),
         workspace_id: scope.to_string(),
         message: message.to_string(),
         author: "author-a".to_string(),

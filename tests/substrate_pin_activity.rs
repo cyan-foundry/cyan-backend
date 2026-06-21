@@ -58,7 +58,13 @@ async fn board_edit_emits_change_event() {
     let board = format!("{group}-board-edit");
     nodes[0].broadcast(
         &group,
-        NetworkEvent::BoardChanged { board_id: board.clone(), editor: nodes[0].node_id.clone(), ts: 5 },
+        NetworkEvent::BoardChanged {
+            board_id: board.clone(),
+            editor: nodes[0].node_id.clone(),
+            ts: 5,
+            name: "Edited Board".to_string(),
+            preview: "latest cell text".to_string(),
+        },
     );
 
     let want = board.clone();
@@ -84,7 +90,13 @@ async fn change_event_carries_editor_and_board() {
     let editor = nodes[0].node_id.clone();
     nodes[0].broadcast(
         &group,
-        NetworkEvent::BoardChanged { board_id: board.clone(), editor: editor.clone(), ts: 7 },
+        NetworkEvent::BoardChanged {
+            board_id: board.clone(),
+            editor: editor.clone(),
+            ts: 7,
+            name: "Attr Board".to_string(),
+            preview: "preview snippet".to_string(),
+        },
     );
 
     let want_board = board.clone();
@@ -97,7 +109,7 @@ async fn change_event_carries_editor_and_board() {
         .expect("peer received board-changed");
 
     match got {
-        NetworkEvent::BoardChanged { board_id, editor: got_editor, ts } => {
+        NetworkEvent::BoardChanged { board_id, editor: got_editor, ts, .. } => {
             assert_eq!(board_id, board, "carries the board id");
             assert_eq!(got_editor, editor, "carries the editor");
             assert_eq!(ts, 7, "carries the edit timestamp");
@@ -132,4 +144,134 @@ fn fresh_db_creates_no_demo_group() {
         )
         .expect("count demo boards");
     assert_eq!(demo_boards, 0, "no Demo Board is ever auto-created");
+}
+
+// ─────────────────── R11 §9/§9b/PATTERN — board-state CONVERGENT sync ───────────────────
+//
+// board_metadata sync is per-field convergent LWW, never a whole-record clobber. Three
+// independent lanes: descriptive (labels/rating/…) on `meta_updated_at`, pin (`is_pinned`)
+// on `pin_updated_at`, and activity counters via MAX. These assert on the process-global
+// `storage::*` merge directly — the oracle for "a stale snapshot never clobbers a newer edit".
+
+/// §9: the board-changed signal carries the board's name + a content preview, so a peer can
+/// refresh that board's preview card live (it used to stay blank — the signal carried no
+/// content). Proves both that the engine BUILDS the preview data and that it survives the wire.
+#[tokio::test]
+async fn board_change_event_carries_preview_data() {
+    let _serial = serial().await;
+    support::ensure_db();
+
+    // A real board with content → it has a non-blank preview.
+    let board = unique_group_id();
+    let ws = unique_group_id();
+    storage::board_insert_simple(&board, &ws, "Design Notes", 1).expect("board");
+    storage::cell_insert(&format!("{board}-cell"), &board, "step", 0, Some("Ship the preview fix"))
+        .expect("cell");
+
+    let (name, preview) = storage::board_preview(&board);
+    assert_eq!(name, "Design Notes", "preview carries the board name");
+    assert!(
+        preview.contains("Ship the preview fix"),
+        "preview carries a content snippet, got {preview:?}"
+    );
+
+    // …and the BoardChanged the engine emits with that data reaches a peer non-blank.
+    let nodes = spawn_mesh(2, cfg()).await.expect("mesh spawns");
+    let group = unique_group_id();
+    meet(&nodes, &group, SYNC_TIMEOUT).await.expect("nodes meet");
+    nodes[0].broadcast(
+        &group,
+        NetworkEvent::BoardChanged {
+            board_id: board.clone(),
+            editor: nodes[0].node_id.clone(),
+            ts: 9,
+            name: name.clone(),
+            preview: preview.clone(),
+        },
+    );
+
+    let want = board.clone();
+    let got = nodes[1]
+        .wait_network(
+            move |e| matches!(e, NetworkEvent::BoardChanged { board_id, .. } if *board_id == want),
+            SYNC_TIMEOUT,
+        )
+        .await
+        .expect("peer received board-changed");
+    match got {
+        NetworkEvent::BoardChanged { name, preview, .. } => {
+            assert!(!name.is_empty(), "peer gets a non-blank name to refresh its preview");
+            assert!(!preview.is_empty(), "peer gets a non-blank content preview");
+        }
+        other => panic!("expected BoardChanged, got {other:?}"),
+    }
+}
+
+/// §9b: pins from two peers MERGE — a stale snapshot row never clobbers a board another peer
+/// just pinned (the "peer A pins 2 boards → peer B's pins disappear" bug).
+#[test]
+fn pins_from_two_peers_merge_not_clobber() {
+    support::ensure_db();
+    let board_a = unique_group_id(); // pinned by "peer A"
+    let board_b = unique_group_id(); // pinned by "peer B"
+
+    // Each peer pins its own board (per-board convergent flag, LWW by updated_at).
+    storage::board_meta_set_pinned(&board_a, true, 10).expect("peer A pins board_a");
+    storage::board_meta_set_pinned(&board_b, true, 10).expect("peer B pins board_b");
+
+    // A snapshot from peer A (who never pinned board_b) carries board_b with is_pinned=false at
+    // an OLDER pin clock — it must NOT un-pin board_b.
+    storage::board_metadata_upsert(
+        &board_b, &[], 0, 0, None, &[], Some("canvas"), 0, /*is_pinned*/ false,
+        /*meta_updated_at*/ 0, /*pin_updated_at*/ 3,
+    )
+    .expect("apply stale snapshot row for board_b");
+
+    // Peer A's pin for board_a arrives (true, newer/equal clock) and lands.
+    storage::board_meta_set_pinned(&board_a, true, 10).expect("apply peer A pin for board_a");
+
+    assert!(storage::board_is_pinned(&board_a), "board_a stays pinned (peer A)");
+    assert!(
+        storage::board_is_pinned(&board_b),
+        "board_b stays pinned — a stale snapshot did NOT clobber peer B's pin"
+    );
+}
+
+/// §9/PATTERN: board_metadata is per-field LWW — a stale whole-record snapshot never clobbers
+/// a field another peer edited newer; an independent field's edit doesn't disturb the others.
+#[test]
+fn board_metadata_field_lww_no_whole_record_clobber() {
+    support::ensure_db();
+    let board = unique_group_id();
+
+    // Descriptive edit (labels) at t=10, then an independent pin at t=20.
+    storage::board_metadata_upsert(
+        &board, &["alpha".to_string()], 0, 0, None, &[], Some("canvas"), 0, false,
+        /*meta*/ 10, /*pin*/ 0,
+    )
+    .expect("set labels");
+    storage::board_meta_set_pinned(&board, true, 20).expect("pin");
+
+    // A STALE whole-record snapshot (everything reset, OLD clocks on both lanes) must clobber
+    // nothing — neither the labels nor the pin.
+    storage::board_metadata_upsert(
+        &board, &[], 0, 0, None, &[], Some("canvas"), 0, false,
+        /*meta*/ 5, /*pin*/ 5,
+    )
+    .expect("apply stale whole-record snapshot");
+
+    let after_stale = &storage::board_metadata_list_by_boards(std::slice::from_ref(&board)).unwrap()[0];
+    assert_eq!(after_stale.labels, vec!["alpha".to_string()], "stale snapshot did NOT clobber labels");
+    assert!(after_stale.is_pinned, "stale snapshot did NOT un-pin the board");
+
+    // A NEWER descriptive-only edit updates labels but leaves the (newer) pin untouched.
+    storage::board_metadata_upsert(
+        &board, &["beta".to_string()], 0, 0, None, &[], Some("canvas"), 0, false,
+        /*meta*/ 30, /*pin*/ 0,
+    )
+    .expect("newer descriptive edit");
+
+    let after_new = &storage::board_metadata_list_by_boards(std::slice::from_ref(&board)).unwrap()[0];
+    assert_eq!(after_new.labels, vec!["beta".to_string()], "newer descriptive edit applied");
+    assert!(after_new.is_pinned, "independent descriptive edit did NOT disturb the pin lane");
 }

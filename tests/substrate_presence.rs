@@ -205,6 +205,7 @@ async fn presence_matches_data_connectivity() {
         &group,
         NetworkEvent::ChatSent {
             id: chat_id.clone(),
+            board_id: format!("{group}-ws"),
             workspace_id: format!("{group}-ws"),
             message: "hello".to_string(),
             author: "node-0".to_string(),

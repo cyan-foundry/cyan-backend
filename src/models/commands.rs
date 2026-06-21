@@ -179,16 +179,19 @@ pub enum CommandMsg {
     // ═══════════════════════════════════════════════════════════════════════
     // CHAT COMMANDS
     // ═══════════════════════════════════════════════════════════════════════
+    /// Send a chat to a **board** (R11 §1 — chat is board-scoped). The engine derives the
+    /// board's workspace + group for storage scoping and group gossip.
     SendChat {
-        workspace_id: String,
+        board_id: String,
         message: String,
         parent_id: Option<String>,
     },
     DeleteChat {
         id: String,
     },
+    /// Load a **board's** chat history (R11 §1).
     LoadChatHistory {
-        workspace_id: String,
+        board_id: String,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
