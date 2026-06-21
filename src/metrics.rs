@@ -96,6 +96,50 @@ pub fn record_snapshot_served() {
     SNAPSHOT_SERVED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// §5 incremental catch-up: snapshots SERVED as an incremental delta (`since` was set,
+/// so only rows newer than the requester's high-water mark were sent). The "a returning
+/// peer pulled only the delta, not a full re-snapshot" oracle.
+static INCREMENTAL_SERVED: AtomicU64 = AtomicU64::new(0);
+
+/// §5 incremental catch-up: snapshots SERVED as a FULL snapshot (`since` absent — the
+/// cold-start / no-common-base fallback). Paired with [`incremental_served`] so a test
+/// can prove a catch-up took the incremental path and NOT the full path.
+static FULL_SERVED: AtomicU64 = AtomicU64::new(0);
+
+/// Rows the LAST served snapshot put on the wire (sum across Structure/Content/Metadata).
+/// The transfer-size oracle: an incremental catch-up serves only the missing range, so this
+/// reflects the delta count, not the whole group.
+static ROWS_SERVED_LAST: AtomicU64 = AtomicU64::new(0);
+
+/// One incremental (`since`-bounded) snapshot served, carrying `rows` data rows.
+#[inline]
+pub fn record_incremental_served(rows: u64) {
+    INCREMENTAL_SERVED.fetch_add(1, Ordering::Relaxed);
+    ROWS_SERVED_LAST.store(rows, Ordering::Relaxed);
+}
+
+/// One full snapshot served, carrying `rows` data rows.
+#[inline]
+pub fn record_full_served(rows: u64) {
+    FULL_SERVED.fetch_add(1, Ordering::Relaxed);
+    ROWS_SERVED_LAST.store(rows, Ordering::Relaxed);
+}
+
+/// Incremental (delta) snapshots this node has served.
+pub fn incremental_served() -> u64 {
+    INCREMENTAL_SERVED.load(Ordering::Relaxed)
+}
+
+/// Full snapshots this node has served.
+pub fn full_served() -> u64 {
+    FULL_SERVED.load(Ordering::Relaxed)
+}
+
+/// Data rows the most recent served snapshot put on the wire.
+pub fn rows_served_last() -> u64 {
+    ROWS_SERVED_LAST.load(Ordering::Relaxed)
+}
+
 /// Total inbound gossip messages processed by this node.
 pub fn gossip_recv() -> u64 {
     GOSSIP_RECV.load(Ordering::Relaxed)
@@ -166,4 +210,7 @@ pub fn reset() {
     AE_DIGEST_SENT.store(0, Ordering::Relaxed);
     AE_REPAIR.store(0, Ordering::Relaxed);
     SNAPSHOT_SERVED.store(0, Ordering::Relaxed);
+    INCREMENTAL_SERVED.store(0, Ordering::Relaxed);
+    FULL_SERVED.store(0, Ordering::Relaxed);
+    ROWS_SERVED_LAST.store(0, Ordering::Relaxed);
 }

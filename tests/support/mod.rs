@@ -417,6 +417,13 @@ impl Node {
 /// The backing tempdir is intentionally leaked so it outlives every node.
 static SHARED_DB: OnceLock<PathBuf> = OnceLock::new();
 
+/// Ensure the process-global substrate DB is initialised (base schema + `storage::init_db`)
+/// and return its path. For storage-oracle UNIT tests that exercise `storage`/`snapshot`/
+/// `group_bundle` directly without spinning nodes. Idempotent (the `OnceLock` inits once).
+pub fn ensure_db() -> PathBuf {
+    shared_db()
+}
+
 fn shared_db() -> PathBuf {
     SHARED_DB
         .get_or_init(|| {

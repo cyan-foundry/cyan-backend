@@ -3580,6 +3580,126 @@ pub extern "C" fn cyan_scan_grant_qr(qr_payload: *const c_char) -> *mut c_char {
 }
 
 // ============================================================================
+// §11 Portable Group Export bundle FFI
+// ============================================================================
+
+/// This node's X25519 bundle public key (hex) — the recipient key an inviter passes to
+/// `cyan_export_group` so the `.cyangroup` is sealed TO this device. Derived deterministically
+/// from this node's XaeroID identity (see `group_bundle::invitee_pubkey_hex`); stable across
+/// launches. iOS: `bundlePublicKey`. Returns the hex string, or null if not initialized.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_bundle_pubkey() -> *mut c_char {
+    let Some(sys) = SYSTEM.get() else {
+        return std::ptr::null_mut();
+    };
+    let secret = sys.secret_key.to_bytes();
+    let pk = crate::group_bundle::invitee_pubkey_hex(&secret);
+    match CString::new(pk) {
+        Ok(c) => c.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Export a group to a signed, invitee-encrypted `.cyangroup` bundle (MESH_HARDENING §11) —
+/// **group Owner only**. `invitee_pubkey` is the invitee's X25519 bundle pubkey (from
+/// `cyan_bundle_pubkey` on their device). The bundle is STRICTLY scoped to this one group, files
+/// are metadata-only (no media bytes), and the whole thing is XaeroID-signed by this node.
+///
+/// iOS: `exportGroup`. Returns `{"success":true,"group_id":...,"bundle":"<json>","path":"<file>"}`
+/// (the bundle body is also written under the data dir) or `{"success":false,"error":...}`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_export_group(
+    group_id: *const c_char,
+    invitee_pubkey: *const c_char,
+) -> *mut c_char {
+    use crate::identity::{pubkey_hex, GroupRoster, Role};
+
+    let Some(gid) = (unsafe { cstr_arg(group_id) }) else {
+        return json_result_ptr(false, None, None, Some("Invalid group_id"));
+    };
+    let Some(invitee) = (unsafe { cstr_arg(invitee_pubkey) }) else {
+        return json_result_ptr(false, None, None, Some("Invalid invitee_pubkey"));
+    };
+    let Some(sys) = SYSTEM.get() else {
+        return json_result_ptr(false, None, None, Some("System not initialized"));
+    };
+
+    // Authority: only the group Owner/Admin may export it (same gate as issuing a grant).
+    if !storage::group_is_owner(&gid, &sys.node_id) {
+        return json_result_ptr(false, None, None, Some("Only the group Owner/Admin may export it"));
+    }
+
+    // Mint the invitee's scope grant for THIS group (role Member), signed by this node. The
+    // export embeds it as the bundle's strict scope; import re-checks it matches the group.
+    let secret = sys.secret_key.to_bytes();
+    let issuer_pk = pubkey_hex(&secret);
+    let mut roster = GroupRoster::new();
+    roster.set_role(&gid, &issuer_pk, Role::Owner);
+    let now = chrono::Utc::now().timestamp();
+    let expiry = (now + 365 * 24 * 3600) as u64;
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let grant = match crate::identity::Grant::issue(
+        &gid, Role::Member, &secret, now as u64, expiry, &nonce, &roster,
+    ) {
+        Ok(g) => g,
+        Err(e) => return json_result_ptr(false, None, None, Some(&format!("Grant: {e}"))),
+    };
+
+    let bundle = match crate::group_bundle::export_group(&gid, &grant, &invitee, &secret, now) {
+        Ok(b) => b,
+        Err(e) => return json_result_ptr(false, None, None, Some(&format!("Export failed: {e}"))),
+    };
+    let body = bundle.to_json();
+
+    // Best-effort: also drop the bundle on disk so the app can share the file directly.
+    let path = DATA_DIR.get().map(|d| d.join("exports").join(format!("{gid}.cyangroup")));
+    if let Some(ref p) = path {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(p, &body);
+    }
+
+    let mut out = serde_json::Map::new();
+    out.insert("success".to_string(), serde_json::Value::Bool(true));
+    out.insert("group_id".to_string(), serde_json::Value::String(gid));
+    out.insert("bundle".to_string(), serde_json::Value::String(body));
+    if let Some(p) = path.and_then(|p| p.to_str().map(|s| s.to_string())) {
+        out.insert("path".to_string(), serde_json::Value::String(p));
+    }
+    match CString::new(serde_json::Value::Object(out).to_string()) {
+        Ok(c) => c.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Import a `.cyangroup` bundle (MESH_HARDENING §11) — verifies the signature + grant scope,
+/// decrypts to THIS device's key, seeds the baseline into storage (works fully offline), and
+/// stamps "synced as of T" so §5 catch-up reconciles the gap on first online contact.
+///
+/// `bundle` is the JSON bundle body (from `cyan_export_group`). iOS: `importGroup`. Returns
+/// `{"success":true,"group_id":...}` or `{"success":false,"error":...}` for an unsigned, forged,
+/// out-of-scope, or undecryptable bundle.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_import_group(bundle: *const c_char) -> *mut c_char {
+    let Some(body) = (unsafe { cstr_arg(bundle) }) else {
+        return json_result_ptr(false, None, None, Some("Invalid bundle"));
+    };
+    let Some(sys) = SYSTEM.get() else {
+        return json_result_ptr(false, None, None, Some("System not initialized"));
+    };
+    let parsed = match crate::group_bundle::GroupBundle::from_json(&body) {
+        Ok(b) => b,
+        Err(e) => return json_result_ptr(false, None, None, Some(&format!("{e}"))),
+    };
+    let secret = sys.secret_key.to_bytes();
+    match crate::group_bundle::import_group(&parsed, &secret) {
+        Ok(gid) => json_result_ptr(true, Some(&gid), None, None),
+        Err(e) => json_result_ptr(false, None, None, Some(&format!("{e}"))),
+    }
+}
+
+// ============================================================================
 // Lens Commands FFI
 // ============================================================================
 

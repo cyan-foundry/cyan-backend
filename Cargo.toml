@@ -79,6 +79,10 @@ pdf-extract = "0.7"
 petgraph = "0.8.3"
 async-trait = "0.1.89"
 glob = "0.3"
+# §11 portable group export — encrypt the bundle to the invitee (X25519 sealed box).
+# Already in the tree transitively via iroh 0.95; we only enable its `seal` feature,
+# so this adds no new crate, just the anonymous sealed-box API.
+crypto_box = { version = "0.10.0-pre.0", features = ["seal"] }
 
 [dev-dependencies]
 # The `testing` feature exposes the embedded RS256 keypair + entitlement

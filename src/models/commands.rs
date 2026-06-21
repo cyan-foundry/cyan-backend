@@ -39,6 +39,17 @@ pub enum NetworkCommand {
     SeedDiscoveredPeer {
         addr_json: String,
     },
+    /// MESH_HARDENING §5 incremental catch-up: pull ONLY the missing range for `group_id` from
+    /// `source_peer` (a snapshot holder), starting at `since` (the requester's high-water mark;
+    /// `None` ⇒ a full snapshot fallback). Drives the bounded `download_snapshot_since` path —
+    /// used by a peer returning after offline/partition to reconcile without a full re-snapshot,
+    /// and by the §11 import path on first online contact. Additive; the live-join path is untouched.
+    CatchUp {
+        group_id: String,
+        source_peer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<i64>,
+    },
     UploadToGroup {
         group_id: String,
         path: String,

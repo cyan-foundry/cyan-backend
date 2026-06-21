@@ -721,6 +721,29 @@ impl NetworkActor {
                 // and peers respond with SnapshotAvailable
             }
 
+            NetworkCommand::CatchUp { group_id, source_peer, since } => {
+                // MESH_HARDENING §5: pull only the missing range from `source_peer`. When `since`
+                // is unset, fall back to the group's persisted "synced as of T" watermark (set by a
+                // §11 bundle import), else the local high-water mark — so a returning peer asks for
+                // exactly what it lacks instead of a full re-snapshot.
+                let since = since
+                    .or_else(|| storage::group_sync_state_get(&group_id))
+                    .or_else(|| {
+                        let hw = crate::snapshot::group_high_water(&group_id);
+                        (hw > 0).then_some(hw)
+                    });
+                if let Some(handle) = self.topics.get(&group_id) {
+                    let _ = handle.cmd_tx.send(ActorMessage::Domain(
+                        TopicCommand::CatchUp { source_peer, since },
+                    ));
+                } else {
+                    tracing::warn!(
+                        "⚠️ [NET] CatchUp: no TopicActor for group {}",
+                        &group_id[..16.min(group_id.len())]
+                    );
+                }
+            }
+
             NetworkCommand::RequestFileDownload { file_id, hash, source_peer, resume_offset } => {
                 tracing::info!(
                     "📥 [NET] RequestFileDownload: {} from {}",
@@ -1610,7 +1633,7 @@ async fn handle_snapshot_server(
     authorizer: Arc<std::sync::Mutex<MeshAuthorizer>>,
 ) -> Result<()> {
     use crate::identity::{Grant, SnapshotDenial};
-    use crate::models::protocol::{SnapshotFrame, SnapshotRequest};
+    use crate::models::protocol::SnapshotRequest;
 
     let peer_id = conn.remote_id().to_string();
     eprintln!("📤 [SNAP] ════════════════════════════════════════════════════════");
@@ -1629,10 +1652,10 @@ async fn handle_snapshot_server(
     let mut req_bytes = vec![0u8; len];
     recv.read_exact(&mut req_bytes).await?;
 
-    let (group_id, grant_qr): (String, Option<String>) =
+    let (group_id, grant_qr, since): (String, Option<String>, Option<i64>) =
         match serde_json::from_slice::<SnapshotRequest>(&req_bytes) {
-            Ok(req) => (req.group_id, req.grant),
-            Err(_) => (String::from_utf8(req_bytes)?, None),
+            Ok(req) => (req.group_id, req.grant, req.since),
+            Err(_) => (String::from_utf8(req_bytes)?, None, None),
         };
 
     eprintln!("   → Requested group: {}...", &group_id[..16.min(group_id.len())]);
@@ -1668,97 +1691,48 @@ async fn handle_snapshot_server(
         return Ok(());
     }
 
-    // Build snapshot from storage
-    if let Some(group) = storage::group_get(&group_id)? {
-        let workspaces = storage::workspace_list_by_group(&group_id)?;
-        let workspace_ids: Vec<String> = workspaces.iter().map(|w| w.id.clone()).collect();
-        let boards = storage::board_list_by_workspaces(&workspace_ids)?;
-
-        eprintln!("   📊 Building snapshot:");
-        eprintln!("      - group: {}", group.name);
-        eprintln!("      - workspaces: {}", workspaces.len());
-        eprintln!("      - boards: {}", boards.len());
-
-        // Extract board_ids before moving boards
-        let board_ids: Vec<String> = boards.iter().map(|b| b.id.clone()).collect();
-
-        // Send Structure frame
-        let structure = SnapshotFrame::Structure {
-            group,
-            workspaces,
-            boards,
-        };
-
-        let data = serde_json::to_vec(&structure)?;
-        eprintln!("   → Sending Structure frame ({} bytes)", data.len());
-        let len = (data.len() as u32).to_be_bytes();
-        send.write_chunk(Bytes::copy_from_slice(&len)).await?;
-        send.write_chunk(Bytes::from(data)).await?;
-
-        // Send Content frame (elements + cells)
-        let elements = storage::element_list_by_boards(&board_ids)?;
-        let cells = storage::cell_list_by_boards(&board_ids)?;
-
-        eprintln!("      - elements: {}", elements.len());
-        eprintln!("      - cells: {}", cells.len());
-
-        let content = SnapshotFrame::Content { elements, cells };
-        let data = serde_json::to_vec(&content)?;
-        eprintln!("   → Sending Content frame ({} bytes)", data.len());
-        let len = (data.len() as u32).to_be_bytes();
-        send.write_chunk(Bytes::copy_from_slice(&len)).await?;
-        send.write_chunk(Bytes::from(data)).await?;
-
-        // Send Metadata frame
-        let chats = storage::chat_list_by_workspaces(&workspace_ids)?;
-        let files = storage::file_list_by_group(&group_id)?;
-        let integrations = storage::integration_list_by_group(&group_id)?;
-        let board_metadata = storage::board_metadata_list_by_boards(&board_ids)?;
-        let notes = storage::note_list_by_boards(&board_ids)?;
-        let pins = storage::pin_list_by_boards(&board_ids)?;
-
-        eprintln!("      - chats: {}", chats.len());
-        eprintln!("      - files: {}", files.len());
-        eprintln!("      - integrations: {}", integrations.len());
-        eprintln!("      - board_metadata: {}", board_metadata.len());
-        eprintln!("      - notes: {}", notes.len());
-        eprintln!("      - pins: {}", pins.len());
-
-        let metadata = SnapshotFrame::Metadata {
-            chats,
-            files,
-            integrations,
-            board_metadata,
-            notes,
-            pins,
-        };
-        let data = serde_json::to_vec(&metadata)?;
-        eprintln!("   → Sending Metadata frame ({} bytes)", data.len());
-        let len = (data.len() as u32).to_be_bytes();
-        send.write_chunk(Bytes::copy_from_slice(&len)).await?;
-        send.write_chunk(Bytes::from(data)).await?;
-
-        // Send Complete frame
-        let complete = SnapshotFrame::Complete;
-        let data = serde_json::to_vec(&complete)?;
-        eprintln!("   → Sending Complete frame");
-        let len = (data.len() as u32).to_be_bytes();
-        send.write_chunk(Bytes::copy_from_slice(&len)).await?;
-        send.write_chunk(Bytes::from(data)).await?;
-
-        // CRITICAL: Signal end of stream and wait for peer to receive
-        send.finish()?;
-        let _ = send.stopped().await;
-
-        // Observability only (stress fabric "snapshot under load / no single-host overload" oracle):
-        // count every snapshot this holder actually served. Behavior-neutral.
-        crate::metrics::record_snapshot_served();
-
-        eprintln!("✅ [SNAP] Snapshot SENT for group {}...", &group_id[..16.min(group_id.len())]);
-        tracing::info!("📤 [SNAP] Snapshot sent for group {}", &group_id[..16.min(group_id.len())]);
-    } else {
+    // Build the snapshot via the shared builder (MESH_HARDENING §5). `since=None` ⇒ the full
+    // snapshot (unchanged cold-start behavior); `since=Some(t)` ⇒ only the rows newer than the
+    // requester's high-water mark — the incremental catch-up. Same `SnapshotFrame` wire shape
+    // and ORDER either way, so the existing apply path is untouched.
+    let frames = crate::snapshot::build_snapshot_frames(&group_id, since)?;
+    if frames.is_empty() {
         eprintln!("⚠️ [SNAP] Group not found in DB: {}...", &group_id[..16.min(group_id.len())]);
+        return Ok(());
     }
+
+    let rows = crate::snapshot::frames_row_count(&frames);
+    eprintln!(
+        "   📊 Serving {} snapshot for {}... ({} data rows, since={:?})",
+        if since.is_some() { "INCREMENTAL" } else { "FULL" },
+        &group_id[..16.min(group_id.len())],
+        rows,
+        since,
+    );
+
+    for frame in &frames {
+        let data = serde_json::to_vec(frame)?;
+        let len = (data.len() as u32).to_be_bytes();
+        send.write_chunk(Bytes::copy_from_slice(&len)).await?;
+        send.write_chunk(Bytes::from(data)).await?;
+    }
+
+    // CRITICAL: Signal end of stream and wait for peer to receive.
+    send.finish()?;
+    let _ = send.stopped().await;
+
+    // Observability only (behavior-neutral). `record_snapshot_served` keeps the existing
+    // "snapshot under load" oracle; the incremental/full split is the §5 "pulled only the
+    // delta, not a full re-snapshot" oracle.
+    crate::metrics::record_snapshot_served();
+    if since.is_some() {
+        crate::metrics::record_incremental_served(rows);
+    } else {
+        crate::metrics::record_full_served(rows);
+    }
+
+    eprintln!("✅ [SNAP] Snapshot SENT for group {}...", &group_id[..16.min(group_id.len())]);
+    tracing::info!("📤 [SNAP] Snapshot sent for group {}", &group_id[..16.min(group_id.len())]);
 
     Ok(())
 }

@@ -69,6 +69,12 @@ pub enum TopicCommand {
     DownloadSnapshot {
         source_peer: String,
     },
+    /// MESH_HARDENING §5 incremental catch-up: pull ONLY rows newer than `since` from
+    /// `source_peer` (a quiet merge, no join-time `Sync*` UI churn). `since=None` is a full pull.
+    CatchUp {
+        source_peer: String,
+        since: Option<i64>,
+    },
     /// Mark snapshot as needed or received
     SetNeedSnapshot(bool),
     /// Announce (over gossip) that this node holds the blob with this Blake3 hash (`IHave`).
@@ -521,6 +527,49 @@ impl TopicActor {
                 });
             }
 
+            TopicCommand::CatchUp { source_peer, since } => {
+                // §5 incremental catch-up: a QUIET (no Sync* UI events) since-bounded merge from a
+                // chosen holder. Reuses the snapshot serve/apply path — same idempotent upsert, so
+                // a delta and a full pull converge identically. Bounded by download_snapshot's own
+                // connect/read timeouts.
+                eprintln!(
+                    "📥 [CATCHUP] group {}... from {}... since={:?}",
+                    &self.group_id[..16.min(self.group_id.len())],
+                    &source_peer[..16.min(source_peer.len())],
+                    since,
+                );
+                let endpoint = self.endpoint.clone();
+                let group_id = self.group_id.clone();
+                let event_tx = self.event_tx.clone();
+                let network_tx = self.network_tx.clone();
+                let grant = self.grant.clone();
+                tokio::spawn(async move {
+                    match download_snapshot_since(
+                        endpoint,
+                        &source_peer,
+                        &group_id,
+                        grant.as_deref(),
+                        since,
+                        event_tx,
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            let _ = network_tx
+                                .send(TopicNetworkCmd::SnapshotComplete { group_id });
+                        }
+                        Err(e) => {
+                            tracing::warn!("🔴 [CATCHUP] catch-up from peer failed: {}", e);
+                            let _ = network_tx.send(TopicNetworkCmd::SnapshotFailed {
+                                group_id,
+                                reason: e.to_string(),
+                            });
+                        }
+                    }
+                });
+            }
+
             TopicCommand::SetNeedSnapshot(needs) => {
                 eprintln!("🗂️ [TOPIC] SetNeedSnapshot({}) for {}...", needs, &self.group_id[..16.min(self.group_id.len())]);
                 self.need_snapshot = needs;
@@ -911,13 +960,28 @@ impl TopicActor {
         if sources.is_empty() {
             return;
         }
-        // Random holder among device peers that offered (Lens is an HTTP enrichment leg, not a mesh
-        // peer, so it never appears here; the mesh repairs itself entirely from device holders).
-        let idx = {
-            use rand::Rng;
-            rand::thread_rng().gen_range(0..sources.len())
+        // MESH_HARDENING §5 closest-holder preference: pick a holder that is a DIRECT LAN/mesh
+        // neighbor (lowest-latency, relay-free) over a remoter one. `known_peers` is this group's
+        // live gossip neighbor set, so an offerer in it is reachable on the LAN right now. With no
+        // LAN offerer we keep the original behavior (spread across whatever offered) — Lens, an HTTP
+        // leg, never appears here, so the mesh still repairs from device holders.
+        let lan_peers: HashSet<String> = self
+            .known_peers
+            .iter()
+            .map(|pk| pk.to_string())
+            .collect();
+        let source_peer = match crate::snapshot::pick_catchup_holder(&sources, &lan_peers, None) {
+            Some(p) if lan_peers.contains(&p) => p,
+            _ => {
+                // No LAN-direct offerer — fall back to the original random spread so concurrent
+                // cold-joiners don't all hammer one host (the "snapshot under load" fix).
+                let idx = {
+                    use rand::Rng;
+                    rand::thread_rng().gen_range(0..sources.len())
+                };
+                sources[idx].clone()
+            }
         };
-        let source_peer = sources[idx].clone();
         self.need_snapshot = false;
 
         eprintln!(
@@ -971,6 +1035,18 @@ impl TopicActor {
 
     async fn broadcast_event(&self, event: &NetworkEvent) -> Result<()> {
         let data = serde_json::to_vec(event)?;
+
+        // MESH_HARDENING §4 offline-hold seam: persist every outgoing broadcast in the durable,
+        // content-addressed hold store BEFORE putting it on the (best-effort) gossip wire. Keyed by
+        // blake3(payload), so it is deliverable on reconnect and idempotent on re-broadcast. This is
+        // the clean seam the Lens super-peer consumes to hold/serve messages for offline peers —
+        // best-effort and behavior-neutral to the live path (a hold-store error never blocks a send).
+        let hash = blake3::hash(&data).to_hex().to_string();
+        let now = chrono::Utc::now().timestamp();
+        if let Err(e) = storage::hold_put(&self.group_id, &hash, &data, now) {
+            tracing::debug!("🪣 [HOLD] hold_put failed (non-fatal): {}", e);
+        }
+
         self.sender.broadcast(Bytes::from(data)).await?;
 
         tracing::debug!(
@@ -1443,6 +1519,24 @@ async fn download_snapshot(
     event_tx: UnboundedSender<SwiftEvent>,
     quiet: bool,
 ) -> Result<()> {
+    download_snapshot_since(endpoint, source_peer, group_id, grant, None, event_tx, quiet).await
+}
+
+/// MESH_HARDENING §5 incremental catch-up: like [`download_snapshot`] but requests only the
+/// rows newer than `since` (the requester's high-water mark). `since=None` is the full pull
+/// (the existing behavior `download_snapshot` forwards to). The apply is the SAME idempotent
+/// upsert-by-id path either way (via `snapshot::apply_snapshot_frame`), so a delta merge and a
+/// full snapshot converge to the identical state.
+#[allow(clippy::too_many_arguments)]
+async fn download_snapshot_since(
+    endpoint: Endpoint,
+    source_peer: &str,
+    group_id: &str,
+    grant: Option<&str>,
+    since: Option<i64>,
+    event_tx: UnboundedSender<SwiftEvent>,
+    quiet: bool,
+) -> Result<()> {
     use crate::models::protocol::SnapshotRequest;
     use tokio::io::AsyncWriteExt;
 
@@ -1485,6 +1579,7 @@ async fn download_snapshot(
     let request = SnapshotRequest {
         group_id: group_id.to_string(),
         grant: grant.map(|g| g.to_string()),
+        since,
     };
     let req_bytes = serde_json::to_vec(&request)?;
     let len = (req_bytes.len() as u32).to_be_bytes();
@@ -1533,50 +1628,26 @@ async fn download_snapshot(
         let frame: SnapshotFrame = serde_json::from_slice(&frame_data)
             .map_err(|e| anyhow!("Failed to parse snapshot frame: {}", e))?;
 
+        // Apply the frame's rows via the SHARED idempotent upsert path (MESH_HARDENING §5),
+        // the same one the §11 bundle import uses — so a full snapshot, an incremental delta,
+        // and an air-gapped import all converge to the identical state. Then emit the per-node
+        // `Sync*` progress events (the substrate oracle) for the rows this frame carried.
+        if let Err(e) = crate::snapshot::apply_snapshot_frame(&frame) {
+            eprintln!("   ⚠️ Snapshot frame apply: {}", e);
+        }
+
         match frame {
             SnapshotFrame::Structure { group, workspaces, boards } => {
-                eprintln!("📥 [SNAP-DL-7] STRUCTURE frame received:");
-                eprintln!("   group: {} ({})", group.name, &group.id[..16.min(group.id.len())]);
-                eprintln!("   workspaces: {}", workspaces.len());
-                eprintln!("   boards: {}", boards.len());
-
-                // Emit sync started
+                eprintln!(
+                    "📥 [SNAP-DL-7] STRUCTURE: group {} ws={} boards={}",
+                    &group.id[..16.min(group.id.len())], workspaces.len(), boards.len()
+                );
+                structure_received = true;
                 if !quiet {
                     let _ = event_tx.send(SwiftEvent::SyncStarted {
                         group_id: group.id.clone(),
                         group_name: group.name.clone(),
                     });
-                }
-
-                // Insert structure into DB
-                eprintln!("📥 [SNAP-DL-7a] Inserting structure into DB...");
-
-                // Insert/update group
-                if let Err(e) = storage::group_insert_simple(&group.id, &group.name, &group.icon, &group.color) {
-                    eprintln!("   ⚠️ Group insert: {}", e);
-                }
-
-                // Insert workspaces — via the full insert so `created_at` and the
-                // ROUND8 §W3 `system` flag replicate (a joiner must recognize the
-                // per-group Plugins workspace as system / non-deletable too).
-                for w in &workspaces {
-                    if let Err(e) = storage::workspace_insert(w) {
-                        eprintln!("   ⚠️ Workspace insert: {}", e);
-                    }
-                }
-
-                // Insert boards
-                for b in &boards {
-                    if let Err(e) = storage::board_insert_simple(&b.id, &b.workspace_id, &b.name, b.created_at) {
-                        eprintln!("   ⚠️ Board insert: {}", e);
-                    }
-                }
-
-                eprintln!("📥 [SNAP-DL-7b] ✓ Structure inserted");
-                structure_received = true;
-
-                // Emit structure received
-                if !quiet {
                     let _ = event_tx.send(SwiftEvent::SyncStructureReceived {
                         group_id: group_id.to_string(),
                         workspace_count: workspaces.len() as u32,
@@ -1586,37 +1657,7 @@ async fn download_snapshot(
             }
 
             SnapshotFrame::Content { elements, cells } => {
-                eprintln!("📥 [SNAP-DL-8] CONTENT frame received:");
-                eprintln!("   elements: {}", elements.len());
-                eprintln!("   cells: {}", cells.len());
-
-                // Insert elements
-                for elem in &elements {
-                    if let Err(e) = storage::element_insert_simple(
-                        &elem.id, &elem.board_id, &elem.element_type,
-                        elem.x, elem.y, elem.width, elem.height, elem.z_index,
-                        elem.style_json.as_deref(), elem.content_json.as_deref(),
-                        elem.created_at, elem.updated_at,
-                    ) {
-                        eprintln!("   ⚠️ Element insert: {}", e);
-                    }
-                }
-
-                // Insert cells
-                for cell in &cells {
-                    if let Err(e) = storage::cell_insert_simple(
-                        &cell.id, &cell.board_id, &cell.cell_type, cell.cell_order,
-                        cell.content.as_deref(), cell.output.as_deref(), cell.collapsed,
-                        cell.height, cell.metadata_json.as_deref(),
-                        cell.created_at, cell.updated_at,
-                    ) {
-                        eprintln!("   ⚠️ Cell insert: {}", e);
-                    }
-                }
-
-                eprintln!("📥 [SNAP-DL-8a] ✓ Content inserted");
-
-                // Emit board ready
+                eprintln!("📥 [SNAP-DL-8] CONTENT: elements={} cells={}", elements.len(), cells.len());
                 if !quiet {
                     let _ = event_tx.send(SwiftEvent::SyncBoardReady {
                         board_id: "all".to_string(),
@@ -1627,75 +1668,11 @@ async fn download_snapshot(
             }
 
             SnapshotFrame::Metadata { chats, files, integrations, board_metadata, notes, pins } => {
-                eprintln!("📥 [SNAP-DL-9] METADATA frame received:");
-                eprintln!("   chats: {}", chats.len());
-                eprintln!("   files: {}", files.len());
-                eprintln!("   integrations: {}", integrations.len());
-                eprintln!("   board_metadata: {}", board_metadata.len());
-                eprintln!("   notes: {}", notes.len());
-                eprintln!("   pins: {}", pins.len());
-
-                // Insert chats
-                for chat in &chats {
-                    if let Err(e) = storage::chat_insert_simple(
-                        &chat.id, &chat.workspace_id, &chat.message,
-                        &chat.author, chat.parent_id.as_deref(), chat.timestamp,
-                    ) {
-                        eprintln!("   ⚠️ Chat insert: {}", e);
-                    }
-                }
-
-                // Insert files (metadata only)
-                for file in &files {
-                    if let Err(e) = storage::file_insert_simple(
-                        &file.id, file.group_id.as_deref(), file.workspace_id.as_deref(),
-                        file.board_id.as_deref(), &file.name, &file.hash, file.size,
-                        file.source_peer.as_deref(), file.created_at,
-                    ) {
-                        eprintln!("   ⚠️ File insert: {}", e);
-                    }
-                }
-
-                // Insert integrations
-                for integ in &integrations {
-                    if let Err(e) = storage::integration_insert(
-                        &integ.id, &integ.scope_type, &integ.scope_id, &integ.integration_type,
-                        &integ.config, integ.created_at,
-                    ) {
-                        eprintln!("   ⚠️ Integration insert: {}", e);
-                    }
-                }
-
-                // Insert board metadata
-                for meta in &board_metadata {
-                    if let Err(e) = storage::board_metadata_upsert(
-                        &meta.board_id, &meta.labels, meta.rating, meta.view_count,
-                        meta.contains_model.as_deref(), &meta.contains_skills,
-                        Some(&meta.board_type), meta.last_accessed, meta.is_pinned,
-                    ) {
-                        eprintln!("   ⚠️ Board metadata insert: {}", e);
-                    }
-                }
-
-                // Insert notes — idempotent LWW upsert-by-id, so a merge snapshot
-                // (anti-entropy repair) converges to the latest value without churn.
-                for nt in &notes {
-                    if let Err(e) = storage::note_upsert(nt) {
-                        eprintln!("   ⚠️ Note insert: {}", e);
-                    }
-                }
-
-                // Insert pins (ROUND8 §W4) — idempotent LWW upsert-by-board_id, so the
-                // pinned-workflow state converges through the anti-entropy merge too.
-                for p in &pins {
-                    if let Err(e) = storage::pin_upsert(p) {
-                        eprintln!("   ⚠️ Pin insert: {}", e);
-                    }
-                }
-
-                eprintln!("📥 [SNAP-DL-9a] ✓ Metadata inserted");
-
-                // Emit files received
+                eprintln!(
+                    "📥 [SNAP-DL-9] METADATA: chats={} files={} integ={} meta={} notes={} pins={}",
+                    chats.len(), files.len(), integrations.len(),
+                    board_metadata.len(), notes.len(), pins.len()
+                );
                 if !files.is_empty() && !quiet {
                     let _ = event_tx.send(SwiftEvent::SyncFilesReceived {
                         group_id: group_id.to_string(),

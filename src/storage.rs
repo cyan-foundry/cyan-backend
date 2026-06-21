@@ -1325,6 +1325,89 @@ pub fn group_members_list(group_id: &str) -> Vec<(String, Option<String>, Option
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// GROUP SYNC STATE — "synced as of T" watermark (MESH_HARDENING §5/§11)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Record that `group_id` is synced as of `synced_as_of` (unix seconds). Monotonic
+/// (Last-Writer-Wins on the MAX): a later import / catch-up only advances the watermark,
+/// never rewinds it, so a stale bundle can't reset a group that has already caught up.
+/// New code: no `unwrap` on the lock (panics cross the FFI boundary).
+pub fn group_sync_state_set(group_id: &str, synced_as_of: i64) -> Result<()> {
+    let conn = db().lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+    conn.execute(
+        "INSERT INTO group_sync_state (group_id, synced_as_of) VALUES (?1, ?2)
+         ON CONFLICT(group_id) DO UPDATE SET synced_as_of = MAX(synced_as_of, excluded.synced_as_of)",
+        params![group_id, synced_as_of],
+    )?;
+    Ok(())
+}
+
+/// The "synced as of T" watermark for `group_id`, or `None` if never recorded. This is the
+/// `since` an incremental catch-up uses on first online contact after a bundle import.
+pub fn group_sync_state_get(group_id: &str) -> Option<i64> {
+    let conn = db().lock().ok()?;
+    conn.query_row(
+        "SELECT synced_as_of FROM group_sync_state WHERE group_id = ?1",
+        params![group_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MESH HOLD — durable, content-addressed offline-hold outbox (MESH_HARDENING §4)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Persist one group broadcast into the durable hold store, content-addressed by
+/// `hash` = blake3(payload). Idempotent: re-holding the same content is a no-op (the
+/// `(group_id, hash)` primary key dedups), so a re-broadcast never bloats the store.
+/// This is the seam the Lens super-peer consumes to hold/serve messages for offline peers.
+pub fn hold_put(group_id: &str, hash: &str, payload: &[u8], created_at: i64) -> Result<()> {
+    let conn = db().lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+    conn.execute(
+        "INSERT OR IGNORE INTO mesh_hold (group_id, hash, payload, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![group_id, hash, payload, created_at],
+    )?;
+    Ok(())
+}
+
+/// Held broadcasts for `group_id` created strictly after `since` (unix seconds), oldest
+/// first, as `(hash, payload, created_at)`. A super-peer serving an offline peer's
+/// reconnect passes the peer's last-seen watermark as `since` and replays only what it missed.
+pub fn hold_list_since(group_id: &str, since: i64) -> Vec<(String, Vec<u8>, i64)> {
+    let Ok(conn) = db().lock() else {
+        return Vec::new();
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT hash, payload, created_at FROM mesh_hold
+         WHERE group_id = ?1 AND created_at > ?2 ORDER BY created_at ASC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match stmt.query_map(params![group_id, since], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    }) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+/// Count of held broadcasts for `group_id` (the offline-hold depth oracle for §4 tests).
+pub fn hold_count(group_id: &str) -> i64 {
+    let Ok(conn) = db().lock() else { return 0 };
+    conn.query_row(
+        "SELECT COUNT(*) FROM mesh_hold WHERE group_id = ?1",
+        params![group_id],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // DIRECT MESSAGES
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1662,6 +1745,43 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                 last_seen INTEGER NOT NULL,
                 PRIMARY KEY (group_id, peer_id)
             )",
+            [],
+        );
+    }
+
+    // Migration: group_sync_state — the "synced as of T" watermark per group (MESH_HARDENING
+    // §5/§11). An imported Group Export bundle stamps the bundle's `synced_as_of` here; the
+    // engine then drives an INCREMENTAL catch-up (`since = synced_as_of`) on first online
+    // contact instead of a full re-snapshot. One row per group; LWW on the max watermark.
+    if conn.prepare("SELECT group_id FROM group_sync_state LIMIT 1").is_err() {
+        tracing::info!("Migration: creating group_sync_state table");
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS group_sync_state (
+                group_id TEXT PRIMARY KEY,
+                synced_as_of INTEGER NOT NULL
+            )",
+            [],
+        );
+    }
+
+    // Migration: mesh_hold — the OFFLINE-HOLD durable outbox (MESH_HARDENING §4). Every group
+    // broadcast is also persisted here, content-addressed by blake3(payload), so it is
+    // deliverable on reconnect. This is the clean seam the Lens super-peer consumes to hold and
+    // re-serve messages for peers that were offline. Append-only; dedup by (group_id, hash).
+    if conn.prepare("SELECT group_id FROM mesh_hold LIMIT 1").is_err() {
+        tracing::info!("Migration: creating mesh_hold table");
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS mesh_hold (
+                group_id TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (group_id, hash)
+            )",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mesh_hold_created ON mesh_hold(group_id, created_at)",
             [],
         );
     }

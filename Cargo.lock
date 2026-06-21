@@ -296,6 +296,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "812e12b5285cc515a9c72a5c1d3b6d46a19dac5acfef5265968c166106e31dd3"
 
 [[package]]
+name = "blake2"
+version = "0.11.0-rc.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1edac47499deef695d9431bf241c75ea29f4cf3dcb78d39e19b31515e4ad3b08"
+dependencies = [
+ "digest 0.11.0-rc.3",
+]
+
+[[package]]
 name = "blake3"
 version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -644,6 +653,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bda4de3e070830cf3a27a394de135b6709aefcc54d1e16f2f029271254a6ed9"
 dependencies = [
  "aead",
+ "blake2",
  "chacha20",
  "crypto_secretbox",
  "curve25519-dalek 5.0.0-pre.1",
@@ -726,6 +736,7 @@ dependencies = [
  "chrono",
  "clap",
  "colored",
+ "crypto_box",
  "cyan-identity",
  "cyan-mcp",
  "dirs",
@@ -885,6 +896,7 @@ dependencies = [
  "block-buffer 0.11.0",
  "const-oid 0.10.1",
  "crypto-common 0.2.0-rc.4",
+ "subtle",
 ]
 
 [[package]]

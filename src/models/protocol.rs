@@ -28,6 +28,13 @@ pub struct SnapshotRequest {
     pub group_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant: Option<String>,
+    /// MESH_HARDENING §5 incremental catch-up: the requester's high-water mark (unix
+    /// seconds). When `Some(t)`, the holder serves ONLY rows newer than `t` (the missing
+    /// range) instead of a full re-snapshot. Absent (`None`) ⇒ a full snapshot, the
+    /// cold-start / no-common-base fallback. Additive + `skip_serializing_if`, so an older
+    /// holder ignores it (serves full) and an older joiner never sends it — fully wire-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<i64>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
