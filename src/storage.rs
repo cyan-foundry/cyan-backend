@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use crate::models::core::{Group, Workspace};
+use crate::util::MutexExt;
 use crate::models::dto::*;
 
 static DB: OnceLock<Mutex<Connection>> = OnceLock::new();
@@ -78,7 +79,7 @@ pub fn db() -> &'static Mutex<Connection> {
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn group_insert(g: &Group) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT OR IGNORE INTO groups (id, name, icon, color, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![g.id, g.name, g.icon, g.color, g.created_at],
@@ -87,13 +88,13 @@ pub fn group_insert(g: &Group) -> Result<()> {
 }
 
 pub fn group_rename(id: &str, name: &str) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute("UPDATE groups SET name=?1 WHERE id=?2", params![name, id])?;
     Ok(())
 }
 
 pub fn group_delete(id: &str) -> Result<bool> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
 
     // Get workspace IDs first
     let workspace_ids: Vec<String> = {
@@ -183,7 +184,7 @@ pub fn group_delete(id: &str) -> Result<bool> {
 }
 
 pub fn group_list_ids() -> HashSet<String> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let mut stmt = conn.prepare("SELECT id FROM groups").unwrap();
     let mut rows = stmt.query([]).unwrap();
     let mut out = HashSet::new();
@@ -199,7 +200,7 @@ pub fn group_list_ids() -> HashSet<String> {
 
 /// Check if node owns this group
 pub fn group_is_owner(group_id: &str, node_id: &str) -> bool {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.query_row(
         "SELECT owner_node_id FROM groups WHERE id = ?1",
         params![group_id],
@@ -209,7 +210,7 @@ pub fn group_is_owner(group_id: &str, node_id: &str) -> bool {
 
 /// Check if node owns this workspace
 pub fn workspace_is_owner(workspace_id: &str, node_id: &str) -> bool {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.query_row(
         "SELECT owner_node_id FROM workspaces WHERE id = ?1",
         params![workspace_id],
@@ -219,7 +220,7 @@ pub fn workspace_is_owner(workspace_id: &str, node_id: &str) -> bool {
 
 /// Check if node owns this board
 pub fn board_is_owner(board_id: &str, node_id: &str) -> bool {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.query_row(
         "SELECT owner_node_id FROM objects WHERE id = ?1 AND type = 'whiteboard'",
         params![board_id],
@@ -229,7 +230,7 @@ pub fn board_is_owner(board_id: &str, node_id: &str) -> bool {
 
 /// Get owner_node_id of a group
 pub fn group_get_owner(group_id: &str) -> Option<String> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.query_row(
         "SELECT owner_node_id FROM groups WHERE id = ?1",
         params![group_id],
@@ -239,7 +240,7 @@ pub fn group_get_owner(group_id: &str) -> Option<String> {
 
 /// Get owner_node_id of a workspace
 pub fn workspace_get_owner(workspace_id: &str) -> Option<String> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.query_row(
         "SELECT owner_node_id FROM workspaces WHERE id = ?1",
         params![workspace_id],
@@ -249,7 +250,7 @@ pub fn workspace_get_owner(workspace_id: &str) -> Option<String> {
 
 /// Get owner_node_id of a board
 pub fn board_get_owner(board_id: &str) -> Option<String> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.query_row(
         "SELECT owner_node_id FROM objects WHERE id = ?1 AND type = 'whiteboard'",
         params![board_id],
@@ -258,7 +259,7 @@ pub fn board_get_owner(board_id: &str) -> Option<String> {
 }
 
 pub fn group_get(id: &str) -> Result<Option<Group>> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let mut stmt = conn.prepare("SELECT id, name, icon, color, created_at FROM groups WHERE id=?1")?;
     stmt.query_row(params![id], |r| {
         Ok(Group {
@@ -273,7 +274,7 @@ pub fn group_get(id: &str) -> Result<Option<Group>> {
 
 /// List all groups
 pub fn group_list() -> Result<Vec<Group>> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let mut stmt = conn.prepare("SELECT id, name, icon, color, created_at FROM groups ORDER BY name")?;
     let rows = stmt.query_map([], |r| {
         Ok(Group {
@@ -336,7 +337,7 @@ pub fn provision_group_workspaces(
         system: true,
     };
     {
-        let conn = db().lock().unwrap();
+        let conn = db().lock_safe();
         for ws in [&default, &plugins] {
             conn.execute(
                 "INSERT OR IGNORE INTO workspaces (id, group_id, name, created_at, is_system, owner_node_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -348,7 +349,7 @@ pub fn provision_group_workspaces(
 }
 
 pub fn workspace_insert(ws: &Workspace) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT OR IGNORE INTO workspaces (id, group_id, name, created_at, is_system) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![ws.id, ws.group_id, ws.name, ws.created_at, ws.system as i32],
@@ -357,7 +358,7 @@ pub fn workspace_insert(ws: &Workspace) -> Result<()> {
 }
 
 pub fn workspace_rename(id: &str, name: &str) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute("UPDATE workspaces SET name=?1 WHERE id=?2", params![name, id])?;
     Ok(())
 }
@@ -365,7 +366,7 @@ pub fn workspace_rename(id: &str, name: &str) -> Result<()> {
 /// ROUND8 §W3: is this a system (non-deletable) workspace — the per-group "Plugins"
 /// workspace? Returns false for unknown ids.
 pub fn workspace_is_system(id: &str) -> bool {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.query_row(
         "SELECT is_system FROM workspaces WHERE id = ?1",
         params![id],
@@ -387,7 +388,7 @@ pub fn workspace_delete(id: &str) -> Result<()> {
         return Err(anyhow::anyhow!("workspace {id} is a system workspace and cannot be deleted"));
     }
 
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
 
     // Delete integration_bindings for this workspace
     conn.execute("DELETE FROM integration_bindings WHERE scope_id=?1", params![id])?;
@@ -436,14 +437,14 @@ pub fn workspace_delete(id: &str) -> Result<()> {
 }
 
 pub fn workspace_get_group_id(workspace_id: &str) -> Option<String> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let mut stmt = conn.prepare("SELECT group_id FROM workspaces WHERE id=?1 LIMIT 1").ok()?;
     stmt.query_row(params![workspace_id], |r| r.get(0)).optional().ok()?
 }
 
 /// Get group_id for a board (via its workspace)
 pub fn board_get_group_id(board_id: &str) -> Option<String> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     // Board -> workspace_id -> group_id
     let mut stmt = conn.prepare(
         "SELECT w.group_id FROM workspaces w
@@ -454,7 +455,7 @@ pub fn board_get_group_id(board_id: &str) -> Option<String> {
 }
 
 pub fn workspace_list_by_group(group_id: &str) -> Result<Vec<Workspace>> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let mut stmt = conn.prepare("SELECT id, group_id, name, created_at, is_system FROM workspaces WHERE group_id=?1 ORDER BY name")?;
     let rows = stmt.query_map(params![group_id], |r| {
         Ok(Workspace {
@@ -470,7 +471,7 @@ pub fn workspace_list_by_group(group_id: &str) -> Result<Vec<Workspace>> {
 
 /// List workspace IDs for a group (lightweight version)
 pub fn workspace_list_ids_by_group(group_id: &str) -> Vec<String> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let mut stmt = match conn.prepare("SELECT id FROM workspaces WHERE group_id=?1") {
         Ok(s) => s,
         Err(_) => return vec![],
@@ -493,7 +494,7 @@ pub fn workspace_list_ids_by_group(group_id: &str) -> Vec<String> {
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn board_insert(id: &str, workspace_id: &str, name: &str, created_at: i64) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT OR IGNORE INTO objects (id, workspace_id, type, name, created_at) VALUES (?1, ?2, 'whiteboard', ?3, ?4)",
         params![id, workspace_id, name, created_at],
@@ -502,13 +503,13 @@ pub fn board_insert(id: &str, workspace_id: &str, name: &str, created_at: i64) -
 }
 
 pub fn board_rename(id: &str, name: &str) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute("UPDATE objects SET name=?1 WHERE id=?2 AND type='whiteboard'", params![name, id])?;
     Ok(())
 }
 
 pub fn board_delete(id: &str) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     // Delete file_transfers for files attached to this board
     conn.execute("DELETE FROM file_transfers WHERE file_id IN (SELECT id FROM objects WHERE board_id=?1)", params![id])?;
     // Delete files attached to this board
@@ -523,20 +524,20 @@ pub fn board_delete(id: &str) -> Result<()> {
 }
 
 pub fn board_set_mode(board_id: &str, mode: &str) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute("UPDATE objects SET board_mode=?1 WHERE id=?2", params![mode, board_id])?;
     Ok(())
 }
 
 pub fn board_get_workspace_id(board_id: &str) -> Option<String> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let mut stmt = conn.prepare("SELECT workspace_id FROM objects WHERE id=?1 AND type='whiteboard' LIMIT 1").ok()?;
     stmt.query_row(params![board_id], |r| r.get(0)).optional().ok()?
 }
 
 pub fn board_list_by_workspaces(workspace_ids: &[String]) -> Result<Vec<WhiteboardDTO>> {
     if workspace_ids.is_empty() { return Ok(vec![]); }
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let placeholders: String = workspace_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!("SELECT id, workspace_id, name, created_at FROM objects WHERE type='whiteboard' AND workspace_id IN ({}) ORDER BY name", placeholders);
     let mut stmt = conn.prepare(&sql)?;
@@ -557,7 +558,7 @@ pub fn board_list_by_workspaces(workspace_ids: &[String]) -> Result<Vec<Whiteboa
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn chat_insert(id: &str, workspace_id: &str, message: &str, author: &str, parent_id: Option<&str>, timestamp: i64) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT OR IGNORE INTO objects (id, workspace_id, type, name, hash, data, created_at) VALUES (?1, ?2, 'chat', ?3, ?4, ?5, ?6)",
         params![id, workspace_id, message, author, parent_id.map(|s| s.as_bytes()), timestamp],
@@ -566,13 +567,13 @@ pub fn chat_insert(id: &str, workspace_id: &str, message: &str, author: &str, pa
 }
 
 pub fn chat_delete(id: &str) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute("DELETE FROM objects WHERE id=?1 AND type='chat'", params![id])?;
     Ok(())
 }
 
 pub fn chat_get_workspace_id(chat_id: &str) -> Option<String> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let mut stmt = conn.prepare("SELECT workspace_id FROM objects WHERE id=?1 AND type='chat' LIMIT 1").ok()?;
     stmt.query_row(params![chat_id], |r| r.get(0)).optional().ok()?
 }
@@ -581,7 +582,7 @@ pub fn chat_get_workspace_id(chat_id: &str) -> Option<String> {
 pub fn chat_list_by_workspaces(workspace_ids: &[String]) -> Result<Vec<ChatDTO>> {
     if workspace_ids.is_empty() { return Ok(vec![]); }
 
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let placeholders: String = workspace_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
         "SELECT id, workspace_id, name, hash, data, created_at
@@ -610,7 +611,7 @@ pub fn chat_list_by_workspaces(workspace_ids: &[String]) -> Result<Vec<ChatDTO>>
 
 /// Get chats for a single workspace
 pub fn chat_list_by_workspace(workspace_id: &str) -> Result<Vec<ChatDTO>> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let mut stmt = conn.prepare(
         "SELECT id, workspace_id, name, hash, data, created_at
          FROM objects WHERE type = 'chat' AND workspace_id = ?1 ORDER BY created_at"
@@ -854,7 +855,7 @@ pub fn file_insert(
     id: &str, group_id: Option<&str>, workspace_id: Option<&str>, board_id: Option<&str>,
     name: &str, hash: &str, size: u64, source_peer: &str, created_at: i64,
 ) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT OR IGNORE INTO objects (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, created_at) VALUES (?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7, ?8, ?9)",
         params![id, group_id, workspace_id, board_id, name, hash, size as i64, source_peer, created_at],
@@ -863,13 +864,13 @@ pub fn file_insert(
 }
 
 pub fn file_set_local_path(id: &str, local_path: &str) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute("UPDATE objects SET local_path=?1 WHERE id=?2 AND type='file'", params![local_path, id])?;
     Ok(())
 }
 
 pub fn file_get_for_transfer(id: &str, hash: &str) -> Option<(String, String, u64)> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.query_row(
         "SELECT name, local_path, size FROM objects WHERE id=?1 AND type='file' AND hash=?2",
         params![id, hash],
@@ -878,14 +879,14 @@ pub fn file_get_for_transfer(id: &str, hash: &str) -> Option<(String, String, u6
 }
 
 pub fn file_get_local_path(id: &str) -> Option<String> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let mut stmt = conn.prepare("SELECT local_path FROM objects WHERE id=?1 AND type='file'").ok()?;
     stmt.query_row(params![id], |r| r.get(0)).optional().ok()?
 }
 
 /// Get the group_id for a file (for routing file downloads to correct TopicActor)
 pub fn file_get_group_id(file_id: &str) -> Option<String> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.query_row(
         "SELECT group_id FROM objects WHERE id = ?1 AND type = 'file'",
         params![file_id],
@@ -895,7 +896,7 @@ pub fn file_get_group_id(file_id: &str) -> Option<String> {
 
 /// List files by group (for snapshot)
 pub fn file_list_by_group(group_id: &str) -> Result<Vec<FileDTO>> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let mut stmt = conn.prepare(
         "SELECT id, group_id, workspace_id, board_id, name, hash, size, source_peer, local_path, created_at
          FROM objects WHERE type = 'file' AND group_id = ?1 ORDER BY name"
@@ -942,7 +943,7 @@ pub fn plugin_bundles_in_group(
     workspace_name: &str,
     suffix: &str,
 ) -> Result<Vec<PluginBundleFile>> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let mut stmt = conn.prepare(
         "SELECT o.id, o.name, o.local_path
          FROM objects o
@@ -973,7 +974,7 @@ pub fn transfer_upsert(
     bytes_received: u64, temp_path: &str, source_peer: &str, status: &str,
 ) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT OR REPLACE INTO file_transfers (file_id, file_name, total_size, hash, bytes_received, temp_path, source_peer, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
         params![file_id, file_name, total_size as i64, hash, bytes_received as i64, temp_path, source_peer, status, now],
@@ -983,7 +984,7 @@ pub fn transfer_upsert(
 
 pub fn transfer_update_progress(file_id: &str, bytes_received: u64) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "UPDATE file_transfers SET bytes_received=?1, updated_at=?2 WHERE file_id=?3",
         params![bytes_received as i64, now, file_id],
@@ -993,7 +994,7 @@ pub fn transfer_update_progress(file_id: &str, bytes_received: u64) -> Result<()
 
 pub fn transfer_set_status(file_id: &str, status: &str) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "UPDATE file_transfers SET status=?1, updated_at=?2 WHERE file_id=?3",
         params![status, now, file_id],
@@ -1002,7 +1003,7 @@ pub fn transfer_set_status(file_id: &str, status: &str) -> Result<()> {
 }
 
 pub fn transfer_list_pending() -> Result<Vec<(String, String, String, u64)>> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let mut stmt = conn.prepare("SELECT file_id, hash, source_peer, bytes_received FROM file_transfers WHERE status IN ('pending', 'in_progress')")?;
     let rows = stmt.query_map([], |r| {
         Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? as u64))
@@ -1015,7 +1016,7 @@ pub fn transfer_list_pending() -> Result<Vec<(String, String, String, u64)>> {
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn element_insert(e: &WhiteboardElementDTO) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT OR IGNORE INTO whiteboard_elements (id, board_id, element_type, x, y, width, height, z_index, style_json, content_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![e.id, e.board_id, e.element_type, e.x, e.y, e.width, e.height, e.z_index, e.style_json, e.content_json, e.created_at, e.updated_at],
@@ -1024,7 +1025,7 @@ pub fn element_insert(e: &WhiteboardElementDTO) -> Result<()> {
 }
 
 pub fn element_update(e: &WhiteboardElementDTO) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "UPDATE whiteboard_elements SET board_id=?2, element_type=?3, x=?4, y=?5, width=?6, height=?7, z_index=?8, style_json=?9, content_json=?10, updated_at=?11 WHERE id=?1",
         params![e.id, e.board_id, e.element_type, e.x, e.y, e.width, e.height, e.z_index, e.style_json, e.content_json, e.updated_at],
@@ -1033,13 +1034,13 @@ pub fn element_update(e: &WhiteboardElementDTO) -> Result<()> {
 }
 
 pub fn element_delete(id: &str) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute("DELETE FROM whiteboard_elements WHERE id=?1", params![id])?;
     Ok(())
 }
 
 pub fn element_clear_board(board_id: &str) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute("DELETE FROM whiteboard_elements WHERE board_id=?1", params![board_id])?;
     Ok(())
 }
@@ -1048,7 +1049,7 @@ pub fn element_clear_board(board_id: &str) -> Result<()> {
 pub fn element_list_by_boards(board_ids: &[String]) -> Result<Vec<WhiteboardElementDTO>> {
     if board_ids.is_empty() { return Ok(vec![]); }
 
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let placeholders: String = board_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
         "SELECT id, board_id, element_type, x, y, width, height, z_index, style_json, content_json, created_at, updated_at
@@ -1085,7 +1086,7 @@ pub fn element_list_by_boards(board_ids: &[String]) -> Result<Vec<WhiteboardElem
 
 pub fn cell_insert(id: &str, board_id: &str, cell_type: &str, cell_order: i32, content: Option<&str>) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT OR IGNORE INTO notebook_cells (id, board_id, cell_type, cell_order, content, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![id, board_id, cell_type, cell_order, content, now, now],
@@ -1095,7 +1096,7 @@ pub fn cell_insert(id: &str, board_id: &str, cell_type: &str, cell_order: i32, c
 
 pub fn cell_update(c: &NotebookCellDTO) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "UPDATE notebook_cells SET cell_type=?2, cell_order=?3, content=?4, output=?5, collapsed=?6, height=?7, metadata_json=?8, updated_at=?9 WHERE id=?1",
         params![c.id, c.cell_type, c.cell_order, c.content, c.output, c.collapsed as i32, c.height, c.metadata_json, now],
@@ -1104,14 +1105,14 @@ pub fn cell_update(c: &NotebookCellDTO) -> Result<()> {
 }
 
 pub fn cell_delete(id: &str) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute("DELETE FROM notebook_cells WHERE id=?1", params![id])?;
     Ok(())
 }
 
 pub fn cell_reorder(board_id: &str, cell_ids: &[String]) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     for (idx, cell_id) in cell_ids.iter().enumerate() {
         conn.execute(
             "UPDATE notebook_cells SET cell_order=?1, updated_at=?2 WHERE id=?3 AND board_id=?4",
@@ -1125,7 +1126,7 @@ pub fn cell_reorder(board_id: &str, cell_ids: &[String]) -> Result<()> {
 pub fn cell_list_by_boards(board_ids: &[String]) -> Result<Vec<NotebookCellDTO>> {
     if board_ids.is_empty() { return Ok(vec![]); }
 
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let placeholders: String = board_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
         "SELECT id, board_id, cell_type, cell_order, content, output, collapsed, height, metadata_json, created_at, updated_at
@@ -1162,7 +1163,7 @@ pub fn cell_list_by_boards(board_ids: &[String]) -> Result<Vec<NotebookCellDTO>>
 pub fn board_meta_upsert(board_id: &str, labels: &[String], rating: i32, contains_model: Option<&str>, contains_skills: &[String]) -> Result<()> {
     let labels_json = serde_json::to_string(labels)?;
     let skills_json = serde_json::to_string(contains_skills)?;
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT INTO board_metadata (board_id, labels, rating, contains_model, contains_skills) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(board_id) DO UPDATE SET labels=?2, rating=?3, contains_model=?4, contains_skills=?5",
         params![board_id, labels_json, rating, contains_model, skills_json],
@@ -1172,7 +1173,7 @@ pub fn board_meta_upsert(board_id: &str, labels: &[String], rating: i32, contain
 
 pub fn board_meta_update_labels(board_id: &str, labels: &[String]) -> Result<()> {
     let labels_json = serde_json::to_string(labels)?;
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT INTO board_metadata (board_id, labels) VALUES (?1, ?2) ON CONFLICT(board_id) DO UPDATE SET labels=?2",
         params![board_id, labels_json],
@@ -1181,7 +1182,7 @@ pub fn board_meta_update_labels(board_id: &str, labels: &[String]) -> Result<()>
 }
 
 pub fn board_meta_update_rating(board_id: &str, rating: i32) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT INTO board_metadata (board_id, rating) VALUES (?1, ?2) ON CONFLICT(board_id) DO UPDATE SET rating=?2",
         params![board_id, rating],
@@ -1193,7 +1194,7 @@ pub fn board_meta_update_rating(board_id: &str, rating: i32) -> Result<()> {
 pub fn board_metadata_list_by_boards(board_ids: &[String]) -> Result<Vec<BoardMetadataDTO>> {
     if board_ids.is_empty() { return Ok(vec![]); }
 
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let placeholders: String = board_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
         "SELECT board_id, labels, rating, view_count, contains_model, contains_skills, board_type, last_accessed, COALESCE(is_pinned, 0)
@@ -1229,7 +1230,7 @@ pub fn board_metadata_list_by_boards(board_ids: &[String]) -> Result<Vec<BoardMe
 
 pub fn profile_upsert(node_id: &str, display_name: &str, avatar_hash: Option<&str>) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT INTO user_profiles (node_id, display_name, avatar_hash, status, updated_at) VALUES (?1, ?2, ?3, 'online', ?4) ON CONFLICT(node_id) DO UPDATE SET display_name=excluded.display_name, avatar_hash=COALESCE(excluded.avatar_hash, user_profiles.avatar_hash), status='online', updated_at=excluded.updated_at",
         params![node_id, display_name, avatar_hash, now],
@@ -1239,7 +1240,7 @@ pub fn profile_upsert(node_id: &str, display_name: &str, avatar_hash: Option<&st
 
 /// Get profile by node_id: (display_name, avatar_hash)
 pub fn profile_get(node_id: &str) -> Option<(String, Option<String>)> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.query_row(
         "SELECT display_name, avatar_hash FROM user_profiles WHERE node_id = ?1",
         params![node_id],
@@ -1255,7 +1256,7 @@ pub fn profile_get(node_id: &str) -> Option<(String, Option<String>)> {
 /// topic can be re-seeded on rejoin. Idempotent upsert keyed by (group_id, peer_id).
 pub fn group_known_peer_upsert(group_id: &str, peer_id: &str, addr_json: &str) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT INTO group_known_peers (group_id, peer_id, addr_json, updated_at)
          VALUES (?1, ?2, ?3, ?4)
@@ -1268,7 +1269,7 @@ pub fn group_known_peer_upsert(group_id: &str, peer_id: &str, addr_json: &str) -
 /// All persisted peer addresses for a group, as `(peer_id, addr_json)` — the re-seed source on
 /// rejoin (MESH §2.3). Returns an empty vec if the group has no saved peers.
 pub fn group_known_peers_list(group_id: &str) -> Vec<(String, String)> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let mut stmt = match conn.prepare(
         "SELECT peer_id, addr_json FROM group_known_peers WHERE group_id = ?1",
     ) {
@@ -1290,7 +1291,7 @@ pub fn group_known_peers_list(group_id: &str) -> Vec<(String, String)> {
 /// chat author / profile). Sets `first_seen` once, advances `last_seen` on every contact. The row
 /// is never deleted, so an offline peer stays in the roster (greyed, with its cached last-seen).
 pub fn member_seen(group_id: &str, peer_id: &str, now: i64) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT INTO group_members (group_id, peer_id, first_seen, last_seen)
          VALUES (?1, ?2, ?3, ?3)
@@ -1304,7 +1305,7 @@ pub fn member_seen(group_id: &str, peer_id: &str, now: i64) -> Result<()> {
 /// Name/avatar are resolved from `user_profiles` (None until a profile is seen). The caller overlays
 /// the live `online` flag from `peers_per_group`. Tenant-scoped by `group_id`.
 pub fn group_members_list(group_id: &str) -> Vec<(String, Option<String>, Option<String>, i64)> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let mut stmt = match conn.prepare(
         "SELECT m.peer_id, p.display_name, p.avatar_hash, m.last_seen
          FROM group_members m
@@ -1412,7 +1413,7 @@ pub fn hold_count(group_id: &str) -> i64 {
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn dm_insert(id: &str, peer_id: &str, message: &str, timestamp: i64, is_incoming: bool) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT OR IGNORE INTO direct_messages (id, peer_id, message, timestamp, is_incoming) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![id, peer_id, message, timestamp, is_incoming],
@@ -1422,7 +1423,7 @@ pub fn dm_insert(id: &str, peer_id: &str, message: &str, timestamp: i64, is_inco
 
 /// List DM history with a peer
 pub fn dm_list_by_peer(peer_id: &str, limit: usize) -> Result<Vec<(String, String, i64, bool)>> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let mut stmt = conn.prepare(
         "SELECT id, message, timestamp, is_incoming FROM direct_messages
          WHERE peer_id = ?1 ORDER BY timestamp ASC LIMIT ?2"
@@ -1439,7 +1440,7 @@ pub fn dm_list_by_peer(peer_id: &str, limit: usize) -> Result<Vec<(String, Strin
 
 /// List integrations by group (scope_id matches group_id or any workspace in group)
 pub fn integration_list_by_group(group_id: &str) -> Result<Vec<IntegrationBindingDTO>> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
 
     // Get workspace IDs for this group
     let workspace_ids: Vec<String> = {
@@ -1484,7 +1485,7 @@ pub fn integration_list_by_group(group_id: &str) -> Result<Vec<IntegrationBindin
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn snapshot_insert_structure(group: &Group, workspaces: &[Workspace], boards: &[WhiteboardDTO]) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute_batch("BEGIN TRANSACTION")?;
 
     conn.execute(
@@ -1511,7 +1512,7 @@ pub fn snapshot_insert_structure(group: &Group, workspaces: &[Workspace], boards
 }
 
 pub fn snapshot_insert_content(elements: &[WhiteboardElementDTO], cells: &[NotebookCellDTO]) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute_batch("BEGIN TRANSACTION")?;
 
     for e in elements {
@@ -1534,7 +1535,7 @@ pub fn snapshot_insert_content(elements: &[WhiteboardElementDTO], cells: &[Noteb
 
 /// Batch insert files (for snapshot)
 pub fn snapshot_insert_files(files: &[FileDTO]) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute_batch("BEGIN TRANSACTION")?;
 
     for f in files {
@@ -1550,7 +1551,7 @@ pub fn snapshot_insert_files(files: &[FileDTO]) -> Result<()> {
 
 /// Batch insert chats (for snapshot)
 pub fn snapshot_insert_chats(chats: &[ChatDTO]) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute_batch("BEGIN TRANSACTION")?;
 
     for c in chats {
@@ -1566,7 +1567,7 @@ pub fn snapshot_insert_chats(chats: &[ChatDTO]) -> Result<()> {
 
 /// Batch insert board metadata (for snapshot)
 pub fn snapshot_insert_metadata(metadata: &[BoardMetadataDTO]) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute_batch("BEGIN TRANSACTION")?;
 
     for m in metadata {
@@ -1951,7 +1952,7 @@ fn migrate_legacy_authoring_cells_conn(conn: &Connection) -> Result<usize> {
 /// Insert a group by individual fields (for snapshot sync)
 pub fn group_insert_simple(id: &str, name: &str, icon: &str, color: &str) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT OR IGNORE INTO groups (id, name, icon, color, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![id, name, icon, color, now],
@@ -1962,7 +1963,7 @@ pub fn group_insert_simple(id: &str, name: &str, icon: &str, color: &str) -> Res
 /// Insert a workspace by individual fields (for snapshot sync)
 pub fn workspace_insert_simple(id: &str, group_id: &str, name: &str) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT OR IGNORE INTO workspaces (id, group_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
         params![id, group_id, name, now],
@@ -1972,7 +1973,7 @@ pub fn workspace_insert_simple(id: &str, group_id: &str, name: &str) -> Result<(
 
 /// Insert a board by individual fields (for snapshot sync) - uses created_at from DTO
 pub fn board_insert_simple(id: &str, workspace_id: &str, name: &str, created_at: i64) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT OR IGNORE INTO objects (id, workspace_id, type, name, created_at) VALUES (?1, ?2, 'whiteboard', ?3, ?4)",
         params![id, workspace_id, name, created_at],
@@ -1987,7 +1988,7 @@ pub fn element_insert_simple(
     style_json: Option<&str>, content_json: Option<&str>,
     created_at: i64, updated_at: i64,
 ) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT OR REPLACE INTO whiteboard_elements (id, board_id, element_type, x, y, width, height, z_index, style_json, content_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![id, board_id, element_type, x, y, width, height, z_index, style_json, content_json, created_at, updated_at],
@@ -2002,7 +2003,7 @@ pub fn cell_insert_simple(
     height: Option<f64>, metadata_json: Option<&str>,
     created_at: i64, updated_at: i64,
 ) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT OR REPLACE INTO notebook_cells (id, board_id, cell_type, cell_order, content, output, collapsed, height, metadata_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![id, board_id, cell_type, cell_order, content, output, collapsed as i32, height, metadata_json, created_at, updated_at],
@@ -2015,7 +2016,7 @@ pub fn chat_insert_simple(
     id: &str, workspace_id: &str, message: &str,
     author: &str, parent_id: Option<&str>, timestamp: i64,
 ) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT OR IGNORE INTO objects (id, workspace_id, type, name, hash, data, created_at) VALUES (?1, ?2, 'chat', ?3, ?4, ?5, ?6)",
         params![id, workspace_id, message, author, parent_id.map(|s| s.as_bytes()), timestamp],
@@ -2028,7 +2029,7 @@ pub fn file_insert_simple(
     id: &str, group_id: Option<&str>, workspace_id: Option<&str>, board_id: Option<&str>,
     name: &str, hash: &str, size: u64, source_peer: Option<&str>, created_at: i64,
 ) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "INSERT OR IGNORE INTO objects (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, created_at) VALUES (?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7, ?8, ?9)",
         params![id, group_id, workspace_id, board_id, name, hash, size as i64, source_peer, created_at],
@@ -2048,7 +2049,7 @@ pub fn board_metadata_upsert(
     last_accessed: i64,
     is_pinned: bool,
 ) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let labels_json = serde_json::to_string(labels).unwrap_or_else(|_| "[]".to_string());
     let skills_json = serde_json::to_string(contains_skills).unwrap_or_else(|_| "[]".to_string());
     let board_type = board_type.unwrap_or("canvas");
@@ -2069,7 +2070,7 @@ pub fn integration_insert(
     id: &str, scope_type: &str, scope_id: &str, integration_type: &str,
     config: &serde_json::Value, created_at: i64,
 ) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let config_json = serde_json::to_string(config).unwrap_or_else(|_| "{}".to_string());
     conn.execute(
         "INSERT OR REPLACE INTO integration_bindings (id, scope_type, scope_id, integration_type, config_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -2089,7 +2090,7 @@ pub fn anonymous_session_save(
     commitment: &str,
     handle: &str,
 ) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let now = chrono::Utc::now().timestamp();
     conn.execute(
         "CREATE TABLE IF NOT EXISTS anonymous_sessions (
@@ -2113,7 +2114,7 @@ pub fn anonymous_session_save(
 }
 
 pub fn anonymous_session_get(scope_id: &str) -> Option<(String, String, String, String, bool)> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     let _ = conn.execute(
         "CREATE TABLE IF NOT EXISTS anonymous_sessions (
             scope_id TEXT PRIMARY KEY,
@@ -2141,7 +2142,7 @@ pub fn anonymous_session_get(scope_id: &str) -> Option<(String, String, String, 
 }
 
 pub fn anonymous_session_reveal(scope_id: &str) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "UPDATE anonymous_sessions SET revealed = 1 WHERE scope_id = ?1",
         params![scope_id],
@@ -2150,7 +2151,7 @@ pub fn anonymous_session_reveal(scope_id: &str) -> Result<()> {
 }
 
 pub fn anonymous_session_delete(scope_id: &str) -> Result<()> {
-    let conn = db().lock().unwrap();
+    let conn = db().lock_safe();
     conn.execute(
         "DELETE FROM anonymous_sessions WHERE scope_id = ?1",
         params![scope_id],

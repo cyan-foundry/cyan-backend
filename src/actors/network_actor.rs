@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::identity::MeshAuthorizer;
+use crate::util::MutexExt;
 use crate::swarm::{BlobSwarm, BLOB_ALPN};
 use crate::{
     actors::{
@@ -1014,7 +1015,7 @@ impl NetworkActor {
                     ));
 
                     // Update peers_per_group
-                    let mut peers = self.peers_per_group.lock().unwrap();
+                    let mut peers = self.peers_per_group.lock_safe();
                     peers.entry(group_id).or_default().insert(peer);
                 }
             }
@@ -1032,7 +1033,7 @@ impl NetworkActor {
                     ));
 
                     // Update peers_per_group
-                    let mut peers_map = self.peers_per_group.lock().unwrap();
+                    let mut peers_map = self.peers_per_group.lock_safe();
                     let group_peers = peers_map.entry(group_id).or_default();
                     for p in peers {
                         group_peers.insert(p);
@@ -1132,7 +1133,7 @@ impl NetworkActor {
         self.topics.insert(group_id.to_string(), handle);
 
         // Initialize peers_per_group entry
-        self.peers_per_group.lock().unwrap()
+        self.peers_per_group.lock_safe()
             .entry(group_id.to_string())
             .or_default();
 
@@ -1167,7 +1168,7 @@ impl NetworkActor {
 
         // Check existing
         {
-            let senders = self.dm_senders.lock().unwrap();
+            let senders = self.dm_senders.lock_safe();
             if let Some(sender) = senders.get(peer_id) {
                 eprintln!("💬 [DM] ✓ Reusing existing stream");
                 return Ok(sender.clone());
@@ -1213,7 +1214,7 @@ impl NetworkActor {
             ).await;
         });
 
-        self.dm_senders.lock().unwrap().insert(peer_id.to_string(), tx.clone());
+        self.dm_senders.lock_safe().insert(peer_id.to_string(), tx.clone());
 
         eprintln!("💬 [DM] ✓ DM stream handler spawned and registered");
 
@@ -1321,7 +1322,7 @@ async fn handle_dm_stream(
     let (tx, mut outbound_rx) = mpsc::unbounded_channel();
 
     // Register sender for bidirectional communication
-    dm_senders.lock().unwrap().insert(peer_id.clone(), tx);
+    dm_senders.lock_safe().insert(peer_id.clone(), tx);
 
     // Emit event that stream is ready
     let _ = event_tx.send(SwiftEvent::ChatStreamReady {
@@ -1390,7 +1391,7 @@ async fn handle_dm_stream(
     }
 
     // Cleanup
-    dm_senders.lock().unwrap().remove(&peer_id);
+    dm_senders.lock_safe().remove(&peer_id);
     let _ = event_tx.send(SwiftEvent::ChatStreamClosed { peer_id: peer_id.clone() });
     tracing::info!("💬 [DM] Stream handler stopped for {}", &peer_id[..16]);
 

@@ -19,6 +19,7 @@ mod xaero_ffi {
 pub use xaero_ffi::*;
 
 mod ai_bridge;
+pub mod util;
 pub mod diagram_gen;
 pub mod cyan_lens_client;
 pub mod models;
@@ -37,6 +38,7 @@ pub mod licensing;
 pub mod sso_grant;
 
 use crate::models::commands::{CommandMsg, NetworkCommand};
+use crate::util::MutexExt;
 use crate::models::core::{Group, Workspace};
 use crate::models::dto::{
     BoardMetadataDTO, ChatDTO, FileDTO, IntegrationBindingDTO, TreeSnapshotDTO, WhiteboardDTO
@@ -422,7 +424,7 @@ impl CommandActor {
                     };
 
                     {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         let _ = db.execute(
                             "INSERT INTO groups (id, name, icon, color, created_at, owner_node_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                             params![g.id, g.name, g.icon, g.color, g.created_at, self.node_id],
@@ -471,7 +473,7 @@ impl CommandActor {
 
                 CommandMsg::RenameGroup { id, name } => {
                     let ok = {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         db.execute("UPDATE groups SET name=?1 WHERE id=?2", params![name, id]).unwrap_or(0) > 0
                     };
 
@@ -550,7 +552,7 @@ impl CommandActor {
                     };
 
                     {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         let _ = db.execute(
                             "INSERT OR IGNORE INTO workspaces (id, group_id, name, created_at, owner_node_id) VALUES (?1, ?2, ?3, ?4, ?5)",
                             params![ws.id, ws.group_id, ws.name, ws.created_at, self.node_id],
@@ -574,12 +576,12 @@ impl CommandActor {
 
                 CommandMsg::RenameWorkspace { id, name } => {
                     let group_id = {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         db.query_row("SELECT group_id FROM workspaces WHERE id=?1", params![id], |r| r.get::<_, String>(0)).ok()
                     };
 
                     {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         let _ = db.execute("UPDATE workspaces SET name=?1 WHERE id=?2", params![name, id]);
                     }
 
@@ -633,12 +635,12 @@ impl CommandActor {
                     let now = chrono::Utc::now().timestamp();
 
                     let group_id = {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         db.query_row("SELECT group_id FROM workspaces WHERE id=?1", params![workspace_id], |r| r.get::<_, String>(0)).ok()
                     };
 
                     {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         let _ = db.execute(
                             "INSERT OR IGNORE INTO objects (id, workspace_id, type, name, created_at, owner_node_id) VALUES (?1, ?2, 'whiteboard', ?3, ?4, ?5)",
                             params![id, workspace_id, name, now, self.node_id],
@@ -669,7 +671,7 @@ impl CommandActor {
                     let group_id = self.get_group_id_for_board(&id);
 
                     {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         let _ = db.execute("UPDATE objects SET name=?1 WHERE id=?2 AND type='whiteboard'", params![name, id]);
                     }
 
@@ -936,7 +938,7 @@ impl CommandActor {
                     let group_id = self.get_group_id_for_board(&board_id);
 
                     {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         let _ = db.execute(
                             "INSERT INTO whiteboard_elements (id, board_id, element_type, x, y, width, height, z_index, style_json, content_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                             params![id, board_id, element_type, x, y, width, height, z_index, style_json, content_json, now, now],
@@ -970,7 +972,7 @@ impl CommandActor {
                     let group_id = self.get_group_id_for_board(&board_id);
 
                     {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         let _ = db.execute(
                             "UPDATE whiteboard_elements SET board_id=?2, element_type=?3, x=?4, y=?5, width=?6, height=?7, z_index=?8, style_json=?9, content_json=?10, updated_at=?11 WHERE id=?1",
                             params![id, board_id, element_type, x, y, width, height, z_index, style_json, content_json, now],
@@ -1002,7 +1004,7 @@ impl CommandActor {
                     let group_id = self.get_group_id_for_board(&board_id);
 
                     {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         let _ = db.execute("DELETE FROM whiteboard_elements WHERE id=?1", params![id]);
                     }
 
@@ -1020,7 +1022,7 @@ impl CommandActor {
                     let group_id = self.get_group_id_for_board(&board_id);
 
                     {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         let _ = db.execute("DELETE FROM whiteboard_elements WHERE board_id=?1", params![board_id]);
                     }
 
@@ -1043,7 +1045,7 @@ impl CommandActor {
                     let group_id = self.get_group_id_for_board(&board_id);
 
                     {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         let _ = db.execute(
                             "INSERT INTO notebook_cells (id, board_id, cell_type, cell_order, content, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                             params![id, board_id, cell_type, cell_order, content, now, now],
@@ -1075,7 +1077,7 @@ impl CommandActor {
                     let group_id = self.get_group_id_for_board(&board_id);
 
                     {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         let _ = db.execute(
                             "UPDATE notebook_cells SET cell_type=?2, cell_order=?3, content=?4, output=?5, collapsed=?6, height=?7, metadata_json=?8, updated_at=?9 WHERE id=?1",
                             params![id, cell_type, cell_order, content, output, collapsed as i32, height, metadata_json, now],
@@ -1108,7 +1110,7 @@ impl CommandActor {
                     let group_id = self.get_group_id_for_board(&board_id);
 
                     {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         let _ = db.execute("DELETE FROM notebook_cells WHERE id=?1", params![id]);
                     }
 
@@ -1127,7 +1129,7 @@ impl CommandActor {
                     let now = chrono::Utc::now().timestamp();
 
                     {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         for (order, cell_id) in cell_ids.iter().enumerate() {
                             let _ = db.execute(
                                 "UPDATE notebook_cells SET cell_order=?1, updated_at=?2 WHERE id=?3",
@@ -1155,7 +1157,7 @@ impl CommandActor {
                     let skills_json = serde_json::to_string(&contains_skills).unwrap_or_else(|_| "[]".to_string());
 
                     {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         let _ = db.execute(
                             "INSERT OR REPLACE INTO board_metadata (board_id, labels, rating, view_count, contains_model, contains_skills, board_type, last_accessed, is_pinned) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                             params![board_id, labels_json, rating, view_count, contains_model, skills_json, board_type, last_accessed, is_pinned as i32],
@@ -1168,7 +1170,7 @@ impl CommandActor {
                 CommandMsg::IncrementBoardViewCount { board_id } => {
                     let now = chrono::Utc::now().timestamp();
                     {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         let _ = db.execute(
                             "UPDATE board_metadata SET view_count = view_count + 1, last_accessed = ?1 WHERE board_id = ?2",
                             params![now, board_id],
@@ -1178,7 +1180,7 @@ impl CommandActor {
 
                 CommandMsg::SetBoardPinned { board_id, is_pinned } => {
                     {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         let _ = db.execute(
                             "UPDATE board_metadata SET is_pinned = ?1 WHERE board_id = ?2",
                             params![is_pinned as i32, board_id],
@@ -1194,7 +1196,7 @@ impl CommandActor {
                     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
                     {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         let _ = db.execute(
                             "INSERT INTO integration_bindings (id, scope_type, scope_id, integration_type, config_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                             params![id, scope_type, scope_id, integration_type, config_json, now],
@@ -1203,7 +1205,7 @@ impl CommandActor {
                 }
 
                 CommandMsg::RemoveIntegration { id } => {
-                    let db = self.db.lock().unwrap();
+                    let db = self.db.lock_safe();
                     let _ = db.execute("DELETE FROM integration_bindings WHERE id=?1", params![id]);
                 }
 
@@ -1212,7 +1214,7 @@ impl CommandActor {
                     let node_id = self.node_id.clone();
 
                     {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         let _ = db.execute(
                             "INSERT OR REPLACE INTO user_profiles (node_id, display_name, avatar_hash, updated_at) VALUES (?1, ?2, ?3, ?4)",
                             params![node_id, display_name, avatar_hash, chrono::Utc::now().timestamp()],
@@ -1221,7 +1223,7 @@ impl CommandActor {
 
                     // Broadcast to all groups
                     let groups = {
-                        let db = self.db.lock().unwrap();
+                        let db = self.db.lock_safe();
                         let mut stmt = db.prepare("SELECT id FROM groups").unwrap();
                         let mut rows = stmt.query([]).unwrap();
                         let mut out = vec![];
@@ -1345,7 +1347,7 @@ impl CommandActor {
     }
 
     fn get_group_id_for_board(&self, board_id: &str) -> Option<String> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock_safe();
         let ws_id: Option<String> = db.query_row(
             "SELECT workspace_id FROM objects WHERE id=?1 AND type='whiteboard'",
             params![board_id],
@@ -1363,7 +1365,7 @@ impl CommandActor {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
-    let db = db.lock().unwrap();
+    let db = db.lock_safe();
 
     let groups: Vec<Group> = {
         let mut stmt = db.prepare("SELECT id, name, icon, color, created_at FROM groups ORDER BY name").unwrap();
@@ -1504,7 +1506,7 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
 #[allow(dead_code)] // pre-existing demo-seed helper; call site removed, kept for FFI demo path
 fn seed_demo_if_empty(db: &Arc<Mutex<Connection>>) {
     let db_clone = db.clone();
-    let count: i64 = db_clone.lock().unwrap().query_row("SELECT COUNT(*) FROM groups", [], |r| r.get(0)).unwrap_or(1);
+    let count: i64 = db_clone.lock_safe().query_row("SELECT COUNT(*) FROM groups", [], |r| r.get(0)).unwrap_or(1);
     if count > 0 {
         return;
     }
@@ -1512,7 +1514,7 @@ fn seed_demo_if_empty(db: &Arc<Mutex<Connection>>) {
     let group_id = blake3::hash(b"demo-group").to_hex().to_string();
     let now = chrono::Utc::now().timestamp();
     {
-        let _ = db_clone.lock().unwrap().execute(
+        let _ = db_clone.lock_safe().execute(
             "INSERT INTO groups (id, name, icon, color, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![group_id, "Demo Group", "folder.fill", "#00AEEF", now],
         );
@@ -1520,7 +1522,7 @@ fn seed_demo_if_empty(db: &Arc<Mutex<Connection>>) {
 
     let workspace_id = blake3::hash(b"demo-workspace").to_hex().to_string();
     {
-        let _ = db_clone.lock().unwrap().execute(
+        let _ = db_clone.lock_safe().execute(
             "INSERT INTO workspaces (id, group_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![workspace_id, group_id, "Demo Workspace", now],
         );
@@ -1528,7 +1530,7 @@ fn seed_demo_if_empty(db: &Arc<Mutex<Connection>>) {
 
     let board_id = blake3::hash(b"demo-board").to_hex().to_string();
     {
-        let _ = db_clone.lock().unwrap().execute(
+        let _ = db_clone.lock_safe().execute(
             "INSERT INTO objects (id, workspace_id, type, name, created_at) VALUES (?1, ?2, 'whiteboard', ?3, ?4)",
             params![board_id, workspace_id, "Demo Board", now],
         );
@@ -1565,13 +1567,13 @@ fn route_event_to_buffers(
         SwiftEvent::FileDownloaded { .. } |
         SwiftEvent::FileDownloadFailed { .. } |
         SwiftEvent::ChatHistoryComplete { .. } => {
-            file_tree.lock().unwrap().push_back(event_json.to_string());
-            board_grid.lock().unwrap().push_back(event_json.to_string());
+            file_tree.lock_safe().push_back(event_json.to_string());
+            board_grid.lock_safe().push_back(event_json.to_string());
         }
 
         // Error events → FileTree (for display)
         SwiftEvent::Error { .. } => {
-            file_tree.lock().unwrap().push_back(event_json.to_string());
+            file_tree.lock_safe().push_back(event_json.to_string());
         }
 
         // Sync events → FileTree + NetworkStatus (for StatusBar)
@@ -1580,8 +1582,8 @@ fn route_event_to_buffers(
         SwiftEvent::SyncBoardReady { .. } |
         SwiftEvent::SyncFilesReceived { .. } |
         SwiftEvent::SyncComplete { .. } => {
-            file_tree.lock().unwrap().push_back(event_json.to_string());
-            network_status.lock().unwrap().push_back(event_json.to_string());
+            file_tree.lock_safe().push_back(event_json.to_string());
+            network_status.lock_safe().push_back(event_json.to_string());
         }
 
         // ═══════════════════════════════════════════════════════════════════
@@ -1598,8 +1600,8 @@ fn route_event_to_buffers(
                 NetworkEvent::WorkspaceRenamed { .. } |
                 NetworkEvent::WorkspaceDeleted { .. } |
                 NetworkEvent::WorkspaceDissolved { .. } => {
-                    file_tree.lock().unwrap().push_back(event_json.to_string());
-                    board_grid.lock().unwrap().push_back(event_json.to_string());
+                    file_tree.lock_safe().push_back(event_json.to_string());
+                    board_grid.lock_safe().push_back(event_json.to_string());
                 }
 
                 // Board changes → FileTree + BoardGrid
@@ -1607,8 +1609,8 @@ fn route_event_to_buffers(
                 NetworkEvent::BoardRenamed { .. } |
                 NetworkEvent::BoardDeleted { .. } |
                 NetworkEvent::BoardDissolved { .. } => {
-                    file_tree.lock().unwrap().push_back(event_json.to_string());
-                    board_grid.lock().unwrap().push_back(event_json.to_string());
+                    file_tree.lock_safe().push_back(event_json.to_string());
+                    board_grid.lock_safe().push_back(event_json.to_string());
                 }
 
                 // Board metadata/mode → BoardGrid
@@ -1616,12 +1618,12 @@ fn route_event_to_buffers(
                 NetworkEvent::BoardMetadataUpdated { .. } |
                 NetworkEvent::BoardLabelsUpdated { .. } |
                 NetworkEvent::BoardRated { .. } => {
-                    board_grid.lock().unwrap().push_back(event_json.to_string());
+                    board_grid.lock_safe().push_back(event_json.to_string());
                 }
 
                 // File changes → FileTree
                 NetworkEvent::FileAvailable { .. } => {
-                    file_tree.lock().unwrap().push_back(event_json.to_string());
+                    file_tree.lock_safe().push_back(event_json.to_string());
                 }
 
                 // Chat events → Chat panel
@@ -1629,10 +1631,10 @@ fn route_event_to_buffers(
                     eprintln!("📨 [ROUTE] ChatSent → chat_panel buffer");
                     eprintln!("   chat_id: {}...", &id[..16.min(id.len())]);
                     eprintln!("   workspace_id: {}...", &workspace_id[..16.min(workspace_id.len())]);
-                    chat_panel.lock().unwrap().push_back(event_json.to_string());
+                    chat_panel.lock_safe().push_back(event_json.to_string());
                 }
                 NetworkEvent::ChatDeleted { .. } => {
-                    chat_panel.lock().unwrap().push_back(event_json.to_string());
+                    chat_panel.lock_safe().push_back(event_json.to_string());
                 }
 
                 // Note events → Whiteboard buffer (notes are board-level content; the
@@ -1641,14 +1643,14 @@ fn route_event_to_buffers(
                 NetworkEvent::NoteAdded { .. } |
                 NetworkEvent::NoteUpdated { .. } |
                 NetworkEvent::NoteDeleted { .. } => {
-                    whiteboard.lock().unwrap().push_back(event_json.to_string());
+                    whiteboard.lock_safe().push_back(event_json.to_string());
                 }
 
                 // Pin event → Whiteboard buffer (board-level pinned-workflow state; the
                 // app reads the authoritative pin via storage and treats this as a
                 // change signal). ROUND8 §W4.
                 NetworkEvent::PinSet { .. } => {
-                    whiteboard.lock().unwrap().push_back(event_json.to_string());
+                    whiteboard.lock_safe().push_back(event_json.to_string());
                 }
 
                 // Whiteboard element events → Whiteboard
@@ -1656,7 +1658,7 @@ fn route_event_to_buffers(
                 NetworkEvent::WhiteboardElementUpdated { .. } |
                 NetworkEvent::WhiteboardElementDeleted { .. } |
                 NetworkEvent::WhiteboardCleared { .. } => {
-                    whiteboard.lock().unwrap().push_back(event_json.to_string());
+                    whiteboard.lock_safe().push_back(event_json.to_string());
                 }
 
                 // Notebook cell events → Whiteboard (notebook is a board type)
@@ -1664,23 +1666,23 @@ fn route_event_to_buffers(
                 NetworkEvent::NotebookCellUpdated { .. } |
                 NetworkEvent::NotebookCellDeleted { .. } |
                 NetworkEvent::NotebookCellsReordered { .. } => {
-                    whiteboard.lock().unwrap().push_back(event_json.to_string());
+                    whiteboard.lock_safe().push_back(event_json.to_string());
                 }
 
                 // Profile updates → Chat (for author display name resolution)
                 NetworkEvent::ProfileUpdated { .. } => {
-                    chat_panel.lock().unwrap().push_back(event_json.to_string());
+                    chat_panel.lock_safe().push_back(event_json.to_string());
                 }
 
                 // Anonymous participation → Chat panel
                 NetworkEvent::AnonymousJoined { .. } |
                 NetworkEvent::IdentityRevealed { .. } => {
-                    chat_panel.lock().unwrap().push_back(event_json.to_string());
+                    chat_panel.lock_safe().push_back(event_json.to_string());
                 }
 
                 // Snapshot available → NetworkStatus (triggers sync flow)
                 NetworkEvent::GroupSnapshotAvailable { .. } => {
-                    network_status.lock().unwrap().push_back(event_json.to_string());
+                    network_status.lock_safe().push_back(event_json.to_string());
                 }
 
                 // MCP plugin relays are mesh pass-through for the super-peer (Lens
@@ -1694,7 +1696,7 @@ fn route_event_to_buffers(
         // BOARD EVENTS (metadata only - deletes handled above)
         // ═══════════════════════════════════════════════════════════════════
         SwiftEvent::BoardMetadataUpdated { .. } => {
-            board_grid.lock().unwrap().push_back(event_json.to_string());
+            board_grid.lock_safe().push_back(event_json.to_string());
         }
 
         // ═══════════════════════════════════════════════════════════════════
@@ -1703,18 +1705,18 @@ fn route_event_to_buffers(
         SwiftEvent::ChatDeleted { .. } |
         SwiftEvent::ChatStreamReady { .. } |
         SwiftEvent::ChatStreamClosed { .. } => {
-            chat_panel.lock().unwrap().push_back(event_json.to_string());
+            chat_panel.lock_safe().push_back(event_json.to_string());
         }
         SwiftEvent::DirectMessageReceived {  id,  peer_id,  message, .. } => {
             eprintln!("📨 [ROUTE] DirectMessageReceived → chat_panel buffer");
             eprintln!("   dm_id: {}...", &id[..16.min(id.len())]);
             eprintln!("   peer_id: {}...", &peer_id[..16.min(peer_id.len())]);
             eprintln!("   message: {}...", &message[..50.min(message.len())]);
-            chat_panel.lock().unwrap().push_back(event_json.to_string());
+            chat_panel.lock_safe().push_back(event_json.to_string());
         }
         SwiftEvent::PeerJoined { .. } |
         SwiftEvent::PeerLeft { .. } => {
-            chat_panel.lock().unwrap().push_back(event_json.to_string());
+            chat_panel.lock_safe().push_back(event_json.to_string());
         }
 
         // ═══════════════════════════════════════════════════════════════════
@@ -1734,7 +1736,7 @@ fn route_event_to_buffers(
         SwiftEvent::ApprovalResolved { .. } |
         SwiftEvent::WorkflowRunFinished { .. } |
         SwiftEvent::WorkflowStatsUpdated { .. } => {
-            network_status.lock().unwrap().push_back(event_json.to_string());
+            network_status.lock_safe().push_back(event_json.to_string());
         }
     }
 }

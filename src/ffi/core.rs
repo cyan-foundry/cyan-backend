@@ -1,4 +1,5 @@
 use crate::ffi::scaffold::*;
+use crate::util::MutexExt;
 use crate::models::commands::*;
 use crate::models::core::*;
 use crate::models::dto::*;
@@ -861,7 +862,7 @@ pub extern "C" fn cyan_get_group_peers(group_id: *const c_char) -> *mut c_char {
     };
 
     let peers: Vec<String> = {
-        let peers_map = sys.peers_per_group.lock().unwrap();
+        let peers_map = sys.peers_per_group.lock_safe();
         peers_map.get(&gid)
             .map(|set| set.iter().map(|pk| pk.to_string()).collect())
             .unwrap_or_default()
@@ -881,7 +882,7 @@ pub extern "C" fn cyan_get_all_peers() -> *mut c_char {
     };
 
     let all_peers: HashMap<String, Vec<String>> = {
-        let peers_map = sys.peers_per_group.lock().unwrap();
+        let peers_map = sys.peers_per_group.lock_safe();
         peers_map.iter()
             .map(|(gid, set)| (gid.clone(), set.iter().map(|pk| pk.to_string()).collect()))
             .collect()
@@ -903,7 +904,7 @@ pub extern "C" fn cyan_get_group_peer_count(group_id: *const c_char) -> i32 {
         return 0;
     };
 
-    let peers_map = sys.peers_per_group.lock().unwrap();
+    let peers_map = sys.peers_per_group.lock_safe();
     peers_map.get(&gid)
         .map(|set| set.len() as i32)
         .unwrap_or(0)
@@ -916,7 +917,7 @@ pub extern "C" fn cyan_get_total_peer_count() -> i32 {
         return 0;
     };
 
-    let peers_map = sys.peers_per_group.lock().unwrap();
+    let peers_map = sys.peers_per_group.lock_safe();
     peers_map.values()
         .map(|set| set.len())
         .sum::<usize>() as i32
@@ -987,7 +988,7 @@ pub extern "C" fn cyan_get_object_count() -> i32 {
         return 0;
     };
 
-    let db = sys.db.lock().unwrap();
+    let db = sys.db.lock_safe();
     let count: i32 = db.query_row(
         "SELECT COUNT(*) FROM objects WHERE type IN ('whiteboard', 'file')",
         [],
@@ -1010,7 +1011,7 @@ pub extern "C" fn cyan_get_boards_for_group(group_id: *const c_char) -> *mut c_c
     let gid = unsafe { CStr::from_ptr(group_id) }.to_string_lossy().to_string();
 
     let boards: Vec<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         // First get all workspace IDs for this group
         let mut ws_stmt = db.prepare(
@@ -1071,7 +1072,7 @@ pub extern "C" fn cyan_get_boards_for_workspace(workspace_id: *const c_char) -> 
     let wid = unsafe { CStr::from_ptr(workspace_id) }.to_string_lossy().to_string();
 
     let boards: Vec<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         // Get group_id for this workspace
         let group_id: String = db.query_row(
@@ -1113,7 +1114,7 @@ pub extern "C" fn cyan_get_all_boards() -> *mut c_char {
     };
 
     let boards: Vec<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         let mut stmt = db.prepare(
             "SELECT o.id, o.workspace_id, w.group_id, o.name, o.created_at,
@@ -1163,7 +1164,7 @@ pub extern "C" fn cyan_load_whiteboard_elements(board_id: *const c_char) -> *mut
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
 
     let elements: Vec<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         let mut stmt = db.prepare(
             "SELECT id, board_id, element_type, x, y, width, height, z_index,
@@ -1238,7 +1239,7 @@ pub extern "C" fn cyan_save_whiteboard_element(element_json: *const c_char) -> b
     let group_id: String;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         // Check if exists
         is_new = db.query_row(
@@ -1320,7 +1321,7 @@ pub extern "C" fn cyan_delete_whiteboard_element(element_id: *const c_char) -> b
     let group_id: String;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         // Get board_id before deleting
         board_id = db.query_row(
@@ -1382,7 +1383,7 @@ pub extern "C" fn cyan_clear_whiteboard(board_id: *const c_char) -> bool {
     let group_id: String;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         // Get group_id via board -> workspace -> group
         group_id = db.query_row(
@@ -1425,7 +1426,7 @@ pub extern "C" fn cyan_get_whiteboard_element_count(board_id: *const c_char) -> 
 
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
 
-    let db = sys.db.lock().unwrap();
+    let db = sys.db.lock_safe();
     db.query_row(
         "SELECT COUNT(*) FROM whiteboard_elements WHERE board_id = ?1",
         params![bid],
@@ -1444,7 +1445,7 @@ pub extern "C" fn cyan_get_workspaces_for_group(group_id: *const c_char) -> *mut
     let gid = unsafe { CStr::from_ptr(group_id) }.to_string_lossy().to_string();
 
     let workspace_ids: Vec<String> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         let mut stmt = db.prepare(
             "SELECT id FROM workspaces WHERE group_id = ?1"
@@ -1543,7 +1544,7 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
         }
         "Workspace" => {
             workspace_id = scope["workspace_id"].as_str().map(|s| s.to_string());
-            let db = sys.db.lock().unwrap();
+            let db = sys.db.lock_safe();
             group_id = workspace_id.as_ref().and_then(|wid| {
                 db.query_row(
                     "SELECT group_id FROM workspaces WHERE id = ?1",
@@ -1555,7 +1556,7 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
         }
         "Board" => {
             board_id = scope["board_id"].as_str().map(|s| s.to_string());
-            let db = sys.db.lock().unwrap();
+            let db = sys.db.lock_safe();
             let ids: Option<(String, String)> = board_id.as_ref().and_then(|bid| {
                 db.query_row(
                     "SELECT o.workspace_id, w.group_id FROM objects o
@@ -1590,7 +1591,7 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
 
     // Insert into database
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         let result = db.execute(
             "INSERT OR REPLACE INTO objects (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, local_path, created_at)
              VALUES (?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -1675,7 +1676,7 @@ pub extern "C" fn cyan_request_file_download(file_id: *const c_char) -> bool {
 
     // Look up file info
     let file_info: Option<(String, String)> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         db.query_row(
             "SELECT hash, source_peer FROM objects WHERE id = ?1 AND type = 'file'",
             params![fid],
@@ -1690,7 +1691,7 @@ pub extern "C" fn cyan_request_file_download(file_id: *const c_char) -> bool {
 
     // Check if already downloaded
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         let local_path: Option<String> = db
             .query_row(
                 "SELECT local_path FROM objects WHERE id = ?1",
@@ -1709,7 +1710,7 @@ pub extern "C" fn cyan_request_file_download(file_id: *const c_char) -> bool {
 
     // Check for existing partial transfer
     let resume_offset = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         db.query_row(
             "SELECT bytes_received FROM file_transfers WHERE file_id = ?1 AND status = 'in_progress'",
             params![fid],
@@ -1739,7 +1740,7 @@ pub extern "C" fn cyan_get_file_status(file_id: *const c_char) -> *mut c_char {
         return CString::new(r#"{"status":"unknown"}"#).unwrap().into_raw();
     };
 
-    let db = sys.db.lock().unwrap();
+    let db = sys.db.lock_safe();
     let local_path: Option<String> = db
         .query_row(
             "SELECT local_path FROM objects WHERE id = ?1 AND type = 'file'",
@@ -1791,7 +1792,7 @@ pub extern "C" fn cyan_get_files(scope_json: *const c_char) -> *mut c_char {
         .unwrap_or("");
 
     let files: Vec<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         let query = match scope_type {
             "Group" => {
@@ -1853,7 +1854,7 @@ pub extern "C" fn cyan_get_file_local_path(file_id: *const c_char) -> *mut c_cha
         return std::ptr::null_mut();
     };
 
-    let db = sys.db.lock().unwrap();
+    let db = sys.db.lock_safe();
     let local_path: Option<String> = db
         .query_row(
             "SELECT local_path FROM objects WHERE id = ?1 AND type = 'file'",
@@ -1883,7 +1884,7 @@ pub extern "C" fn cyan_load_notebook_cells(board_id: *const c_char) -> *mut c_ch
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
 
     let cells: Vec<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         let mut stmt = match db.prepare(
             "SELECT id, board_id, cell_type, cell_order, content, output,
@@ -1962,7 +1963,7 @@ pub extern "C" fn cyan_save_notebook_cell(cell_json: *const c_char) -> bool {
     let group_id: String;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         // Check if exists
         is_new = db.query_row(
@@ -2039,7 +2040,7 @@ pub extern "C" fn cyan_delete_notebook_cell(cell_id: *const c_char) -> bool {
     let group_id: String;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         // Get board_id and group_id before delete
         let ids: Option<(String, String)> = db.query_row(
@@ -2103,7 +2104,7 @@ pub extern "C" fn cyan_reorder_notebook_cells(board_id: *const c_char, cell_ids_
     let group_id: String;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         group_id = db.query_row(
             "SELECT w.group_id FROM objects o
@@ -2151,7 +2152,7 @@ pub extern "C" fn cyan_get_board_mode(board_id: *const c_char) -> *mut c_char {
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
 
     let mode: String = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         let raw_mode: String = db.query_row(
             "SELECT COALESCE(board_mode, 'canvas') FROM objects WHERE id = ?1",
             params![bid],
@@ -2195,7 +2196,7 @@ pub extern "C" fn cyan_set_board_mode(board_id: *const c_char, mode: *const c_ch
     let group_id: String;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         group_id = db.query_row(
             "SELECT w.group_id FROM objects o
@@ -2238,7 +2239,7 @@ pub extern "C" fn cyan_load_cell_elements(cell_id: *const c_char) -> *mut c_char
     let cid = unsafe { CStr::from_ptr(cell_id) }.to_string_lossy().to_string();
 
     let elements: Vec<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         let mut stmt = match db.prepare(
             "SELECT id, board_id, element_type, x, y, width, height, z_index,
@@ -2377,7 +2378,7 @@ pub extern "C" fn cyan_get_board_metadata(board_id: *const c_char) -> *mut c_cha
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
 
     let metadata: Option<BoardMetadataDTO> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         db.query_row(
             "SELECT board_id, labels, rating, view_count, contains_model,
@@ -2404,7 +2405,7 @@ pub extern "C" fn cyan_get_board_metadata(board_id: *const c_char) -> *mut c_cha
     };
 
     let result = metadata.unwrap_or_else(|| {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         let board_type: String = db.query_row(
             "SELECT COALESCE(board_mode, 'canvas') FROM objects WHERE id = ?1",
             params![&bid],
@@ -2437,7 +2438,7 @@ pub extern "C" fn cyan_get_boards_metadata(scope_type: *const c_char, scope_id: 
     let sid = unsafe { CStr::from_ptr(scope_id) }.to_string_lossy().to_string();
 
     let results: Vec<BoardMetadataDTO> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         let query = match stype.as_str() {
             "workspace" => {
@@ -2516,7 +2517,7 @@ pub extern "C" fn cyan_get_top_boards(group_id: *const c_char, limit: i32) -> *m
     let lim = if limit <= 0 { 10 } else { limit.min(50) };
 
     let results: Vec<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         let mut stmt = match db.prepare(
             "SELECT o.id, o.name, o.workspace_id, w.name as workspace_name,
@@ -2574,7 +2575,7 @@ pub extern "C" fn cyan_set_board_labels(board_id: *const c_char, labels_json: *c
     let group_id: String;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         group_id = db.query_row(
             "SELECT w.group_id FROM objects o
@@ -2624,7 +2625,7 @@ pub extern "C" fn cyan_add_board_label(board_id: *const c_char, label: *const c_
     let updated_labels: Vec<String>;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         group_id = db.query_row(
             "SELECT w.group_id FROM objects o
@@ -2688,7 +2689,7 @@ pub extern "C" fn cyan_remove_board_label(board_id: *const c_char, label: *const
     let updated_labels: Vec<String>;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         group_id = db.query_row(
             "SELECT w.group_id FROM objects o
@@ -2742,7 +2743,7 @@ pub extern "C" fn cyan_rate_board(board_id: *const c_char, rating: i32) -> bool 
     let group_id: String;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         group_id = db.query_row(
             "SELECT w.group_id FROM objects o
@@ -2787,7 +2788,7 @@ pub extern "C" fn cyan_record_board_view(board_id: *const c_char) -> bool {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let db = sys.db.lock().unwrap();
+    let db = sys.db.lock_safe();
 
     db.execute(
         "INSERT INTO board_metadata (board_id, view_count, last_accessed) VALUES (?1, 1, ?2)
@@ -2811,7 +2812,7 @@ pub extern "C" fn cyan_set_board_model(board_id: *const c_char, model_name: *con
         if m.is_empty() { None } else { Some(m) }
     };
 
-    let db = sys.db.lock().unwrap();
+    let db = sys.db.lock_safe();
 
     db.execute(
         "INSERT INTO board_metadata (board_id, contains_model) VALUES (?1, ?2)
@@ -2835,7 +2836,7 @@ pub extern "C" fn cyan_set_board_skills(board_id: *const c_char, skills_json: *c
         return false;
     }
 
-    let db = sys.db.lock().unwrap();
+    let db = sys.db.lock_safe();
 
     db.execute(
         "INSERT INTO board_metadata (board_id, contains_skills) VALUES (?1, ?2)
@@ -2854,7 +2855,7 @@ pub extern "C" fn cyan_get_board_link(board_id: *const c_char) -> *mut c_char {
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
 
     let link: Option<String> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         db.query_row(
             "SELECT w.group_id, o.workspace_id
@@ -2887,7 +2888,7 @@ pub extern "C" fn cyan_search_boards_by_label(label: *const c_char) -> *mut c_ch
     let pattern = format!("%\"{}%", search_label); // JSON contains pattern
 
     let results: Vec<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         let mut stmt = match db.prepare(
             "SELECT o.id, o.name, o.workspace_id, w.name, w.group_id,
@@ -2940,7 +2941,7 @@ pub extern "C" fn cyan_pin_board(board_id: *const c_char) -> bool {
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
 
     let result = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         db.execute(
             "INSERT INTO board_metadata (board_id, is_pinned) VALUES (?1, 1)
              ON CONFLICT(board_id) DO UPDATE SET is_pinned = 1",
@@ -2961,7 +2962,7 @@ pub extern "C" fn cyan_unpin_board(board_id: *const c_char) -> bool {
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
 
     let result = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         db.execute(
             "UPDATE board_metadata SET is_pinned = 0 WHERE board_id = ?1",
             params![bid],
@@ -2980,7 +2981,7 @@ pub extern "C" fn cyan_is_board_pinned(board_id: *const c_char) -> bool {
 
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
 
-    let db = sys.db.lock().unwrap();
+    let db = sys.db.lock_safe();
     db.query_row(
         "SELECT COALESCE(is_pinned, 0) FROM board_metadata WHERE board_id = ?1",
         params![bid],
@@ -3006,7 +3007,7 @@ pub extern "C" fn cyan_get_user_profile(node_id: *const c_char) -> *mut c_char {
     };
 
     let profile: Option<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         db.query_row(
             "SELECT node_id, display_name, avatar_hash, status, last_seen, updated_at
              FROM user_profiles WHERE node_id = ?1",
@@ -3060,7 +3061,7 @@ pub extern "C" fn cyan_get_profiles_batch(node_ids_json: *const c_char) -> *mut 
     let mut result = serde_json::Map::new();
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         for nid in &node_ids {
             let profile: Option<serde_json::Value> = db.query_row(
@@ -3130,7 +3131,7 @@ pub extern "C" fn cyan_set_my_profile(
             Err(_) => None,
         }
     } else {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         db.query_row(
             "SELECT avatar_hash FROM user_profiles WHERE node_id = ?1",
             params![&node_id],
@@ -3140,7 +3141,7 @@ pub extern "C" fn cyan_set_my_profile(
 
     // Upsert profile
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         let _ = db.execute(
             "INSERT INTO user_profiles (node_id, display_name, avatar_hash, status, updated_at)
              VALUES (?1, ?2, ?3, 'online', ?4)
@@ -3155,7 +3156,7 @@ pub extern "C" fn cyan_set_my_profile(
 
     // Broadcast to all groups
     let group_ids: Vec<String> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         let mut stmt = db.prepare("SELECT id FROM groups").unwrap();
         stmt.query_map([], |row| row.get(0))
             .unwrap()
@@ -3201,7 +3202,7 @@ pub extern "C" fn cyan_get_my_profile() -> *mut c_char {
     let node_id = sys.node_id.clone();
 
     let profile: Option<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         db.query_row(
             "SELECT node_id, display_name, avatar_hash, status, last_seen, updated_at
              FROM user_profiles WHERE node_id = ?1",
@@ -3250,7 +3251,7 @@ pub extern "C" fn cyan_update_peer_status(node_id: *const c_char, status: *const
 
     let now = chrono::Utc::now().timestamp();
 
-    let db = sys.db.lock().unwrap();
+    let db = sys.db.lock_safe();
     let result = db.execute(
         "INSERT INTO user_profiles (node_id, status, last_seen, updated_at)
          VALUES (?1, ?2, ?3, ?3)
@@ -3350,7 +3351,7 @@ fn join_from_invite(invite: &serde_json::Value) -> *mut c_char {
 
     // Check if group already exists
     let exists: bool = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         db.query_row(
             "SELECT 1 FROM groups WHERE id = ?1",
             params![&group_id],
@@ -3367,7 +3368,7 @@ fn join_from_invite(invite: &serde_json::Value) -> *mut c_char {
     // Insert group into database
     let now = chrono::Utc::now().timestamp();
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         if let Err(e) = db.execute(
             "INSERT INTO groups (id, name, icon, color, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![&group_id, &group_name, &group_icon, &group_color, now],
@@ -4548,7 +4549,7 @@ pub extern "C" fn cyan_reveal_anonymous_identity(scope_id: *const c_char) -> *mu
     let real_pubkey = xaeroid::XaeroID::ed25519_pubkey(&secret_bytes);
     
     let display_name: Option<String> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         db.query_row(
             "SELECT display_name FROM user_profiles WHERE node_id = ?1",
             rusqlite::params![&sys.node_id],
