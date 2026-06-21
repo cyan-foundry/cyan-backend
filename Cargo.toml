@@ -96,3 +96,9 @@ crypto_box = { version = "0.10.0-pre.0", features = ["seal"] }
 # The `testing` feature exposes the embedded RS256 keypair + entitlement
 # minter/verifier fakes so the licensing tests sign/verify with no real broker.
 cyan-identity = { path = "../cyan-identity", features = ["testing"] }
+
+# W17 §B — the device-XaeroID Keychain vault (`device_vault::KeychainVault`). The
+# Security-framework generic-password binding for the real macOS OS secure store;
+# headless/test builds use the `MemVault` fake instead, so this never runs in CI.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "2"

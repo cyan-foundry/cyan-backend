@@ -266,6 +266,28 @@ pub extern "C" fn cyan_set_xaero_id(id: *const c_char) -> bool {
     true
 }
 
+/// Wipe the device's local identity key — the engine half of the iOS "delete
+/// identity" flow (W17 §B). Deletes the device XaeroID private key from the OS
+/// secure store (Keychain, or the headless fake) and best-effort removes the
+/// on-disk `node_id.txt`, so a fresh identity is created on the next launch.
+///
+/// Idempotent and panic-free: returns `true` once the key is gone (already-absent
+/// counts as success), `false` only if the vault delete itself errored. Local
+/// data/DB is untouched — this clears identity custody only.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_delete_identity() -> bool {
+    let vault = crate::device_vault();
+    if let Err(e) = crate::device_vault::delete_identity(vault.as_ref()) {
+        eprintln!("cyan_delete_identity: vault delete failed: {e}");
+        return false;
+    }
+    // Best-effort: drop the cached public node id so a new one is minted next run.
+    if let Some(dir) = DATA_DIR.get() {
+        let _ = std::fs::remove_file(dir.join("node_id.txt"));
+    }
+    true
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {

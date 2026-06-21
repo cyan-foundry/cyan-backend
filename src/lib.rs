@@ -36,6 +36,8 @@ pub mod mcp_host;
 pub mod identity;
 pub mod licensing;
 pub mod sso_grant;
+pub mod group_rekey;
+pub mod device_vault;
 
 use crate::models::commands::{CommandMsg, NetworkCommand};
 use crate::util::MutexExt;
@@ -82,6 +84,18 @@ pub static RELAY_URL: OnceCell<String> = OnceCell::new();
 pub static BOOTSTRAP_NODE_ID: OnceCell<String> = OnceCell::new();
 static NODE_ID: OnceCell<String> = OnceCell::new();
 static AI_RESPONSE_QUEUE: OnceCell<Mutex<VecDeque<String>>> = OnceCell::new();
+
+/// Process-wide device-key vault (W17 §B). The macOS Keychain in production, the
+/// in-memory fake headless/in tests — see [`device_vault::default_device_vault`].
+/// Lazily built so the FFI "delete identity" / migration paths share one backing.
+pub static DEVICE_VAULT: OnceCell<Arc<dyn device_vault::Vault>> = OnceCell::new();
+
+/// The shared device-key vault, initialized on first use.
+pub fn device_vault() -> Arc<dyn device_vault::Vault> {
+    DEVICE_VAULT
+        .get_or_init(device_vault::default_device_vault)
+        .clone()
+}
 
 /// This node's live, resolvable address as a serialized `iroh::EndpointAddr` (MESH_HARDENING §2.2).
 /// The `NetworkActor` publishes it once its endpoint has a direct address; `cyan_issue_grant_qr`

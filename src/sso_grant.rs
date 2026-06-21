@@ -12,7 +12,10 @@
 //!   1. **Cache** the signed grant ([`GrantCache`]) so it verifies with NO broker
 //!      reachable — the prod backing is the iOS keychain; this is the seam.
 //!   2. **Verify** it (RS256 signature + XaeroID-pubkey binding + `exp` + grace)
-//!      via the cyan-identity `GrantVerifier`.
+//!      via the cyan-identity `GrantVerifier` — or, per W17 §A, against the
+//!      pinned **per-tenant org key** via `OrgGrantVerifier` (legacy `"cyan-lens"`
+//!      grants still accepted, and a revoked `xaero_pubkey` rejected even when the
+//!      grant is otherwise live). See [`SsoSession::from_org_token`].
 //!   3. On sign-in, **seed** the device into the grant's `groups` through the
 //!      existing group-join path (the [`GroupJoiner`] seam → `JoinGroup`).
 //!   4. **Enforce** the grant's `role` via the shared `RolePolicy`.
@@ -29,7 +32,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use async_trait::async_trait;
 use cyan_identity::{
-    Action, Actor, AuthZ, Decision, Grant, GrantVerifier, Resource, Role, RolePolicy,
+    Action, Actor, AuthZ, Decision, Grant, GrantVerifier, OrgGrantVerifier, Resource, Role,
+    RolePolicy, SignedRevocationList,
 };
 use secrecy::SecretString;
 
@@ -164,6 +168,40 @@ impl SsoSession {
         now: u64,
     ) -> Result<Self> {
         let grant = verifier.verify_at(token, xaero_pubkey, now)?;
+        Ok(Self::new(grant))
+    }
+
+    /// Resolve a session by verifying `token` against the pinned **per-tenant org
+    /// key** (W17 §A) rather than the single global broker key. The
+    /// [`OrgGrantVerifier`] rebuilds the `grant ← delegate ← org root` chain and
+    /// pins the issuer to the tenant's org DID; built `.with_legacy(..)` it ALSO
+    /// keeps accepting legacy `"cyan-lens"`-issued grants during the cutover. Same
+    /// offline contract as [`SsoSession::from_cached_token`] (binding + `exp`
+    /// + grace), so a cached org grant verifies with NO broker reachable.
+    pub fn from_org_token(
+        token: &SecretString,
+        verifier: &OrgGrantVerifier,
+        xaero_pubkey: &str,
+        now: u64,
+    ) -> Result<Self> {
+        let grant = verifier.verify_at(token, xaero_pubkey, now)?;
+        Ok(Self::new(grant))
+    }
+
+    /// Like [`SsoSession::from_org_token`] but additionally rejects a grant whose
+    /// `xaero_pubkey` is on the org-signed `revocation` list (W17 §A/§C) — even if
+    /// the grant is otherwise valid and unexpired (the "fired employee" who still
+    /// holds a live token). The list is itself verified org-signed against the
+    /// grant's pinned org key before it is trusted, so a forged list can neither
+    /// suppress nor fabricate a revocation.
+    pub fn from_org_token_checked(
+        token: &SecretString,
+        verifier: &OrgGrantVerifier,
+        xaero_pubkey: &str,
+        now: u64,
+        revocation: &SignedRevocationList,
+    ) -> Result<Self> {
+        let grant = verifier.verify_with_revocation_at(token, xaero_pubkey, now, revocation)?;
         Ok(Self::new(grant))
     }
 
