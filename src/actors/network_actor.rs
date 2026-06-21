@@ -20,12 +20,13 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use iroh::discovery::mdns::MdnsDiscovery;
+use futures_lite::StreamExt;
+use iroh::discovery::mdns::{DiscoveryEvent, MdnsDiscovery};
 use iroh::discovery::static_provider::StaticProvider;
 use iroh::{
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
-    Endpoint, PublicKey, SecretKey,
+    Endpoint, EndpointAddr, PublicKey, SecretKey,
 };
 use iroh_gossip::net::Gossip;
 use serde::{Deserialize, Serialize};
@@ -206,6 +207,12 @@ pub struct NetworkActor {
     /// out via `static_discovery()`; inert unless a caller adds entries.
     static_discovery: StaticProvider,
 
+    /// mDNS discovery handle (MESH_HARDENING §2.1). Built explicitly (instead of via the builder)
+    /// so `start()` can `subscribe()` to its discovery stream and route LAN-discovered peers into
+    /// the group topics — the fix that makes single-laptop / same-WiFi mesh with no infra. `None`
+    /// only if mDNS failed to start (e.g. no usable multicast interface); the engine still runs.
+    mdns: Option<MdnsDiscovery>,
+
     /// Content-addressed blob swarm (G10). Shared with each TopicActor so i-have/who-has
     /// negotiation rides the group gossip, and exposed via `swarm()` for the swarm-fetch path.
     swarm: Arc<BlobSwarm>,
@@ -241,8 +248,14 @@ impl NetworkActor {
         // addresses so nodes can dial each other without relying on mDNS multicast.
         let static_discovery = StaticProvider::new();
 
-        // Build endpoint with all ALPNs
-        let endpoint = Endpoint::builder()
+        // mDNS discovery (MESH_HARDENING §2.1): build it explicitly with this node's id so we keep a
+        // handle and can `subscribe()` to its discovery stream in `start()`. Behavior for resolving
+        // peer addresses is identical to the previous `MdnsDiscovery::builder()` form; the only
+        // addition is that we now also LISTEN for discovered peers and seed them into group topics.
+        // Best-effort: if it can't start (no multicast interface), fall back to the builder form so
+        // the endpoint still binds with mDNS exactly as before.
+        let public = secret_key.public();
+        let mut builder = Endpoint::builder()
             .secret_key(secret_key)
             .alpns(vec![
                 iroh_gossip::ALPN.to_vec(),
@@ -251,8 +264,19 @@ impl NetworkActor {
                 DM_ALPN.to_vec(),
                 BLOB_ALPN.to_vec(),
             ])
-            .relay_mode(relay_mode)
-            .discovery(MdnsDiscovery::builder())
+            .relay_mode(relay_mode);
+        let mdns = match MdnsDiscovery::builder().build(public) {
+            Ok(m) => {
+                builder = builder.discovery(m.clone());
+                Some(m)
+            }
+            Err(e) => {
+                tracing::warn!("⚠️ [NET] mDNS discovery unavailable ({e}); LAN seeding disabled");
+                builder = builder.discovery(MdnsDiscovery::builder());
+                None
+            }
+        };
+        let endpoint = builder
             .discovery(static_discovery.clone())
             .bind()
             .await?;
@@ -329,6 +353,7 @@ impl NetworkActor {
             groups_needing_snapshot: HashSet::new(),
             cfg,
             static_discovery,
+            mdns,
             swarm,
             authorizer,
         })
@@ -426,6 +451,51 @@ impl NetworkActor {
 
         // NOTE: Router handles DM, file, and snapshot acceptance now
         // No need for spawn_dm_acceptor or spawn_protocol_acceptor
+
+        // mDNS LAN seeding (MESH_HARDENING §2.1): listen for peers discovered on the local network
+        // and route each into our group topics. This is the offline/single-laptop fix — gossip needs
+        // a present, resolvable peer in a topic's bootstrap set to ever fire `NeighborUp`, and mDNS
+        // is the only source of that with no internet/relay/bootstrap. Each discovered peer is fed
+        // back through this actor's own command loop as `SeedDiscoveredPeer` (which seeds it into
+        // every joined group); gossip only forms a neighbor for genuinely shared topics.
+        if let Some(mdns) = self.mdns.clone() {
+            let seed_tx = self.self_cmd_tx.clone();
+            tokio::spawn(async move {
+                let mut events = mdns.subscribe().await;
+                while let Some(ev) = events.next().await {
+                    if let DiscoveryEvent::Discovered { endpoint_info, .. } = ev {
+                        let addr = endpoint_info.to_endpoint_addr();
+                        match serde_json::to_string(&addr) {
+                            Ok(addr_json) => {
+                                let _ = seed_tx.send(NetworkCommand::SeedDiscoveredPeer { addr_json });
+                            }
+                            Err(e) => tracing::warn!("⚠️ [NET] mDNS addr serialize failed: {e}"),
+                        }
+                    }
+                }
+                tracing::info!("🛑 [NET] mDNS discovery stream ended");
+            });
+            eprintln!("🔍 [NET] mDNS LAN seeding task started");
+        }
+
+        // Publish our resolvable address for the QR inviter-addr seam (§2.2): poll until the endpoint
+        // has a direct address, then store it so `cyan_issue_grant_qr` can stamp the full NodeAddr
+        // into invites. Best-effort and non-blocking; gives up quietly if no address ever appears.
+        {
+            let endpoint = self.endpoint.clone();
+            tokio::spawn(async move {
+                for _ in 0..50 {
+                    let addr = endpoint.addr();
+                    if addr.addrs.iter().next().is_some() {
+                        if let Ok(json) = serde_json::to_string(&addr) {
+                            crate::publish_local_endpoint_addr(json);
+                        }
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            });
+        }
 
         // Broadcast our profile on startup
         self.broadcast_profile_to_all_groups();
@@ -617,6 +687,31 @@ impl NetworkActor {
                         "⚠️ [NET] No TopicActor for group {}",
                         &group_id[..16.min(group_id.len())]
                     );
+                }
+            }
+
+            NetworkCommand::SeedGroupPeer { group_id, addr_json } => {
+                // ONE seeding pipeline (§2): a single resolvable peer → one group topic. Used by the
+                // QR-inviter / persisted / bootstrap / Lens sources (and the test harness).
+                match serde_json::from_str::<EndpointAddr>(&addr_json) {
+                    Ok(addr) => self.seed_peer_into_group(&group_id, addr).await,
+                    Err(e) => tracing::warn!("⚠️ [NET] SeedGroupPeer bad addr_json: {e}"),
+                }
+            }
+
+            NetworkCommand::SeedDiscoveredPeer { addr_json } => {
+                // mDNS source (§2.1): a LAN-discovered peer, group membership unknown → offer it to
+                // every joined group. Gossip only forms a neighbor where the topic is genuinely shared.
+                match serde_json::from_str::<EndpointAddr>(&addr_json) {
+                    Ok(addr) => {
+                        if addr.id.to_string() != self.node_id {
+                            let groups: Vec<String> = self.topics.keys().cloned().collect();
+                            for group_id in groups {
+                                self.seed_peer_into_group(&group_id, addr.clone()).await;
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("⚠️ [NET] SeedDiscoveredPeer bad addr_json: {e}"),
                 }
             }
 
@@ -940,6 +1035,34 @@ impl NetworkActor {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // MESH SEEDING (MESH_HARDENING §2)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// The ONE seeding pipeline (§2): make a peer's full `EndpointAddr` resolvable, persist it for
+    /// rejoin, and route it into a group's gossip topic so `NeighborUp` can fire. Every seed source
+    /// (mDNS / QR-inviter / persisted known-peers / bootstrap / Lens) funnels through here, so there
+    /// is exactly one place that turns "an address" into "a present peer in a topic's bootstrap set".
+    async fn seed_peer_into_group(&mut self, group_id: &str, addr: EndpointAddr) {
+        let peer = addr.id;
+        // 1. Make the peer dialable out of band — the mechanism `cyan_node.rs` already proves.
+        self.static_discovery.add_endpoint_info(addr.clone());
+        // 2. Persist for rejoin re-seeding (§2.3). Serialize is infallible for EndpointAddr in practice.
+        if let Ok(addr_json) = serde_json::to_string(&addr) {
+            let _ = storage::group_known_peer_upsert(group_id, &peer.to_string(), &addr_json);
+        }
+        // 3. Route the peer into the group topic — spawning it if we have not joined the group yet.
+        if self.topics.contains_key(group_id) {
+            if let Some(handle) = self.topics.get(group_id) {
+                let _ = handle
+                    .cmd_tx
+                    .send(ActorMessage::Domain(TopicCommand::JoinPeers(vec![peer])));
+            }
+        } else {
+            let _ = self.spawn_topic_actor(group_id, vec![peer], None).await;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // TOPIC ACTOR MANAGEMENT
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -989,6 +1112,23 @@ impl NetworkActor {
         self.peers_per_group.lock().unwrap()
             .entry(group_id.to_string())
             .or_default();
+
+        // Persisted-peer re-seed (§2.3): re-feed every saved NodeAddr for this group so the topic
+        // re-forms on rejoin/restart without needing bootstrap/relay reachable. add_endpoint_info
+        // makes each resolvable; JoinPeers routes them into the freshly-subscribed topic. No-op for
+        // a group with no saved peers (a brand-new group), so first-join behavior is unchanged.
+        for (peer_id, addr_json) in storage::group_known_peers_list(group_id) {
+            if let Ok(addr) = serde_json::from_str::<EndpointAddr>(&addr_json) {
+                self.static_discovery.add_endpoint_info(addr);
+            }
+            if let Ok(pk) = PublicKey::from_str(&peer_id)
+                && let Some(handle) = self.topics.get(group_id)
+            {
+                let _ = handle
+                    .cmd_tx
+                    .send(ActorMessage::Domain(TopicCommand::JoinPeers(vec![pk])));
+            }
+        }
 
         eprintln!("🚀 [TOPIC-SPAWN-3] ✓ State initialized for group");
         Ok(())

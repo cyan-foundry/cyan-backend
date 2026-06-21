@@ -79,6 +79,25 @@ pub static BOOTSTRAP_NODE_ID: OnceCell<String> = OnceCell::new();
 static NODE_ID: OnceCell<String> = OnceCell::new();
 static AI_RESPONSE_QUEUE: OnceCell<Mutex<VecDeque<String>>> = OnceCell::new();
 
+/// This node's live, resolvable address as a serialized `iroh::EndpointAddr` (MESH_HARDENING §2.2).
+/// The `NetworkActor` publishes it once its endpoint has a direct address; `cyan_issue_grant_qr`
+/// reads it to stamp the inviter's full NodeAddr into the QR so a joiner can dial directly (no
+/// relay/bootstrap). `None` until published. Additive seam — nothing else depends on it.
+pub static LOCAL_ENDPOINT_ADDR: OnceCell<Mutex<Option<String>>> = OnceCell::new();
+
+/// Publish this node's serialized `EndpointAddr` for the QR inviter-addr seam (§2.2). Idempotent.
+pub fn publish_local_endpoint_addr(addr_json: String) {
+    let cell = LOCAL_ENDPOINT_ADDR.get_or_init(|| Mutex::new(None));
+    if let Ok(mut g) = cell.lock() {
+        *g = Some(addr_json);
+    }
+}
+
+/// The last-published local `EndpointAddr` JSON, if any (§2.2).
+pub fn local_endpoint_addr() -> Option<String> {
+    LOCAL_ENDPOINT_ADDR.get().and_then(|m| m.lock().ok().and_then(|g| g.clone()))
+}
+
 /// Get bootstrap node ID - returns set value or default
 pub fn bootstrap_node_id() -> &'static str {
     BOOTSTRAP_NODE_ID

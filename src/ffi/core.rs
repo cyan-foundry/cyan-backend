@@ -79,7 +79,7 @@ pub extern "C" fn cyan_init(db_path: *const c_char) -> bool {
 
 use crate::{CyanSystem, AI_RESPONSE_QUEUE, DATA_DIR, DISCOVERY_KEY, NODE_ID, RELAY_URL, RUNTIME, SYSTEM};
 use rusqlite::params;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, CStr, CString};
 use std::path::{Path, PathBuf};
 // Initialize tracing (only once)
@@ -920,6 +920,64 @@ pub extern "C" fn cyan_get_total_peer_count() -> i32 {
     peers_map.values()
         .map(|set| set.len())
         .sum::<usize>() as i32
+}
+
+/// Get the persistent presence ROSTER for a group (MESH_HARDENING §3) as a JSON array:
+/// `[{"peer_id","name","avatar","online","last_seen"}, ...]`.
+///
+/// Distinct from `cyan_get_group_peers` (which returns only the LIVE neighbor set): this returns
+/// every member ever seen in the group — online members in green, offline members greyed with their
+/// cached name + last-seen (chat-style roster). `online` is overlaid from the live neighbor set, so
+/// a member currently in `peers_per_group` reports `true`. `name`/`avatar` come from the profile
+/// store (null until a profile is seen). Tenant-scoped by `group_id`. Caller frees via `cyan_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_group_members(group_id: *const c_char) -> *mut c_char {
+    let Some(gid) = (unsafe { cstr_arg(group_id) }) else {
+        return std::ptr::null_mut();
+    };
+    let Some(sys) = SYSTEM.get() else {
+        return std::ptr::null_mut();
+    };
+
+    // Live neighbor set for the online overlay (the same map the live-peer FFI reads). No `unwrap`
+    // on the lock (engine/FFI path): a poisoned lock degrades to an empty overlay, never a crash.
+    let online: HashSet<String> = sys
+        .peers_per_group
+        .lock()
+        .ok()
+        .and_then(|peers_map| {
+            peers_map
+                .get(&gid)
+                .map(|set| set.iter().map(|pk| pk.to_string()).collect())
+        })
+        .unwrap_or_default();
+
+    let members: Vec<serde_json::Value> = crate::storage::group_members_list(&gid)
+        .into_iter()
+        .map(|(peer_id, name, avatar, last_seen)| {
+            let mut m = serde_json::Map::new();
+            m.insert("peer_id".to_string(), serde_json::Value::String(peer_id.clone()));
+            m.insert(
+                "name".to_string(),
+                name.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+            );
+            m.insert(
+                "avatar".to_string(),
+                avatar.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+            );
+            m.insert("online".to_string(), serde_json::Value::Bool(online.contains(&peer_id)));
+            m.insert("last_seen".to_string(), serde_json::Value::Number(last_seen.into()));
+            serde_json::Value::Object(m)
+        })
+        .collect();
+
+    match serde_json::to_string(&serde_json::Value::Array(members)) {
+        Ok(json) => match CString::new(json) {
+            Ok(c) => c.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+        Err(_) => std::ptr::null_mut(),
+    }
 }
 
 /// Get total object count (whiteboards + files)
@@ -3268,6 +3326,14 @@ fn join_from_invite(invite: &serde_json::Value) -> *mut c_char {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // Inviter's full resolvable address (MESH_HARDENING §2.2): a serialized `EndpointAddr` the QR
+    // optionally carries. When present we seed it into the group topic on join (below) so the joiner
+    // dials the inviter directly with no relay/bootstrap/mDNS — air-gapped first-join forms a mesh.
+    let inviter_addr = invite
+        .get("inviter_addr")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     // Optional signed capability-grant QR payload (additive). When present, it is forwarded
     // with the JoinGroup so the snapshot holder can authorize the per-group snapshot read for
     // an enforced group. Absent ⇒ unchanged behavior (fail-open / un-enforced groups).
@@ -3321,6 +3387,17 @@ fn join_from_invite(invite: &serde_json::Value) -> *mut c_char {
         grant,
     });
     println!("🔵 [SYNC-4] JoinGroup command sent");
+
+    // Seed the inviter's full address into the group topic (MESH_HARDENING §2.2). Additive: only
+    // when the QR carried `inviter_addr`. This is the ONE seeding pipeline (engine `SeedGroupPeer`)
+    // — it makes the inviter resolvable and routes it into the topic so `NeighborUp` fires on first
+    // join with no relay/bootstrap reachable. Absent ⇒ unchanged (dial inviter_node_id via discovery).
+    if let Some(addr_json) = inviter_addr {
+        let _ = sys.network_tx.send(NetworkCommand::SeedGroupPeer {
+            group_id: group_id.clone(),
+            addr_json,
+        });
+    }
 
     // Emit event for UI refresh
     let group = Group {
@@ -3437,6 +3514,19 @@ pub extern "C" fn cyan_issue_grant_qr(
         &roster,
     ) {
         Ok(qr) => {
+            // Stamp this node's full resolvable address into the invite (MESH_HARDENING §2.2) so the
+            // joiner can dial us directly with no relay/bootstrap. Additive: if we have no published
+            // address yet, the field stays absent and the QR is byte-identical to before.
+            let qr = match crate::local_endpoint_addr() {
+                Some(addr_json) => match crate::identity::GrantInvite::from_qr_payload(&qr) {
+                    Ok(mut invite) => {
+                        invite.inviter_addr = Some(addr_json);
+                        invite.to_qr_payload()
+                    }
+                    Err(_) => qr,
+                },
+                None => qr,
+            };
             // Build the success body without `json!` (its expansion trips the
             // workspace `unwrap` lint) — a plain map → string is panic-free.
             let mut out = serde_json::Map::new();
@@ -3481,6 +3571,10 @@ pub extern "C" fn cyan_scan_grant_qr(qr_payload: *const c_char) -> *mut c_char {
     invite_json.insert("group_icon".to_string(), s(invite.group_icon.unwrap_or_else(|| "folder.fill".to_string())));
     invite_json.insert("group_color".to_string(), s(invite.group_color.unwrap_or_else(|| "#00AEEF".to_string())));
     invite_json.insert("inviter_node_id".to_string(), s(invite.inviter_node_id));
+    // Forward the inviter's full address (§2.2) when the QR carried it, so the join path seeds it.
+    if let Some(addr_json) = invite.inviter_addr {
+        invite_json.insert("inviter_addr".to_string(), s(addr_json));
+    }
     invite_json.insert("grant".to_string(), s(invite.grant.to_qr_payload()));
     join_from_invite(&serde_json::Value::Object(invite_json))
 }

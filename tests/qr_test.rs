@@ -175,3 +175,29 @@ fn expired_or_revoked_qr_rejected() {
     // And it confers no write capability.
     assert!(!holder.authorize_write(GROUP, "joiner-peer").is_allowed());
 }
+
+/// MESH_HARDENING §2.2 — the additive `inviter_addr` field (the inviter's full resolvable
+/// `EndpointAddr`, serialized) round-trips through the QR payload and defaults to absent on the
+/// legacy/pure path. This is the payload half of the QR seed source; the engine half (seeding it
+/// forms a neighbor) is `substrate_mesh_seed::qr_join_forms_neighbor_via_seeded_addr`.
+#[test]
+fn qr_carries_optional_inviter_addr() {
+    let admin = secret(1);
+    let roster = roster_with_admin(&admin, Role::Admin);
+    let qr = issue_grant_qr(
+        GROUP, "Sales", None, None, Role::Member, &admin, "node-admin",
+        NOW, NOW + 3600, "nonce-addr", &roster,
+    )
+    .expect("issue a grant QR");
+
+    // Legacy/pure issue path leaves the address absent (drop-in, unchanged QR shape).
+    let mut invite = GrantInvite::from_qr_payload(&qr).expect("decode invite");
+    assert_eq!(invite.inviter_addr, None, "addr defaults to absent");
+
+    // Stamp a serialized EndpointAddr (what the issuing device does) and round-trip it.
+    let addr_json = r#"{"id":"ed25519pubkeyhex","addrs":[]}"#.to_string();
+    invite.inviter_addr = Some(addr_json.clone());
+    let round = GrantInvite::from_qr_payload(&invite.to_qr_payload()).expect("re-decode");
+    assert_eq!(round.inviter_addr, Some(addr_json), "inviter_addr survives the QR round-trip");
+    assert_eq!(round.inviter_node_id, "node-admin", "existing fields unaffected");
+}

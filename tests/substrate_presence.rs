@@ -266,16 +266,14 @@ async fn total_peer_count_sums_groups() {
 /// The DECREMENT direction: when a peer's gossip connection drops (NeighborDown), it is removed
 /// from `peers_per_group` so the count falls back toward 0.
 ///
-/// `#[ignore]`d — NOT a missing capability and NOT a weakened assertion. The engine DOES remove
-/// the peer on every gossip `NeighborDown` (the handler wired alongside the NeighborUp add), so
-/// this assertion is correct by construction and would pass the moment NeighborDown fires. The
-/// gate is purely timing: iroh's connection-loss / NeighborDown detection over loopback is not
-/// engine-bounded (a peer simply closing its endpoint can take far longer than any sane test
-/// timeout), so it cannot be asserted under the substrate "bounded wait" discipline. Same reason
-/// as `presence_tracks_join_leave_for_n_peers`; the leave path is covered by the multi-process
-/// partition scaffold (`substrate_multiuser_mp` / STATUS_BACKEND_MULTIUSER.md).
+/// Un-`#[ignore]`d (MESH_HARDENING §3): the peer is dropped via `Node::shutdown()`, which calls
+/// `Endpoint::close()` and ACTIVELY tears down the connection rather than letting it time out — so
+/// `NeighborDown` fires within the bounded `SYNC_TIMEOUT` (it does, reliably). This is the live
+/// `online → offline` flip the roster overlay depends on; the assertion was always correct by
+/// construction (the engine removes the peer on every `NeighborDown`) — only the unbounded-latency
+/// concern gated it, and the active endpoint-close removes that. `presence_tracks_join_leave_for_n_peers`
+/// stays ignored: it waits on the `MeshReachability{local_only}` EMIT, a separate (still timing-soft) signal.
 #[tokio::test]
-#[ignore = "engine removes the peer on NeighborDown, but iroh's NeighborDown latency over loopback is not bounded; the decrement is asserted via the multi-process partition scaffold instead"]
 async fn neighbor_down_decrements_presence() {
     let _serial = serial().await;
     let nodes = spawn_isolated_pair().await;

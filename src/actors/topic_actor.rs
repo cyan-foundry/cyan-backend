@@ -613,6 +613,15 @@ impl TopicActor {
                     map.entry(self.group_id.clone()).or_default().insert(peer);
                 }
 
+                // Roster (MESH_HARDENING §3): record this peer as a persistent group MEMBER. The row
+                // survives restart and the peer going offline (greyed in the roster, online overlaid
+                // from the live neighbor set at read time). first_seen is set once; last_seen advances.
+                let _ = storage::member_seen(
+                    &self.group_id,
+                    &peer.to_string(),
+                    chrono::Utc::now().timestamp(),
+                );
+
                 // CRITICAL: Re-send snapshot request when peer joins
                 // The initial request may have been sent before mesh was ready
                 if self.need_snapshot {
@@ -692,6 +701,11 @@ impl TopicActor {
     }
 
     async fn handle_network_event(&mut self, evt: NetworkEvent, from_peer: &str) {
+        // Roster (MESH_HARDENING §3): the author of any gossip event we receive is a group MEMBER —
+        // record them (deduped; `from_peer` is never self, self-messages are filtered upstream). This
+        // catches members who are present over gossip even if we never saw their NeighborUp directly.
+        let _ = storage::member_seen(&self.group_id, from_peer, chrono::Utc::now().timestamp());
+
         // Check for GroupSnapshotAvailable - this triggers snapshot download
         if let NetworkEvent::GroupSnapshotAvailable { ref source, ref group_id } = evt {
             eprintln!("═══════════════════════════════════════════════════════════════════");

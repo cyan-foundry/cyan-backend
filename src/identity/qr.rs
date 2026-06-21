@@ -34,6 +34,13 @@ pub struct GrantInvite {
     pub group_color: Option<String>,
     /// The issuing admin's node id — used as the gossip bootstrap peer on join.
     pub inviter_node_id: String,
+    /// The inviter's full resolvable address (a serialized `iroh::EndpointAddr`), additive and
+    /// optional (MESH_HARDENING §2.2). When present, the joiner can dial the inviter directly with
+    /// no relay/bootstrap/mDNS — the engine seeds it into the group topic so `NeighborUp` fires on
+    /// first join even on an air-gapped LAN. Absent ⇒ unchanged behavior (dial by `inviter_node_id`
+    /// via discovery). Kept as a String so this crate stays free of an iroh dependency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inviter_addr: Option<String>,
     /// The signed capability grant carrying the joiner's role.
     pub grant: Grant,
 }
@@ -108,6 +115,10 @@ pub fn issue_grant_qr(
         group_icon: group_icon.map(String::from),
         group_color: group_color.map(String::from),
         inviter_node_id: inviter_node_id.to_string(),
+        // Filled in by the issuing device when it has a live endpoint (FFI `cyan_issue_grant_qr`);
+        // the pure crypto layer leaves it None so this crate stays iroh-free and the unit tests
+        // (deterministic, no mesh) are unaffected.
+        inviter_addr: None,
         grant,
     };
     Ok(invite.to_qr_payload())

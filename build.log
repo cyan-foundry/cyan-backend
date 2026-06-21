@@ -2498,3 +2498,56 @@ warning: Cargo.toml: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_t
 warning: `cyan-backend` (manifest) generated 3 warnings
    Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
     Finished `release` profile [optimized] target(s) in 34.20s
+warning: Cargo.toml: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: Cargo.toml: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: Cargo.toml: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: `cyan-backend` (manifest) generated 3 warnings
+   Compiling ring v0.17.14
+   Compiling time-core v0.1.6
+   Compiling num-conv v0.1.0
+   Compiling num-traits v0.2.19
+   Compiling sha2 v0.10.9
+   Compiling secrecy v0.8.0
+   Compiling time-macros v0.2.24
+   Compiling ed25519-dalek v2.2.0
+   Compiling time v0.3.44
+   Compiling xaeroid v1.0.1 (/Users/anirudhvyas/xaeroid)
+   Compiling num-integer v0.1.46
+   Compiling chrono v0.4.42
+   Compiling euclid v0.20.14
+   Compiling num-bigint v0.4.6
+   Compiling netwatch v0.12.0
+   Compiling yasna v0.5.2
+   Compiling lopdf v0.34.0
+   Compiling simple_asn1 v0.6.3
+   Compiling portmapper v0.12.0
+   Compiling pdf-extract v0.7.12
+   Compiling rustls v0.23.35
+   Compiling rustls-webpki v0.103.8
+   Compiling rcgen v0.14.5
+   Compiling jsonwebtoken v9.3.1
+   Compiling tokio-rustls v0.26.4
+   Compiling hyper-rustls v0.27.7
+   Compiling hickory-proto v0.25.2
+   Compiling tokio-websockets v0.12.3
+   Compiling reqwest v0.12.24
+   Compiling pkarr v5.0.0
+   Compiling cyan-identity v0.1.0 (/Users/anirudhvyas/cyan-identity)
+   Compiling rustls-platform-verifier v0.5.3
+   Compiling hickory-resolver v0.25.2
+   Compiling swarm-discovery v0.4.1
+   Compiling iroh-quinn-proto v0.13.0
+   Compiling iroh-quinn v0.14.0
+   Compiling iroh-relay v0.95.1
+   Compiling irpc v0.11.0
+   Compiling iroh v0.95.1
+   Compiling iroh-gossip v0.95.0
+   Compiling iroh-blobs v0.97.0
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 1m 13s

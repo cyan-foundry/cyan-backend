@@ -23,6 +23,22 @@ pub enum NetworkCommand {
         group_id: String,
         event: NetworkEvent,
     },
+    /// Seed a resolvable peer into ONE group's gossip topic (MESH_HARDENING §2). `addr_json` is a
+    /// serialized `iroh::EndpointAddr` (the full NodeAddr, not just a pubkey). The engine makes it
+    /// resolvable (`add_endpoint_info`), persists it for rejoin re-seeding, and routes the peer into
+    /// the group topic so `NeighborUp` fires. The ONE pipeline behind every seed source (QR/inviter,
+    /// persisted known-peers, bootstrap/Lens addr). Additive; absent sources simply don't send it.
+    SeedGroupPeer {
+        group_id: String,
+        addr_json: String,
+    },
+    /// Seed a resolvable peer into EVERY currently-joined group (MESH_HARDENING §2.1). Emitted by the
+    /// mDNS discovery task: a LAN-discovered peer's group membership isn't known yet, so it is offered
+    /// to all topics (gossip only forms a neighbor for genuinely shared topics). `addr_json` is a
+    /// serialized `iroh::EndpointAddr`. This is what makes single-laptop / same-WiFi mesh with no infra.
+    SeedDiscoveredPeer {
+        addr_json: String,
+    },
     UploadToGroup {
         group_id: String,
         path: String,

@@ -321,6 +321,46 @@ impl Node {
         &self.db_path
     }
 
+    /// This node's resolvable address as a serialized `EndpointAddr` JSON (MESH_HARDENING §2). The
+    /// seed-pipeline tests hand this to another node's `seed_group_peer` to simulate a peer learned
+    /// via mDNS / QR / persisted store. Bounded: waits for a direct loopback address.
+    pub async fn endpoint_addr_json(&self, timeout: Duration) -> Result<String> {
+        let addr = await_direct_addr(&self.endpoint, timeout).await?;
+        serde_json::to_string(&addr).map_err(|e| anyhow!("serialize EndpointAddr: {e}"))
+    }
+
+    /// Drive the engine's ONE seeding pipeline (§2): feed a resolvable peer `EndpointAddr` (JSON)
+    /// into `group_id`'s topic. The engine makes it resolvable, persists it, and routes it into the
+    /// topic so `NeighborUp` fires — the source-agnostic core every seed source funnels through.
+    pub fn seed_group_peer(&self, group_id: &str, addr_json: &str) {
+        self.cmd(NetworkCommand::SeedGroupPeer {
+            group_id: group_id.to_string(),
+            addr_json: addr_json.to_string(),
+        });
+    }
+
+    /// The persistent roster for `group_id` as `(peer_id, name, avatar, online, last_seen)` — the
+    /// exact shape `cyan_get_group_members` returns (MESH_HARDENING §3). Members come from the shared
+    /// `storage::group_members` table; `online` is overlaid from THIS node's live `peers_per_group`.
+    pub fn members(&self, group_id: &str) -> Vec<(String, Option<String>, Option<String>, bool, i64)> {
+        let online: HashSet<String> = self
+            .peers_per_group
+            .lock()
+            .map(|m| {
+                m.get(group_id)
+                    .map(|s| s.iter().map(|pk| pk.to_string()).collect())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        storage::group_members_list(group_id)
+            .into_iter()
+            .map(|(peer_id, name, avatar, last_seen)| {
+                let online = online.contains(&peer_id);
+                (peer_id, name, avatar, online, last_seen)
+            })
+            .collect()
+    }
+
     /// This node's blob swarm handle (G10). The per-node `iroh-blobs` store is the honest
     /// per-node oracle for swarm tests (`has`/`holders`) — unaffected by the shared SQLite DB.
     pub fn swarm(&self) -> Arc<BlobSwarm> {

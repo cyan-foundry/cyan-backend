@@ -1248,6 +1248,83 @@ pub fn profile_get(node_id: &str) -> Option<(String, Option<String>)> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// GROUP KNOWN PEERS — persisted NodeAddr store for topic re-seeding (MESH §2.3)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Persist a resolvable peer `EndpointAddr` (serialized JSON) for a group, so the group's gossip
+/// topic can be re-seeded on rejoin. Idempotent upsert keyed by (group_id, peer_id).
+pub fn group_known_peer_upsert(group_id: &str, peer_id: &str, addr_json: &str) -> Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    let conn = db().lock().unwrap();
+    conn.execute(
+        "INSERT INTO group_known_peers (group_id, peer_id, addr_json, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(group_id, peer_id) DO UPDATE SET addr_json=excluded.addr_json, updated_at=excluded.updated_at",
+        params![group_id, peer_id, addr_json, now],
+    )?;
+    Ok(())
+}
+
+/// All persisted peer addresses for a group, as `(peer_id, addr_json)` — the re-seed source on
+/// rejoin (MESH §2.3). Returns an empty vec if the group has no saved peers.
+pub fn group_known_peers_list(group_id: &str) -> Vec<(String, String)> {
+    let conn = db().lock().unwrap();
+    let mut stmt = match conn.prepare(
+        "SELECT peer_id, addr_json FROM group_known_peers WHERE group_id = ?1",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match stmt.query_map(params![group_id], |r| Ok((r.get(0)?, r.get(1)?))) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GROUP MEMBERS — persistent presence roster (MESH §3)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Record that `peer_id` was seen in `group_id` at `now` (gossip NeighborUp / gossip author /
+/// chat author / profile). Sets `first_seen` once, advances `last_seen` on every contact. The row
+/// is never deleted, so an offline peer stays in the roster (greyed, with its cached last-seen).
+pub fn member_seen(group_id: &str, peer_id: &str, now: i64) -> Result<()> {
+    let conn = db().lock().unwrap();
+    conn.execute(
+        "INSERT INTO group_members (group_id, peer_id, first_seen, last_seen)
+         VALUES (?1, ?2, ?3, ?3)
+         ON CONFLICT(group_id, peer_id) DO UPDATE SET last_seen=excluded.last_seen",
+        params![group_id, peer_id, now],
+    )?;
+    Ok(())
+}
+
+/// The persistent roster for a group: `(peer_id, name, avatar, last_seen)` ordered by first contact.
+/// Name/avatar are resolved from `user_profiles` (None until a profile is seen). The caller overlays
+/// the live `online` flag from `peers_per_group`. Tenant-scoped by `group_id`.
+pub fn group_members_list(group_id: &str) -> Vec<(String, Option<String>, Option<String>, i64)> {
+    let conn = db().lock().unwrap();
+    let mut stmt = match conn.prepare(
+        "SELECT m.peer_id, p.display_name, p.avatar_hash, m.last_seen
+         FROM group_members m
+         LEFT JOIN user_profiles p ON p.node_id = m.peer_id
+         WHERE m.group_id = ?1
+         ORDER BY m.first_seen ASC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match stmt.query_map(params![group_id], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+    }) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // DIRECT MESSAGES
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1549,6 +1626,42 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         );
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ib_scope ON integration_bindings(scope_id)",
+            [],
+        );
+    }
+
+    // Migration: group_known_peers — the per-group persisted NodeAddr store (MESH_HARDENING §2.3).
+    // On rejoin we re-seed each group's gossip topic from these saved `EndpointAddr`s so the mesh
+    // re-forms without depending on bootstrap/relay being reachable. Keyed by (group_id, peer_id);
+    // the group_id IS the tenant boundary (a group belongs to one tenant), so this is tenant-scoped.
+    if conn.prepare("SELECT group_id FROM group_known_peers LIMIT 1").is_err() {
+        tracing::info!("Migration: creating group_known_peers table");
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS group_known_peers (
+                group_id TEXT NOT NULL,
+                peer_id TEXT NOT NULL,
+                addr_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (group_id, peer_id)
+            )",
+            [],
+        );
+    }
+
+    // Migration: group_members — the persistent presence ROSTER (MESH_HARDENING §3). Anyone ever
+    // seen in a group (gossip NeighborUp / gossip author) is recorded with first_seen/last_seen and
+    // survives restart; name/avatar resolve from user_profiles, and `online` is overlaid at read
+    // time from the live neighbor set (peers_per_group). Tenant-scoped by group_id like the roster.
+    if conn.prepare("SELECT group_id FROM group_members LIMIT 1").is_err() {
+        tracing::info!("Migration: creating group_members table");
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS group_members (
+                group_id TEXT NOT NULL,
+                peer_id TEXT NOT NULL,
+                first_seen INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL,
+                PRIMARY KEY (group_id, peer_id)
+            )",
             [],
         );
     }
