@@ -20,7 +20,6 @@ pub use xaero_ffi::*;
 
 mod ai_bridge;
 pub mod util;
-pub mod diagram_gen;
 pub mod cyan_lens_client;
 pub mod models;
 mod ffi;

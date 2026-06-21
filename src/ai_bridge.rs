@@ -196,16 +196,6 @@ enum AICommand {
     GetAsks { group_id: String, limit: Option<i32> },
     GetDecisions { group_id: String, limit: Option<i32> },
     Summarize { query_type: String, topic: Option<String>, hours: Option<u64> },
-    // CANVAS: Diagram Generation via Claude API
-    GenerateDiagram {
-        source_type: String,
-        prompt: Option<String>,
-        github_url: Option<String>,
-        image_base64: Option<String>,
-        current_mermaid: Option<String>,
-        diagram_type: String,
-        board_id: String,
-    },
 }
 
 #[derive(Debug, Serialize)]
@@ -409,10 +399,6 @@ impl AIBridge {
             AICommand::InferModel { cell_id, input } => self.cmd_infer_model(&cell_id, input).await,
             AICommand::ListModels { group_id } => self.cmd_list_models(&group_id).await,
             AICommand::GetCellModel { cell_id, board_id } => self.cmd_get_cell_model(&cell_id, &board_id).await,
-            
-            // CANVAS: Diagram Generation
-            AICommand::GenerateDiagram { source_type, prompt, github_url, image_base64, current_mermaid, diagram_type, board_id } =>
-                self.cmd_generate_diagram(source_type, prompt, github_url, image_base64, current_mermaid, diagram_type, board_id).await,
         }
     }
 
@@ -586,80 +572,6 @@ Output the Mermaid code in a ```mermaid code block."#.to_string(),
                 error: Some(format!("Request failed: {}", e)),
             }).unwrap_or_default()),
         }
-    }
-
-    // ========================================================================
-    // CANVAS: Diagram Generation (SVG + Mermaid via Claude API)
-    // ========================================================================
-
-    async fn cmd_generate_diagram(
-        &self,
-        source_type: String,
-        prompt: Option<String>,
-        github_url: Option<String>,
-        image_base64: Option<String>,
-        current_mermaid: Option<String>,
-        diagram_type: String,
-        board_id: String,
-    ) -> CommandResponse {
-        let api_key = self.claude_api_key.read().await;
-        let api_key = match api_key.as_ref() {
-            Some(k) => k.clone(),
-            None => return CommandResponse::err("Claude API key not configured. Set your API key in Settings."),
-        };
-
-        let source = match source_type.as_str() {
-            "description" => {
-                crate::diagram_gen::DiagramSource::Description {
-                    prompt: prompt.unwrap_or_default(),
-                }
-            }
-            "github" => {
-                crate::diagram_gen::DiagramSource::Github {
-                    url: github_url.unwrap_or_default(),
-                    prompt,
-                }
-            }
-            "image" => {
-                crate::diagram_gen::DiagramSource::Image {
-                    image_base64: image_base64.unwrap_or_default(),
-                    prompt,
-                }
-            }
-            "edit" => {
-                crate::diagram_gen::DiagramSource::Edit {
-                    current_mermaid: current_mermaid.unwrap_or_default(),
-                    instruction: prompt.unwrap_or_default(),
-                }
-            }
-            _ => return CommandResponse::err(format!("Unknown source type: {}", source_type)),
-        };
-
-        let dt = match diagram_type.as_str() {
-            "flowchart" => crate::diagram_gen::DiagramType::Flowchart,
-            "sequence" => crate::diagram_gen::DiagramType::Sequence,
-            "class_diagram" => crate::diagram_gen::DiagramType::ClassDiagram,
-            "architecture" => crate::diagram_gen::DiagramType::Architecture,
-            _ => crate::diagram_gen::DiagramType::Auto,
-        };
-
-        let request = crate::diagram_gen::DiagramRequest {
-            source,
-            diagram_type: dt,
-            board_id,
-        };
-
-        // TODO: get actual peer_id from system
-        let peer_id = "local";
-
-        let result = crate::diagram_gen::generate_diagram(
-            &self.claude_client,
-            &api_key,
-            &request,
-            peer_id,
-        ).await;
-
-        CommandResponse::ok_with_data(serde_json::to_value(result).unwrap_or_default())
     }
 
     // ========================================================================
