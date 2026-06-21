@@ -184,14 +184,17 @@ pub fn group_delete(id: &str) -> Result<bool> {
 }
 
 pub fn group_list_ids() -> HashSet<String> {
-    let conn = db().lock_safe();
-    let mut stmt = conn.prepare("SELECT id FROM groups").unwrap();
-    let mut rows = stmt.query([]).unwrap();
-    let mut out = HashSet::new();
-    while let Some(r) = rows.next().unwrap() {
-        out.insert(r.get::<_, String>(0).unwrap());
-    }
-    out
+    (|| -> rusqlite::Result<HashSet<String>> {
+        let conn = db().lock_safe();
+        let mut stmt = conn.prepare("SELECT id FROM groups")?;
+        let mut rows = stmt.query([])?;
+        let mut out = HashSet::new();
+        while let Some(r) = rows.next()? {
+            out.insert(r.get::<_, String>(0)?);
+        }
+        Ok(out)
+    })()
+    .unwrap_or_default()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

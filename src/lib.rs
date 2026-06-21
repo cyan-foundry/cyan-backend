@@ -324,7 +324,7 @@ impl CyanSystem {
         let db_clone = system.db.clone();
         let event_tx_clone = event_tx.clone();
         let command_actor_node_id = node_id.clone();
-        RUNTIME.get().unwrap().spawn(async move {
+        RUNTIME.get().ok_or_else(|| anyhow::anyhow!("async runtime not initialized"))?.spawn(async move {
             CommandActor {
                 db: db_clone,
                 rx: cmd_rx,
@@ -354,7 +354,7 @@ impl CyanSystem {
         };
         let event_tx_for_network = event_tx.clone();
         eprintln!("🚀 Spawning NetworkActor (new architecture)...");
-        RUNTIME.get().unwrap().spawn(async move {
+        RUNTIME.get().ok_or_else(|| anyhow::anyhow!("async runtime not initialized"))?.spawn(async move {
             match actors::NetworkActor::new(
                 secret_key_clone,
                 event_tx_for_network,
@@ -371,7 +371,7 @@ impl CyanSystem {
         eprintln!("🔵 Step 6: NetworkActor spawned");
 
         // Event router: routes events to appropriate component buffer(s)
-        RUNTIME.get().unwrap().spawn(async move {
+        RUNTIME.get().ok_or_else(|| anyhow::anyhow!("async runtime not initialized"))?.spawn(async move {
             while let Some(event) = event_rx.recv().await {
                 match serde_json::to_string(&event) {
                     Ok(event_json) => {
@@ -1222,16 +1222,17 @@ impl CommandActor {
                     }
 
                     // Broadcast to all groups
-                    let groups = {
+                    let groups = (|| -> rusqlite::Result<Vec<String>> {
                         let db = self.db.lock_safe();
-                        let mut stmt = db.prepare("SELECT id FROM groups").unwrap();
-                        let mut rows = stmt.query([]).unwrap();
+                        let mut stmt = db.prepare("SELECT id FROM groups")?;
+                        let mut rows = stmt.query([])?;
                         let mut out = vec![];
-                        while let Some(r) = rows.next().unwrap() {
-                            out.push(r.get::<_, String>(0).unwrap());
+                        while let Some(r) = rows.next()? {
+                            out.push(r.get::<_, String>(0)?);
                         }
-                        out
-                    };
+                        Ok(out)
+                    })()
+                    .unwrap_or_default();
 
                     for gid in groups {
                         let _ = self.network_tx.send(NetworkCommand::Broadcast {
@@ -1367,8 +1368,8 @@ impl CommandActor {
 fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
     let db = db.lock_safe();
 
-    let groups: Vec<Group> = {
-        let mut stmt = db.prepare("SELECT id, name, icon, color, created_at FROM groups ORDER BY name").unwrap();
+    let groups: Vec<Group> = (|| -> rusqlite::Result<Vec<Group>> {
+        let mut stmt = db.prepare("SELECT id, name, icon, color, created_at FROM groups ORDER BY name")?;
         let rows = stmt.query_map([], |r| {
             Ok(Group {
                 id: r.get(0)?,
@@ -1377,12 +1378,13 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
                 color: r.get(3)?,
                 created_at: r.get(4)?,
             })
-        }).unwrap();
-        rows.filter_map(Result::ok).collect()
-    };
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    })()
+    .unwrap_or_default();
 
-    let workspaces: Vec<Workspace> = {
-        let mut stmt = db.prepare("SELECT id, group_id, name, created_at, is_system FROM workspaces ORDER BY name").unwrap();
+    let workspaces: Vec<Workspace> = (|| -> rusqlite::Result<Vec<Workspace>> {
+        let mut stmt = db.prepare("SELECT id, group_id, name, created_at, is_system FROM workspaces ORDER BY name")?;
         let rows = stmt.query_map([], |r| {
             Ok(Workspace {
                 id: r.get(0)?,
@@ -1391,12 +1393,13 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
                 created_at: r.get(3)?,
                 system: r.get::<_, i32>(4)? != 0,
             })
-        }).unwrap();
-        rows.filter_map(Result::ok).collect()
-    };
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    })()
+    .unwrap_or_default();
 
-    let whiteboards: Vec<WhiteboardDTO> = {
-        let mut stmt = db.prepare("SELECT id, workspace_id, name, created_at FROM objects WHERE type='whiteboard' ORDER BY name").unwrap();
+    let whiteboards: Vec<WhiteboardDTO> = (|| -> rusqlite::Result<Vec<WhiteboardDTO>> {
+        let mut stmt = db.prepare("SELECT id, workspace_id, name, created_at FROM objects WHERE type='whiteboard' ORDER BY name")?;
         let rows = stmt.query_map([], |r| {
             Ok(WhiteboardDTO {
                 id: r.get(0)?,
@@ -1404,12 +1407,13 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
                 name: r.get(2)?,
                 created_at: r.get(3)?,
             })
-        }).unwrap();
-        rows.filter_map(Result::ok).collect()
-    };
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    })()
+    .unwrap_or_default();
 
-    let files: Vec<FileDTO> = {
-        let mut stmt = db.prepare("SELECT id, group_id, workspace_id, board_id, name, hash, size, source_peer, local_path, created_at FROM objects WHERE type='file' ORDER BY name").unwrap();
+    let files: Vec<FileDTO> = (|| -> rusqlite::Result<Vec<FileDTO>> {
+        let mut stmt = db.prepare("SELECT id, group_id, workspace_id, board_id, name, hash, size, source_peer, local_path, created_at FROM objects WHERE type='file' ORDER BY name")?;
         let rows = stmt.query_map([], |r| {
             Ok(FileDTO {
                 id: r.get(0)?,
@@ -1423,12 +1427,13 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
                 local_path: r.get(8)?,
                 created_at: r.get(9)?,
             })
-        }).unwrap();
-        rows.filter_map(Result::ok).collect()
-    };
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    })()
+    .unwrap_or_default();
 
-    let chats: Vec<ChatDTO> = {
-        let mut stmt = db.prepare("SELECT id, workspace_id, name, hash, data, created_at FROM objects WHERE type='chat' ORDER BY created_at").unwrap();
+    let chats: Vec<ChatDTO> = (|| -> rusqlite::Result<Vec<ChatDTO>> {
+        let mut stmt = db.prepare("SELECT id, workspace_id, name, hash, data, created_at FROM objects WHERE type='chat' ORDER BY created_at")?;
         let rows = stmt.query_map([], |r| {
             let parent_bytes: Option<Vec<u8>> = r.get(4)?;
             let parent_id = parent_bytes.and_then(|b| String::from_utf8(b).ok());
@@ -1440,9 +1445,10 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
                 parent_id,
                 timestamp: r.get(5)?,
             })
-        }).unwrap();
-        rows.filter_map(Result::ok).collect()
-    };
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    })()
+    .unwrap_or_default();
 
     let integrations: Vec<IntegrationBindingDTO> = {
         match db.prepare("SELECT id, scope_type, scope_id, integration_type, config_json, created_at FROM integration_bindings ORDER BY created_at") {
@@ -1458,9 +1464,8 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
                         config,
                         created_at: r.get(5)?,
                     })
-                }).unwrap()
-                    .filter_map(|r| r.ok())
-                    .collect()
+                }).map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default()
             }
             Err(_) => vec![],
         }
@@ -1483,7 +1488,7 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
                         last_accessed: row.get(7)?,
                         is_pinned: row.get::<_, i32>(8)? != 0,
                     })
-                }).unwrap().filter_map(|r| r.ok()).collect()
+                }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
             }
             Err(_) => vec![],
         }
