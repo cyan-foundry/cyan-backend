@@ -29,5 +29,5 @@ pub unsafe fn cstr_arg(ptr: *const c_char) -> Option<String> {
 }
 
 pub fn to_c_string(s: String) -> *const c_char {
-    CString::new(s).unwrap().into_raw()
+    CString::new(s).unwrap_or_default().into_raw()
 }

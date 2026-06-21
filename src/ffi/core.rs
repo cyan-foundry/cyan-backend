@@ -178,7 +178,10 @@ pub extern "C" fn cyan_init_with_identity(
             }
         };
 
-        bytes.try_into().unwrap()
+        match bytes.try_into() {
+            Ok(arr) => arr,
+            Err(_) => return false,
+        }
     };
 
     // Parse optional relay_url
@@ -207,7 +210,9 @@ pub extern "C" fn cyan_init_with_identity(
             .expect("runtime");
         RUNTIME.set(runtime).ok();
 
-        let rt = RUNTIME.get().unwrap();
+        let Some(rt) = RUNTIME.get() else {
+            return false;
+        };
         let sys = rt.block_on(async {
             CyanSystem::new(path, Some(secret_key_bytes)).await
         });
@@ -251,7 +256,10 @@ pub extern "C" fn cyan_set_xaero_id(id: *const c_char) -> bool {
     if id.is_null() {
         return false;
     }
-    let s = unsafe { CStr::from_ptr(id) }.to_str().ok().unwrap().to_string();
+    let Ok(s) = unsafe { CStr::from_ptr(id) }.to_str() else {
+        return false;
+    };
+    let s = s.to_string();
 
     let _ = NODE_ID.set(s.clone());
     save_node_id_to_disk(&s);
@@ -869,7 +877,7 @@ pub extern "C" fn cyan_get_group_peers(group_id: *const c_char) -> *mut c_char {
     };
 
     match serde_json::to_string(&peers) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -889,7 +897,7 @@ pub extern "C" fn cyan_get_all_peers() -> *mut c_char {
     };
 
     match serde_json::to_string(&all_peers) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -1005,27 +1013,26 @@ pub extern "C" fn cyan_get_object_count() -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_boards_for_group(group_id: *const c_char) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let gid = unsafe { CStr::from_ptr(group_id) }.to_string_lossy().to_string();
 
-    let boards: Vec<serde_json::Value> = {
+    let boards: Vec<serde_json::Value> = (|| -> rusqlite::Result<Vec<serde_json::Value>> {
         let db = sys.db.lock_safe();
 
         // First get all workspace IDs for this group
         let mut ws_stmt = db.prepare(
             "SELECT id FROM workspaces WHERE group_id = ?1"
-        ).unwrap();
+        )?;
 
         let workspace_ids: Vec<String> = ws_stmt
-            .query_map(params![gid.clone()], |row| row.get::<_, String>(0))
-            .unwrap()
+            .query_map(params![gid.clone()], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
             .collect();
 
         if workspace_ids.is_empty() {
-            return CString::new("[]").unwrap().into_raw();
+            return Ok(Vec::new());
         }
 
         // Query boards for all workspaces in this group
@@ -1035,7 +1042,7 @@ pub extern "C" fn cyan_get_boards_for_group(group_id: *const c_char) -> *mut c_c
                 "SELECT id, workspace_id, name, created_at FROM objects
                  WHERE type = 'whiteboard' AND workspace_id = ?1
                  ORDER BY created_at DESC"
-            ).unwrap();
+            )?;
 
             let boards_iter = stmt.query_map(params![wid], |row| {
                 Ok(serde_json::json!({
@@ -1046,18 +1053,18 @@ pub extern "C" fn cyan_get_boards_for_group(group_id: *const c_char) -> *mut c_c
                     "created_at": row.get::<_, i64>(3)?,
                     "element_count": 0
                 }))
-            }).unwrap();
+            })?;
 
             for board in boards_iter.filter_map(|r| r.ok()) {
                 all_boards.push(board);
             }
         }
-        all_boards
-    };
+        Ok(all_boards)
+    })().unwrap_or_default();
 
     match serde_json::to_string(&boards) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -1066,12 +1073,12 @@ pub extern "C" fn cyan_get_boards_for_group(group_id: *const c_char) -> *mut c_c
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_boards_for_workspace(workspace_id: *const c_char) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let wid = unsafe { CStr::from_ptr(workspace_id) }.to_string_lossy().to_string();
 
-    let boards: Vec<serde_json::Value> = {
+    let boards: Vec<serde_json::Value> = (|| -> rusqlite::Result<Vec<serde_json::Value>> {
         let db = sys.db.lock_safe();
 
         // Get group_id for this workspace
@@ -1085,9 +1092,9 @@ pub extern "C" fn cyan_get_boards_for_workspace(workspace_id: *const c_char) -> 
             "SELECT id, workspace_id, name, created_at FROM objects
              WHERE type = 'whiteboard' AND workspace_id = ?1
              ORDER BY created_at DESC"
-        ).unwrap();
+        )?;
 
-        stmt.query_map(params![wid], |row| {
+        Ok(stmt.query_map(params![wid], |row| {
             Ok(serde_json::json!({
                 "id": row.get::<_, String>(0)?,
                 "workspace_id": row.get::<_, String>(1)?,
@@ -1096,12 +1103,12 @@ pub extern "C" fn cyan_get_boards_for_workspace(workspace_id: *const c_char) -> 
                 "created_at": row.get::<_, i64>(3)?,
                 "element_count": 0
             }))
-        }).unwrap().filter_map(|r| r.ok()).collect()
-    };
+        })?.filter_map(|r| r.ok()).collect())
+    })().unwrap_or_default();
 
     match serde_json::to_string(&boards) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -1110,10 +1117,10 @@ pub extern "C" fn cyan_get_boards_for_workspace(workspace_id: *const c_char) -> 
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_all_boards() -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
-    let boards: Vec<serde_json::Value> = {
+    let boards: Vec<serde_json::Value> = (|| -> rusqlite::Result<Vec<serde_json::Value>> {
         let db = sys.db.lock_safe();
 
         let mut stmt = db.prepare(
@@ -1127,9 +1134,9 @@ pub extern "C" fn cyan_get_all_boards() -> *mut c_char {
              LEFT JOIN board_metadata m ON o.id = m.board_id
              WHERE o.type = 'whiteboard'
              ORDER BY COALESCE(m.is_pinned, 0) DESC, o.created_at DESC"
-        ).unwrap();
+        )?;
 
-        stmt.query_map([], |row| {
+        Ok(stmt.query_map([], |row| {
             Ok(serde_json::json!({
                 "id": row.get::<_, String>(0)?,
                 "workspace_id": row.get::<_, String>(1)?,
@@ -1142,12 +1149,12 @@ pub extern "C" fn cyan_get_all_boards() -> *mut c_char {
                 "rating": row.get::<_, i32>(7)?,
                 "last_accessed": row.get::<_, i64>(8)?
             }))
-        }).unwrap().filter_map(|r| r.ok()).collect()
-    };
+        })?.filter_map(|r| r.ok()).collect())
+    })().unwrap_or_default();
 
     match serde_json::to_string(&boards) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -1158,12 +1165,12 @@ pub extern "C" fn cyan_get_all_boards() -> *mut c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_load_whiteboard_elements(board_id: *const c_char) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
 
-    let elements: Vec<serde_json::Value> = {
+    let elements: Vec<serde_json::Value> = (|| -> rusqlite::Result<Vec<serde_json::Value>> {
         let db = sys.db.lock_safe();
 
         let mut stmt = db.prepare(
@@ -1172,9 +1179,9 @@ pub extern "C" fn cyan_load_whiteboard_elements(board_id: *const c_char) -> *mut
              FROM whiteboard_elements
              WHERE board_id = ?1
              ORDER BY z_index ASC, created_at ASC"
-        ).unwrap();
+        )?;
 
-        stmt.query_map(params![bid], |row| {
+        Ok(stmt.query_map(params![bid], |row| {
             Ok(serde_json::json!({
                 "id": row.get::<_, String>(0)?,
                 "board_id": row.get::<_, String>(1)?,
@@ -1189,12 +1196,12 @@ pub extern "C" fn cyan_load_whiteboard_elements(board_id: *const c_char) -> *mut
                 "created_at": row.get::<_, i64>(10)?,
                 "updated_at": row.get::<_, i64>(11)?
             }))
-        }).unwrap().filter_map(|r| r.ok()).collect()
-    };
+        })?.filter_map(|r| r.ok()).collect())
+    })().unwrap_or_default();
 
     match serde_json::to_string(&elements) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -1439,27 +1446,26 @@ pub extern "C" fn cyan_get_whiteboard_element_count(board_id: *const c_char) -> 
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_workspaces_for_group(group_id: *const c_char) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let gid = unsafe { CStr::from_ptr(group_id) }.to_string_lossy().to_string();
 
-    let workspace_ids: Vec<String> = {
+    let workspace_ids: Vec<String> = (|| -> rusqlite::Result<Vec<String>> {
         let db = sys.db.lock_safe();
 
         let mut stmt = db.prepare(
             "SELECT id FROM workspaces WHERE group_id = ?1"
-        ).unwrap();
+        )?;
 
-        stmt.query_map(params![gid], |row| row.get::<_, String>(0))
-            .unwrap()
+        Ok(stmt.query_map(params![gid], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
-            .collect()
-    };
+            .collect())
+    })().unwrap_or_default();
 
     match serde_json::to_string(&workspace_ids) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -1473,15 +1479,15 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
     eprintln!("🦀 cyan_upload_file called!");
     let Some(file_path) = (unsafe { cstr_arg(path) }) else {
         eprintln!("🦀 cyan_upload_file: invalid path");
-        return CString::new(r#"{"success":false,"error":"Invalid path"}"#).unwrap().into_raw();
+        return CString::new(r#"{"success":false,"error":"Invalid path"}"#).unwrap_or_default().into_raw();
     };
     eprintln!("🦀 cyan_upload_file: path = {}", file_path);
     let Some(scope_str) = (unsafe { cstr_arg(scope_json) }) else {
-        return CString::new(r#"{"success":false,"error":"Invalid scope"}"#).unwrap().into_raw();
+        return CString::new(r#"{"success":false,"error":"Invalid scope"}"#).unwrap_or_default().into_raw();
     };
     let Some(sys) = SYSTEM.get() else {
         eprintln!("🦀 cyan_upload_file: invalid scope");
-        return CString::new(r#"{"success":false,"error":"System not initialized"}"#).unwrap().into_raw();
+        return CString::new(r#"{"success":false,"error":"System not initialized"}"#).unwrap_or_default().into_raw();
     };
 
     eprintln!("🦀 cyan_upload_file: scope = {}", scope_str);
@@ -1491,7 +1497,7 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
         Err(e) => {
             eprintln!("🦀failed to parse scope due to : {e:?}");
             return CString::new(format!(r#"{{"success":false,"error":"Invalid scope JSON: {}"}}"#, e))
-                .unwrap().into_raw();
+                .unwrap_or_default().into_raw();
         }
     };
 
@@ -1501,7 +1507,7 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
         Err(e) => {
             eprintln!("🦀failed to read file path due to : {e:?}");
             return CString::new(format!(r#"{{"success":false,"error":"Failed to read file: {}"}}"#, e))
-                .unwrap().into_raw();
+                .unwrap_or_default().into_raw();
         }
     };
 
@@ -1523,13 +1529,13 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
     if let Err(e) = std::fs::create_dir_all(&files_dir) {
         eprintln!("🦀 failed to create dir due to : {e:?}");
         return CString::new(format!(r#"{{"success":false,"error":"Failed to create files dir at {:?}: {}"}}"#, files_dir, e))
-            .unwrap().into_raw();
+            .unwrap_or_default().into_raw();
     }
     let local_path = files_dir.join(&hash);
     if let Err(e) = std::fs::write(&local_path, &bytes) {
         eprintln!("🦀 failed to write file due  to : {e:?}");
         return CString::new(format!(r#"{{"success":false,"error":"Failed to store file: {}"}}"#, e))
-            .unwrap().into_raw();
+            .unwrap_or_default().into_raw();
     }
 
     // Determine scope and IDs
@@ -1572,7 +1578,7 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
         scope_type => {
             eprintln!("🦀 invalid scope type error  {scope_type:?}");
             return CString::new(r#"{"success":false,"error":"Unknown scope type"}"#)
-                .unwrap().into_raw();
+                .unwrap_or_default().into_raw();
         }
     }
 
@@ -1580,7 +1586,7 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
         Some(g) => g.clone(),
         None => {
             return CString::new(r#"{"success":false,"error":"Could not determine group"}"#)
-                .unwrap().into_raw();
+                .unwrap_or_default().into_raw();
         }
     };
 
@@ -1611,7 +1617,7 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
 
         if let Err(e) = result {
             return CString::new(format!(r#"{{"success":false,"error":"DB error: {}"}}"#, e))
-                .unwrap().into_raw();
+                .unwrap_or_default().into_raw();
         }
     }
 
@@ -1661,7 +1667,7 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
         "size": size
     });
 
-    CString::new(result.to_string()).unwrap().into_raw()
+    CString::new(result.to_string()).unwrap_or_default().into_raw()
 }
 
 /// Request download of a file from its source peer
@@ -1734,10 +1740,10 @@ pub extern "C" fn cyan_request_file_download(file_id: *const c_char) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_file_status(file_id: *const c_char) -> *mut c_char {
     let Some(fid) = (unsafe { cstr_arg(file_id) }) else {
-        return CString::new(r#"{"status":"unknown"}"#).unwrap().into_raw();
+        return CString::new(r#"{"status":"unknown"}"#).unwrap_or_default().into_raw();
     };
     let Some(sys) = SYSTEM.get() else {
-        return CString::new(r#"{"status":"unknown"}"#).unwrap().into_raw();
+        return CString::new(r#"{"status":"unknown"}"#).unwrap_or_default().into_raw();
     };
 
     let db = sys.db.lock_safe();
@@ -1764,7 +1770,7 @@ pub extern "C" fn cyan_get_file_status(file_id: *const c_char) -> *mut c_char {
         }
     };
 
-    CString::new(status.to_string()).unwrap().into_raw()
+    CString::new(status.to_string()).unwrap_or_default().into_raw()
 }
 
 /// Get files for a scope
@@ -1773,15 +1779,15 @@ pub extern "C" fn cyan_get_file_status(file_id: *const c_char) -> *mut c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_files(scope_json: *const c_char) -> *mut c_char {
     let Some(scope_str) = (unsafe { cstr_arg(scope_json) }) else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let scope: serde_json::Value = match serde_json::from_str(&scope_str) {
         Ok(v) => v,
-        Err(_) => return CString::new("[]").unwrap().into_raw(),
+        Err(_) => return CString::new("[]").unwrap_or_default().into_raw(),
     };
 
     let scope_type = scope["type"].as_str().unwrap_or("");
@@ -1791,7 +1797,7 @@ pub extern "C" fn cyan_get_files(scope_json: *const c_char) -> *mut c_char {
         .or_else(|| scope["board_id"].as_str())
         .unwrap_or("");
 
-    let files: Vec<serde_json::Value> = {
+    let files: Vec<serde_json::Value> = (|| -> rusqlite::Result<Vec<serde_json::Value>> {
         let db = sys.db.lock_safe();
 
         let query = match scope_type {
@@ -1807,11 +1813,11 @@ pub extern "C" fn cyan_get_files(scope_json: *const c_char) -> *mut c_char {
                 "SELECT id, group_id, workspace_id, board_id, name, hash, size, source_peer, local_path, created_at
                  FROM objects WHERE type = 'file' AND board_id = ?1"
             }
-            _ => return CString::new("[]").unwrap().into_raw(),
+            _ => return Ok(Vec::new()),
         };
 
-        let mut stmt = db.prepare(query).unwrap();
-        stmt.query_map(params![id], |row| {
+        let mut stmt = db.prepare(query)?;
+        Ok(stmt.query_map(params![id], |row| {
             let local_path: Option<String> = row.get(8)?;
             let is_local = local_path
                 .as_ref()
@@ -1831,15 +1837,14 @@ pub extern "C" fn cyan_get_files(scope_json: *const c_char) -> *mut c_char {
                 "created_at": row.get::<_, i64>(9)?,
                 "is_local": is_local
             }))
-        })
-            .unwrap()
+        })?
             .filter_map(|r| r.ok())
-            .collect()
-    };
+            .collect())
+    })().unwrap_or_default();
 
     match serde_json::to_string(&files) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -1866,7 +1871,7 @@ pub extern "C" fn cyan_get_file_local_path(file_id: *const c_char) -> *mut c_cha
 
     match local_path {
         Some(path) if Path::new(&path).exists() => {
-            CString::new(path).unwrap().into_raw()
+            CString::new(path).unwrap_or_default().into_raw()
         }
         _ => std::ptr::null_mut(),
     }
@@ -1878,7 +1883,7 @@ pub extern "C" fn cyan_get_file_local_path(file_id: *const c_char) -> *mut c_cha
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_load_notebook_cells(board_id: *const c_char) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
@@ -1894,7 +1899,7 @@ pub extern "C" fn cyan_load_notebook_cells(board_id: *const c_char) -> *mut c_ch
              ORDER BY cell_order ASC"
         ) {
             Ok(s) => s,
-            Err(_) => return CString::new("[]").unwrap().into_raw(),
+            Err(_) => return CString::new("[]").unwrap_or_default().into_raw(),
         };
 
         stmt.query_map(params![bid], |row| {
@@ -1911,12 +1916,12 @@ pub extern "C" fn cyan_load_notebook_cells(board_id: *const c_char) -> *mut c_ch
                 "created_at": row.get::<_, i64>(9)?,
                 "updated_at": row.get::<_, i64>(10)?
             }))
-        }).unwrap().filter_map(|r| r.ok()).collect()
+        }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     };
 
     match serde_json::to_string(&cells) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -2146,7 +2151,7 @@ pub extern "C" fn cyan_reorder_notebook_cells(board_id: *const c_char, cell_ids_
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_board_mode(board_id: *const c_char) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("canvas").unwrap().into_raw();
+        return CString::new("canvas").unwrap_or_default().into_raw();
     };
 
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
@@ -2167,7 +2172,7 @@ pub extern "C" fn cyan_get_board_mode(board_id: *const c_char) -> *mut c_char {
         }
     };
 
-    CString::new(mode).unwrap().into_raw()
+    CString::new(mode).unwrap_or_default().into_raw()
 }
 
 /// Set board mode (canvas, notebook, or notes)
@@ -2233,7 +2238,7 @@ pub extern "C" fn cyan_set_board_mode(board_id: *const c_char, mode: *const c_ch
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_load_cell_elements(cell_id: *const c_char) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let cid = unsafe { CStr::from_ptr(cell_id) }.to_string_lossy().to_string();
@@ -2249,7 +2254,7 @@ pub extern "C" fn cyan_load_cell_elements(cell_id: *const c_char) -> *mut c_char
              ORDER BY z_index ASC, created_at ASC"
         ) {
             Ok(s) => s,
-            Err(_) => return CString::new("[]").unwrap().into_raw(),
+            Err(_) => return CString::new("[]").unwrap_or_default().into_raw(),
         };
 
         stmt.query_map(params![cid], |row| {
@@ -2268,12 +2273,12 @@ pub extern "C" fn cyan_load_cell_elements(cell_id: *const c_char) -> *mut c_char
                 "updated_at": row.get::<_, i64>(11)?,
                 "cell_id": row.get::<_, Option<String>>(12)?
             }))
-        }).unwrap().filter_map(|r| r.ok()).collect()
+        }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     };
 
     match serde_json::to_string(&elements) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -2359,7 +2364,7 @@ pub extern "C" fn cyan_poll_ai_insights() -> *mut c_char {
 
     match runtime.block_on(sys.ai_bridge.poll_insights()) {
         Some(insight) => match serde_json::to_string(&insight) {
-            Ok(json) => CString::new(json).unwrap().into_raw(),
+            Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
             Err(_) => std::ptr::null_mut(),
         },
         None => std::ptr::null_mut(),
@@ -2421,7 +2426,7 @@ pub extern "C" fn cyan_get_board_metadata(board_id: *const c_char) -> *mut c_cha
     });
 
     match serde_json::to_string(&result) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -2431,7 +2436,7 @@ pub extern "C" fn cyan_get_board_metadata(board_id: *const c_char) -> *mut c_cha
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_boards_metadata(scope_type: *const c_char, scope_id: *const c_char) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let stype = unsafe { CStr::from_ptr(scope_type) }.to_string_lossy().to_string();
@@ -2477,7 +2482,7 @@ pub extern "C" fn cyan_get_boards_metadata(scope_type: *const c_char, scope_id: 
 
         let mut stmt = match db.prepare(query) {
             Ok(s) => s,
-            Err(_) => return CString::new("[]").unwrap().into_raw(),
+            Err(_) => return CString::new("[]").unwrap_or_default().into_raw(),
         };
 
         let param = if stype == "all" { "" } else { &sid };
@@ -2497,12 +2502,12 @@ pub extern "C" fn cyan_get_boards_metadata(scope_type: *const c_char, scope_id: 
                 last_accessed: row.get(7)?,
                 is_pinned: row.get::<_, i32>(8)? != 0,
             })
-        }).unwrap().filter_map(|r| r.ok()).collect()
+        }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     };
 
     match serde_json::to_string(&results) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -2510,7 +2515,7 @@ pub extern "C" fn cyan_get_boards_metadata(scope_type: *const c_char, scope_id: 
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_top_boards(group_id: *const c_char, limit: i32) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let gid = unsafe { CStr::from_ptr(group_id) }.to_string_lossy().to_string();
@@ -2531,7 +2536,7 @@ pub extern "C" fn cyan_get_top_boards(group_id: *const c_char, limit: i32) -> *m
              LIMIT ?2"
         ) {
             Ok(s) => s,
-            Err(_) => return CString::new("[]").unwrap().into_raw(),
+            Err(_) => return CString::new("[]").unwrap_or_default().into_raw(),
         };
 
         stmt.query_map(params![&gid, lim], |row| {
@@ -2548,12 +2553,12 @@ pub extern "C" fn cyan_get_top_boards(group_id: *const c_char, limit: i32) -> *m
                 "board_type": row.get::<_, String>(6)?,
                 "contains_model": row.get::<_, Option<String>>(7)?
             }))
-        }).unwrap().filter_map(|r| r.ok()).collect()
+        }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     };
 
     match serde_json::to_string(&results) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -2872,8 +2877,8 @@ pub extern "C" fn cyan_get_board_link(board_id: *const c_char) -> *mut c_char {
     };
 
     match link {
-        Some(url) => CString::new(url).unwrap().into_raw(),
-        None => CString::new(format!("cyan://board/{}", bid)).unwrap().into_raw(),
+        Some(url) => CString::new(url).unwrap_or_default().into_raw(),
+        None => CString::new(format!("cyan://board/{}", bid)).unwrap_or_default().into_raw(),
     }
 }
 
@@ -2881,7 +2886,7 @@ pub extern "C" fn cyan_get_board_link(board_id: *const c_char) -> *mut c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_search_boards_by_label(label: *const c_char) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let search_label = unsafe { CStr::from_ptr(label) }.to_string_lossy().to_string();
@@ -2901,7 +2906,7 @@ pub extern "C" fn cyan_search_boards_by_label(label: *const c_char) -> *mut c_ch
              LIMIT 50"
         ) {
             Ok(s) => s,
-            Err(_) => return CString::new("[]").unwrap().into_raw(),
+            Err(_) => return CString::new("[]").unwrap_or_default().into_raw(),
         };
 
         stmt.query_map(params![&pattern], |row| {
@@ -2918,12 +2923,12 @@ pub extern "C" fn cyan_search_boards_by_label(label: *const c_char) -> *mut c_ch
                 "link": format!("cyan://group/{}/workspace/{}/board/{}",
                     row.get::<_, String>(4)?, row.get::<_, String>(2)?, row.get::<_, String>(0)?)
             }))
-        }).unwrap().filter_map(|r| r.ok()).collect()
+        }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     };
 
     match serde_json::to_string(&results) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -3026,7 +3031,7 @@ pub extern "C" fn cyan_get_user_profile(node_id: *const c_char) -> *mut c_char {
     };
 
     match profile {
-        Some(p) => CString::new(p.to_string()).unwrap().into_raw(),
+        Some(p) => CString::new(p.to_string()).unwrap_or_default().into_raw(),
         None => {
             let fallback = serde_json::json!({
                 "node_id": nid,
@@ -3035,7 +3040,7 @@ pub extern "C" fn cyan_get_user_profile(node_id: *const c_char) -> *mut c_char {
                 "status": "unknown",
                 "last_seen": null
             });
-            CString::new(fallback.to_string()).unwrap().into_raw()
+            CString::new(fallback.to_string()).unwrap_or_default().into_raw()
         }
     }
 }
@@ -3046,16 +3051,16 @@ pub extern "C" fn cyan_get_user_profile(node_id: *const c_char) -> *mut c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_profiles_batch(node_ids_json: *const c_char) -> *mut c_char {
     let Some(json_str) = (unsafe { cstr_arg(node_ids_json) }) else {
-        return CString::new("{}").unwrap().into_raw();
+        return CString::new("{}").unwrap_or_default().into_raw();
     };
 
     let node_ids: Vec<String> = match serde_json::from_str(&json_str) {
         Ok(ids) => ids,
-        Err(_) => return CString::new("{}").unwrap().into_raw(),
+        Err(_) => return CString::new("{}").unwrap_or_default().into_raw(),
     };
 
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("{}").unwrap().into_raw();
+        return CString::new("{}").unwrap_or_default().into_raw();
     };
 
     let mut result = serde_json::Map::new();
@@ -3091,7 +3096,7 @@ pub extern "C" fn cyan_get_profiles_batch(node_ids_json: *const c_char) -> *mut 
         }
     }
 
-    CString::new(serde_json::Value::Object(result).to_string()).unwrap().into_raw()
+    CString::new(serde_json::Value::Object(result).to_string()).unwrap_or_default().into_raw()
 }
 
 /// Set my profile (display name and optional avatar)
@@ -3155,14 +3160,13 @@ pub extern "C" fn cyan_set_my_profile(
     }
 
     // Broadcast to all groups
-    let group_ids: Vec<String> = {
+    let group_ids: Vec<String> = (|| -> rusqlite::Result<Vec<String>> {
         let db = sys.db.lock_safe();
-        let mut stmt = db.prepare("SELECT id FROM groups").unwrap();
-        stmt.query_map([], |row| row.get(0))
-            .unwrap()
+        let mut stmt = db.prepare("SELECT id FROM groups")?;
+        Ok(stmt.query_map([], |row| row.get(0))?
             .filter_map(|r| r.ok())
-            .collect()
-    };
+            .collect())
+    })().unwrap_or_default();
 
     let evt = NetworkEvent::ProfileUpdated {
         node_id: node_id.clone(),
@@ -3189,7 +3193,7 @@ pub extern "C" fn cyan_get_my_node_id() -> *mut c_char {
         return std::ptr::null_mut();
     };
 
-    CString::new(sys.node_id.clone()).unwrap().into_raw()
+    CString::new(sys.node_id.clone()).unwrap_or_default().into_raw()
 }
 
 /// Get my own profile
@@ -3221,7 +3225,7 @@ pub extern "C" fn cyan_get_my_profile() -> *mut c_char {
     };
 
     match profile {
-        Some(p) => CString::new(p.to_string()).unwrap().into_raw(),
+        Some(p) => CString::new(p.to_string()).unwrap_or_default().into_raw(),
         None => {
             let fallback = serde_json::json!({
                 "node_id": node_id,
@@ -3230,7 +3234,7 @@ pub extern "C" fn cyan_get_my_profile() -> *mut c_char {
                 "status": "online",
                 "last_seen": null
             });
-            CString::new(fallback.to_string()).unwrap().into_raw()
+            CString::new(fallback.to_string()).unwrap_or_default().into_raw()
         }
     }
 }
@@ -3423,7 +3427,7 @@ fn json_error_ptr(msg: &str) -> *mut c_char {
     let result = serde_json::json!({
         "error": msg
     });
-    CString::new(result.to_string()).unwrap().into_raw()
+    CString::new(result.to_string()).unwrap_or_default().into_raw()
 }
 
 // Helper function for join result responses
@@ -3440,7 +3444,7 @@ fn json_result_ptr(success: bool, group_id: Option<&str>, group_name: Option<&st
             "error": error.unwrap_or("Unknown error")
         })
     };
-    CString::new(result.to_string()).unwrap().into_raw()
+    CString::new(result.to_string()).unwrap_or_default().into_raw()
 }
 
 // ============================================================================
@@ -4295,25 +4299,22 @@ pub extern "C" fn cyan_autocomplete_path(
         // g\ → list all groups
         0 | 1 if cleaned.is_empty() || !cleaned.contains('\\') => {
             let filter = if cleaned.is_empty() { "" } else { parts[0] };
-            let mut stmt = conn.prepare(
-                "SELECT name FROM groups WHERE name LIKE ?1 ORDER BY name LIMIT 10"
-            ).unwrap_or_else(|_| conn.prepare("SELECT '' LIMIT 0").unwrap());
-            
             let pattern = format!("{}%", filter);
-            stmt.query_map(rusqlite::params![pattern], |row| {
-                let name: String = row.get(0)?;
-                Ok(name)
-            })
-            .ok()
-            .map(|rows| {
-                rows.filter_map(|r| r.ok())
+            conn.prepare(
+                "SELECT name FROM groups WHERE name LIKE ?1 ORDER BY name LIMIT 10"
+            )
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map(rusqlite::params![pattern], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                Ok(rows.filter_map(|r| r.ok())
                     .map(|name| {
                         serde_json::json!({
                             "name": name,
                             "path": format!("g\\{}", name)
                         })
                     })
-                    .collect()
+                    .collect::<Vec<_>>())
             })
             .unwrap_or_default()
         }
@@ -4328,31 +4329,28 @@ pub extern "C" fn cyan_autocomplete_path(
             ).ok();
             
             if let Some(gid) = gid {
-                let mut stmt = conn.prepare(
+                conn.prepare(
                     "SELECT name FROM workspaces WHERE group_id = ?1 ORDER BY name LIMIT 10"
-                ).unwrap_or_else(|_| conn.prepare("SELECT '' LIMIT 0").unwrap());
-                
-                stmt.query_map(rusqlite::params![gid], |row| {
-                    let name: String = row.get(0)?;
-                    Ok(name)
-                })
-                .ok()
-                .map(|rows| {
-                    rows.filter_map(|r| r.ok())
+                )
+                .and_then(|mut stmt| {
+                    let rows = stmt.query_map(rusqlite::params![gid], |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                    Ok(rows.filter_map(|r| r.ok())
                         .map(|name| {
                             serde_json::json!({
                                 "name": name,
                                 "path": format!("g\\{}\\{}", group_name, name)
                             })
                         })
-                        .collect()
+                        .collect::<Vec<_>>())
                 })
                 .unwrap_or_default()
             } else {
                 vec![]
             }
         }
-        
+
         // g\GroupName\Partial → filter workspaces
         2 => {
             let group_name = parts[0];
@@ -4365,24 +4363,21 @@ pub extern "C" fn cyan_autocomplete_path(
             
             if let Some(gid) = gid {
                 let pattern = format!("{}%", ws_filter);
-                let mut stmt = conn.prepare(
+                conn.prepare(
                     "SELECT name FROM workspaces WHERE group_id = ?1 AND name LIKE ?2 COLLATE NOCASE ORDER BY name LIMIT 10"
-                ).unwrap_or_else(|_| conn.prepare("SELECT '' LIMIT 0").unwrap());
-                
-                stmt.query_map(rusqlite::params![gid, pattern], |row| {
-                    let name: String = row.get(0)?;
-                    Ok(name)
-                })
-                .ok()
-                .map(|rows| {
-                    rows.filter_map(|r| r.ok())
+                )
+                .and_then(|mut stmt| {
+                    let rows = stmt.query_map(rusqlite::params![gid, pattern], |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                    Ok(rows.filter_map(|r| r.ok())
                         .map(|name| {
                             serde_json::json!({
                                 "name": name,
                                 "path": format!("g\\{}\\{}", group_name, name)
                             })
                         })
-                        .collect()
+                        .collect::<Vec<_>>())
                 })
                 .unwrap_or_default()
             } else {
@@ -4408,24 +4403,21 @@ pub extern "C" fn cyan_autocomplete_path(
                 ).ok();
                 
                 if let Some(wid) = wid {
-                    let mut stmt = conn.prepare(
+                    conn.prepare(
                         "SELECT name FROM objects WHERE workspace_id = ?1 AND type = 'whiteboard' ORDER BY name LIMIT 10"
-                    ).unwrap_or_else(|_| conn.prepare("SELECT '' LIMIT 0").unwrap());
-                    
-                    stmt.query_map(rusqlite::params![wid], |row| {
-                        let name: String = row.get(0)?;
-                        Ok(name)
-                    })
-                    .ok()
-                    .map(|rows| {
-                        rows.filter_map(|r| r.ok())
+                    )
+                    .and_then(|mut stmt| {
+                        let rows = stmt.query_map(rusqlite::params![wid], |row| {
+                            row.get::<_, String>(0)
+                        })?;
+                        Ok(rows.filter_map(|r| r.ok())
                             .map(|name| {
                                 serde_json::json!({
                                     "name": name,
                                     "path": format!("g\\{}\\{}\\{}", group_name, ws_name, name)
                                 })
                             })
-                            .collect()
+                            .collect::<Vec<_>>())
                     })
                     .unwrap_or_default()
                 } else {
@@ -4541,7 +4533,10 @@ pub extern "C" fn cyan_reveal_anonymous_identity(scope_id: *const c_char) -> *mu
     
     let secret_bytes = sys.secret_key.to_bytes();
     let eph_secret_bytes: [u8; 32] = match hex::decode(&eph_secret) {
-        Ok(b) if b.len() == 32 => b.try_into().unwrap(),
+        Ok(b) if b.len() == 32 => match b.try_into() {
+            Ok(arr) => arr,
+            Err(_) => return std::ptr::null_mut(),
+        },
         _ => return std::ptr::null_mut(),
     };
     
