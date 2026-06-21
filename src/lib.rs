@@ -38,6 +38,7 @@ pub mod licensing;
 pub mod sso_grant;
 pub mod group_rekey;
 pub mod device_vault;
+pub mod rendezvous;
 
 use crate::models::commands::{CommandMsg, NetworkCommand};
 use crate::util::MutexExt;
@@ -69,8 +70,11 @@ use tokio::{
 // CONSTANTS - exported for actors module
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Default bootstrap node ID (used if BOOTSTRAP_NODE_ID not set)
-const DEFAULT_BOOTSTRAP_NODE_ID: &str = "f992aa3b5409410b373605002a47e5521f1f2a9d10d2910544c3b37f4d6ed618";
+// §5: the bootstrap node id is no longer a load-bearing hardcode here. It is resolved at startup
+// from a signed, discoverable rendezvous config (`rendezvous::fetch_and_apply_if_configured`); the
+// only remaining hardcoded value is the *bundled cold-start fallback*
+// (`rendezvous::BUNDLED_BOOTSTRAP_NODE_ID`), used when no signed config is configured/reachable —
+// which keeps behavior identical to before when no rendezvous URL is set.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // GLOBALS
@@ -116,12 +120,14 @@ pub fn local_endpoint_addr() -> Option<String> {
     LOCAL_ENDPOINT_ADDR.get().and_then(|m| m.lock().ok().and_then(|g| g.clone()))
 }
 
-/// Get bootstrap node ID - returns set value or default
+/// Get the bootstrap node id in effect: the value resolved from the signed rendezvous config (set
+/// into `BOOTSTRAP_NODE_ID` by `rendezvous::apply`), else the bundled cold-start fallback. No
+/// standalone hardcode — the fallback lives in one place (`rendezvous::BUNDLED_BOOTSTRAP_NODE_ID`).
 pub fn bootstrap_node_id() -> &'static str {
     BOOTSTRAP_NODE_ID
         .get()
         .map(|s| s.as_str())
-        .unwrap_or(DEFAULT_BOOTSTRAP_NODE_ID)
+        .unwrap_or(rendezvous::BUNDLED_BOOTSTRAP_NODE_ID)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

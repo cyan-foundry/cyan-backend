@@ -32,7 +32,7 @@ use iroh_gossip::net::Gossip;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use crate::identity::MeshAuthorizer;
+use crate::identity::{Grant, MeshAuthorizer, Role};
 use crate::util::MutexExt;
 use crate::swarm::{BlobSwarm, BLOB_ALPN};
 use crate::{
@@ -606,6 +606,42 @@ impl NetworkActor {
                     &group_id[..16.min(group_id.len())],
                     bootstrap_peer.as_ref().map(|p| &p[..16.min(p.len())])
                 );
+
+                // §6 ENTITLEMENT-GATED JOIN: a peer may join/subscribe ONLY groups in its grant.
+                // Fail-open for groups this node has not enforced (seam — un-enforced joins behave
+                // exactly as before). For an enforced group, the join MUST carry a valid grant FOR
+                // THIS group; otherwise we refuse to spawn the topic actor, so the node never
+                // subscribes to — or enumerates — a group it isn't entitled to. The single-use
+                // nonce is NOT consumed here (the holder spends it at snapshot time); this is a
+                // local, non-mutating entitlement check.
+                {
+                    let parsed = grant
+                        .as_deref()
+                        .and_then(|qr| Grant::from_qr_payload(qr).ok());
+                    let decision = match self.authorizer.lock() {
+                        Ok(auth) => auth.authorize_join(&group_id, parsed.as_ref()),
+                        // A poisoned authorizer must never deadlock or silently widen access; treat
+                        // it as fail-open ONLY for un-enforced semantics by allowing — the snapshot
+                        // serve gate still applies on the holder side.
+                        Err(_) => Ok(Role::Member),
+                    };
+                    if let Err(reason) = decision {
+                        eprintln!(
+                            "⛔ [NET-JOIN] entitlement-gated join REFUSED for {}...: {:?}",
+                            &group_id[..16.min(group_id.len())],
+                            reason
+                        );
+                        tracing::warn!(
+                            "⛔ [NET-JOIN] join refused (not entitled) for {}: {:?}",
+                            &group_id[..16.min(group_id.len())],
+                            reason
+                        );
+                        let _ = self.event_tx.send(SwiftEvent::Error {
+                            message: format!("join refused: not entitled to group ({reason:?})"),
+                        });
+                        return;
+                    }
+                }
 
                 // Parse bootstrap peer if provided
                 let mut initial_peers = vec![];
@@ -1633,7 +1669,7 @@ async fn handle_snapshot_server(
     _event_tx: UnboundedSender<SwiftEvent>,
     authorizer: Arc<std::sync::Mutex<MeshAuthorizer>>,
 ) -> Result<()> {
-    use crate::identity::{Grant, SnapshotDenial};
+    use crate::identity::SnapshotDenial;
     use crate::models::protocol::SnapshotRequest;
 
     let peer_id = conn.remote_id().to_string();

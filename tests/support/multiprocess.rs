@@ -42,6 +42,20 @@ pub struct NodeMetrics {
     pub snapshot_served: u64,
 }
 
+/// The `read_deltas` response (§1 incremental catch-up SERVE side): the events of ONE group a
+/// holder reports as newer than the caller's cursor. `count` EXCLUDES the always-present group row
+/// (so a caught-up reader sees 0); `high_water` is the cursor to send next to stay current. `frames`
+/// is the raw `SnapshotFrame` JSON the caller can apply (kept as `Value` so the rig need not depend
+/// on the engine's protocol types).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Deltas {
+    pub group_id: String,
+    pub since: i64,
+    pub high_water: i64,
+    pub count: u64,
+    pub frames: Vec<serde_json::Value>,
+}
+
 /// Default per-request timeout for control verbs (boot/addr/count are fast).
 pub const REQ_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -320,6 +334,20 @@ impl MpNode {
             .and_then(|s| s.parse::<usize>().ok())
             .ok_or_else(|| anyhow!("{}: unexpected count response: {resp}", self.name))?;
         Ok(n)
+    }
+
+    /// Read this node's events for `group_id` newer than `since_cursor` (§1 incremental catch-up
+    /// SERVE side). Group-scoped: never returns another group's events. `since_cursor = 0` is a
+    /// full read; passing the node's `high_water` back yields an empty (caught-up) delta.
+    pub async fn read_deltas(&mut self, group_id: &str, since_cursor: i64) -> Result<Deltas> {
+        let resp = self
+            .request(&format!("read_deltas {group_id} {since_cursor}"), REQ_TIMEOUT)
+            .await?;
+        let json = resp
+            .strip_prefix("deltas ")
+            .ok_or_else(|| anyhow!("{}: unexpected read_deltas response: {resp}", self.name))?;
+        serde_json::from_str(json)
+            .with_context(|| format!("{}: parse read_deltas json: {json}", self.name))
     }
 
     // ── Stress / chaos fabric (Round 7) ───────────────────────────────────────────────────

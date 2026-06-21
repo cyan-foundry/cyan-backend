@@ -26,7 +26,7 @@ use xaeroid::XaeroID;
 
 pub mod mesh;
 pub mod qr;
-pub use mesh::{DenyReason, MeshAuthorizer, SnapshotDenial, WriteDecision};
+pub use mesh::{DenyReason, JoinDenial, MeshAuthorizer, SnapshotDenial, WriteDecision};
 pub use qr::{issue_grant_qr, scan_grant_qr_at, GrantInvite, ScanError};
 
 /// Current grant wire/QR version. Bumped only on a breaking payload change.
@@ -363,6 +363,34 @@ impl GrantVerifier {
             return Err(VerifyError::ReplayedNonce);
         }
         self.seen_nonces.insert(grant.nonce.clone());
+        Ok(grant.role)
+    }
+
+    /// Read-only entitlement check against the wall clock. See [`GrantVerifier::check_at`].
+    pub fn check(&self, grant: &Grant) -> Result<Role, VerifyError> {
+        self.check_at(grant, XaeroID::now_secs())
+    }
+
+    /// Verify a grant as-of `now` WITHOUT consuming its nonce — a non-mutating entitlement check.
+    ///
+    /// Identical to [`GrantVerifier::verify_at`] (signature · issuer-is-current-admin · not expired ·
+    /// not revoked) EXCEPT it does not record the nonce, so it neither rejects an already-seen nonce
+    /// nor burns it. This is the JOINER-side self-gate ([`super::mesh::MeshAuthorizer::authorize_join`]):
+    /// "may I subscribe to this group?" is a local read that must NOT consume the single-use nonce the
+    /// HOLDER will later spend at snapshot time (`verify_at` via `authorize_snapshot`).
+    pub fn check_at(&self, grant: &Grant, now: u64) -> Result<Role, VerifyError> {
+        if !grant.verify_signature() {
+            return Err(VerifyError::BadSignature);
+        }
+        if !self.roster.is_admin(&grant.group_id, &grant.issued_by) {
+            return Err(VerifyError::IssuerNotAdmin);
+        }
+        if now >= grant.expiry {
+            return Err(VerifyError::Expired);
+        }
+        if self.is_revoked(&grant.group_id, &grant.nonce) {
+            return Err(VerifyError::Revoked);
+        }
         Ok(grant.role)
     }
 }

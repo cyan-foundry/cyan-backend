@@ -55,6 +55,11 @@ pub extern "C" fn cyan_init(db_path: *const c_char) -> bool {
         CStr::from_ptr(db_path).to_string_lossy().to_string()
     };
     let res = std::thread::spawn(|| {
+        // §5: resolve the bootstrap/relay/discovery_key from the signed rendezvous config BEFORE the
+        // tokio runtime exists (so the best-effort blocking fetch runs outside any async context).
+        // No-op unless CYAN_RENDEZVOUS_URL is set ⇒ identical to pre-§5 behavior offline.
+        crate::rendezvous::fetch_and_apply_if_configured();
+
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().expect("runtime");
         RUNTIME.set(runtime).ok();
 
@@ -203,6 +208,13 @@ pub extern "C" fn cyan_init_with_identity(
     }
 
     let res = std::thread::spawn(move || {
+        // §5: resolve bootstrap/relay/discovery_key from the signed rendezvous config BEFORE the
+        // runtime is built. This runs AFTER the explicit FFI relay_url/discovery_key args above, and
+        // `OnceCell::set` is first-wins, so an FFI-provided value still wins — the config only fills
+        // in what FFI didn't set (notably the bootstrap id, replacing the old hardcode). No-op unless
+        // CYAN_RENDEZVOUS_URL is set, so the existing FFI init path is unchanged when none is provided.
+        crate::rendezvous::fetch_and_apply_if_configured();
+
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()

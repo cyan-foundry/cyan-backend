@@ -32,6 +32,10 @@
 //! - `wait_sync <gid> <timeout_ms>`       `@@CYAN@@ ok wait_sync` | `@@CYAN@@ timeout wait_sync`
 //! - `count <kind> <gid>`                 `@@CYAN@@ count <kind> <n>`
 //!   kinds: groups|workspaces|system_workspaces|boards|elements|cells|chats|notes|files
+//! - `read_deltas <gid> <since_cursor>`   `@@CYAN@@ deltas <json>` (§1 incremental catch-up SERVE
+//!   side: this node's events for `gid` newer than `since_cursor`, group-scoped; json =
+//!   `{group_id,since,high_water,count,frames:[SnapshotFrame...]}` — what a holder serves a late
+//!   joiner so the Lens replica can do incremental catch-up, not just a full snapshot)
 //! - `admin_pubkey`                       `@@CYAN@@ admin_pubkey <hex>`
 //! - `enforce_group <gid>`                `@@CYAN@@ ok enforce_group` (enforce + self=Owner-admin)
 //! - `set_admin <gid> <pubkey> [role]`    `@@CYAN@@ ok set_admin`
@@ -512,6 +516,41 @@ async fn handle_verb(
             let gid = rest.get(1).ok_or_else(|| anyhow!("group_id required"))?;
             let n = count_kind(kind, gid)?;
             Ok(format!("count {kind} {n}"))
+        }
+
+        // ── §1 read_deltas — incremental catch-up SERVE side (SUPER_PEER_COMPLETION §1) ──────
+        // Read THIS node's storage for the events of ONE group whose version is strictly newer
+        // than `since_cursor`, and return them — so a holder (e.g. the Lens EmbeddedReplica) can
+        // SERVE incremental catch-up to a late/returning peer instead of a full re-snapshot. It is
+        // the read-only HOLDER counterpart to the `catch_up` REQUESTER verb. Reuses the engine's
+        // `snapshot::build_snapshot_frames(group, Some(since))` (the same since-bounded path the live
+        // `CatchUp` command uses) so a delta served here and a delta pulled there are identical.
+        //
+        // STRICTLY group-scoped: the frames are built solely from `group_id`'s own rows, so another
+        // group's events can never appear. The response is single-line JSON (no whitespace) carrying:
+        //   {group_id, since, high_water, count, frames:[SnapshotFrame...]}
+        // `count` is the number of DATA rows newer than the cursor (EXCLUDING the always-present
+        // group row in the Structure frame — so a caught-up reader sees count=0). `high_water` is
+        // this holder's current max version (the cursor a caller sends next to stay current).
+        // `read_deltas <group_id> <since_cursor>` → `deltas <json>`.
+        "read_deltas" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?;
+            let since: i64 = rest
+                .get(1)
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| anyhow!("since_cursor required (i64)"))?;
+            let frames = cyan_backend::snapshot::build_snapshot_frames(gid, Some(since))
+                .map_err(|e| anyhow!("build_snapshot_frames: {e}"))?;
+            let count = cyan_backend::snapshot::frames_row_count(&frames);
+            let high_water = cyan_backend::snapshot::group_high_water(gid);
+            let json = serde_json::to_string(&serde_json::json!({
+                "group_id": gid,
+                "since": since,
+                "high_water": high_water,
+                "count": count,
+                "frames": frames,
+            }))?;
+            Ok(format!("deltas {json}"))
         }
 
         // ── Mesh-hardening verbs (MESH_HARDENING §2/§5/§11) ──────────────────────────────

@@ -39,6 +39,20 @@ pub enum DenyReason {
     InsufficientRole,
 }
 
+/// Why a peer's own attempt to JOIN/subscribe a group was refused (the entitlement-gated join,
+/// SUPER_PEER_COMPLETION_SPEC §6). This is the JOINER-side self-gate: "a peer may join/subscribe
+/// ONLY groups in its grant", the dual of [`SnapshotDenial`] (the HOLDER-side serve gate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinDenial {
+    /// The group is entitlement-enforced but no grant was presented for the join.
+    NoGrant,
+    /// A grant was presented, but for a DIFFERENT group than the one being joined — the exact
+    /// cross-group bleed §6 forbids ("only groups in its grant").
+    WrongGroup,
+    /// The presented grant failed verification (signature · issuer-admin · expiry · revocation).
+    Verify(VerifyError),
+}
+
 /// Why a snapshot request was refused (the join-time read gate).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotDenial {
@@ -145,6 +159,47 @@ impl MeshAuthorizer {
                 },
             );
         Ok(role)
+    }
+
+    /// The **entitlement-gated join** (SUPER_PEER_COMPLETION_SPEC §6): decide whether THIS node may
+    /// join/subscribe `group_id`, given the grant (if any) it holds for the join. A peer may join
+    /// ONLY groups in its grant — a join for a non-granted group is rejected, so a node can neither
+    /// subscribe to nor enumerate groups it isn't entitled to.
+    ///
+    /// Fail-open if the group is not enforced (un-enforced groups join exactly as before — the
+    /// "seam, not a rewrite" rule keeps shipping behavior identical). If enforced, the join must
+    /// carry a grant FOR THIS group that verifies. This is a NON-consuming check ([`GrantVerifier::check_at`]):
+    /// the single-use nonce is spent later by the HOLDER at snapshot time, not here.
+    pub fn authorize_join(
+        &self,
+        group_id: &str,
+        grant: Option<&Grant>,
+    ) -> Result<Role, JoinDenial> {
+        if !self.is_enforced(group_id) {
+            return Ok(Role::Member);
+        }
+        let grant = grant.ok_or(JoinDenial::NoGrant)?;
+        if grant.group_id != group_id {
+            return Err(JoinDenial::WrongGroup);
+        }
+        self.verifier.check(grant).map_err(JoinDenial::Verify)
+    }
+
+    /// As [`authorize_join`], but verifying as-of `now` (deterministic clock for tests).
+    pub fn authorize_join_at(
+        &self,
+        group_id: &str,
+        grant: Option<&Grant>,
+        now: u64,
+    ) -> Result<Role, JoinDenial> {
+        if !self.is_enforced(group_id) {
+            return Ok(Role::Member);
+        }
+        let grant = grant.ok_or(JoinDenial::NoGrant)?;
+        if grant.group_id != group_id {
+            return Err(JoinDenial::WrongGroup);
+        }
+        self.verifier.check_at(grant, now).map_err(JoinDenial::Verify)
     }
 
     /// Decide whether to serve `group_id`'s snapshot to a joining `peer_id`. This is the
