@@ -59,6 +59,19 @@
 //! - `post_edits <gid> <n> [board]`       `@@CYAN@@ ok post_edits <n>` (local insert + gossip broadcast)
 //! - `post_chat <gid> <n> [ws]`           `@@CYAN@@ ok post_chat <n>` (local insert + ChatSent broadcast)
 //! - `post_workflow <gid> [steps] [ws]`   `@@CYAN@@ ok post_workflow <board> <steps>` (board+cells+pin broadcast)
+//!
+//! ## Distributed workflow RUN verbs (Round 10 — run-execution + run-state propagation)
+//! - `wf_author <gid> <shape>`            `@@CYAN@@ ok wf_author <board>` (author a RUNNABLE workflow:
+//!   board + step cells carrying pipeline configs, broadcast Added+Updated so peers get the configs;
+//!   shape ∈ linear|diamond|gated)
+//! - `wf_run <board> [wave|seq]`          `@@CYAN@@ ok wf_run <json>` (RUN the pipeline — wave-concurrent
+//!   over a level-set plan, or sequential fallback; <json> summarizes the exec events that fired:
+//!   started/finished/finished_state/stats/progress + running/done/failed/awaiting/pending step lists
+//!   + mode/peak/run_id. Run-state rides the SAME cell-update gossip path to every peer.)
+//! - `wf_state <board> <step_id>`         `@@CYAN@@ state <step_id> <status>` (THIS peer's run-state for
+//!   the step, read from its OWN notebook_cells metadata — the convergence oracle; `absent` if missing)
+//! - `wf_approve <board> <step_id>`       `@@CYAN@@ ok wf_approve` (approve a human gate on THIS peer;
+//!   broadcasts the approval so the run unblocks for every peer)
 //! - `post_notes <gid> <n> [board]`       `@@CYAN@@ ok post_notes <n>` (local note insert, NO broadcast; digest-converge)
 //! - `set_pin <gid> <0|1> [board]`        `@@CYAN@@ ok set_pin <pinned>` (local pin, NO broadcast; digest-converge)
 //! - `seed_blob <gid> <size> [name]`      `@@CYAN@@ blob <file_id> <hash>` (hold + announce)
@@ -85,7 +98,8 @@ use tokio::sync::Notify;
 
 use cyan_backend::actors::NetworkActor;
 use cyan_backend::identity::{pubkey_hex, Grant, MeshAuthorizer, Role};
-use cyan_backend::models::commands::NetworkCommand;
+use cyan_backend::models::commands::{CommandMsg, NetworkCommand};
+use cyan_backend::models::dto::NotebookCellDTO;
 use cyan_backend::models::events::{NetworkEvent, SwiftEvent};
 use cyan_backend::models::node_config::{DiscoveryPolicy, NodeConfig, RelayPolicy};
 use cyan_backend::storage;
@@ -157,7 +171,22 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| PathBuf::from("data"))
     });
     std::fs::create_dir_all(&data_dir).ok();
-    let _ = cyan_backend::DATA_DIR.set(data_dir);
+    let _ = cyan_backend::DATA_DIR.set(data_dir.clone());
+
+    // Point the on-device MCP plugin root at an EMPTY dir (unless the caller set one),
+    // so a workflow's `local` mcp_tool steps resolve "not installed" and fail FAST +
+    // deterministically offline — the test-only local step the run-execution harness
+    // drives (real local/MCP execution is out of substrate scope; see CLAUDE.md). No
+    // network, no spawn, no backoff: `resolve_installed_tool` returns None → a surfaced
+    // error, which is enough to drive pending→running→terminal and the exec events.
+    if std::env::var("CYAN_PLUGINS_ROOT").is_err() {
+        let proot = data_dir.join("plugins-empty");
+        std::fs::create_dir_all(&proot).ok();
+        // SAFETY: set once at boot, before any actor/run task reads it.
+        unsafe {
+            std::env::set_var("CYAN_PLUGINS_ROOT", &proot);
+        }
+    }
 
     // Identity + channels.
     let mut rng = ChaCha8Rng::from_os_rng();
@@ -223,6 +252,50 @@ async fn main() -> Result<()> {
         });
     }
 
+    // ── Workflow-run bridge (Round 10) ────────────────────────────────────────────
+    // `pipeline::run_pipeline_*` drives step-state changes through a `CommandMsg`
+    // channel (the app's CommandActor seam). cyan_node has no CommandActor, so this
+    // task IS the seam for the one command a run emits — `UpdateNotebookCell`: apply
+    // it to THIS node's storage AND broadcast `NotebookCellUpdated` over the group, so
+    // the run-state (each step's pipeline `state.status`) rides the SAME gossip path
+    // that carries chat/boards and converges on every peer. Mirrors the engine's
+    // CommandActor arm in `lib.rs`. Other CommandMsg variants are local-only here.
+    let (cmd_msg_tx, mut cmd_msg_rx) = mpsc::unbounded_channel::<CommandMsg>();
+    {
+        let net_tx = cmd_tx.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = cmd_msg_rx.recv().await {
+                if let CommandMsg::UpdateNotebookCell {
+                    id, board_id, cell_type, cell_order, content, output, collapsed, height, metadata_json,
+                } = msg
+                {
+                    let dto = NotebookCellDTO {
+                        id: id.clone(),
+                        board_id: board_id.clone(),
+                        cell_type: cell_type.clone(),
+                        cell_order,
+                        content: content.clone(),
+                        output: output.clone(),
+                        collapsed,
+                        height,
+                        metadata_json: metadata_json.clone(),
+                        created_at: 0,
+                        updated_at: 0,
+                    };
+                    let _ = storage::cell_update(&dto);
+                    if let Some(gid) = storage::board_get_group_id(&board_id) {
+                        let _ = net_tx.send(NetworkCommand::Broadcast {
+                            group_id: gid,
+                            event: NetworkEvent::NotebookCellUpdated {
+                                id, board_id, cell_type, cell_order, content, output, collapsed, height, metadata_json,
+                            },
+                        });
+                    }
+                }
+            }
+        });
+    }
+
     // Control loop: read requests on stdin, write tagged responses on stdout.
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
@@ -248,6 +321,7 @@ async fn main() -> Result<()> {
             &endpoint,
             &static_discovery,
             &cmd_tx,
+            &cmd_msg_tx,
             &synced,
             &downloaded,
             &notify,
@@ -275,6 +349,7 @@ async fn handle_verb(
     endpoint: &iroh::Endpoint,
     static_discovery: &iroh::discovery::static_provider::StaticProvider,
     cmd_tx: &UnboundedSender<NetworkCommand>,
+    cmd_msg_tx: &UnboundedSender<CommandMsg>,
     synced: &Arc<Mutex<HashSet<String>>>,
     downloaded: &Arc<Mutex<HashMap<String, String>>>,
     notify: &Arc<Notify>,
@@ -777,6 +852,48 @@ async fn handle_verb(
             Ok(format!("ok post_workflow {board} {steps}"))
         }
 
+        // ── Distributed workflow RUN verbs (Round 10) ─────────────────────────────────────
+        // Author a RUNNABLE workflow: a board + step cells whose metadata carries the pipeline
+        // configs (DAG shape), broadcast (Added then Updated-with-metadata) so every peer gets
+        // the configs and can read/approve. `wf_author <gid> <shape>` (shape ∈ linear|diamond|gated).
+        "wf_author" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?;
+            let shape = rest.get(1).copied().unwrap_or("linear");
+            let board = author_workflow(gid, shape, node_id, cmd_tx)?;
+            Ok(format!("ok wf_author {board}"))
+        }
+
+        // RUN the authored workflow through the real wave executor (`run_pipeline_with_plan`):
+        // `wave` (default) runs a level-set physical plan WAVE-CONCURRENTLY; `seq` runs the
+        // sequential toposort fallback. Returns a JSON summary of the exec events that fired
+        // (DASHBOARD_CONTRACT §A) — the run-execution oracle. Step run-state rides the cell-update
+        // gossip path to every peer (assert with `wf_state`). `wf_run <board> [wave|seq]`.
+        "wf_run" => {
+            let board = rest.first().ok_or_else(|| anyhow!("board_id required"))?;
+            let mode = rest.get(1).copied().unwrap_or("wave");
+            let json = run_workflow(board, mode, cmd_msg_tx).await?;
+            Ok(format!("ok wf_run {json}"))
+        }
+
+        // THIS peer's run-state for a step, read from its OWN notebook_cells metadata — the
+        // convergence oracle (never a log line). `wf_state <board> <step_id>` → `state <id> <status>`.
+        "wf_state" => {
+            let board = rest.first().ok_or_else(|| anyhow!("board_id required"))?;
+            let step = rest.get(1).ok_or_else(|| anyhow!("step_id required"))?;
+            let status = workflow_state(board, step)?;
+            Ok(format!("state {step} {status}"))
+        }
+
+        // Approve a human gate on THIS peer and broadcast the approval over the mesh, so the run
+        // unblocks for EVERY peer (branch-barrier release). `wf_approve <board> <step_id>`.
+        "wf_approve" => {
+            let board = rest.first().ok_or_else(|| anyhow!("board_id required"))?;
+            let step = rest.get(1).ok_or_else(|| anyhow!("step_id required"))?;
+            cyan_backend::pipeline::approve_step(board, step, Some("harness"), cmd_msg_tx, None)
+                .map_err(|e| anyhow!("approve_step: {e}"))?;
+            Ok("ok wf_approve".to_string())
+        }
+
         // Generate a deterministic blob of <size> bytes, content-address it, hold it in this node's
         // swarm store, and announce it to the group so peers can swarm-fetch. Also writes a file
         // metadata row + local_path so `count files` and direct transfer both see it.
@@ -1011,6 +1128,354 @@ async fn wait_download(
     })
     .await
     .ok()
+}
+
+// ── Distributed workflow RUN helpers (Round 10) ────────────────────────────────────────────
+
+/// The DAG shape of a runnable workflow: `(step_id, depends_on, executor)`. `local` steps run
+/// (and, with the empty plugin root, deterministically fail "not installed" — the test-only local
+/// step); `manual` steps are human-approval gates. Three shapes exercise the executor:
+///   linear  — s0→s1→s2 (a chain; every step its own wave)
+///   diamond — a→{b,c}→d (b,c independent ⇒ one wave ⇒ run CONCURRENTLY)
+///   gated   — g(gate) ; b depends on g (gated branch) ; x independent (branch barrier)
+fn workflow_shape(shape: &str) -> Result<Vec<(&'static str, Vec<&'static str>, &'static str)>> {
+    let specs = match shape {
+        "linear" => vec![
+            ("s0", vec![], "local"),
+            ("s1", vec!["s0"], "local"),
+            ("s2", vec!["s1"], "local"),
+        ],
+        "diamond" => vec![
+            ("a", vec![], "local"),
+            ("b", vec!["a"], "local"),
+            ("c", vec!["a"], "local"),
+            ("d", vec!["b", "c"], "local"),
+        ],
+        "gated" => vec![
+            ("g", vec![], "manual"),
+            ("b", vec!["g"], "local"),
+            ("x", vec![], "local"),
+        ],
+        other => return Err(anyhow!("unknown workflow shape '{other}' (linear|diamond|gated)")),
+    };
+    Ok(specs)
+}
+
+/// Build a `PipelineStepConfig` for one authored step (everything but id/deps/executor default).
+fn make_step_config(
+    step_id: &str,
+    depends_on: &[&str],
+    executor: &str,
+) -> cyan_backend::pipeline::PipelineStepConfig {
+    cyan_backend::pipeline::PipelineStepConfig {
+        step_id: step_id.to_string(),
+        depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
+        stage: Some(step_id.to_string()),
+        executor: executor.to_string(),
+        model: None,
+        model_config: None,
+        tools: vec![],
+        output_format: "markdown".to_string(),
+        command: None,
+        timeout_seconds: Some(5),
+        retry_count: Some(0),
+        auto_advance: false,
+        notifications: vec![],
+        state: cyan_backend::pipeline::PipelineStepState::default(),
+    }
+}
+
+/// A step cell's metadata JSON: the pipeline config plus, for executable (non-gate) steps, an
+/// `mcp_tool` spec pointing at a NON-installed plugin so the run fails fast + offline (the
+/// deterministic test-only local step). Single line, no whitespace — travels as one gossip field.
+fn step_metadata(config: &cyan_backend::pipeline::PipelineStepConfig) -> Result<String> {
+    let mut meta = serde_json::Map::new();
+    meta.insert("pipeline".to_string(), serde_json::to_value(config)?);
+    if config.executor != "manual" {
+        meta.insert(
+            "mcp_tool".to_string(),
+            serde_json::json!({ "plugin_id": "nope", "tool": "nope", "args": {} }),
+        );
+    }
+    Ok(serde_json::Value::Object(meta).to_string())
+}
+
+/// Author a runnable workflow on THIS node and replicate it: a board + one step cell per shape
+/// step, each carrying its pipeline config. Broadcast `BoardCreated`, then per cell
+/// `NotebookCellAdded` (creates the row on peers) + `NotebookCellUpdated` (writes the metadata on
+/// peers) — so every peer holds the configs and can read run-state / approve gates. Returns the
+/// board id.
+fn author_workflow(
+    gid: &str,
+    shape: &str,
+    node_id: &str,
+    cmd_tx: &UnboundedSender<NetworkCommand>,
+) -> Result<String> {
+    let specs = workflow_shape(shape)?;
+    let tag = &node_id[..8.min(node_id.len())];
+    let ws = format!("{gid}-ws");
+    let board = format!("{gid}-wfr-{shape}-{tag}");
+    let now = chrono::Utc::now().timestamp();
+
+    storage::board_insert(&board, &ws, "Workflow Run", now)
+        .map_err(|e| anyhow!("board_insert: {e}"))?;
+    cmd_tx
+        .send(NetworkCommand::Broadcast {
+            group_id: gid.to_string(),
+            event: NetworkEvent::BoardCreated {
+                id: board.clone(),
+                workspace_id: ws.clone(),
+                name: "Workflow Run".to_string(),
+                created_at: now,
+            },
+        })
+        .map_err(|e| anyhow!("send BoardCreated: {e}"))?;
+
+    for (i, (sid, deps, exec)) in specs.iter().enumerate() {
+        let config = make_step_config(sid, deps, exec);
+        let meta = step_metadata(&config)?;
+        let cell_id = format!("{board}-{sid}");
+        let content = format!("step {sid}");
+        let order = i as i32;
+
+        storage::cell_insert(&cell_id, &board, "code", order, Some(&content))
+            .map_err(|e| anyhow!("cell_insert: {e}"))?;
+        let dto = NotebookCellDTO {
+            id: cell_id.clone(),
+            board_id: board.clone(),
+            cell_type: "code".to_string(),
+            cell_order: order,
+            content: Some(content.clone()),
+            output: None,
+            collapsed: false,
+            height: None,
+            metadata_json: Some(meta.clone()),
+            created_at: now,
+            updated_at: now,
+        };
+        storage::cell_update(&dto).map_err(|e| anyhow!("cell_update: {e}"))?;
+
+        cmd_tx
+            .send(NetworkCommand::Broadcast {
+                group_id: gid.to_string(),
+                event: NetworkEvent::NotebookCellAdded {
+                    id: cell_id.clone(),
+                    board_id: board.clone(),
+                    cell_type: "code".to_string(),
+                    cell_order: order,
+                    content: Some(content.clone()),
+                },
+            })
+            .map_err(|e| anyhow!("send NotebookCellAdded: {e}"))?;
+        cmd_tx
+            .send(NetworkCommand::Broadcast {
+                group_id: gid.to_string(),
+                event: NetworkEvent::NotebookCellUpdated {
+                    id: cell_id,
+                    board_id: board.clone(),
+                    cell_type: "code".to_string(),
+                    cell_order: order,
+                    content: Some(content),
+                    output: None,
+                    collapsed: false,
+                    height: None,
+                    metadata_json: Some(meta),
+                },
+            })
+            .map_err(|e| anyhow!("send NotebookCellUpdated: {e}"))?;
+    }
+
+    Ok(board)
+}
+
+/// Reload the board's step configs from THIS node's storage (parsed from each cell's
+/// `metadata_json.pipeline`), ordered by `cell_order`.
+fn load_step_configs(board_id: &str) -> Result<Vec<cyan_backend::pipeline::PipelineStepConfig>> {
+    let conn = storage::db().lock().map_err(|e| anyhow!("db lock: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT metadata_json FROM notebook_cells WHERE board_id = ?1 ORDER BY cell_order",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![board_id], |r| r.get::<_, Option<String>>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let Some(mj) = row? else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&mj) else { continue };
+        let Some(p) = v.get("pipeline") else { continue };
+        if let Ok(cfg) =
+            serde_json::from_value::<cyan_backend::pipeline::PipelineStepConfig>(p.clone())
+        {
+            out.push(cfg);
+        }
+    }
+    Ok(out)
+}
+
+/// Compute the level-set physical plan from the authored configs — the minimal materializer
+/// (WORKFLOW_MATERIALIZATION §1): wave index = longest-path depth, each wave is one concurrent
+/// batch of its independent steps; `manual` steps are gates, and a step depending on a gate carries
+/// it as its `gate_barrier`. This is what Lens would emit; here the harness emits it so the run is
+/// wave-concurrent. tenant = the board's group (matches `tenant = group_id`).
+fn build_level_set_plan(
+    board_id: &str,
+    configs: &[cyan_backend::pipeline::PipelineStepConfig],
+) -> cyan_backend::exec_plan::PhysicalPlan {
+    use cyan_backend::exec_plan::{PhysicalPlan, PlannedStep, Wave};
+    use std::collections::{BTreeMap, HashSet};
+
+    let tenant = storage::board_get_group_id(board_id).unwrap_or_else(|| "device".to_string());
+    let ids: HashSet<&str> = configs.iter().map(|c| c.step_id.as_str()).collect();
+    let gate_ids: HashSet<&str> = configs
+        .iter()
+        .filter(|c| c.executor == "manual")
+        .map(|c| c.step_id.as_str())
+        .collect();
+
+    // Fixpoint over a (small, acyclic) DAG: level = 1 + max(dep levels).
+    let mut level: BTreeMap<String, usize> =
+        configs.iter().map(|c| (c.step_id.clone(), 0usize)).collect();
+    loop {
+        let mut changed = false;
+        for c in configs {
+            let want = c
+                .depends_on
+                .iter()
+                .filter(|d| ids.contains(d.as_str()))
+                .map(|d| level.get(d).copied().unwrap_or(0) + 1)
+                .max()
+                .unwrap_or(0);
+            if want > level[&c.step_id] {
+                level.insert(c.step_id.clone(), want);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Group steps by level into waves; each wave is one concurrent batch.
+    let mut by_level: BTreeMap<usize, Vec<PlannedStep>> = BTreeMap::new();
+    let mut batch_by_level: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for c in configs {
+        let lvl = level[&c.step_id];
+        let gate_barrier = c
+            .depends_on
+            .iter()
+            .find(|d| gate_ids.contains(d.as_str()))
+            .cloned();
+        by_level.entry(lvl).or_default().push(PlannedStep {
+            id: c.step_id.clone(),
+            placement: "local".to_string(),
+            cache_key: String::new(),
+            cache_hit: false,
+            is_gate: c.executor == "manual",
+            gate_barrier,
+            cost_usd: 0.0,
+            concurrency_weight: 1,
+        });
+        batch_by_level.entry(lvl).or_default().push(c.step_id.clone());
+    }
+
+    let max_concurrency = by_level.values().map(|s| s.len()).max().unwrap_or(1) as u32;
+    let waves: Vec<Wave> = by_level
+        .into_iter()
+        .map(|(lvl, steps)| Wave {
+            index: lvl as u32,
+            steps,
+            batches: vec![batch_by_level.remove(&lvl).unwrap_or_default()],
+        })
+        .collect();
+
+    PhysicalPlan {
+        tenant_id: tenant,
+        waves,
+        max_concurrency,
+        max_cost_usd: 0.0,
+        total_cost_usd: 0.0,
+    }
+}
+
+/// Run the workflow through the real executor and summarize the exec events that fired into a
+/// single-line JSON (the run-execution oracle). `mode = "seq"` ⇒ sequential fallback (no plan).
+async fn run_workflow(
+    board_id: &str,
+    mode: &str,
+    cmd_msg_tx: &UnboundedSender<CommandMsg>,
+) -> Result<String> {
+    let configs = load_step_configs(board_id)?;
+    if configs.is_empty() {
+        return Err(anyhow!("no pipeline steps on board {board_id} (author first)"));
+    }
+    let plan = if mode == "seq" {
+        None
+    } else {
+        Some(build_level_set_plan(board_id, &configs))
+    };
+
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<SwiftEvent>();
+    let result = cyan_backend::pipeline::run_pipeline_with_plan(board_id, plan, cmd_msg_tx, &ev_tx)
+        .await
+        .map_err(|e| anyhow!("run_pipeline_with_plan: {e}"))?;
+
+    // Drain the run's exec events (the channel is closed once `run_pipeline_with_plan` returns,
+    // so this is bounded — no live wait) and bucket the step-state transitions.
+    use std::collections::BTreeSet;
+    let (mut started, mut finished, mut stats, mut progress) = (0u32, 0u32, 0u32, 0u32);
+    let mut finished_state = String::new();
+    let mut by_state: std::collections::BTreeMap<String, BTreeSet<String>> = Default::default();
+    while let Ok(ev) = ev_rx.try_recv() {
+        match ev {
+            SwiftEvent::WorkflowRunStarted { .. } => started += 1,
+            SwiftEvent::WorkflowRunFinished { state, .. } => {
+                finished += 1;
+                finished_state = state;
+            }
+            SwiftEvent::WorkflowStatsUpdated { .. } => stats += 1,
+            SwiftEvent::StepProgress { .. } => progress += 1,
+            SwiftEvent::StepStateChanged { step_id, state, .. } => {
+                by_state.entry(state).or_default().insert(step_id);
+            }
+            _ => {}
+        }
+    }
+    let bucket = |k: &str| -> Vec<String> {
+        by_state.get(k).map(|s| s.iter().cloned().collect()).unwrap_or_default()
+    };
+
+    let summary = serde_json::json!({
+        "run_id": result.get("run_id").and_then(|v| v.as_str()).unwrap_or(""),
+        "mode": result.get("mode").and_then(|v| v.as_str()).unwrap_or(""),
+        "peak": result.get("peak_concurrency").and_then(|v| v.as_u64()).unwrap_or(0),
+        "started": started,
+        "finished": finished,
+        "finished_state": finished_state,
+        "stats": stats,
+        "progress": progress,
+        "running": bucket("running"),
+        "done": bucket("done"),
+        "failed": bucket("failed"),
+        "awaiting": bucket("awaiting_approval"),
+        "pending": bucket("pending"),
+        "approved": bucket("approved"),
+    });
+    Ok(serde_json::to_string(&summary)?)
+}
+
+/// THIS node's run-state for one step: the cell's `pipeline.state.status`, or `absent`.
+fn workflow_state(board_id: &str, step_id: &str) -> Result<String> {
+    let conn = storage::db().lock().map_err(|e| anyhow!("db lock: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT json_extract(metadata_json, '$.pipeline.state.status') \
+         FROM notebook_cells \
+         WHERE board_id = ?1 AND json_extract(metadata_json, '$.pipeline.step_id') = ?2",
+    )?;
+    let status = stmt
+        .query_row(rusqlite::params![board_id, step_id], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .ok()
+        .flatten();
+    Ok(status.unwrap_or_else(|| "absent".to_string()))
 }
 
 /// Count rows of `kind` scoped to `group_id`, reading THIS process's storage.

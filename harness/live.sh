@@ -23,7 +23,7 @@
 #                           corp    = SIMULATE a corporate firewall: block direct UDP/QUIC so peers
 #                                     MUST fall back to relay / WebSocket (rigorous via Docker).
 #                           offline = no internet / no relay / no bootstrap: mDNS-LAN only.
-#   --scenario S   (all)    sync | files | chat | workflow | all  — behaviors to exercise + ASSERT.
+#   --scenario S   (all)    sync | files | chat | workflow | workflow-run | all  — behaviors to ASSERT.
 #   --keep                  leave peers/relay running for manual poking (Docker tier; see notes).
 #   --app N                 ALSO launch up to N real Cyan app instances for a manual UX pass
 #                           (separate from the asserted headless run; capped to available logins).
@@ -35,6 +35,11 @@
 #   files    — each peer uploads a blob → every peer fetches + blake3-verifies every other peer's blob.
 #   workflow — one peer authors+lays out a local-placement workflow → every peer sees the steps
 #              (cells) and the pinned gate (pins). Execution/placement is local/MCP, out of scope.
+#   workflow-run — one peer authors AND RUNS a local-placement workflow (the real wave executor) →
+#              steps move pending→running→terminal, the dashboard exec events fire, and the RUN-STATE
+#              converges on every peer (cell-update gossip). A human gate stalls only its branch; an
+#              approval on one peer unblocks the run for all. Step *execution* is local/MCP (out of
+#              substrate scope) — driven by the test-only local step; run-state + events are asserted.
 set -uo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -60,7 +65,7 @@ while [ $# -gt 0 ]; do
     --peers)    PEERS="${2:?--peers needs N}"; shift 2 ;;
     --mode)     MODE="${2:?--mode needs macos|docker}"; shift 2 ;;
     --net)      NET="${2:?--net needs home|corp|offline}"; shift 2 ;;
-    --scenario) SCENARIO="${2:?--scenario needs sync|files|chat|workflow|all}"; shift 2 ;;
+    --scenario) SCENARIO="${2:?--scenario needs sync|files|chat|workflow|workflow-run|all}"; shift 2 ;;
     --keep)     KEEP=1; shift ;;
     --app)      APP="${2:?--app needs N}"; shift 2 ;;
     --help|-h)  usage; exit 0 ;;
@@ -70,7 +75,7 @@ done
 
 case "$MODE" in macos|docker) ;; *) fail "--mode must be macos|docker (got '$MODE')"; exit 2 ;; esac
 case "$NET" in home|corp|offline) ;; *) fail "--net must be home|corp|offline (got '$NET')"; exit 2 ;; esac
-case "$SCENARIO" in sync|files|chat|workflow|all) ;; *) fail "--scenario invalid (got '$SCENARIO')"; exit 2 ;; esac
+case "$SCENARIO" in sync|files|chat|workflow|workflow-run|all) ;; *) fail "--scenario invalid (got '$SCENARIO')"; exit 2 ;; esac
 if ! [ "$PEERS" -ge 2 ] 2>/dev/null; then fail "--peers must be an integer >= 2 (got '$PEERS')"; exit 2; fi
 
 note "peers=$PEERS mode=$MODE net=$NET scenario=$SCENARIO keep=$KEEP app=$APP"
@@ -134,10 +139,19 @@ OUT="$(mktemp -t cyan-live.XXXXXX)"
 trap 'rm -f "$OUT" "$OUT.err"' EXIT
 
 note "booting $PEERS headless peers (auto identity, no login) → group → scenario '$SCENARIO'…"
-( cd "$REPO_DIR"
-  CYAN_LIVE=1 CYAN_LIVE_N="$PEERS" CYAN_LIVE_SCENARIO="$SCENARIO" CYAN_LIVE_NET="$NET" \
-    cargo test --test substrate_live live_run -- --exact --nocapture
-) 2>"$OUT.err" | tee "$OUT" | grep -E '^\[live\]|info ' >/dev/null || true
+# The distributed workflow-RUN scenario is its own gated binary (it authors AND RUNS a workflow,
+# asserting run-state + exec-events converge); every other scenario rides the sync/authoring rig.
+if [ "$SCENARIO" = "workflow-run" ]; then
+  ( cd "$REPO_DIR"
+    CYAN_LIVE=1 CYAN_LIVE_N="$PEERS" CYAN_LIVE_NET="$NET" \
+      cargo test --test substrate_workflow_run workflow_run_live -- --exact --nocapture
+  ) 2>"$OUT.err" | tee "$OUT" | grep -E '^\[live\]|info ' >/dev/null || true
+else
+  ( cd "$REPO_DIR"
+    CYAN_LIVE=1 CYAN_LIVE_N="$PEERS" CYAN_LIVE_SCENARIO="$SCENARIO" CYAN_LIVE_NET="$NET" \
+      cargo test --test substrate_live live_run -- --exact --nocapture
+  ) 2>"$OUT.err" | tee "$OUT" | grep -E '^\[live\]|info ' >/dev/null || true
+fi
 
 # ── Render the per-scenario, per-peer PASS/FAIL table from the machine lines ────────────────
 echo

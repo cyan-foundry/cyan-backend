@@ -369,6 +369,53 @@ impl MpNode {
         Ok(board.to_string())
     }
 
+    // ── Distributed workflow RUN (Round 10) ───────────────────────────────────────────────
+
+    /// Author a RUNNABLE workflow on this node (board + step cells carrying pipeline configs),
+    /// broadcast so peers get the configs. `shape` ∈ linear|diamond|gated. Returns the board id.
+    pub async fn wf_author(&mut self, group_id: &str, shape: &str) -> Result<String> {
+        let resp = self
+            .request(&format!("wf_author {group_id} {shape}"), REQ_TIMEOUT)
+            .await?;
+        resp.strip_prefix("ok wf_author ")
+            .map(|s| s.trim().to_string())
+            .ok_or_else(|| anyhow!("{}: unexpected wf_author response: {resp}", self.name))
+    }
+
+    /// RUN the authored workflow through the real wave executor. `mode` ∈ wave|seq. Returns the
+    /// run summary JSON (started/finished/finished_state/stats/progress + running/done/failed/
+    /// awaiting/pending step lists + mode/peak/run_id) — the run-execution oracle.
+    pub async fn wf_run(&mut self, board_id: &str, mode: &str) -> Result<serde_json::Value> {
+        // A run executes N steps (each may spawn an offline plugin probe); scale the timeout.
+        let timeout = REQ_TIMEOUT + Duration::from_secs(30);
+        let resp = self
+            .request(&format!("wf_run {board_id} {mode}"), timeout)
+            .await?;
+        let json = resp
+            .strip_prefix("ok wf_run ")
+            .ok_or_else(|| anyhow!("{}: unexpected wf_run response: {resp}", self.name))?;
+        serde_json::from_str(json)
+            .with_context(|| format!("{}: parse wf_run json: {json}", self.name))
+    }
+
+    /// THIS peer's run-state for a step (its own storage) — the convergence oracle. `absent` if
+    /// the step cell has no status yet.
+    pub async fn wf_state(&mut self, board_id: &str, step_id: &str) -> Result<String> {
+        let resp = self
+            .request(&format!("wf_state {board_id} {step_id}"), REQ_TIMEOUT)
+            .await?;
+        resp.strip_prefix(&format!("state {step_id} "))
+            .map(|s| s.trim().to_string())
+            .ok_or_else(|| anyhow!("{}: unexpected wf_state response: {resp}", self.name))
+    }
+
+    /// Approve a human gate on THIS peer; the approval is broadcast so the run unblocks for all.
+    pub async fn wf_approve(&mut self, board_id: &str, step_id: &str) -> Result<()> {
+        self.request(&format!("wf_approve {board_id} {step_id}"), REQ_TIMEOUT)
+            .await
+            .map(|_| ())
+    }
+
     /// Author `n` notes into THIS node's storage WITHOUT broadcasting them (ROUND8 §W2).
     /// Note ids are node-namespaced, so two peers' note sets are disjoint and only the
     /// anti-entropy digest+snapshot path can reconcile them — the digest-convergence proof.
