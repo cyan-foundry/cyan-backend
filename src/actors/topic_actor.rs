@@ -208,9 +208,15 @@ impl TopicActor {
         // ordered); same SwiftEvents emitted in the same order, so the FFI event stream is unchanged.
         let (persist_tx, mut persist_rx) = mpsc::unbounded_channel::<NetworkEvent>();
         let persist_event_tx = event_tx.clone();
+        let persist_node_id = node_id.clone();
         tokio::spawn(async move {
             while let Some(evt) = persist_rx.recv().await {
                 Self::persist_event(&evt);
+                // R10FB §N: count an incoming non-author chat as unread (once, ever) and
+                // emit UnreadChanged BEFORE the event itself so badges update live.
+                if let Some(changed) = Self::account_unread(&evt, &persist_node_id) {
+                    let _ = persist_event_tx.send(changed);
+                }
                 let _ = persist_event_tx.send(SwiftEvent::Network(evt));
             }
         });
@@ -1275,8 +1281,53 @@ impl TopicActor {
             NetworkEvent::ProfileUpdated { node_id, display_name, avatar_hash } => {
                 let _ = storage::profile_upsert(node_id, display_name, avatar_hash.as_deref());
             }
+            // R10FB §B3: pin sync — apply the synced board pinned flag (upsert, LWW by
+            // arrival; the single-FIFO persist worker preserves per-board order).
+            NetworkEvent::BoardPinned { board_id, is_pinned, .. } => {
+                let _ = storage::board_meta_set_pinned(board_id, *is_pinned);
+            }
+            // R10FB §F4: file delete — apply the tombstone so the deletion converges.
+            NetworkEvent::FileDeleted { id, deleted_at } => {
+                let _ = storage::file_soft_delete(id, *deleted_at);
+            }
+            // R10FB §L: BoardChanged is a transient activity signal — no storage write; the
+            // persist worker still forwards it as SwiftEvent::Network so the peer's preview
+            // refreshes and the activity marker updates.
+            NetworkEvent::BoardChanged { .. } => {}
             _ => {}
         }
+    }
+
+    /// R10FB §N — unread accounting for an inbound gossip event, run by the persist worker.
+    /// An incoming chat from a **non-author** reader counts once, ever (idempotent by
+    /// message_id; gossip echoes and re-syncs never re-increment). Opening a chat is a read,
+    /// never this write, so it cannot inflate the count. Chat is workspace-scoped in this
+    /// engine, so the unread rolls up under workspace + group (the board dimension is the
+    /// seam for board-scoped types — nudges/asks/decisions, §N5). Returns `UnreadChanged`
+    /// (carrying the fresh counts map) only on a real first-time increment.
+    fn account_unread(evt: &NetworkEvent, local_node_id: &str) -> Option<SwiftEvent> {
+        let NetworkEvent::ChatSent { id, workspace_id, author, timestamp, .. } = evt else {
+            return None;
+        };
+        if author == local_node_id {
+            return None; // our own message is never unread for us
+        }
+        let group_id = storage::workspace_get_group_id(workspace_id);
+        let newly = storage::unread_record(
+            id,
+            "chat",
+            group_id.as_deref(),
+            Some(workspace_id),
+            None,
+            *timestamp,
+        )
+        .unwrap_or(false);
+        if !newly {
+            return None;
+        }
+        storage::unread_counts()
+            .ok()
+            .map(|counts| SwiftEvent::UnreadChanged { counts })
     }
 }
 

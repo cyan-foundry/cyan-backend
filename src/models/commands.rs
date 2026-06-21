@@ -328,6 +328,20 @@ pub enum CommandMsg {
     },
 
     // ═══════════════════════════════════════════════════════════════════════
+    // NOTIFICATION / FILE COMMANDS (R10FB §N / §F)
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Mark a scope (board / workspace / group id) read: clears its unread items and the
+    /// rollups, then emits `UnreadChanged` so badges update live (R10FB §N).
+    MarkRead {
+        scope_id: String,
+    },
+    /// User-initiated file delete: soft-delete/tombstone locally and gossip `FileDeleted`
+    /// so the deletion converges to peers (R10FB §F4).
+    DeleteFile {
+        file_id: String,
+    },
+
+    // ═══════════════════════════════════════════════════════════════════════
     // INTEGRATION COMMANDS
     // ═══════════════════════════════════════════════════════════════════════
     AddIntegration {

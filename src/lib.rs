@@ -669,6 +669,7 @@ impl CommandActor {
 
                 CommandMsg::RenameBoard { id, name } => {
                     let group_id = self.get_group_id_for_board(&id);
+                    self.note_board_activity(&id, group_id.as_deref());
 
                     {
                         let db = self.db.lock_safe();
@@ -936,6 +937,7 @@ impl CommandActor {
                     let id = blake3::hash(format!("elem:{}-{}", board_id, chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)).as_bytes()).to_hex().to_string();
                     let now = chrono::Utc::now().timestamp();
                     let group_id = self.get_group_id_for_board(&board_id);
+                    self.note_board_activity(&board_id, group_id.as_deref());
 
                     {
                         let db = self.db.lock_safe();
@@ -970,6 +972,7 @@ impl CommandActor {
                 CommandMsg::UpdateWhiteboardElement { id, board_id, element_type, x, y, width, height, z_index, style_json, content_json } => {
                     let now = chrono::Utc::now().timestamp();
                     let group_id = self.get_group_id_for_board(&board_id);
+                    self.note_board_activity(&board_id, group_id.as_deref());
 
                     {
                         let db = self.db.lock_safe();
@@ -1002,6 +1005,7 @@ impl CommandActor {
 
                 CommandMsg::DeleteWhiteboardElement { id, board_id } => {
                     let group_id = self.get_group_id_for_board(&board_id);
+                    self.note_board_activity(&board_id, group_id.as_deref());
 
                     {
                         let db = self.db.lock_safe();
@@ -1020,6 +1024,7 @@ impl CommandActor {
 
                 CommandMsg::ClearWhiteboard { board_id } => {
                     let group_id = self.get_group_id_for_board(&board_id);
+                    self.note_board_activity(&board_id, group_id.as_deref());
 
                     {
                         let db = self.db.lock_safe();
@@ -1043,6 +1048,7 @@ impl CommandActor {
                     let id = blake3::hash(format!("cell:{}-{}", board_id, chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)).as_bytes()).to_hex().to_string();
                     let now = chrono::Utc::now().timestamp();
                     let group_id = self.get_group_id_for_board(&board_id);
+                    self.note_board_activity(&board_id, group_id.as_deref());
 
                     {
                         let db = self.db.lock_safe();
@@ -1075,6 +1081,7 @@ impl CommandActor {
                     let cell_type = crate::workflow::coerce_authoring_cell_type(&cell_type);
                     let now = chrono::Utc::now().timestamp();
                     let group_id = self.get_group_id_for_board(&board_id);
+                    self.note_board_activity(&board_id, group_id.as_deref());
 
                     {
                         let db = self.db.lock_safe();
@@ -1108,6 +1115,7 @@ impl CommandActor {
 
                 CommandMsg::DeleteNotebookCell { id, board_id } => {
                     let group_id = self.get_group_id_for_board(&board_id);
+                    self.note_board_activity(&board_id, group_id.as_deref());
 
                     {
                         let db = self.db.lock_safe();
@@ -1127,6 +1135,7 @@ impl CommandActor {
                 CommandMsg::ReorderNotebookCells { board_id, cell_ids } => {
                     let group_id = self.get_group_id_for_board(&board_id);
                     let now = chrono::Utc::now().timestamp();
+                    self.note_board_activity(&board_id, group_id.as_deref());
 
                     {
                         let db = self.db.lock_safe();
@@ -1179,14 +1188,49 @@ impl CommandActor {
                 }
 
                 CommandMsg::SetBoardPinned { board_id, is_pinned } => {
-                    {
-                        let db = self.db.lock_safe();
-                        let _ = db.execute(
-                            "UPDATE board_metadata SET is_pinned = ?1 WHERE board_id = ?2",
-                            params![is_pinned as i32, board_id],
-                        );
+                    // R10FB §B3: pinning is a SYNCED board property. Upsert the flag locally,
+                    // then gossip `BoardPinned` so the pin appears on peers (the previous
+                    // local-only UPDATE was the "pin didn't show on peer 2" bug).
+                    let now = chrono::Utc::now().timestamp();
+                    let _ = storage::board_meta_set_pinned(&board_id, is_pinned);
+                    let group_id = self.get_group_id_for_board(&board_id);
+                    let event = NetworkEvent::BoardPinned {
+                        board_id: board_id.clone(),
+                        is_pinned,
+                        updated_at: now,
+                    };
+                    if let Some(gid) = group_id {
+                        let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                            group_id: gid,
+                            event: event.clone(),
+                        });
                     }
+                    let _ = self.event_tx.send(SwiftEvent::Network(event));
+                    // Keep the existing local UI signal for back-compat.
                     let _ = self.event_tx.send(SwiftEvent::BoardMetadataUpdated { board_id });
+                }
+
+                CommandMsg::MarkRead { scope_id } => {
+                    // R10FB §N: opening clears unread at this scope; rollups drop automatically.
+                    let _ = storage::unread_mark_read(&scope_id);
+                    if let Ok(counts) = storage::unread_counts() {
+                        let _ = self.event_tx.send(SwiftEvent::UnreadChanged { counts });
+                    }
+                }
+
+                CommandMsg::DeleteFile { file_id } => {
+                    // R10FB §F4: user-initiated soft-delete/tombstone that syncs to peers.
+                    let now = chrono::Utc::now().timestamp();
+                    let group_id = storage::file_get_group_id(&file_id);
+                    let _ = storage::file_soft_delete(&file_id, now);
+                    let event = NetworkEvent::FileDeleted { id: file_id.clone(), deleted_at: now };
+                    if let Some(gid) = group_id {
+                        let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                            group_id: gid,
+                            event: event.clone(),
+                        });
+                    }
+                    let _ = self.event_tx.send(SwiftEvent::Network(event));
                 }
 
                 // Integration commands
@@ -1340,8 +1384,9 @@ impl CommandActor {
                 }
 
                 CommandMsg::SeedDemoIfEmpty => {
-                    // Demo seeding handled via cyan_seed_demo_if_empty FFI
-                    tracing::debug!("SeedDemoIfEmpty triggered");
+                    // R10FB §D: demo seeding REMOVED. Inert no-op kept for ABI/command-shape
+                    // stability — never creates a "Demo Group"/"Demo Board".
+                    tracing::debug!("SeedDemoIfEmpty is a no-op (demo seeding removed)");
                 }
             }
         }
@@ -1358,6 +1403,25 @@ impl CommandActor {
         ws_id.and_then(|ws| {
             db.query_row("SELECT group_id FROM workspaces WHERE id=?1", params![ws], |r| r.get(0)).ok()
         })
+    }
+
+    /// R10FB §L (live activity): announce that this board was just edited, so peers refresh
+    /// that board's preview live and show a "recently active/edited" marker. Gossiped (when
+    /// the board has a group) and surfaced locally as `SwiftEvent::Network(BoardChanged)`.
+    /// `group_id` is the board's group, already resolved by the caller (avoid a re-lookup).
+    fn note_board_activity(&self, board_id: &str, group_id: Option<&str>) {
+        let event = NetworkEvent::BoardChanged {
+            board_id: board_id.to_string(),
+            editor: self.node_id.clone(),
+            ts: chrono::Utc::now().timestamp(),
+        };
+        if let Some(gid) = group_id {
+            let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                group_id: gid.to_string(),
+                event: event.clone(),
+            });
+        }
+        let _ = self.event_tx.send(SwiftEvent::Network(event));
     }
 }
 
@@ -1508,39 +1572,10 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
     serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string())
 }
 
-#[allow(dead_code)] // pre-existing demo-seed helper; call site removed, kept for FFI demo path
-fn seed_demo_if_empty(db: &Arc<Mutex<Connection>>) {
-    let db_clone = db.clone();
-    let count: i64 = db_clone.lock_safe().query_row("SELECT COUNT(*) FROM groups", [], |r| r.get(0)).unwrap_or(1);
-    if count > 0 {
-        return;
-    }
-
-    let group_id = blake3::hash(b"demo-group").to_hex().to_string();
-    let now = chrono::Utc::now().timestamp();
-    {
-        let _ = db_clone.lock_safe().execute(
-            "INSERT INTO groups (id, name, icon, color, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![group_id, "Demo Group", "folder.fill", "#00AEEF", now],
-        );
-    }
-
-    let workspace_id = blake3::hash(b"demo-workspace").to_hex().to_string();
-    {
-        let _ = db_clone.lock_safe().execute(
-            "INSERT INTO workspaces (id, group_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![workspace_id, group_id, "Demo Workspace", now],
-        );
-    }
-
-    let board_id = blake3::hash(b"demo-board").to_hex().to_string();
-    {
-        let _ = db_clone.lock_safe().execute(
-            "INSERT INTO objects (id, workspace_id, type, name, created_at) VALUES (?1, ?2, 'whiteboard', ?3, ?4)",
-            params![board_id, workspace_id, "Demo Board", now],
-        );
-    }
-}
+// R10FB §D: the demo-seed helper has been REMOVED. A fresh/empty DB must never auto-create
+// a "Demo Group"/"Demo Board" — the engine creates no data on its own; first-run is the
+// app's empty state. The `SeedDemoIfEmpty` command + `cyan_seed_demo_if_empty` FFI are kept
+// as inert no-ops (gated) so the C ABI stays stable until iOS stops calling them.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // EVENT ROUTING - Routes SwiftEvent to appropriate component buffers
@@ -1626,8 +1661,18 @@ fn route_event_to_buffers(
                     board_grid.lock_safe().push_back(event_json.to_string());
                 }
 
+                // Live activity (R10FB §L) + pin sync (R10FB §B3) → FileTree + BoardGrid.
+                // BoardChanged refreshes the board's preview live and feeds the
+                // "recently active/edited" marker; BoardPinned flips the pin on the card.
+                NetworkEvent::BoardChanged { .. } |
+                NetworkEvent::BoardPinned { .. } => {
+                    file_tree.lock_safe().push_back(event_json.to_string());
+                    board_grid.lock_safe().push_back(event_json.to_string());
+                }
+
                 // File changes → FileTree
-                NetworkEvent::FileAvailable { .. } => {
+                NetworkEvent::FileAvailable { .. } |
+                NetworkEvent::FileDeleted { .. } => {
                     file_tree.lock_safe().push_back(event_json.to_string());
                 }
 
@@ -1741,6 +1786,14 @@ fn route_event_to_buffers(
         SwiftEvent::ApprovalResolved { .. } |
         SwiftEvent::WorkflowRunFinished { .. } |
         SwiftEvent::WorkflowStatsUpdated { .. } => {
+            network_status.lock_safe().push_back(event_json.to_string());
+        }
+
+        // Unread counts (R10FB §N) → FileTree + BoardGrid (dots at group/workspace/board)
+        // and NetworkStatus (the dock total badge). Receive-only; the app re-reads the map.
+        SwiftEvent::UnreadChanged { .. } => {
+            file_tree.lock_safe().push_back(event_json.to_string());
+            board_grid.lock_safe().push_back(event_json.to_string());
             network_status.lock_safe().push_back(event_json.to_string());
         }
     }

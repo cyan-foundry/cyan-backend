@@ -896,12 +896,12 @@ pub fn file_get_group_id(file_id: &str) -> Option<String> {
     ).optional().ok()?
 }
 
-/// List files by group (for snapshot)
+/// List files by group (for snapshot). Tombstoned (soft-deleted) files are excluded.
 pub fn file_list_by_group(group_id: &str) -> Result<Vec<FileDTO>> {
     let conn = db().lock_safe();
     let mut stmt = conn.prepare(
         "SELECT id, group_id, workspace_id, board_id, name, hash, size, source_peer, local_path, created_at
-         FROM objects WHERE type = 'file' AND group_id = ?1 ORDER BY name"
+         FROM objects WHERE type = 'file' AND group_id = ?1 AND COALESCE(deleted, 0) = 0 ORDER BY name"
     )?;
 
     let rows = stmt.query_map(params![group_id], |r| {
@@ -920,6 +920,281 @@ pub fn file_list_by_group(group_id: &str) -> Result<Vec<FileDTO>> {
     })?;
 
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// List the active (non-tombstoned) files scoped to a board (R10FB §F1 — files persist
+/// at board level). The board dimension is `objects.board_id`.
+pub fn file_list_by_board(board_id: &str) -> Result<Vec<FileDTO>> {
+    let conn = db().lock_safe();
+    let mut stmt = conn.prepare(
+        "SELECT id, group_id, workspace_id, board_id, name, hash, size, source_peer, local_path, created_at
+         FROM objects WHERE type = 'file' AND board_id = ?1 AND COALESCE(deleted, 0) = 0 ORDER BY name",
+    )?;
+    let rows = stmt.query_map(params![board_id], |r| {
+        Ok(FileDTO {
+            id: r.get(0)?,
+            group_id: r.get(1)?,
+            workspace_id: r.get(2)?,
+            board_id: r.get(3)?,
+            name: r.get(4)?,
+            hash: r.get(5)?,
+            size: r.get::<_, i64>(6)? as u64,
+            source_peer: r.get(7)?,
+            local_path: r.get(8)?,
+            created_at: r.get(9)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Resolve a file by its stable workflow handle `group_id:workspace_id:board_id:file_name`
+/// (R10FB §F3). Returns the active (non-tombstoned) board-scoped file with that name, or
+/// `None`. Names are unique per level (see `file_insert_dedup`), so this is unambiguous.
+pub fn file_resolve_handle(
+    group_id: &str,
+    workspace_id: &str,
+    board_id: &str,
+    file_name: &str,
+) -> Option<FileDTO> {
+    let conn = db().lock_safe();
+    conn.query_row(
+        "SELECT id, group_id, workspace_id, board_id, name, hash, size, source_peer, local_path, created_at
+         FROM objects
+         WHERE type = 'file' AND COALESCE(deleted, 0) = 0
+           AND group_id = ?1 AND workspace_id = ?2 AND board_id = ?3 AND name = ?4
+         LIMIT 1",
+        params![group_id, workspace_id, board_id, file_name],
+        |r| {
+            Ok(FileDTO {
+                id: r.get(0)?,
+                group_id: r.get(1)?,
+                workspace_id: r.get(2)?,
+                board_id: r.get(3)?,
+                name: r.get(4)?,
+                hash: r.get(5)?,
+                size: r.get::<_, i64>(6)? as u64,
+                source_peer: r.get(7)?,
+                local_path: r.get(8)?,
+                created_at: r.get(9)?,
+            })
+        },
+    )
+    .optional()
+    .ok()?
+}
+
+/// Soft-delete (tombstone) a file (R10FB §F4). The engine never hard-deletes a file; the
+/// tombstone syncs to peers via `NetworkEvent::FileDeleted`. Idempotent.
+pub fn file_soft_delete(id: &str, deleted_at: i64) -> Result<()> {
+    let conn = db().lock_safe();
+    conn.execute(
+        "UPDATE objects SET deleted = 1 WHERE id = ?1 AND type = 'file'",
+        params![id],
+    )?;
+    // The deletion order is carried by the FileDeleted event; `deleted_at` is accepted for
+    // a stable signature and future durable-tombstone use.
+    let _ = deleted_at;
+    Ok(())
+}
+
+/// Whether a file is tombstoned. `None` if the file id is unknown.
+pub fn file_is_deleted(id: &str) -> Option<bool> {
+    let conn = db().lock_safe();
+    conn.query_row(
+        "SELECT COALESCE(deleted, 0) FROM objects WHERE id = ?1 AND type = 'file'",
+        params![id],
+        |r| Ok(r.get::<_, i64>(0)? != 0),
+    )
+    .optional()
+    .ok()?
+}
+
+/// Insert a user-shared file enforcing **unique names per level + dedupe** (R10FB §F2).
+///
+/// The "level" is the most specific scope present (board → workspace → group). Among the
+/// active files at that level:
+/// - same name **and** same content (`hash`) ⇒ **dedupe**: no new row, returns the
+///   existing `(id, name)` (idempotent re-share).
+/// - same name, different content ⇒ **rename**: the new file gets `name (2)`, `name (3)`…
+///   so names stay unique within the level.
+///
+/// Returns the `(id, name)` actually used. The plain `file_insert*` paths (snapshot/sync)
+/// are unchanged — they preserve ids verbatim so replicas converge.
+pub fn file_insert_dedup(
+    id: &str,
+    group_id: Option<&str>,
+    workspace_id: Option<&str>,
+    board_id: Option<&str>,
+    name: &str,
+    hash: &str,
+    size: u64,
+    source_peer: &str,
+    created_at: i64,
+) -> Result<(String, String)> {
+    let conn = db().lock_safe();
+    let existing = files_at_level(&conn, group_id, workspace_id, board_id)?;
+
+    // Dedupe: identical content already shared at this level → reuse it.
+    if let Some((eid, ename, _)) = existing.iter().find(|(_, n, h)| n == name && h == hash) {
+        return Ok((eid.clone(), ename.clone()));
+    }
+
+    // Otherwise pick a name unique within the level.
+    let taken: HashSet<&str> = existing.iter().map(|(_, n, _)| n.as_str()).collect();
+    let unique_name = unique_file_name(name, &taken);
+
+    conn.execute(
+        "INSERT OR IGNORE INTO objects (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, created_at, deleted)
+         VALUES (?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7, ?8, ?9, 0)",
+        params![id, group_id, workspace_id, board_id, unique_name, hash, size as i64, source_peer, created_at],
+    )?;
+    Ok((id.to_string(), unique_name))
+}
+
+/// Active (non-tombstoned) files at the most-specific scope level of (group, ws, board).
+fn files_at_level(
+    conn: &Connection,
+    group_id: Option<&str>,
+    workspace_id: Option<&str>,
+    board_id: Option<&str>,
+) -> Result<Vec<(String, String, String)>> {
+    let (sql, key): (&str, &str) = if let Some(b) = board_id {
+        (
+            "SELECT id, name, hash FROM objects WHERE type='file' AND COALESCE(deleted,0)=0 AND board_id = ?1",
+            b,
+        )
+    } else if let Some(w) = workspace_id {
+        (
+            "SELECT id, name, hash FROM objects WHERE type='file' AND COALESCE(deleted,0)=0 AND workspace_id = ?1 AND board_id IS NULL",
+            w,
+        )
+    } else if let Some(g) = group_id {
+        (
+            "SELECT id, name, hash FROM objects WHERE type='file' AND COALESCE(deleted,0)=0 AND group_id = ?1 AND workspace_id IS NULL AND board_id IS NULL",
+            g,
+        )
+    } else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Produce a name not already in `taken`, appending ` (n)` before the extension.
+fn unique_file_name(name: &str, taken: &HashSet<&str>) -> String {
+    if !taken.contains(name) {
+        return name.to_string();
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    let mut n = 2;
+    loop {
+        let candidate = format!("{stem} ({n}){ext}");
+        if !taken.contains(candidate.as_str()) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BOARD PINNED (R10FB §B3 — synced board property)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Set a board's pinned flag (`board_metadata.is_pinned`), upserting the metadata row so
+/// the flag lands even on a peer that has no metadata row yet (R10FB §B3).
+pub fn board_meta_set_pinned(board_id: &str, is_pinned: bool) -> Result<()> {
+    let conn = db().lock_safe();
+    conn.execute(
+        "INSERT INTO board_metadata (board_id, is_pinned) VALUES (?1, ?2)
+         ON CONFLICT(board_id) DO UPDATE SET is_pinned = excluded.is_pinned",
+        params![board_id, is_pinned as i32],
+    )?;
+    Ok(())
+}
+
+/// Whether a board is pinned.
+pub fn board_is_pinned(board_id: &str) -> bool {
+    let conn = db().lock_safe();
+    conn.query_row(
+        "SELECT COALESCE(is_pinned, 0) FROM board_metadata WHERE board_id = ?1",
+        params![board_id],
+        |r| Ok(r.get::<_, i64>(0)? != 0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UNREAD (R10FB §N — per-reader unread, idempotent by message_id)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Record a message as unread for this reader. Idempotent by `message_id`: a message
+/// counts once, ever — re-delivery (gossip echo, re-sync) never re-increments, and opening
+/// a chat (a read) never calls this. Returns `true` iff this is the first time the message
+/// is recorded (so the caller can emit an `UnreadChanged` only on a real change).
+///
+/// `kind` is the notification type ('chat' now; the seam for nudges/asks/decisions, §N5).
+/// The scope columns drive the board→workspace→group rollup in [`unread_counts`].
+pub fn unread_record(
+    message_id: &str,
+    kind: &str,
+    group_id: Option<&str>,
+    workspace_id: Option<&str>,
+    board_id: Option<&str>,
+    created_at: i64,
+) -> Result<bool> {
+    let conn = db().lock_safe();
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO unread (message_id, kind, group_id, workspace_id, board_id, read, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+        params![message_id, kind, group_id, workspace_id, board_id, created_at],
+    )?;
+    Ok(changed > 0)
+}
+
+/// The live `{scope_id: count}` map of unread counts (R10FB §N). Each open (unread) item
+/// contributes +1 to each of its non-null board, workspace and group ids, so the same map
+/// answers the board card, the workspace and the group at once.
+pub fn unread_counts() -> Result<std::collections::HashMap<String, i64>> {
+    let conn = db().lock_safe();
+    let mut stmt = conn.prepare(
+        "SELECT group_id, workspace_id, board_id FROM unread WHERE read = 0",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for row in rows {
+        let (g, w, b) = row?;
+        for id in [g, w, b].into_iter().flatten() {
+            *counts.entry(id).or_insert(0) += 1;
+        }
+    }
+    Ok(counts)
+}
+
+/// Mark every unread item under `scope_id` as read — `scope_id` may be a board, workspace
+/// or group id, so opening at any level clears it and the rollups drop automatically
+/// (R10FB §N). Returns the number of items cleared. Read state is sticky (the row stays,
+/// so the message stays counted-once and never re-increments on re-delivery).
+pub fn unread_mark_read(scope_id: &str) -> Result<usize> {
+    let conn = db().lock_safe();
+    let n = conn.execute(
+        "UPDATE unread SET read = 1
+         WHERE read = 0 AND (board_id = ?1 OR workspace_id = ?1 OR group_id = ?1)",
+        params![scope_id],
+    )?;
+    Ok(n)
 }
 
 /// One installed plugin bundle file discovered in a group's Plugins workspace.
@@ -1881,6 +2156,38 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                 pinned INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )",
+            [],
+        );
+    }
+
+    // R10FB §F4: soft-delete/tombstone column for files (objects). A user-initiated
+    // delete sets `deleted=1` so the deletion converges to peers; the engine never
+    // hard-deletes a file. All file reads filter `deleted=0`. Idempotent migration.
+    if conn.prepare("SELECT deleted FROM objects LIMIT 1").is_err() {
+        tracing::info!("Migration: adding deleted column to objects (file tombstone)");
+        let _ = conn.execute("ALTER TABLE objects ADD COLUMN deleted INTEGER DEFAULT 0", []);
+    }
+
+    // R10FB §N: per-reader unread ledger. One row per message_id, ever — the PRIMARY KEY
+    // makes counting idempotent (a message counts once for this reader). `kind` is the
+    // notification type seam ('chat' now; 'nudge'/'ask'/'decision' later, §N5). Each row
+    // carries the board/workspace/group scope so counts roll up at all three levels.
+    if conn.prepare("SELECT message_id FROM unread LIMIT 1").is_err() {
+        tracing::info!("Migration: creating unread table");
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS unread (
+                message_id   TEXT PRIMARY KEY,
+                kind         TEXT NOT NULL,
+                group_id     TEXT,
+                workspace_id TEXT,
+                board_id     TEXT,
+                read         INTEGER NOT NULL DEFAULT 0,
+                created_at   INTEGER NOT NULL
+            )",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_unread_open ON unread(read)",
             [],
         );
     }

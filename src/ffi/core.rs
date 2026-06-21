@@ -851,10 +851,83 @@ pub extern "C" fn cyan_upload_file_to_workspace(workspace_id: *const c_char, pat
     });
 }
 
+/// R10FB §D: demo seeding has been REMOVED. This symbol is kept (inert) only so the C ABI
+/// stays stable until iOS stops calling it — the command it sends is a no-op and a fresh
+/// DB never gets a "Demo Group"/"Demo Board".
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_seed_demo_if_empty() {
     if let Some(sys) = SYSTEM.get() {
         let _ = sys.command_tx.send(CommandMsg::SeedDemoIfEmpty);
+    }
+}
+
+// ---------- FFI: unread / notifications (R10FB §N) ----------
+
+/// Unread counts as a JSON object `{scope_id: count}` covering board, workspace and group
+/// ids (a single message rolls up to all three). The app looks up its board-card, workspace
+/// and group ids in this one map; sum it for the dock badge total. Caller frees with
+/// `cyan_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_unread_counts() -> *mut c_char {
+    let counts = storage::unread_counts().unwrap_or_default();
+    let json = serde_json::to_string(&counts).unwrap_or_else(|_| "{}".to_string());
+    match CString::new(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Mark a scope read — `scope_id` may be a board, workspace or group id. Clears that scope's
+/// unread items and the rollups, then emits `UnreadChanged` so badges update live. Opening a
+/// chat is a READ (this), never a write that increments.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_mark_read(scope_id: *const c_char) {
+    let Some(scope_id) = (unsafe { cstr_arg(scope_id) }) else {
+        return;
+    };
+    if let Some(sys) = SYSTEM.get() {
+        let _ = sys.command_tx.send(CommandMsg::MarkRead { scope_id });
+    }
+}
+
+// ---------- FFI: files — delete + handle resolver (R10FB §F) ----------
+
+/// User-initiated file delete (R10FB §F4): soft-delete/tombstone locally and gossip the
+/// deletion so it converges to peers. No hard delete in the engine.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_delete_file(file_id: *const c_char) {
+    let Some(file_id) = (unsafe { cstr_arg(file_id) }) else {
+        return;
+    };
+    if let Some(sys) = SYSTEM.get() {
+        let _ = sys.command_tx.send(CommandMsg::DeleteFile { file_id });
+    }
+}
+
+/// Resolve a file by its stable workflow handle `group_id:workspace_id:board_id:file_name`
+/// (R10FB §F3). Returns the file as JSON, or `null` if no active file matches. Caller frees
+/// with `cyan_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_resolve_file_handle(
+    group_id: *const c_char,
+    workspace_id: *const c_char,
+    board_id: *const c_char,
+    file_name: *const c_char,
+) -> *mut c_char {
+    let (Some(g), Some(w), Some(b), Some(name)) = (
+        unsafe { cstr_arg(group_id) },
+        unsafe { cstr_arg(workspace_id) },
+        unsafe { cstr_arg(board_id) },
+        unsafe { cstr_arg(file_name) },
+    ) else {
+        return std::ptr::null_mut();
+    };
+    match storage::file_resolve_handle(&g, &w, &b, &name) {
+        Some(file) => match serde_json::to_string(&file).ok().and_then(|j| CString::new(j).ok()) {
+            Some(s) => s.into_raw(),
+            None => std::ptr::null_mut(),
+        },
+        None => std::ptr::null_mut(),
     }
 }
 

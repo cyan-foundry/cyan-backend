@@ -233,6 +233,32 @@ pub enum NetworkEvent {
         proof_signature: String,
         revealed_at: i64,
     },
+    // ---- Live activity (R10FB §L) ----
+    /// A board was edited (step add/edit, element change, rename, …). Gossiped so peers
+    /// refresh that board's preview live and show a "recently active/edited" marker —
+    /// receive-only on the peer side (no storage write; a transient activity signal).
+    BoardChanged {
+        board_id: String,
+        /// Node id of the peer that made the edit.
+        editor: String,
+        ts: i64,
+    },
+    // ---- Pin sync (R10FB §B3) ----
+    /// A board's pinned flag (`board_metadata.is_pinned`) changed. Pinning is now a
+    /// synced board property: the receiver upserts the flag so it lands even with no
+    /// prior metadata row. Last write wins (single-FIFO persist keeps per-board order).
+    BoardPinned {
+        board_id: String,
+        is_pinned: bool,
+        updated_at: i64,
+    },
+    // ---- File delete (R10FB §F4) ----
+    /// A file was deleted by a user. Soft-delete/tombstone (no hard delete in the engine)
+    /// so the deletion converges to peers; the receiver applies the same tombstone.
+    FileDeleted {
+        id: String,
+        deleted_at: i64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,6 +433,12 @@ pub enum SwiftEvent {
         board_id: String,
         workflow_id: String,
         snapshot: crate::dashboard::DashboardSnapshot,
+    },
+    /// Unread counts changed (R10FB §N). Carries the full `{scope_id: count}` map (board,
+    /// workspace and group ids) so the app updates badges LIVE at all three levels and the
+    /// dock total without traversing away. Additive, receive-only.
+    UnreadChanged {
+        counts: std::collections::HashMap<String, i64>,
     },
 }
 
