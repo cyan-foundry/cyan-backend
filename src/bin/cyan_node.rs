@@ -39,6 +39,22 @@
 //! - `revoke_grant <gid> <nonce>`         `@@CYAN@@ ok revoke_grant`
 //! - `join_group_grant <gid> <boot|-> <qr>`  `@@CYAN@@ ok join_group_grant`
 //!
+//! ## Mesh-hardening verbs (MESH_HARDENING_SPEC §2/§5/§11 — the Docker/netem e2e rig)
+//! - `seed_peer <gid> <endpoint-addr-json>`  `@@CYAN@@ ok seed_peer` (§2 seed pipeline →
+//!   `SeedGroupPeer`: make a peer resolvable + route it into the group topic so `NeighborUp`
+//!   fires with NO relay/bootstrap — the LAN/no-infra mesh-formation path)
+//! - `catch_up <gid> <source_peer_hex> [since]`  `@@CYAN@@ ok catch_up` (§5 incremental
+//!   catch-up → `CatchUp`: pull ONLY the range since `since` from a holder; `since` omitted ⇒
+//!   the persisted import/high-water mark)
+//! - `count members <gid>`                  `@@CYAN@@ count members <n>` (§3 persisted roster)
+//! - `bundle_pubkey`                         `@@CYAN@@ bundle_pubkey <x25519-hex>` (§11 the
+//!   device's sealed-box recipient key an inviter exports to)
+//! - `export_group <gid> <invitee_x_pub_hex>` `@@CYAN@@ bundle <bundle-json>` (§11 signed,
+//!   grant-scoped, invitee-encrypted `.cyangroup` payload — single-line JSON, travels
+//!   out-of-band over the harness like email/AirDrop/USB)
+//! - `import_group <bundle-json>`            `@@CYAN@@ ok import_group <gid>` (§11 air-gapped
+//!   import: verify + scope + decrypt + seed + stamp watermark; touches NO network)
+//!
 //! ## Stress / chaos fabric verbs (Round 7)
 //! - `post_edits <gid> <n> [board]`       `@@CYAN@@ ok post_edits <n>` (local insert + gossip broadcast)
 //! - `post_chat <gid> <n> [ws]`           `@@CYAN@@ ok post_chat <n>` (local insert + ChatSent broadcast)
@@ -421,6 +437,81 @@ async fn handle_verb(
             let gid = rest.get(1).ok_or_else(|| anyhow!("group_id required"))?;
             let n = count_kind(kind, gid)?;
             Ok(format!("count {kind} {n}"))
+        }
+
+        // ── Mesh-hardening verbs (MESH_HARDENING §2/§5/§11) ──────────────────────────────
+        // §2 seed pipeline: turn a resolvable EndpointAddr into a present peer in ONE group's
+        // gossip topic. This is the no-relay/no-bootstrap formation path — the engine makes the
+        // addr resolvable (`add_endpoint_info`), persists it for rejoin, and routes it into the
+        // topic so `NeighborUp` fires. In the rig this stands in for an mDNS-discovered peer
+        // (Docker bridges don't carry multicast reliably; the seed pipeline it feeds is the same).
+        // `seed_peer <gid> <endpoint-addr-json>`.
+        "seed_peer" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?.to_string();
+            // The addr JSON has no whitespace from serde, but rejoin defensively.
+            let addr_json = rest[1..].join(" ");
+            if addr_json.is_empty() {
+                return Err(anyhow!("addr_json required"));
+            }
+            cmd_tx
+                .send(NetworkCommand::SeedGroupPeer { group_id: gid, addr_json })
+                .map_err(|e| anyhow!("send SeedGroupPeer: {e}"))?;
+            Ok("ok seed_peer".to_string())
+        }
+
+        // §5 incremental catch-up: pull ONLY the missing range for a group from a holder, since
+        // the requester's high-water mark. `since` omitted ⇒ the engine uses the persisted
+        // import/high-water mark. Used by a peer returning after a partition/offline window to
+        // reconcile WITHOUT a full re-snapshot. `catch_up <gid> <source_peer_hex> [since]`.
+        "catch_up" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?.to_string();
+            let source = rest.get(1).ok_or_else(|| anyhow!("source_peer required"))?.to_string();
+            let since: Option<i64> = rest.get(2).and_then(|s| s.parse().ok());
+            cmd_tx
+                .send(NetworkCommand::CatchUp { group_id: gid, source_peer: source, since })
+                .map_err(|e| anyhow!("send CatchUp: {e}"))?;
+            Ok("ok catch_up".to_string())
+        }
+
+        // §11 this device's X25519 sealed-box recipient key — what an inviter exports a bundle
+        // TO so only this device can open it. Derived from the node's Ed25519 identity.
+        "bundle_pubkey" => {
+            let hex = cyan_backend::group_bundle::invitee_pubkey_hex(grant_secret);
+            Ok(format!("bundle_pubkey {hex}"))
+        }
+
+        // §11 export a signed, grant-scoped, invitee-encrypted `.cyangroup` bundle of THIS node's
+        // current group state. This node issues a Member grant for the group (signed by its own
+        // admin key — it is the producer), then seals the snapshot to the invitee's X25519 key.
+        // The bundle JSON is returned on the wire (single line, no whitespace) so it can be
+        // handed out-of-band to an air-gapped importer — exactly the email/AirDrop/USB delivery
+        // §11 describes. `export_group <gid> <invitee_x_pub_hex>` → `bundle <json>`.
+        "export_group" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?;
+            let invitee_x_pub = rest.get(1).ok_or_else(|| anyhow!("invitee_x_pub_hex required"))?;
+            let now = unix_now();
+            let expiry = now + 3600;
+            let nonce = format!("{}-{}-export", &admin_pubkey[..8], gid);
+            let grant = Grant::issue_unchecked(gid, Role::Member, grant_secret, now, expiry, &nonce);
+            let bundle =
+                cyan_backend::group_bundle::export_group(gid, &grant, invitee_x_pub, grant_secret, now as i64)
+                    .map_err(|e| anyhow!("export_group: {e}"))?;
+            Ok(format!("bundle {}", bundle.to_json()))
+        }
+
+        // §11 air-gapped import: verify (outer sig · grant sig · scope) + decrypt + seed storage +
+        // stamp the "synced as of T" watermark §5 catch-up reconciles from. Touches NO network —
+        // the honest cold-start path. `import_group <bundle-json>` → `ok import_group <gid>`.
+        "import_group" => {
+            let json = rest.join(" ");
+            if json.is_empty() {
+                return Err(anyhow!("bundle json required"));
+            }
+            let bundle = cyan_backend::group_bundle::GroupBundle::from_json(&json)
+                .map_err(|e| anyhow!("parse bundle: {e}"))?;
+            let gid = cyan_backend::group_bundle::import_group(&bundle, grant_secret)
+                .map_err(|e| anyhow!("import_group: {e}"))?;
+            Ok(format!("ok import_group {gid}"))
         }
 
         // ── Stress / chaos fabric verbs (Round 7) ─────────────────────────────────────────
@@ -978,6 +1069,10 @@ fn count_kind(kind: &str, group_id: &str) -> Result<usize> {
         "files" => storage::file_list_by_group(group_id)
             .map_err(|e| anyhow!("file_list_by_group: {e}"))?
             .len(),
+        // MESH_HARDENING §3: the PERSISTENT roster — every peer ever seen over the mesh,
+        // online or not (the row is never deleted). The honest per-node oracle for "an offline
+        // peer keeps its cached row" and "the roster survives reconnect".
+        "members" => storage::group_members_list(group_id).len(),
         other => return Err(anyhow!("unknown count kind '{other}'")),
     };
     Ok(n)

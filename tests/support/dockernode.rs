@@ -45,6 +45,9 @@ pub enum Relay {
 pub struct DockerNode {
     pub name: String,
     pub node_id: String,
+    /// The primary Docker network this container was launched on (the one `partition`/`heal`
+    /// detach and re-attach to emulate a node going offline/coming back without killing it).
+    pub network: String,
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
@@ -166,6 +169,7 @@ impl DockerNode {
         let mut node = DockerNode {
             name: spec.name.to_string(),
             node_id: String::new(),
+            network: spec.network.to_string(),
             child,
             stdin,
             stdout: BufReader::new(stdout),
@@ -285,6 +289,137 @@ impl DockerNode {
             .ok_or_else(|| anyhow!("{}: unexpected count response: {resp}", self.name))
     }
 
+    // ── Mesh-hardening verbs (MESH_HARDENING §2/§3/§5/§11) ──────────────────────────────
+
+    /// §2 seed pipeline: feed a resolvable `EndpointAddr` (JSON) into ONE group's gossip topic
+    /// so `NeighborUp` fires with no relay/bootstrap. The no-infra mesh-formation path (the rig
+    /// stand-in for an mDNS-discovered peer, since Docker bridges don't carry multicast).
+    pub async fn seed_peer(&mut self, group_id: &str, addr_json: &str) -> Result<()> {
+        self.request(&format!("seed_peer {group_id} {addr_json}"), REQ_TIMEOUT)
+            .await
+            .map(|_| ())
+    }
+
+    /// §5 incremental catch-up: pull only the range since `since` from `source_peer` (a holder).
+    /// `since == None` ⇒ the engine uses the persisted import/high-water mark. Returning peers
+    /// reconcile a partition/offline gap with this instead of a full re-snapshot.
+    pub async fn catch_up(
+        &mut self,
+        group_id: &str,
+        source_peer: &str,
+        since: Option<i64>,
+    ) -> Result<()> {
+        let line = match since {
+            Some(s) => format!("catch_up {group_id} {source_peer} {s}"),
+            None => format!("catch_up {group_id} {source_peer}"),
+        };
+        self.request(&line, REQ_TIMEOUT).await.map(|_| ())
+    }
+
+    /// §3 persisted roster size for a group (every peer ever seen, online or not).
+    pub async fn count_members(&mut self, group_id: &str) -> Result<usize> {
+        self.count("members", group_id).await
+    }
+
+    /// §11 this device's X25519 sealed-box recipient key (hex) — an inviter exports a bundle TO it.
+    pub async fn bundle_pubkey(&mut self) -> Result<String> {
+        let resp = self.request("bundle_pubkey", REQ_TIMEOUT).await?;
+        resp.strip_prefix("bundle_pubkey ")
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("{}: unexpected bundle_pubkey response: {resp}", self.name))
+    }
+
+    /// §11 export a signed, grant-scoped, invitee-encrypted `.cyangroup` bundle (JSON on the wire).
+    /// The bundle is handed out-of-band to an importer — it never crosses the mesh.
+    pub async fn export_group(&mut self, group_id: &str, invitee_x_pub_hex: &str) -> Result<String> {
+        let resp = self
+            .request(&format!("export_group {group_id} {invitee_x_pub_hex}"), REQ_TIMEOUT)
+            .await?;
+        resp.strip_prefix("bundle ")
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("{}: unexpected export_group response: {resp}", self.name))
+    }
+
+    /// §11 air-gapped import: verify + decrypt + seed + stamp watermark, touching NO network.
+    /// Returns the imported group id.
+    pub async fn import_group(&mut self, bundle_json: &str) -> Result<String> {
+        let resp = self
+            .request(&format!("import_group {bundle_json}"), REQ_TIMEOUT)
+            .await?;
+        resp.strip_prefix("ok import_group ")
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("{}: unexpected import_group response: {resp}", self.name))
+    }
+
+    /// Post `n` live whiteboard-element edits (local insert + gossip broadcast) — §12 continuous
+    /// delta-sync driver. Returns the count the node acknowledged.
+    pub async fn post_edits(&mut self, group_id: &str, n: usize) -> Result<usize> {
+        let resp = self.request(&format!("post_edits {group_id} {n}"), REQ_TIMEOUT).await?;
+        resp.strip_prefix("ok post_edits ")
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .ok_or_else(|| anyhow!("{}: unexpected post_edits response: {resp}", self.name))
+    }
+
+    /// Post `n` live board-chat messages (local insert + `ChatSent` broadcast) — §12 chat-live driver.
+    pub async fn post_chat(&mut self, group_id: &str, n: usize) -> Result<usize> {
+        let resp = self.request(&format!("post_chat {group_id} {n}"), REQ_TIMEOUT).await?;
+        resp.strip_prefix("ok post_chat ")
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .ok_or_else(|| anyhow!("{}: unexpected post_chat response: {resp}", self.name))
+    }
+
+    // ── netem / chaos: emulate offline, partition, and a degraded link (host-side docker) ──────
+    //
+    // These shell out to the host `docker` CLI against this container by name — they do NOT use
+    // the stdin/stdout control channel, so they work even while the node is partitioned/paused.
+
+    /// Take the node OFFLINE without killing it: `docker pause` freezes the process (its TCP/QUIC
+    /// state goes dark). The engine state + DB survive, so `unpause` is a faithful "came back".
+    pub async fn pause(&self) -> Result<()> {
+        docker(&["pause", &self.name]).await
+    }
+
+    /// Bring a paused node back online.
+    pub async fn unpause(&self) -> Result<()> {
+        docker(&["unpause", &self.name]).await
+    }
+
+    /// Partition this node from its primary network (detach the bridge) — the process keeps
+    /// running but loses all reachability to peers on that network. Heal with [`heal`].
+    pub async fn partition(&self) -> Result<()> {
+        docker(&["network", "disconnect", &self.network, &self.name]).await
+    }
+
+    /// Re-attach this node to its primary network after a [`partition`].
+    pub async fn heal(&self) -> Result<()> {
+        docker(&["network", "connect", &self.network, &self.name]).await
+    }
+
+    /// Attach this container to an ADDITIONAL network (e.g. so a durable holder is reachable from
+    /// two otherwise-isolated mesh islands, like the relay is).
+    pub async fn connect_network(&self, network: &str) -> Result<()> {
+        docker(&["network", "connect", network, &self.name]).await
+    }
+
+    /// Apply a fixed egress latency to `eth0` via `tc netem` (needs `iproute2` + `NET_ADMIN`,
+    /// both present in the rig image). Idempotent: replaces any prior qdisc.
+    pub async fn set_latency(&self, delay_ms: u32) -> Result<()> {
+        // `del` first so re-applying is idempotent; ignore its failure on a clean iface.
+        let _ = docker(&["exec", &self.name, "tc", "qdisc", "del", "dev", "eth0", "root"]).await;
+        let delay = format!("{delay_ms}ms");
+        docker(&[
+            "exec", &self.name, "tc", "qdisc", "add", "dev", "eth0", "root", "netem", "delay",
+            &delay,
+        ])
+        .await
+    }
+
+    /// Remove any `tc netem` shaping from `eth0`.
+    pub async fn clear_latency(&self) -> Result<()> {
+        let _ = docker(&["exec", &self.name, "tc", "qdisc", "del", "dev", "eth0", "root"]).await;
+        Ok(())
+    }
+
     pub async fn quit(&mut self) -> Result<()> {
         self.stdin.write_all(b"quit\n").await.ok();
         self.stdin.flush().await.ok();
@@ -312,6 +447,32 @@ impl DockerNode {
             || log.contains("conn_type=Direct")
             || log.contains("connection type: Direct")
     }
+}
+
+/// Run a host-side `docker <args>` command (chaos verbs: pause/unpause/network/exec tc), failing
+/// with the captured stderr. Used for impairments that must work even while a node is unreachable.
+async fn docker(args: &[&str]) -> Result<()> {
+    let out = Command::new("docker")
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("spawn docker {:?}", args))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "docker {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// One-directional address injection: teach `learner` how to reach `target` (so `learner` can
+/// dial it directly where routable, via relay otherwise). Bounded by `addr`/`add_peer`.
+pub async fn wire_into(learner: &mut DockerNode, target: &mut DockerNode) -> Result<()> {
+    let target_addr = target.addr().await?;
+    learner.add_peer(&target_addr).await
 }
 
 /// Exchange both nodes' serialized addresses into each other's StaticProvider so either can

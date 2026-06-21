@@ -26,10 +26,11 @@ RUN cargo build --release --bin cyan_node \
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates netcat-openbsd iptables curl && rm -rf /var/lib/apt/lists/*
+      ca-certificates netcat-openbsd iptables iproute2 curl && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/cyan_node /usr/local/bin/cyan_node
 COPY ws-entrypoint.sh /usr/local/bin/ws-entrypoint.sh
-RUN chmod +x /usr/local/bin/ws-entrypoint.sh && mkdir -p /data
+COPY shape.sh /usr/local/bin/shape.sh
+RUN chmod +x /usr/local/bin/ws-entrypoint.sh /usr/local/bin/shape.sh && mkdir -p /data
 ENV BIN=cyan_node
 # Default entrypoint runs cyan_node directly (stdin/stdout line protocol). The WebSocket
 # rung overrides the entrypoint with ws-entrypoint.sh to black-hole outbound UDP first.

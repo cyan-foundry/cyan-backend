@@ -47,6 +47,8 @@ echo "[assemble] cyan-identity <- $PARENT_DIR/cyan-identity"
 copy_crate "$PARENT_DIR/cyan-identity" "cyan-identity"
 
 cp "$HARNESS_DIR/scripts/ws-entrypoint.sh" "$CTX/ws-entrypoint.sh"
+# shape.sh ships in the node image for the mesh-e2e netem latency knob (tc-based).
+cp "$HARNESS_DIR/scripts/shape.sh" "$CTX/shape.sh"
 
 echo "[assemble] context ready at $CTX"
 du -sh "$CTX" 2>/dev/null || true

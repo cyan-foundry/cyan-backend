@@ -50,6 +50,38 @@ test-all: up build-node ## the green matrix (LAN, relay, WS)
 	@set -e; for t in test-lan test-relay test-ws; do \
 	  echo "### $$t"; $(MAKE) $$t; done; echo "ALL GREEN RUNGS DONE"
 
+# ── Mesh-hardening e2e (MESH_HARDENING_SPEC §6/§7/§10/§12) ────────────────────────────────────
+# Real cyan_node containers + netem/chaos (pause=offline, network disconnect=partition, tc=latency)
+# driven by tests/substrate_mesh_e2e.rs; asserts on the RECEIVER's storage. All gated by CYAN_RIG=1.
+RUN_MESH = cd $(REPO_DIR) && CYAN_RIG=1 cargo test --test substrate_mesh_e2e
+# The runnable (green-by-construction) scenarios — the two honest-red scaffolds (cross-net bootstrap
+# discovery, super-peer offline-hold) are EXCLUDED here (they unimplemented!() pending real infra).
+MESH_SCENARIOS = \
+  lan_mesh_forms_and_live_delta_no_infra \
+  partition_then_both_edit_then_heal_converges_via_delta \
+  node_offline_then_reconnect_incremental_catchup \
+  lens_down_mesh_and_sync_continue \
+  bootstrap_down_lan_and_superpeer_still_work \
+  all_infra_down_lan_sovereign_works \
+  acceptance_crud_and_continuous_delta_sync \
+  acceptance_chat_live \
+  acceptance_presence_roster_persists_offline \
+  acceptance_airgapped_import_baseline
+
+mesh-e2e: up build-node ## §6/§10/§12 mesh e2e: all runnable scenarios (real containers + netem)
+	@set -e; for t in $(MESH_SCENARIOS); do \
+	  echo "### $$t"; $(RUN_MESH) $$t -- --ignored --nocapture --exact; done; \
+	  echo "MESH E2E SCENARIOS DONE"
+
+mesh-one: ## run ONE mesh scenario: make mesh-one T=all_infra_down_lan_sovereign_works
+	$(RUN_MESH) $(T) -- --ignored --nocapture --exact
+
+mesh-red: ## print the honest-red scenarios + why they need real infra (not faked)
+	@echo "bootstrap_seeded_cross_net_mesh — needs the xaeroflux bootstrap discovery container"
+	@echo "  (cross-net TRANSPORT is green via test-relay). xaeroflux is untouched by this batch."
+	@echo "offline_peer_message_held_by_superpeer_delivered_on_return — needs the headless-cyan"
+	@echo "  Lens super-peer binary (cyan-lens hold/redeliver logic is fakes-only). See STATUS."
+
 stress: ## run a stress scenario: make stress SCENARIO=swarm PEERS=6  (see ./stress.sh help)
 	./stress.sh $(SCENARIO) $(PEERS)
 
@@ -59,8 +91,9 @@ ps:    ; $(COMPOSE) ps
 down:  ## stop the relay
 	$(COMPOSE) down
 clean: down ## stop everything + remove networks/build context
-	-docker rm -f cyan-rig-peer-a cyan-rig-peer-b >/dev/null 2>&1 || true
+	-docker rm -f cyan-rig-peer-a cyan-rig-peer-b cyan-rig-superpeer >/dev/null 2>&1 || true
 	$(COMPOSE) down -v --remove-orphans
 	-docker network rm cyan-rig_airgap >/dev/null 2>&1 || true
 	rm -rf .ctx .logs
-.PHONY: help relay-info up build-node test-lan test-relay test-ws test-offline test-all stress logs ps down clean
+.PHONY: help relay-info up build-node test-lan test-relay test-ws test-offline test-all \
+        mesh-e2e mesh-one mesh-red stress logs ps down clean
