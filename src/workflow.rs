@@ -13,9 +13,14 @@
 //! The legacy-board migration lives in `storage::migrate_legacy_authoring_cells`
 //! (it needs the DB connection the engine migrations run on).
 
+use anyhow::{anyhow, bail, Result};
+use cyan_identity::{OrgGrantVerifier, Role, SignedRevocationList};
+use secrecy::SecretString;
 use serde::Serialize;
 
 use crate::mcp_host::{PLUGINS_WORKSPACE_NAME, PLUGIN_BUNDLE_SUFFIX};
+use crate::models::dto::WorkflowStateDTO;
+use crate::sso_grant::SsoSession;
 use crate::storage;
 
 /// The one and only authorable cell kind.
@@ -176,6 +181,66 @@ pub fn autocomplete_index(board_id: &str) -> AutocompleteIndex {
         .collect();
 
     AutocompleteIndex { tenant_id, plugins, artifacts, actions }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Deploy + lock lifecycle (R12 D2/E1).
+//
+// A deployed workflow is LOCKED for editing; unlocking it mid-flight requires an
+// **org-XaeroID grant (W17)** — the org signing key is the approval authority, not
+// an ad-hoc flag. This is the engine round-trip: request → org-grant check → unlock.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Mark a board's workflow DEPLOYED — it is now running (optionally with a live dashboard)
+/// and LOCKED for editing (E1). iOS reads `workflow_state_get` to gate the face: a deployed
+/// board with `dashboard_available` surfaces the dashboard, not the editor (D2).
+pub fn mark_deployed(board_id: &str, dashboard_available: bool, now_unix: i64) -> Result<WorkflowStateDTO> {
+    storage::workflow_state_set_deployed(board_id, dashboard_available, now_unix)?;
+    Ok(storage::workflow_state_get(board_id))
+}
+
+/// Request an UNLOCK of a deployed (locked) workflow, gated by an org-XaeroID grant (E1/W17).
+///
+/// The unlock is approved **iff** the presented `token`:
+///   1. verifies org-signed against the tenant's pinned org key (offline; binding + `exp` +
+///      grace), optionally rejected by an org-signed `revocation` list (the fired-employee
+///      case); AND
+///   2. is scoped to THIS board's `tenant` (a grant never authorizes another tenant); AND
+///   3. carries at least `Admin` authority (the approver, not the requester, holds the grant).
+///
+/// On approval the `locked` lane is cleared and the fresh state returned. On any failure the
+/// board STAYS locked and an error explains why — no unsigned/ad-hoc unlock path exists.
+pub fn request_unlock(
+    board_id: &str,
+    tenant: &str,
+    token: &SecretString,
+    verifier: &OrgGrantVerifier,
+    xaero_pubkey: &str,
+    now_unix: u64,
+    revocation: Option<&SignedRevocationList>,
+) -> Result<WorkflowStateDTO> {
+    let session = match revocation {
+        Some(rl) => SsoSession::from_org_token_checked(token, verifier, xaero_pubkey, now_unix, rl),
+        None => SsoSession::from_org_token(token, verifier, xaero_pubkey, now_unix),
+    }
+    .map_err(|e| anyhow!("unlock denied: org grant did not verify: {e}"))?;
+
+    if session.tenant() != tenant {
+        bail!(
+            "unlock denied: grant tenant '{}' does not own board tenant '{}'",
+            session.tenant(),
+            tenant
+        );
+    }
+    if session.role().level() < Role::Admin.level() {
+        bail!(
+            "unlock denied: role '{}' is below the Admin approval authority",
+            session.role().as_str()
+        );
+    }
+
+    storage::workflow_state_set_locked(board_id, false, now_unix as i64)?;
+    Ok(storage::workflow_state_get(board_id))
 }
 
 /// First non-empty line of a step's text, trimmed — the artifact display label.

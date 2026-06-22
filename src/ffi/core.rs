@@ -3066,45 +3066,38 @@ pub extern "C" fn cyan_search_boards_by_label(label: *const c_char) -> *mut c_ch
 // BOARD PINNING FFI FUNCTIONS
 // ============================================================
 
-/// Pin a board (show at top of grid)
+/// Pin a board (show at top of grid).
+///
+/// R12 C1/C2: pin is a SYNCED, convergent board property. Route through the command
+/// actor (`SetBoardPinned`) so it (a) stamps a real `pin_updated_at` clock for per-board
+/// LWW merge and (b) gossips `BoardPinned` to peers — the previous direct-SQL write set
+/// no clock (LWW could never converge) and never left the device (pin/unpin invisible on
+/// the other peer until a full group re-fetch). Returns whether the command was enqueued.
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_pin_board(board_id: *const c_char) -> bool {
-    let Some(sys) = SYSTEM.get() else {
-        return false;
-    };
-
-    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
-
-    let result = {
-        let db = sys.db.lock_safe();
-        db.execute(
-            "INSERT INTO board_metadata (board_id, is_pinned) VALUES (?1, 1)
-             ON CONFLICT(board_id) DO UPDATE SET is_pinned = 1",
-            params![bid],
-        )
-    };
-
-    result.is_ok()
+    set_board_pinned_via_command(board_id, true)
 }
 
-/// Unpin a board
+/// Unpin a board. See [`cyan_pin_board`] — same convergent command path (R12 C1/C2).
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_unpin_board(board_id: *const c_char) -> bool {
-    let Some(sys) = SYSTEM.get() else {
+    set_board_pinned_via_command(board_id, false)
+}
+
+/// Shared helper for [`cyan_pin_board`]/[`cyan_unpin_board`]: enqueue the convergent
+/// `SetBoardPinned` command (LWW clock + `BoardPinned` gossip + `BoardMetadataUpdated`
+/// UI signal, all handled in the command actor).
+fn set_board_pinned_via_command(board_id: *const c_char, is_pinned: bool) -> bool {
+    let Some(board_id) = (unsafe { cstr_arg(board_id) }) else {
         return false;
     };
-
-    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
-
-    let result = {
-        let db = sys.db.lock_safe();
-        db.execute(
-            "UPDATE board_metadata SET is_pinned = 0 WHERE board_id = ?1",
-            params![bid],
-        )
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return false,
     };
-
-    result.is_ok()
+    sys.command_tx
+        .send(CommandMsg::SetBoardPinned { board_id, is_pinned })
+        .is_ok()
 }
 
 /// Check if a board is pinned
@@ -3123,6 +3116,23 @@ pub extern "C" fn cyan_is_board_pinned(board_id: *const c_char) -> bool {
         |row| row.get::<_, i32>(0),
     )
         .unwrap_or(0) != 0
+}
+
+/// R12 D2/E1: read a board's workflow lifecycle state as JSON so iOS can gate the board face.
+/// Shape: `{"board_id","deployed","dashboard_available","locked","updated_at"}`. A board with
+/// no deployment returns the default authoring state (deployed=false, locked=false). Additive,
+/// read-only — the unlock approval (org grant) is engine-side (`workflow::request_unlock`).
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_board_workflow_state(board_id: *const c_char) -> *mut c_char {
+    let Some(bid) = (unsafe { cstr_arg(board_id) }) else {
+        return std::ptr::null_mut();
+    };
+    let state = crate::storage::workflow_state_get(&bid);
+    let json = serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string());
+    match CString::new(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
 }
 
 // ============================================================

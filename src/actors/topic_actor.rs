@@ -217,6 +217,11 @@ impl TopicActor {
                 if let Some(changed) = Self::account_unread(&evt, &persist_node_id) {
                     let _ = persist_event_tx.send(changed);
                 }
+                // R12 B1: a file from another peer fires a distinct board-scoped FileReceived
+                // (a "file received" notification), separate from the chat-message event.
+                if let Some(received) = Self::file_received_event(&evt, &persist_node_id) {
+                    let _ = persist_event_tx.send(received);
+                }
                 let _ = persist_event_tx.send(SwiftEvent::Network(evt));
             }
         });
@@ -1326,6 +1331,33 @@ impl TopicActor {
         storage::unread_counts()
             .ok()
             .map(|counts| SwiftEvent::UnreadChanged { counts })
+    }
+
+    /// R12 B1 — translate an inbound `FileAvailable` into a distinct board-scoped
+    /// `FileReceived` (a "file received" notification), the file analog of an inbound chat.
+    /// Returns `None` for non-file events and for our OWN share echoing back (`source_peer`
+    /// is this device) — only a peer's file raises the notification.
+    fn file_received_event(evt: &NetworkEvent, local_node_id: &str) -> Option<SwiftEvent> {
+        let NetworkEvent::FileAvailable {
+            id, group_id, workspace_id, board_id, name, hash, size, source_peer, created_at,
+        } = evt
+        else {
+            return None;
+        };
+        if source_peer == local_node_id {
+            return None; // our own shared file never notifies us
+        }
+        Some(SwiftEvent::FileReceived {
+            id: id.clone(),
+            board_id: board_id.clone().unwrap_or_default(),
+            workspace_id: workspace_id.clone().unwrap_or_default(),
+            group_id: group_id.clone().unwrap_or_default(),
+            name: name.clone(),
+            hash: hash.clone(),
+            size: *size,
+            source_peer: source_peer.clone(),
+            created_at: *created_at,
+        })
     }
 }
 

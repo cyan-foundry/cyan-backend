@@ -69,6 +69,53 @@ async fn file_shares_at_scope(workspace_id: Option<&str>, board_id: Option<&str>
     );
 }
 
+/// R12 B1 (P1): an inbound file from a peer raises a DISTINCT board-scoped `FileReceived`
+/// event (the file analog of a chat-message notification) — not only the chat event. The
+/// sender's own echo must NOT fire it (guarded by `source_peer`).
+#[tokio::test]
+async fn inbound_file_raises_file_received_event() {
+    use cyan_backend::models::events::{NetworkEvent, SwiftEvent};
+
+    let _serial = serial().await;
+    let nodes = spawn_mesh(2, cfg()).await.expect("mesh spawns");
+    let group = unique_group_id();
+    meet(&nodes, &group, SYNC_TIMEOUT).await.expect("nodes meet");
+
+    let board = format!("{group}-board-fr");
+    let file_id = format!("file-fr-{}", &group[16..32]);
+    nodes[0].broadcast(
+        &group,
+        NetworkEvent::FileAvailable {
+            id: file_id.clone(),
+            group_id: Some(group.clone()),
+            workspace_id: Some(format!("{group}-ws")),
+            board_id: Some(board.clone()),
+            name: "deck.pdf".to_string(),
+            hash: "hash-fr".to_string(),
+            size: 4096,
+            source_peer: nodes[0].node_id.clone(),
+            created_at: 1,
+        },
+    );
+
+    let want_id = file_id.clone();
+    let want_board = board.clone();
+    let got = nodes[1]
+        .wait_for(
+            move |e| matches!(e, SwiftEvent::FileReceived { id, board_id, .. } if *id == want_id && *board_id == want_board),
+            SYNC_TIMEOUT,
+        )
+        .await
+        .expect("peer raises a distinct FileReceived for the inbound file");
+    match got {
+        SwiftEvent::FileReceived { name, source_peer, .. } => {
+            assert_eq!(name, "deck.pdf", "carries the file name for the notification");
+            assert_eq!(source_peer, nodes[0].node_id, "attributes the sender");
+        }
+        other => panic!("expected FileReceived, got {other:?}"),
+    }
+}
+
 /// G6: a file uploaded at group scope is fetchable on a peer, blake3-verified.
 #[tokio::test]
 async fn file_shared_at_group_scope() {

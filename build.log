@@ -2551,3 +2551,23 @@ warning: `cyan-backend` (manifest) generated 3 warnings
    Compiling iroh-blobs v0.97.0
    Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
     Finished `release` profile [optimized] target(s) in 1m 13s
+warning: Cargo.toml: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: Cargo.toml: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: Cargo.toml: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: `cyan-backend` (manifest) generated 3 warnings
+   Compiling reqwest v0.12.24
+   Compiling cyan-mcp v0.1.0 (/Users/anirudhvyas/cyan-mcp)
+   Compiling pkarr v5.0.0
+   Compiling cyan-identity v0.1.0 (/Users/anirudhvyas/cyan-identity)
+   Compiling iroh-relay v0.95.1
+   Compiling iroh v0.95.1
+   Compiling iroh-gossip v0.95.0
+   Compiling iroh-blobs v0.97.0
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 1m 01s

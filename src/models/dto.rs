@@ -199,6 +199,40 @@ pub struct PinDTO {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// WORKFLOW LIFECYCLE STATE (R12 D2/E1)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Per-board workflow lifecycle state — the engine-side support state iOS gates the board
+/// face on (R12 D2/E1). `deployed` + `dashboard_available` let the app surface the running
+/// DASHBOARD instead of the editor; `locked` (set on deploy) means edits are frozen and an
+/// UNLOCK requires an org-XaeroID grant (W17). Defaults (no row) = authoring/editable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowStateDTO {
+    pub board_id: String,
+    /// The workflow has been deployed (it is running / live), not just authored.
+    pub deployed: bool,
+    /// A live dashboard exists for this workflow → iOS shows the dashboard, not the editor.
+    pub dashboard_available: bool,
+    /// Edits are locked (set on deploy). Unlocking mid-flight requires an org grant.
+    pub locked: bool,
+    pub updated_at: i64,
+}
+
+impl WorkflowStateDTO {
+    /// The default authoring state for a board with no deployment yet: editable, unlocked,
+    /// no dashboard.
+    pub fn authoring(board_id: &str) -> Self {
+        WorkflowStateDTO {
+            board_id: board_id.to_string(),
+            deployed: false,
+            dashboard_available: false,
+            locked: false,
+            updated_at: 0,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // WHITEBOARD ELEMENT
 // ═══════════════════════════════════════════════════════════════════════════
 

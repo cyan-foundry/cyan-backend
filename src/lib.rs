@@ -1649,6 +1649,9 @@ fn route_event_to_buffers(
         SwiftEvent::FileDownloadProgress { .. } |
         SwiftEvent::FileDownloaded { .. } |
         SwiftEvent::FileDownloadFailed { .. } |
+        // R12 B1: a distinct inbound-file notification, routed to the file + board surfaces
+        // (the Files panel) so the receiving peer can raise a "file received" notification.
+        SwiftEvent::FileReceived { .. } |
         SwiftEvent::ChatHistoryComplete { .. } => {
             file_tree.lock_safe().push_back(event_json.to_string());
             board_grid.lock_safe().push_back(event_json.to_string());

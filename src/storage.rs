@@ -893,16 +893,101 @@ fn pin_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PinDTO> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// WORKFLOW LIFECYCLE STATE (R12 D2/E1)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Read a board's workflow lifecycle state. A board with no row is in the default authoring
+/// state (editable, unlocked, no dashboard) — never an error.
+pub fn workflow_state_get(board_id: &str) -> WorkflowStateDTO {
+    let Ok(conn) = db().lock() else {
+        return WorkflowStateDTO::authoring(board_id);
+    };
+    conn.query_row(
+        "SELECT board_id, deployed, dashboard_available, locked, updated_at
+         FROM board_workflow_state WHERE board_id = ?1",
+        params![board_id],
+        |r| {
+            Ok(WorkflowStateDTO {
+                board_id: r.get(0)?,
+                deployed: r.get::<_, i32>(1)? != 0,
+                dashboard_available: r.get::<_, i32>(2)? != 0,
+                locked: r.get::<_, i32>(3)? != 0,
+                updated_at: r.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| WorkflowStateDTO::authoring(board_id))
+}
+
+/// Mark a workflow DEPLOYED (D2/E1): it is now running, optionally with a live dashboard, and
+/// is LOCKED for editing. Idempotent upsert keyed by board_id; LWW on `updated_at` so a stale
+/// write never reverts a newer state.
+pub fn workflow_state_set_deployed(
+    board_id: &str,
+    dashboard_available: bool,
+    updated_at: i64,
+) -> Result<()> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    conn.execute(
+        "INSERT INTO board_workflow_state (board_id, deployed, dashboard_available, locked, updated_at)
+         VALUES (?1, 1, ?2, 1, ?3)
+         ON CONFLICT(board_id) DO UPDATE SET
+            deployed            = 1,
+            dashboard_available = excluded.dashboard_available,
+            locked              = 1,
+            updated_at          = excluded.updated_at
+         WHERE excluded.updated_at >= board_workflow_state.updated_at",
+        params![board_id, dashboard_available as i32, updated_at],
+    )?;
+    Ok(())
+}
+
+/// Set just the `locked` lane (LWW on `updated_at`). Unlocking is gated upstream by an org
+/// grant (see `workflow::request_unlock`); this is the storage primitive it calls on success.
+pub fn workflow_state_set_locked(board_id: &str, locked: bool, updated_at: i64) -> Result<()> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    conn.execute(
+        "INSERT INTO board_workflow_state (board_id, deployed, dashboard_available, locked, updated_at)
+         VALUES (?1, 0, 0, ?2, ?3)
+         ON CONFLICT(board_id) DO UPDATE SET
+            locked     = excluded.locked,
+            updated_at = excluded.updated_at
+         WHERE excluded.updated_at >= board_workflow_state.updated_at",
+        params![board_id, locked as i32, updated_at],
+    )?;
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // FILES
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Idempotent insert of an inbound file delta.
+///
+/// R12 B3: applying the same file twice must collapse to ONE row. Two layers of idempotency:
+///   * `INSERT OR IGNORE` on the `id` primary key — the SAME delta replayed is a no-op (snapshot
+///     convergence relies on the id being preserved verbatim);
+///   * a content-addressed `WHERE NOT EXISTS` guard on `(board scope, hash)` — the SAME content
+///     re-announced under a DIFFERENT id (a file followed by a message re-shared the file →
+///     rendered twice on the receiver) collapses to the row already present in that board scope.
+///
+/// Soft-deleted (tombstoned) rows don't suppress a re-share, so a delete→re-add still lands.
 pub fn file_insert(
     id: &str, group_id: Option<&str>, workspace_id: Option<&str>, board_id: Option<&str>,
     name: &str, hash: &str, size: u64, source_peer: &str, created_at: i64,
 ) -> Result<()> {
     let conn = db().lock_safe();
     conn.execute(
-        "INSERT OR IGNORE INTO objects (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, created_at) VALUES (?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7, ?8, ?9)",
+        "INSERT OR IGNORE INTO objects (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, created_at)
+         SELECT ?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7, ?8, ?9
+         WHERE NOT EXISTS (
+             SELECT 1 FROM objects
+             WHERE type = 'file' AND hash = ?6 AND COALESCE(deleted, 0) = 0
+               AND COALESCE(board_id, '') = COALESCE(?4, '')
+         )",
         params![id, group_id, workspace_id, board_id, name, hash, size as i64, source_peer, created_at],
     )?;
     Ok(())
@@ -2255,6 +2340,23 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         );
     }
 
+    // R12 D2/E1: per-board workflow lifecycle state — `deployed`/`dashboard_available` gate
+    // the board face (editor vs running dashboard); `locked` (set on deploy) freezes edits and
+    // an unlock requires an org-XaeroID grant (W17). Keyed by board_id; LWW on updated_at.
+    if conn.prepare("SELECT board_id FROM board_workflow_state LIMIT 1").is_err() {
+        tracing::info!("Migration: creating board_workflow_state table");
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS board_workflow_state (
+                board_id            TEXT PRIMARY KEY,
+                deployed            INTEGER NOT NULL DEFAULT 0,
+                dashboard_available INTEGER NOT NULL DEFAULT 0,
+                locked              INTEGER NOT NULL DEFAULT 0,
+                updated_at          INTEGER NOT NULL DEFAULT 0
+            )",
+            [],
+        );
+    }
+
     // R10FB §F4: soft-delete/tombstone column for files (objects). A user-initiated
     // delete sets `deleted=1` so the deletion converges to peers; the engine never
     // hard-deletes a file. All file reads filter `deleted=0`. Idempotent migration.
@@ -2262,6 +2364,17 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         tracing::info!("Migration: adding deleted column to objects (file tombstone)");
         let _ = conn.execute("ALTER TABLE objects ADD COLUMN deleted INTEGER DEFAULT 0", []);
     }
+
+    // R12 A2: cold-chat first-open speed. `chat_list_by_board` ran a full scan of the big
+    // multi-purpose `objects` table (chats + files + boards + whiteboard elements) for every
+    // board's chat load. A partial, ordered index makes it an index range scan in
+    // created_at order, so the first page returns without a table scan. Partial (`WHERE
+    // type='chat'`) keeps it tiny and off the file/board write paths.
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_objects_chat_board
+         ON objects(board_id, created_at) WHERE type = 'chat'",
+        [],
+    );
 
     // R10FB §N: per-reader unread ledger. One row per message_id, ever — the PRIMARY KEY
     // makes counting idempotent (a message counts once for this reader). `kind` is the

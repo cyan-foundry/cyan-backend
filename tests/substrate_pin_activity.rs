@@ -46,6 +46,85 @@ async fn pin_propagates_to_peer() {
     assert!(storage::board_is_pinned(&board), "pin landed on the peer's board");
 }
 
+/// R12 C2 (P0): pin/unpin converges BIDIRECTIONALLY as a live `BoardPinned` delta — whoever
+/// changed it LAST (by LWW clock) wins on BOTH peers, regardless of who changed it or the order
+/// the deltas arrive. This is the dogfood bug: A unpins → B never saw it live; B re-pins → A
+/// never saw it back. The shared process-global store is the convergence oracle after each
+/// directional delta; `wait_network` proves the delta was delivered (not a full re-fetch).
+#[tokio::test]
+async fn pin_converges_bidirectionally() {
+    let _serial = serial().await;
+    let nodes = spawn_mesh(2, cfg()).await.expect("mesh spawns");
+    let group = unique_group_id();
+    meet(&nodes, &group, SYNC_TIMEOUT).await.expect("nodes meet");
+
+    let board = format!("{group}-board-bidi");
+
+    // Baseline: peer A pins the board (clock=5); peer B observes it via delta + store.
+    nodes[0].broadcast(
+        &group,
+        NetworkEvent::BoardPinned { board_id: board.clone(), is_pinned: true, updated_at: 5 },
+    );
+    let w = board.clone();
+    nodes[1]
+        .wait_network(
+            move |e| matches!(e, NetworkEvent::BoardPinned { board_id, is_pinned, .. } if *board_id == w && *is_pinned),
+            SYNC_TIMEOUT,
+        )
+        .await
+        .expect("B observes the baseline pin");
+    assert!(storage::board_is_pinned(&board), "baseline pin landed");
+
+    // Direction 1 — peer A UNPINS (clock=10). B must see it LIVE (delta), not after a re-fetch.
+    nodes[0].broadcast(
+        &group,
+        NetworkEvent::BoardPinned { board_id: board.clone(), is_pinned: false, updated_at: 10 },
+    );
+    let w = board.clone();
+    nodes[1]
+        .wait_network(
+            move |e| matches!(e, NetworkEvent::BoardPinned { board_id, is_pinned, .. } if *board_id == w && !*is_pinned),
+            SYNC_TIMEOUT,
+        )
+        .await
+        .expect("B observes the unpin live");
+    assert!(!storage::board_is_pinned(&board), "A's unpin converged on B");
+
+    // Direction 2 — peer B RE-PINS (clock=20). A must observe it back (the broken direction).
+    nodes[1].broadcast(
+        &group,
+        NetworkEvent::BoardPinned { board_id: board.clone(), is_pinned: true, updated_at: 20 },
+    );
+    let w = board.clone();
+    nodes[0]
+        .wait_network(
+            move |e| matches!(e, NetworkEvent::BoardPinned { board_id, is_pinned, .. } if *board_id == w && *is_pinned),
+            SYNC_TIMEOUT,
+        )
+        .await
+        .expect("A observes B's re-pin");
+    assert!(storage::board_is_pinned(&board), "B's re-pin converged BACK on A");
+
+    // LWW guard — peer A re-broadcasts a STALE unpin (clock=15 < 20). It must NOT clobber the
+    // newer re-pin: convergence is by clock, independent of arrival order / last sender.
+    nodes[0].broadcast(
+        &group,
+        NetworkEvent::BoardPinned { board_id: board.clone(), is_pinned: false, updated_at: 15 },
+    );
+    let w = board.clone();
+    nodes[1]
+        .wait_network(
+            move |e| matches!(e, NetworkEvent::BoardPinned { board_id, updated_at, .. } if *board_id == w && *updated_at == 15),
+            SYNC_TIMEOUT,
+        )
+        .await
+        .expect("B receives the stale unpin");
+    assert!(
+        storage::board_is_pinned(&board),
+        "a stale unpin (clock 15 < 20) did NOT clobber the newer re-pin"
+    );
+}
+
 /// §L: a board edit emits a board-changed signal that reaches peers (so they refresh the
 /// board's preview live). Driven over the same group gossip the real edit handlers use.
 #[tokio::test]

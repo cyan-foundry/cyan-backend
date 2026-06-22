@@ -312,6 +312,24 @@ pub enum SwiftEvent {
     FileDownloadProgress { file_id: String, progress: f64 },
     /// File download completed
     FileDownloaded { file_id: String, local_path: String },
+    /// R12 B1: a NEW file arrived from another peer (board-scoped, like an inbound chat),
+    /// so the app can raise a distinct "file received" notification — separate from the
+    /// chat-message event. Emitted once per inbound `FileAvailable` whose `source_peer` is
+    /// NOT this device (the sender's own echo never fires it). Additive, receive-only.
+    FileReceived {
+        id: String,
+        #[serde(default)]
+        board_id: String,
+        #[serde(default)]
+        workspace_id: String,
+        #[serde(default)]
+        group_id: String,
+        name: String,
+        hash: String,
+        size: u64,
+        source_peer: String,
+        created_at: i64,
+    },
     /// File download failed
     FileDownloadFailed { file_id: String, error: String },
     /// Board metadata was updated

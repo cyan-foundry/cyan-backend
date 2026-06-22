@@ -74,6 +74,50 @@ fn duplicate_name_rejected_or_deduped() {
     assert_eq!(names.len(), 2, "two distinct files (one deduped, one renamed)");
 }
 
+/// R12 B3 (P1): applying an inbound file delta is idempotent at the engine — a repeat
+/// collapses to ONE row. Covers both replay shapes: the SAME delta (same id) applied twice,
+/// and the SAME content re-announced under a DIFFERENT id within the same board scope (the
+/// dogfood "file followed by a message rendered the file twice" bug).
+#[test]
+fn file_delta_applied_twice_dedups_to_one_row() {
+    support::ensure_db();
+    let g = unique_group_id();
+    let w = unique_group_id();
+    let b = unique_group_id();
+
+    // Same delta (same id) applied twice — id-PK idempotency.
+    storage::file_insert(
+        &format!("{b}-f"), Some(&g), Some(&w), Some(&b), "deck.bin", "hashX", 12, "peer", 1,
+    )
+    .expect("first apply");
+    storage::file_insert(
+        &format!("{b}-f"), Some(&g), Some(&w), Some(&b), "deck.bin", "hashX", 12, "peer", 1,
+    )
+    .expect("replay same delta");
+
+    // Same content (hashX) re-announced under a DIFFERENT id in the same board — content-hash
+    // idempotency collapses the duplicate render.
+    storage::file_insert(
+        &format!("{b}-f-dup"), Some(&g), Some(&w), Some(&b), "deck.bin", "hashX", 12, "peer", 2,
+    )
+    .expect("re-announce same content, new id");
+
+    let rows = storage::file_list_by_board(&b).expect("list by board");
+    assert_eq!(
+        rows.iter().filter(|f| f.hash == "hashX").count(),
+        1,
+        "the same file content collapses to a single row in the board"
+    );
+
+    // A genuinely different file (different hash) in the same board still lands.
+    storage::file_insert(
+        &format!("{b}-g"), Some(&g), Some(&w), Some(&b), "other.bin", "hashY", 7, "peer", 3,
+    )
+    .expect("distinct content");
+    let rows = storage::file_list_by_board(&b).expect("list by board");
+    assert_eq!(rows.len(), 2, "distinct content is not suppressed by the dedup guard");
+}
+
 /// F3: a file is resolvable by its stable `group_id:workspace_id:board_id:file_name` handle,
 /// and a tombstoned file is no longer resolvable.
 #[test]
