@@ -336,6 +336,20 @@ impl GrantVerifier {
             .contains(&(group_id.to_string(), nonce.to_string()))
     }
 
+    /// Record `nonce` as spent WITHOUT re-verifying the grant (no signature/issuer-admin check).
+    /// Used by a JOINER that just spent a grant to pull a snapshot: it trusts the holder that
+    /// served it and marks the single-use nonce consumed so that, if this node later becomes a
+    /// holder, it refuses to re-serve the same spent grant. Idempotent.
+    pub fn mark_consumed(&mut self, nonce: &str) {
+        self.seen_nonces.insert(nonce.to_string());
+    }
+
+    /// Whether `nonce` has already been consumed (served once via [`verify_at`], or marked spent
+    /// by [`mark_consumed`]). The replay gate: a presented grant whose nonce is consumed is spent.
+    pub fn is_consumed(&self, nonce: &str) -> bool {
+        self.seen_nonces.contains(nonce)
+    }
+
     /// Verify a grant against the wall clock. See [`GrantVerifier::verify_at`].
     pub fn verify(&mut self, grant: &Grant) -> Result<Role, VerifyError> {
         self.verify_at(grant, XaeroID::now_secs())

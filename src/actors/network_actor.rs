@@ -619,7 +619,24 @@ impl NetworkActor {
                         .as_deref()
                         .and_then(|qr| Grant::from_qr_payload(qr).ok());
                     let decision = match self.authorizer.lock() {
-                        Ok(auth) => auth.authorize_join(&group_id, parsed.as_ref()),
+                        Ok(mut auth) => {
+                            let d = auth.authorize_join(&group_id, parsed.as_ref());
+                            // SINGLE-USE, MESH-WIDE: we are about to spend this grant to pull
+                            // `group_id`'s snapshot from a holder. Mark its nonce consumed in OUR
+                            // own authority now, so that if WE later serve this group, the snapshot
+                            // serve gate refuses a replay of the same QR. Without this, a peer that
+                            // received the snapshot becomes a fail-open re-distribution point that
+                            // serves a replayed (already-consumed) grant — the leak the replay test
+                            // catches. Marking here (not at completion) is deterministic: it lands
+                            // before this node could ever serve a peer.
+                            if let Some(g) = parsed
+                                .as_ref()
+                                .filter(|g| d.is_ok() && g.group_id == group_id)
+                            {
+                                auth.note_grant_used(g);
+                            }
+                            d
+                        }
                         // A poisoned authorizer must never deadlock or silently widen access; treat
                         // it as fail-open ONLY for un-enforced semantics by allowing — the snapshot
                         // serve gate still applies on the holder side.

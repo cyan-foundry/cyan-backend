@@ -219,6 +219,25 @@ impl MeshAuthorizer {
         group_id: &str,
         grant: Option<&Grant>,
     ) -> Result<Role, SnapshotDenial> {
+        // REPLAY GATE (applies even to a fail-open holder): a grant whose single-use nonce is
+        // already consumed — anywhere this node knows about: it served the snapshot once, OR it
+        // spent the grant itself to pull (see `note_grant_used`) — is refused. This makes single-
+        // use hold at EVERY holder of the group, not just the issuer: a peer that received the
+        // snapshot does not become an open re-distribution point for a replayed QR. Checked BEFORE
+        // the fail-open shortcut so an un-enforcing holder still refuses a spent grant.
+        //
+        // EXCEPTION — idempotent re-serve: the SAME peer that this nonce already authorized may
+        // re-pull (a dropped/timed-out snapshot stream retries with the same QR from the same
+        // node). That is not a replay — it is the one entitled holder finishing its transfer — so
+        // we allow it. A replay is a DIFFERENT peer presenting an already-spent nonce.
+        if let Some(g) = grant.filter(|g| g.group_id == group_id) {
+            if let Some(role) = self.role_via_nonce(group_id, peer_id, &g.nonce) {
+                return Ok(role);
+            }
+            if self.verifier.is_consumed(&g.nonce) {
+                return Err(SnapshotDenial::Verify(VerifyError::ReplayedNonce));
+            }
+        }
         if !self.is_enforced(group_id) {
             return Ok(Role::Member);
         }
@@ -230,6 +249,14 @@ impl MeshAuthorizer {
             .map_err(SnapshotDenial::Verify)
     }
 
+    /// Record that THIS node spent `grant` to pull a snapshot for its group. Marks the single-use
+    /// nonce consumed in our own authority (without re-verifying issuer-admin — the joiner trusts
+    /// the holder that served it). If this node later serves the group, [`authorize_snapshot`]'s
+    /// replay gate then refuses a replay of the same QR. Idempotent.
+    pub fn note_grant_used(&mut self, grant: &Grant) {
+        self.verifier.mark_consumed(&grant.nonce);
+    }
+
     /// Revoke a grant by `(group_id, nonce)` — tombstones it in the verifier AND drops any peer
     /// this node had authorized via that nonce (so an already-authorized peer loses write access).
     pub fn revoke(&mut self, group_id: &str, nonce: &str) {
@@ -237,6 +264,18 @@ impl MeshAuthorizer {
         if let Some(peers) = self.authorized.get_mut(group_id) {
             peers.retain(|_, auth| auth.nonce != nonce);
         }
+    }
+
+    /// The role recorded for `peer_id` in `group_id` IF it was authorized via exactly `nonce`.
+    /// Used by [`authorize_snapshot`] to allow the already-authorized holder to re-pull (a retried
+    /// snapshot stream) without tripping the single-use replay gate — distinct from a different
+    /// peer presenting the same spent nonce.
+    fn role_via_nonce(&self, group_id: &str, peer_id: &str, nonce: &str) -> Option<Role> {
+        self.authorized
+            .get(group_id)
+            .and_then(|m| m.get(peer_id))
+            .filter(|a| a.nonce == nonce)
+            .map(|a| a.role)
     }
 
     /// The role this node has recorded for `peer_id` in `group_id`, if any.
