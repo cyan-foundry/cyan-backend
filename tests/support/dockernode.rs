@@ -29,6 +29,11 @@ pub fn node_image() -> String {
     std::env::var("CYAN_NODE_IMAGE").unwrap_or_else(|_| "cyan/node:rig".to_string())
 }
 
+/// The xaeroflux bootstrap image (the discovery-rendezvous node), overridable via env.
+pub fn bootstrap_image() -> String {
+    std::env::var("CYAN_BOOTSTRAP_IMAGE").unwrap_or_else(|_| "cyan/bootstrap:rig".to_string())
+}
+
 /// The relay URL peers use on the relay/WebSocket rungs (Makefile sets `CYAN_RELAY_URL`).
 pub fn relay_url() -> String {
     std::env::var("CYAN_RELAY_URL").unwrap_or_else(|_| "http://cyan-rig-relay:3340".to_string())
@@ -94,6 +99,12 @@ impl DockerNode {
 
     /// Launch a peer container and resolve its node id (also confirms the actor booted).
     pub async fn spawn(spec: Spec<'_>) -> Result<DockerNode> {
+        Self::spawn_with_env(spec, &[]).await
+    }
+
+    /// `spawn` plus extra `-e KEY=VALUE` env pairs — used to drive the §5 discover-via-published-
+    /// config path (`CYAN_RENDEZVOUS_URL` + `CYAN_ORG_PUBKEY`) the explicit `Spec` fields don't cover.
+    pub async fn spawn_with_env(spec: Spec<'_>, extra_env: &[(&str, &str)]) -> Result<DockerNode> {
         Self::pre_clean(spec.name);
 
         // Capture container stderr (engine eprintln + iroh tracing) to a file so the relay
@@ -145,6 +156,10 @@ impl DockerNode {
         if spec.block_udp {
             args.push("--entrypoint".into());
             args.push("/usr/local/bin/ws-entrypoint.sh".into());
+        }
+        for (k, v) in extra_env {
+            args.push("-e".into());
+            args.push(format!("{k}={v}"));
         }
         args.push(node_image());
 
@@ -218,6 +233,16 @@ impl DockerNode {
         })
         .await
         .map_err(|_| anyhow!("{}: timeout after {:?} reading response", self.name, timeout))?
+    }
+
+    /// The bootstrap id this node RESOLVED at startup — from an explicit `BOOTSTRAP_NODE_ID`, a
+    /// verified rendezvous config (`CYAN_RENDEZVOUS_URL`), or the bundled fallback. Lets a test
+    /// assert positively that a peer adopted the LIVE published id (not the hardcode), or fell back.
+    pub async fn bootstrap_id(&mut self) -> Result<String> {
+        let resp = self.request("bootstrap_id", REQ_TIMEOUT).await?;
+        resp.strip_prefix("bootstrap_id ")
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("{}: unexpected bootstrap_id response: {resp}", self.name))
     }
 
     /// This node's serialized `EndpointAddr` (JSON) — `{"id":..,"addrs":[{"Relay"|"Ip"..}]}`.
@@ -483,4 +508,337 @@ pub async fn wire_pair(a: &mut DockerNode, b: &mut DockerNode) -> Result<()> {
     a.add_peer(&b_addr).await?;
     b.add_peer(&a_addr).await?;
     Ok(())
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// BootstrapNode — the REAL xaeroflux discovery-rendezvous container (NOT a cyan_node)
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// The bootstrap is `xaeroflux_bootstrap` (xaeroflux/src/bin/xaeroflux_bootstrap.rs), built into
+// `cyan/bootstrap:rig` (harness/Dockerfile.bootstrap). It does NOT speak the `@@CYAN@@` stdin/stdout
+// control protocol — it runs detached and serves the iroh-gossip discovery mesh, acting as the
+// cross-network peer-introducer / gossip relay. On startup it SELF-PUBLISHES a signed rendezvous
+// config (its own node_id + bound direct addrs + discovery_key + relay) to a file inside the
+// container, which we read back over `docker exec cat` — the same JSON a deploy would serve at the
+// well-known URL and peers would fetch. This is the LIVE source of the bootstrap id (no hardcode).
+
+/// The named Docker volume the bootstrap writes its rendezvous config into and the [`ConfigServer`]
+/// serves from — the rig stand-in for the object store / well-known URL a deploy would use.
+pub const RDV_VOLUME: &str = "cyan-rig-rdv";
+
+/// One running `xaeroflux_bootstrap` CONTAINER, plus the signed rendezvous config it published.
+pub struct BootstrapNode {
+    pub name: String,
+    /// The bootstrap's node_id (== its ed25519 public key, hex) — read from the published config,
+    /// NOT hardcoded. This is what peers pin/dial.
+    pub node_id: String,
+    /// The dialable direct socket addrs (`ip:port`) the bootstrap published — filtered to the
+    /// private/Docker-bridge addresses peers on the isolation networks can actually reach.
+    pub addrs: Vec<String>,
+    /// The raw bytes of the signed rendezvous config the bootstrap self-published (xaeroflux's
+    /// `SignedRendezvousConfig` JSON: `{config:{...}, signer, signature}`). This is exactly what a
+    /// static server would serve and `rendezvous::fetch_and_apply_if_configured` would fetch.
+    pub published_config: Vec<u8>,
+}
+
+impl Drop for BootstrapNode {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", &self.name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+impl BootstrapNode {
+    /// Launch the bootstrap on `networks` (attaches to all of them so it can bridge isolated
+    /// islands like a real rendezvous), wait until it self-publishes its rendezvous config, and
+    /// read back the LIVE node_id + dialable addrs. Iggy + n0 DNS are disabled (no broker / no
+    /// public DNS in the rig), so the only thing it does is discovery/gossip — exactly its role.
+    pub async fn spawn(name: &str, networks: &[&str], discovery_key: &str) -> Result<BootstrapNode> {
+        Self::spawn_inner(name, networks, discovery_key, true, None).await
+    }
+
+    /// `spawn` with control over whether the shared rendezvous volume is recreated fresh (true for
+    /// a brand-new bootstrap, false for a redeploy onto the same volume so the [`ConfigServer`]
+    /// mount stays valid) and an optional `exclude_id` to wait PAST (so a redeploy resolves the
+    /// NEW published id, not the stale one still on the volume until the new node overwrites it).
+    async fn spawn_inner(
+        name: &str,
+        networks: &[&str],
+        discovery_key: &str,
+        fresh_volume: bool,
+        exclude_id: Option<&str>,
+    ) -> Result<BootstrapNode> {
+        // Best-effort clean of a stale container with this name.
+        let _ = docker(&["rm", "-f", name]).await;
+
+        // The bootstrap writes its rendezvous config into RDV_VOLUME so the ConfigServer can serve
+        // it. A brand-new bootstrap recreates the volume so no prior run's config lingers.
+        if fresh_volume {
+            let _ = docker(&["volume", "rm", "-f", RDV_VOLUME]).await;
+            docker(&["volume", "create", RDV_VOLUME]).await?;
+        }
+
+        let primary = *networks
+            .first()
+            .ok_or_else(|| anyhow!("bootstrap needs at least one network"))?;
+        let args: Vec<String> = vec![
+            "run".into(),
+            "-d".into(),
+            "--name".into(),
+            name.into(),
+            "--network".into(),
+            primary.into(),
+            "-v".into(),
+            format!("{RDV_VOLUME}:/opt/cyan/data"),
+            "-e".into(),
+            format!("DISCOVERY_KEY={discovery_key}"),
+            "-e".into(),
+            "IGGY_ENABLED=0".into(),
+            "-e".into(),
+            "NO_N0=1".into(),
+            "-e".into(),
+            "XAEROFLUX_ENV=rig".into(),
+            "-e".into(),
+            "RUST_LOG=info".into(),
+            bootstrap_image(),
+        ];
+        let out = Command::new("docker")
+            .args(&args)
+            .output()
+            .await
+            .with_context(|| format!("docker run bootstrap ({name})"))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "docker run bootstrap {name} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+
+        // Attach to the remaining networks so the bootstrap is reachable from each isolated island.
+        for net in &networks[1..] {
+            docker(&["network", "connect", net, name]).await?;
+        }
+
+        // Poll for the self-published rendezvous config (with at least one dialable direct addr).
+        // Bounded — a bootstrap that never publishes a dialable addr is a real finding, not a hang.
+        let mut node = BootstrapNode {
+            name: name.to_string(),
+            node_id: String::new(),
+            addrs: Vec::new(),
+            published_config: Vec::new(),
+        };
+        node.refresh_published_config(Duration::from_secs(60), exclude_id).await?;
+        Ok(node)
+    }
+
+    /// Read the bootstrap's currently-published rendezvous config out of the container, parse the
+    /// LIVE node_id + dialable addrs, and store the raw signed bytes. Polls (bounded) until the
+    /// file exists, carries ≥1 private/dialable addr, and (if `exclude_id` is set) advertises an id
+    /// DIFFERENT from it (used after a redeploy to skip the stale config still on the volume).
+    pub async fn refresh_published_config(
+        &mut self,
+        timeout: Duration,
+        exclude_id: Option<&str>,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Ok(bytes) = self.read_config_file().await
+                && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            {
+                let node_id = v["config"]["bootstrap"]["node_id"].as_str().unwrap_or("");
+                let addrs: Vec<String> = v["config"]["bootstrap"]["addr"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|s| s.as_str())
+                            .filter(|s| is_dialable_in_rig(s))
+                            .map(|s| s.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let fresh = exclude_id.map(|x| x != node_id).unwrap_or(true);
+                if !node_id.is_empty() && !addrs.is_empty() && fresh {
+                    self.node_id = node_id.to_string();
+                    self.addrs = addrs;
+                    self.published_config = bytes;
+                    return Ok(());
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "{}: bootstrap did not publish a fresh dialable rendezvous config within {:?}",
+                    self.name,
+                    timeout
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// `docker exec <name> cat /opt/cyan/data/rendezvous.json` — the published signed config.
+    async fn read_config_file(&self) -> Result<Vec<u8>> {
+        let out = Command::new("docker")
+            .args(["exec", &self.name, "cat", "/opt/cyan/data/rendezvous.json"])
+            .output()
+            .await
+            .with_context(|| format!("docker exec cat rendezvous ({})", self.name))?;
+        if !out.status.success() {
+            return Err(anyhow!("rendezvous.json not readable yet"));
+        }
+        Ok(out.stdout)
+    }
+
+    /// The bootstrap's iroh `EndpointAddr` in the JSON form `add_peer` accepts
+    /// (`{"id":..,"addrs":[{"Ip":"ip:port"}]}`) — built from the LIVE published node_id + addrs.
+    /// This is the ONLY address material peers are given: they learn how to reach the BOOTSTRAP,
+    /// never each other (cross-peer discovery is the bootstrap's job to prove).
+    pub fn endpoint_addr_json(&self) -> String {
+        let addrs: Vec<serde_json::Value> = self
+            .addrs
+            .iter()
+            .map(|a| serde_json::json!({ "Ip": a }))
+            .collect();
+        serde_json::json!({ "id": self.node_id, "addrs": addrs }).to_string()
+    }
+
+    /// Restart the bootstrap container so it generates a FRESH node identity and republishes — the
+    /// redeploy scenario (a new node.key ⇒ a new node_id). Because the container is `--rm`-free here
+    /// we remove + relaunch; a fresh ephemeral DB dir means a new key, hence a new id.
+    pub async fn redeploy(&mut self, networks: &[&str], discovery_key: &str) -> Result<()> {
+        let name = self.name.clone();
+        let old_id = self.node_id.clone();
+        let _ = docker(&["rm", "-f", &name]).await;
+        // An identity-rotating redeploy: wipe the persisted `node.key` (and the stale config) from
+        // the SHARED volume so the new node generates a FRESH id — exactly the case §5 must survive
+        // with no app retune. The volume itself is kept so the ConfigServer mount stays valid.
+        let _ = docker(&[
+            "run", "--rm", "-v", &format!("{RDV_VOLUME}:/v"), "busybox", "sh", "-c",
+            "rm -f /v/node.key /v/rendezvous.json",
+        ])
+        .await;
+        // Reuse the SAME volume and wait until the published id has CHANGED from the old one — i.e.
+        // the new node has written a fresh rendezvous.json.
+        let replacement =
+            BootstrapNode::spawn_inner(&name, networks, discovery_key, false, Some(&old_id)).await?;
+        self.node_id = replacement.node_id.clone();
+        self.addrs = replacement.addrs.clone();
+        self.published_config = replacement.published_config.clone();
+        std::mem::forget(replacement); // same container name; avoid the old Drop rm-f'ing it
+        Ok(())
+    }
+
+    /// Corrupt the SERVED rendezvous config so its signature no longer covers the bytes (flip a
+    /// value inside the signed `config`). A peer fetching it must reject it and fall back — proving
+    /// no false bootstrap is adopted from a tampered doc. Modifies the shared volume in place.
+    pub async fn tamper_served_config(&self) -> Result<()> {
+        docker(&[
+            "run", "--rm", "-v", &format!("{RDV_VOLUME}:/v"), "busybox", "sh", "-c",
+            // Change the discovery_key inside the signed config; signer/signature are untouched, so
+            // verification fails. (The string appears in both config and is safe to flip for this.)
+            "sed -i 's/cyan-rig/evil-mesh/' /v/rendezvous.json",
+        ])
+        .await
+    }
+
+    pub fn read_log(&self) -> String {
+        std::process::Command::new("docker")
+            .args(["logs", &self.name])
+            .output()
+            .map(|o| {
+                let mut s = String::from_utf8_lossy(&o.stdout).to_string();
+                s.push_str(&String::from_utf8_lossy(&o.stderr));
+                s
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// A socket addr the rig's containers can actually dial: a private (RFC1918) Docker-bridge address
+/// or loopback. The bootstrap also publishes its public egress IP (from STUN/QAD), which no peer on
+/// an isolated bridge can reach — filtering those out keeps dial attempts fast and meaningful.
+fn is_dialable_in_rig(addr: &str) -> bool {
+    let host = match addr.rsplit_once(':') {
+        Some((h, _)) => h,
+        None => addr,
+    };
+    host.starts_with("172.")
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host.starts_with("127.")
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ConfigServer — the "well-known URL" that serves the bootstrap's self-published rendezvous config
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// A tiny `busybox httpd` container that serves [`RDV_VOLUME`] (the volume the bootstrap writes its
+// rendezvous.json into) over HTTP. This is the rig stand-in for the object store / CloudFront path
+// a deploy uploads the config to. Peers fetch `http://<server>:8080/rendezvous.json` via
+// `CYAN_RENDEZVOUS_URL` and verify it — exactly the iOS-app discover→pin path, with NO hardcoded id.
+
+pub struct ConfigServer {
+    pub name: String,
+    /// The URL peers reach (resolvable on the shared Docker networks via the container name).
+    pub url: String,
+}
+
+impl Drop for ConfigServer {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", &self.name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+impl ConfigServer {
+    /// Serve `RDV_VOLUME` over HTTP on `networks` (attach to all islands the peers live on). The
+    /// served file is whatever the bootstrap last published; start this only AFTER the bootstrap's
+    /// config is present so a peer never fetches an empty/partial doc.
+    pub async fn spawn(name: &str, networks: &[&str]) -> Result<ConfigServer> {
+        let _ = docker(&["rm", "-f", name]).await;
+        let primary = *networks
+            .first()
+            .ok_or_else(|| anyhow!("config server needs at least one network"))?;
+        // busybox httpd: foreground (-f), port 8080, webroot the mounted (read-only) volume.
+        let args: Vec<String> = vec![
+            "run".into(),
+            "-d".into(),
+            "--name".into(),
+            name.into(),
+            "--network".into(),
+            primary.into(),
+            "-v".into(),
+            format!("{RDV_VOLUME}:/web:ro"),
+            "busybox".into(),
+            "httpd".into(),
+            "-f".into(),
+            "-p".into(),
+            "8080".into(),
+            "-h".into(),
+            "/web".into(),
+        ];
+        let out = Command::new("docker")
+            .args(&args)
+            .output()
+            .await
+            .with_context(|| format!("docker run config server ({name})"))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "docker run config server {name} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        for net in &networks[1..] {
+            docker(&["network", "connect", net, name]).await?;
+        }
+        Ok(ConfigServer {
+            name: name.to_string(),
+            url: format!("http://{name}:8080/rendezvous.json"),
+        })
+    }
 }

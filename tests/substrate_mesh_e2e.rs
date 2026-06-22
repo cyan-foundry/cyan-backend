@@ -16,10 +16,13 @@
 //!   offline-message-hold logic lives in cyan-lens (tested there against fakes) and is OUT of this
 //!   substrate rig — so the one §10 row that needs Lens's offline-hold/redeliver is `#[ignore]`d
 //!   with that reason, not faked.
-//! - **bootstrap** — the thin discovery rendezvous; the TRUE cross-network stranger-introduction
-//!   needs the xaeroflux bootstrap binary as a container (xaeroflux is untouched per the spec), so
-//!   `bootstrap_seeded_cross_net_mesh` is `#[ignore]`d, pointing at the relay rung that already
-//!   proves the cross-net TRANSPORT.
+//! - **bootstrap** — the discovery rendezvous: the REAL `xaeroflux_bootstrap` binary as a
+//!   container (`harness/Dockerfile.bootstrap`, image `cyan/bootstrap:rig`; xaeroflux is read-only,
+//!   never modified). It self-publishes a signed rendezvous config and acts as the cross-network
+//!   gossip relay / peer-introducer, so two `cyan_node` peers on isolated bridges find each other
+//!   THROUGH it — proven live by `bootstrap_seeded_cross_net_mesh` +
+//!   `discovery_via_published_config_forms_cross_net_mesh` (+ the tampered/redeploy rungs). See
+//!   STATUS_BOOTSTRAP_DISCOVERY_E2E.md.
 //!
 //! ## Oracle split (honest)
 //! - **Convergence** (does the receiver end up holding the data) is asserted here, per-node.
@@ -40,7 +43,15 @@ mod dockernode;
 
 use std::time::Duration;
 
-use dockernode::{relay_url, wire_into, wire_pair, DockerNode, Relay, Spec};
+use dockernode::{
+    relay_url, wire_into, wire_pair, BootstrapNode, ConfigServer, DockerNode, Relay, Spec,
+};
+
+/// The bundled cold-start fallback id (mirrors `rendezvous::BUNDLED_BOOTSTRAP_NODE_ID`). A peer
+/// that adopted the LIVE published config resolves a DIFFERENT id; a peer that rejected a tampered
+/// config falls back to exactly this one.
+const BUNDLED_BOOTSTRAP_ID: &str =
+    "f992aa3b5409410b373605002a47e5521f1f2a9d10d2910544c3b37f4d6ed618";
 
 /// The rig is opt-in: only run when `CYAN_RIG=1`. A bare `--ignored` run without the rig skips
 /// cleanly rather than failing on no Docker.
@@ -61,6 +72,10 @@ const MESH_B: &str = "cyan-rig_mesh_b";
 const SYNC: Duration = Duration::from_secs(120);
 /// Live-propagation budget once the mesh is up.
 const LIVE: Duration = Duration::from_secs(60);
+/// Cross-network discovery is slower: the bootstrap must hear both peers' groups_exchange,
+/// introduce them, and the gossip overlay must stabilize through the relay node before a
+/// broadcast floods across the two isolated bridges. Be generous.
+const CROSS_NET: Duration = Duration::from_secs(180);
 
 // ── spawn helpers ──────────────────────────────────────────────────────────────────────────
 
@@ -440,22 +455,281 @@ async fn acceptance_airgapped_import_baseline() {
 
 // ════════════════════ Honest red scaffolds — blocked on real infra (NOT faked) ═══════════════
 
-/// §6 / §10 (bootstrap-seeded cross-network mesh): two peers on ISOLATED bridges that have no
-/// pre-shared addrs find each other through a thin discovery rendezvous.
+/// §6 / §10 (bootstrap-seeded cross-network mesh): two peers on ISOLATED bridges that have NO
+/// pre-shared peer addresses find EACH OTHER through the real xaeroflux discovery-rendezvous
+/// bootstrap, and a live edit authored on one propagates to the other.
 ///
-/// RED (honest): introducing two strangers across isolated networks WITHOUT pre-shared addrs is
-/// the xaeroflux bootstrap's gossip-discovery rendezvous role. `cyan_node` cannot relay third-
-/// party addrs (it is a peer, not a rendezvous), and xaeroflux is untouched by this batch (no
-/// bootstrap image is built here). The cross-network TRANSPORT itself is already proven GREEN by
-/// `substrate_relay::connects_via_relay_when_direct_blocked` (peers on split bridges sync via the
-/// relay). What remains unproven in-rig is only the auto-DISCOVERY of strangers — which needs the
-/// real xaeroflux bootstrap container.
-#[ignore = "needs the xaeroflux bootstrap discovery-rendezvous binary as a container (xaeroflux \
-            untouched per spec; no bootstrap image built here). Cross-net TRANSPORT is proven by \
-            substrate_relay::connects_via_relay_when_direct_blocked. See STATUS_MESH_HARNESS.md."]
+/// This is the make-or-break mesh property the §5 unit tests could not reach: not just "resolve
+/// the bootstrap id from a config", but the LIVE loop — a real `xaeroflux_bootstrap` container
+/// self-publishes its id, two `cyan_node` peers on networks with no route between them are told
+/// ONLY how to reach the bootstrap (never each other), and the bootstrap's gossip peer-introduction
+/// forms the cross-net mesh.
+///
+/// ## Why convergence here can ONLY have gone through the bootstrap
+/// - `peer-a` is on `mesh_a`, `peer-b` on `mesh_b` — separate Docker bridges with no route between
+///   them, and Docker bridges don't carry multicast, so mDNS cannot bridge them either.
+/// - `RELAY=Disabled` everywhere: no iroh relay is in this scenario.
+/// - The ONLY address material either peer receives is the BOOTSTRAP's `EndpointAddr` (read from
+///   the config it self-published) — never the other peer's. No `wire_pair`.
+/// So the only common reachability is the bootstrap; if `peer-b` ends up holding `peer-a`'s live
+/// edit, the bootstrap discovered them to each other and relayed it across the two islands.
+///
+/// ## Oracle (receiver storage, never logs)
+/// Both peers seed the SAME baseline so a gossiped element APPLIES on receipt (the cross-net
+/// snapshot TRANSPORT is separately proven by `substrate_relay::connects_via_relay_when_direct_blocked`;
+/// this scenario isolates the DISCOVERY + live-gossip-relay property). After the mesh forms through
+/// the bootstrap, `peer-a`'s 3 live edits converge on `peer-b` (5 fixture + 3 = 8), and `peer-b`'s
+/// roster records `peer-a` — a peer it has no direct route to and was never handed the address of.
+#[ignore = "Docker rig (xaeroflux bootstrap container); run via `make -C harness bootstrap-e2e` (CYAN_RIG=1)"]
 #[tokio::test]
 async fn bootstrap_seeded_cross_net_mesh() {
-    unimplemented!("blocked on a real xaeroflux bootstrap container; see the doc comment + STATUS");
+    if !rig_enabled() {
+        eprintln!("CYAN_RIG!=1 — skipping bootstrap cross-net rung");
+        return;
+    }
+
+    // 1. The REAL xaeroflux bootstrap, reachable from BOTH isolated islands. We read its LIVE
+    //    node_id + dialable addrs from the signed config it self-publishes — no hardcode.
+    let boot = BootstrapNode::spawn("cyan-rig-bootstrap", &[MESH_A, MESH_B], DKEY)
+        .await
+        .unwrap_or_else(|e| panic!("xaeroflux bootstrap up + published config: {e}"));
+    assert_ne!(boot.node_id.len(), 0, "bootstrap published a node_id");
+    let boot_addr = boot.endpoint_addr_json();
+
+    // 2. Two peers on DIFFERENT, isolated networks, each pinning the LIVE bootstrap id. Both seed
+    //    the same baseline (so a gossiped edit applies on receipt — see oracle note above).
+    let mut a = DockerNode::spawn(Spec {
+        name: "cyan-rig-peer-a",
+        network: MESH_A,
+        relay: Relay::Disabled,
+        discovery_key: DKEY,
+        bootstrap_node_id: Some(&boot.node_id),
+        seed_fixture_group: Some(GROUP),
+        block_udp: false,
+    })
+    .await
+    .unwrap_or_else(|e| panic!("spawn peer-a on mesh_a: {e}"));
+    let mut b = DockerNode::spawn(Spec {
+        name: "cyan-rig-peer-b",
+        network: MESH_B,
+        relay: Relay::Disabled,
+        discovery_key: DKEY,
+        bootstrap_node_id: Some(&boot.node_id),
+        seed_fixture_group: Some(GROUP),
+        block_udp: false,
+    })
+    .await
+    .unwrap_or_else(|e| panic!("spawn peer-b on mesh_b: {e}"));
+
+    // 3. The ONLY address material either peer is given is how to reach the BOOTSTRAP — never each
+    //    other. Discovering the other peer is the bootstrap's job.
+    a.add_peer(&boot_addr).await.expect("peer-a learns the bootstrap addr");
+    b.add_peer(&boot_addr).await.expect("peer-b learns the bootstrap addr");
+
+    // 4. Mesh-formation barrier: wait until BOTH peers have a group-topic neighbor (the bootstrap)
+    //    in their roster, so the relay node has both ends before we author the (one-shot) edit.
+    wait_count_at_least(&mut a, "members", 1, CROSS_NET, "peer-a meets the bootstrap on the group topic").await;
+    wait_count_at_least(&mut b, "members", 1, CROSS_NET, "peer-b meets the bootstrap on the group topic").await;
+
+    // 5. peer-a authors a live edit. With no A<->B route, no relay, and mDNS not carried, the only
+    //    path to peer-b is A -> bootstrap (gossip relay) -> B. 5 fixture + 3 new = 8.
+    a.post_edits(GROUP, 3).await.expect("peer-a posts 3 live edits");
+    let b_got = wait_count_at_least(&mut b, "elements", 8, CROSS_NET, "peer-a's edit crosses networks via the bootstrap").await;
+    assert_eq!(b_got, 8, "peer-b converged on the fixture + peer-a's live edits THROUGH the bootstrap");
+
+    // 6. The reverse direction also crosses the islands: peer-b authors 2 edits → they flood
+    //    B -> bootstrap -> A. peer-a converges to its 8 + peer-b's 2 = 10; peer-b is also 10.
+    //    Bidirectional convergence with the bootstrap as the SOLE bridge is the cross-net mesh.
+    //    (NOTE: the persistent roster records `delivered_from` — the relay neighbor, i.e. the
+    //    bootstrap — not the multi-hop author, so each peer's roster holds the bootstrap, not the
+    //    far peer. The converged element rows ARE the far peer's authored content; that is the
+    //    proof the data crossed the islands.)
+    b.post_edits(GROUP, 2).await.expect("peer-b posts 2 live edits");
+    let a_got = wait_count_at_least(&mut a, "elements", 10, CROSS_NET, "peer-b's edit crosses back via the bootstrap").await;
+    let b_final = wait_count_at_least(&mut b, "elements", 10, CROSS_NET, "peer-b holds the union").await;
+    assert_eq!((a_got, b_final), (10, 10), "bidirectional cross-net convergence through the bootstrap");
+    assert!(b.count("members", GROUP).await.unwrap() >= 1, "peer-b holds a live group-topic neighbor (the bootstrap bridge)");
+
+    let _ = a.quit().await;
+    let _ = b.quit().await;
+    drop(boot);
+}
+
+/// §5 end-to-end: a peer DISCOVERS the live bootstrap purely from the SIGNED CONFIG the bootstrap
+/// self-published — no hardcoded id, no `BOOTSTRAP_NODE_ID` env — then forms the cross-net mesh.
+///
+/// The bootstrap writes its signed rendezvous config to a volume a `busybox httpd` ConfigServer
+/// serves at a well-known URL (the rig stand-in for the object store). Each peer is given ONLY
+/// `CYAN_RENDEZVOUS_URL` + the pinned org key (`CYAN_ORG_PUBKEY` == the bootstrap node_id for a
+/// self-signed config) — NOT the id or discovery_key. It must fetch + verify the config to learn
+/// the LIVE bootstrap id (asserted: `bootstrap_id == live`, `!= bundled hardcode`), and then the
+/// same cross-net loop as `bootstrap_seeded_cross_net_mesh` runs on top of it.
+#[ignore = "Docker rig (xaeroflux bootstrap + config server); run via `make -C harness bootstrap-e2e` (CYAN_RIG=1)"]
+#[tokio::test]
+async fn discovery_via_published_config_forms_cross_net_mesh() {
+    if !rig_enabled() {
+        eprintln!("CYAN_RIG!=1 — skipping published-config discovery rung");
+        return;
+    }
+    let boot = BootstrapNode::spawn("cyan-rig-bootstrap", &[MESH_A, MESH_B], DKEY)
+        .await
+        .unwrap_or_else(|e| panic!("bootstrap up + published config: {e}"));
+    // Serve the bootstrap's self-published config at a URL reachable from both islands.
+    let cfg = ConfigServer::spawn("cyan-rig-config", &[MESH_A, MESH_B])
+        .await
+        .unwrap_or_else(|e| panic!("config server up: {e}"));
+    let boot_addr = boot.endpoint_addr_json();
+
+    // Peers learn EVERYTHING discovery-related (bootstrap id + discovery_key) from the verified
+    // config: no BOOTSTRAP_NODE_ID, empty DISCOVERY_KEY env. RELAY=Disabled (sovereign gossip via
+    // the bootstrap, not a relay). The org key pins the bootstrap node_id (self-signed config).
+    let env: [(&str, &str); 2] = [
+        ("CYAN_RENDEZVOUS_URL", cfg.url.as_str()),
+        ("CYAN_ORG_PUBKEY", boot.node_id.as_str()),
+    ];
+    let cfg_peer = |name: &'static str, net: &'static str| Spec {
+        name,
+        network: net,
+        relay: Relay::Disabled,
+        discovery_key: "", // ← intentionally empty: resolved from the verified config
+        bootstrap_node_id: None, // ← intentionally absent: resolved from the verified config
+        seed_fixture_group: Some(GROUP),
+        block_udp: false,
+    };
+    let mut a = DockerNode::spawn_with_env(cfg_peer("cyan-rig-peer-a", MESH_A), &env)
+        .await
+        .unwrap_or_else(|e| panic!("spawn peer-a (config-driven): {e}"));
+    let mut b = DockerNode::spawn_with_env(cfg_peer("cyan-rig-peer-b", MESH_B), &env)
+        .await
+        .unwrap_or_else(|e| panic!("spawn peer-b (config-driven): {e}"));
+
+    // The peers adopted the LIVE bootstrap id FROM THE CONFIG — not the bundled hardcode.
+    assert_eq!(a.bootstrap_id().await.unwrap(), boot.node_id, "peer-a pinned the LIVE bootstrap from the published config");
+    assert_eq!(b.bootstrap_id().await.unwrap(), boot.node_id, "peer-b pinned the LIVE bootstrap from the published config");
+    assert_ne!(boot.node_id, BUNDLED_BOOTSTRAP_ID, "the live id is NOT the bundled hardcode (no retune)");
+
+    // Feed each peer the bootstrap's dialable addr (the config's `addr` field; the engine's
+    // addr-seed path), never each other's, then run the cross-net loop.
+    a.add_peer(&boot_addr).await.expect("peer-a learns the bootstrap addr");
+    b.add_peer(&boot_addr).await.expect("peer-b learns the bootstrap addr");
+    wait_count_at_least(&mut a, "members", 1, CROSS_NET, "peer-a meets the bootstrap").await;
+    wait_count_at_least(&mut b, "members", 1, CROSS_NET, "peer-b meets the bootstrap").await;
+
+    a.post_edits(GROUP, 3).await.expect("peer-a posts 3 live edits");
+    let got = wait_count_at_least(&mut b, "elements", 8, CROSS_NET, "live edit crosses via the config-discovered bootstrap").await;
+    assert_eq!(got, 8, "peer-b converged via a bootstrap discovered purely from the published config");
+
+    let _ = a.quit().await;
+    let _ = b.quit().await;
+    drop(cfg);
+    drop(boot);
+}
+
+/// §5 negative: a TAMPERED published config (signature no longer covers the bytes) is REJECTED — a
+/// peer fetching it falls back to the bundled bootstrap and adopts NO false bootstrap id.
+///
+/// Positive oracle (not a "prove a negative" timeout): we assert the peer's RESOLVED bootstrap id
+/// equals the bundled fallback — it did not adopt the tampered config's id.
+#[ignore = "Docker rig (xaeroflux bootstrap + config server); run via `make -C harness bootstrap-e2e` (CYAN_RIG=1)"]
+#[tokio::test]
+async fn tampered_published_config_rejected_peer_uses_fallback() {
+    if !rig_enabled() {
+        eprintln!("CYAN_RIG!=1 — skipping tampered-config rung");
+        return;
+    }
+    let boot = BootstrapNode::spawn("cyan-rig-bootstrap", &[MESH_A, MESH_B], DKEY)
+        .await
+        .unwrap_or_else(|e| panic!("bootstrap up: {e}"));
+    let cfg = ConfigServer::spawn("cyan-rig-config", &[MESH_A, MESH_B])
+        .await
+        .unwrap_or_else(|e| panic!("config server up: {e}"));
+    // Corrupt the served config BEFORE the peer fetches it.
+    boot.tamper_served_config().await.expect("tamper the served config");
+
+    let env: [(&str, &str); 2] = [
+        ("CYAN_RENDEZVOUS_URL", cfg.url.as_str()),
+        ("CYAN_ORG_PUBKEY", boot.node_id.as_str()),
+    ];
+    let mut peer = DockerNode::spawn_with_env(
+        Spec {
+            name: "cyan-rig-peer-a",
+            network: MESH_A,
+            relay: Relay::Disabled,
+            discovery_key: DKEY,
+            bootstrap_node_id: None,
+            seed_fixture_group: None,
+            block_udp: false,
+        },
+        &env,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("spawn peer (tampered config): {e}"));
+
+    let resolved = peer.bootstrap_id().await.expect("resolved bootstrap id");
+    assert_eq!(resolved, BUNDLED_BOOTSTRAP_ID, "tampered config rejected → bundled fallback, no false bootstrap");
+    assert_ne!(resolved, boot.node_id, "the live (correctly-signed) id was NOT adopted from a tampered doc");
+
+    let _ = peer.quit().await;
+    drop(cfg);
+    drop(boot);
+}
+
+/// §5 redeploy: the bootstrap is REDEPLOYED with a fresh identity (rotated `node.key`) and
+/// republishes; a FRESH peer (TOFU, no pinned key) picks up the NEW id from the same URL with ZERO
+/// app/env change — the whole point of §5 (no per-deploy retune).
+#[ignore = "Docker rig (xaeroflux bootstrap + config server); run via `make -C harness bootstrap-e2e` (CYAN_RIG=1)"]
+#[tokio::test]
+async fn bootstrap_redeploy_new_id_picked_up_no_app_change() {
+    if !rig_enabled() {
+        eprintln!("CYAN_RIG!=1 — skipping redeploy rung");
+        return;
+    }
+    let mut boot = BootstrapNode::spawn("cyan-rig-bootstrap", &[MESH_A, MESH_B], DKEY)
+        .await
+        .unwrap_or_else(|e| panic!("bootstrap up: {e}"));
+    let cfg = ConfigServer::spawn("cyan-rig-config", &[MESH_A, MESH_B])
+        .await
+        .unwrap_or_else(|e| panic!("config server up: {e}"));
+    let first_id = boot.node_id.clone();
+
+    // TOFU mode (no CYAN_ORG_PUBKEY) — the trust model that lets the id rotate without an app retune.
+    let env_for = |url: &str| -> Vec<(String, String)> {
+        vec![("CYAN_RENDEZVOUS_URL".to_string(), url.to_string())]
+    };
+    let env0 = env_for(&cfg.url);
+    let env0r: Vec<(&str, &str)> = env0.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut before = DockerNode::spawn_with_env(
+        Spec { name: "cyan-rig-peer-a", network: MESH_A, relay: Relay::Disabled,
+               discovery_key: DKEY, bootstrap_node_id: None, seed_fixture_group: None, block_udp: false },
+        &env0r,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("spawn pre-redeploy peer: {e}"));
+    assert_eq!(before.bootstrap_id().await.unwrap(), first_id, "fresh peer adopts the FIRST live id");
+    let _ = before.quit().await;
+
+    // Redeploy with a rotated identity; the same ConfigServer/URL now serves the NEW config.
+    boot.redeploy(&[MESH_A, MESH_B], DKEY).await.expect("redeploy bootstrap with new id");
+    assert_ne!(boot.node_id, first_id, "redeploy rotated the bootstrap node_id");
+
+    // A FRESH peer, SAME URL, NO env change → discovers the NEW id (no per-deploy retune).
+    let env1 = env_for(&cfg.url);
+    let env1r: Vec<(&str, &str)> = env1.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut after = DockerNode::spawn_with_env(
+        Spec { name: "cyan-rig-peer-b", network: MESH_B, relay: Relay::Disabled,
+               discovery_key: DKEY, bootstrap_node_id: None, seed_fixture_group: None, block_udp: false },
+        &env1r,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("spawn post-redeploy peer: {e}"));
+    let picked = after.bootstrap_id().await.unwrap();
+    assert_eq!(picked, boot.node_id, "fresh peer picked up the REDEPLOYED id from the same URL");
+    assert_ne!(picked, first_id, "it is the new id, not the pre-redeploy one");
+    assert_ne!(picked, BUNDLED_BOOTSTRAP_ID, "and not the bundled hardcode");
+
+    let _ = after.quit().await;
+    drop(cfg);
+    drop(boot);
 }
 
 /// §10 (a peer is offline; its messages are held and delivered on return): a message addressed to
