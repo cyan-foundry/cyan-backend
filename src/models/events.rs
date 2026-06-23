@@ -1,6 +1,7 @@
 pub use crate::ai_bridge::AIBridge;
 use crate::models::core::{Group, Workspace};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -218,6 +219,35 @@ pub enum NetworkEvent {
         method: String,
         /// Event payload as a JSON string (opaque to the mesh; Lens parses it).
         payload: String,
+    },
+    // ---- MCP remote tool invocation (sovereignty model) ----
+    /// A cloud Lens `MeshTransport` dispatch routed to THIS host: run `tool` on
+    /// the locally-installed `plugin_id` against LOCAL data, tenant-scoped, and
+    /// reply with a `RemoteToolResult` carrying the same `corr_id`. This is the
+    /// "Contido local, Lens on AWS" path — the plugin + data stay local; Lens only
+    /// orchestrates. The device runs it via its existing cyan-mcp host
+    /// (`mesh_invoke::RemoteInvokeHandler`). Normal peers ignore it (no consumer).
+    RemoteToolCall {
+        /// Correlation id matching the result back to this call.
+        corr_id: String,
+        /// Tenant the call is scoped to (carried on every mesh hop).
+        tenant_id: String,
+        /// Locally-installed plugin that exposes the tool.
+        plugin_id: String,
+        /// Tool name to invoke.
+        tool: String,
+        /// JSON arguments for the call (opaque on the mesh).
+        args: Value,
+    },
+    /// The result of a [`RemoteToolCall`], correlated by `corr_id`. Exactly one of
+    /// `result` / `error` is set.
+    RemoteToolResult {
+        /// Correlation id echoing the originating `RemoteToolCall::corr_id`.
+        corr_id: String,
+        /// The tool's JSON result, if it ran successfully.
+        result: Option<Value>,
+        /// A human-readable error, if the tool could not run.
+        error: Option<String>,
     },
     // ---- Anonymous participation events ----
     AnonymousJoined {

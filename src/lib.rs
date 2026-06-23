@@ -32,6 +32,7 @@ pub mod snapshot;
 pub mod group_bundle;
 pub mod lens_commands;
 pub mod mcp_host;
+pub mod mesh_invoke;
 pub mod identity;
 pub mod licensing;
 pub mod sso_grant;
@@ -1785,6 +1786,12 @@ fn route_event_to_buffers(
                 // replica) to enrich — a normal device has no local consumer and
                 // surfaces nothing to the app (plugins are files, not events).
                 NetworkEvent::PluginRelay { .. } => {}
+
+                // Remote tool invocation is host-to-host mesh traffic consumed by
+                // the remote-invoke handler (mesh_invoke::RemoteInvokeHandler), not
+                // by the app: there is no UI panel for a Lens-orchestrated tool call
+                // running locally. Pass-through here.
+                NetworkEvent::RemoteToolCall { .. } | NetworkEvent::RemoteToolResult { .. } => {}
             }
         }
 
