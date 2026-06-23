@@ -71,6 +71,16 @@ pub fn group_high_water(group_id: &str) -> i64 {
     for p in storage::pin_list_by_boards(&board_ids).unwrap_or_default() {
         bump(p.updated_at);
     }
+    // board_metadata (descriptive + pin LWW lanes) and workflow_state are sent in FULL by the
+    // snapshot, but their clocks still count toward the watermark so it stays the true max
+    // version across every row a peer holds.
+    for m in storage::board_metadata_list_by_boards(&board_ids).unwrap_or_default() {
+        bump(m.meta_updated_at);
+        bump(m.pin_updated_at);
+    }
+    for ws in storage::workflow_state_list_by_boards(&board_ids).unwrap_or_default() {
+        bump(ws.updated_at);
+    }
     for f in storage::file_list_by_group(group_id).unwrap_or_default() {
         bump(f.created_at);
     }
@@ -152,6 +162,11 @@ pub fn build_snapshot_frames(group_id: &str, since: Option<i64>) -> Result<Vec<S
         since,
         |p| p.updated_at,
     );
+    // R12 D2/E1 workflow lifecycle state — sent in FULL like `board_metadata` (one tiny row per
+    // deployed board, applied via the idempotent LWW `workflow_state_upsert`), so an incremental
+    // catch-up still carries it regardless of `since` and a returning peer reconciles a deploy/lock
+    // it missed while offline.
+    let workflow_states = storage::workflow_state_list_by_boards(&board_ids)?;
     let metadata = SnapshotFrame::Metadata {
         chats,
         files,
@@ -159,6 +174,7 @@ pub fn build_snapshot_frames(group_id: &str, since: Option<i64>) -> Result<Vec<S
         board_metadata,
         notes,
         pins,
+        workflow_states,
     };
 
     Ok(vec![structure, content, metadata, SnapshotFrame::Complete])
@@ -180,13 +196,15 @@ pub fn frame_row_count(frame: &SnapshotFrame) -> u64 {
             board_metadata,
             notes,
             pins,
+            workflow_states,
         } => {
             (chats.len()
                 + files.len()
                 + integrations.len()
                 + board_metadata.len()
                 + notes.len()
-                + pins.len()) as u64
+                + pins.len()
+                + workflow_states.len()) as u64
         }
         SnapshotFrame::Complete => 0,
     }
@@ -252,6 +270,7 @@ pub fn apply_snapshot_frame(frame: &SnapshotFrame) -> Result<()> {
             board_metadata,
             notes,
             pins,
+            workflow_states,
         } => {
             for ch in chats {
                 // R11 §1: chat is board-scoped. A pre-R11 frame may omit board_id; fall back
@@ -310,6 +329,9 @@ pub fn apply_snapshot_frame(frame: &SnapshotFrame) -> Result<()> {
             }
             for p in pins {
                 storage::pin_upsert(p)?;
+            }
+            for ws in workflow_states {
+                storage::workflow_state_upsert(ws)?;
             }
         }
         SnapshotFrame::Complete => {}

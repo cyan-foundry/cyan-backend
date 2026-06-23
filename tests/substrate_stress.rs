@@ -516,6 +516,77 @@ async fn dropped_delta_is_repaired_by_next_sweep() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════
+// F2. R12 C3: a dropped BOARD-PIN and a missed WORKFLOW-STATE deploy are repaired by the sweep.
+//     C1/C2 made board-pin a convergent delta and D2/E1 added per-board workflow-state, but until
+//     C3 NEITHER lane was in the digest — so a dropped `BoardPinned` (or a deploy that never had a
+//     live delta) was undetectable and stayed diverged forever. This is the multi-process heal
+//     across REAL divergent storage: each `cyan_node` has its own DB, so a local-only write is a
+//     genuine divergence only anti-entropy can reconcile. Covers BOTH lanes, BOTH directions, and
+//     no-stale-clock clobber. Deterministic + light ⇒ runs in CI like the element repair above.
+// ════════════════════════════════════════════════════════════════════════════════════════
+#[tokio::test]
+async fn dropped_board_pin_and_workflow_state_repaired_by_sweep() {
+    let _serial = serial().await;
+    let key = unique_discovery_key();
+    let group = unique_group_id();
+    let n = 3;
+
+    let mut nodes = form_group_ae(n, &key, &group).await.expect("form group + sync all peers");
+
+    // ── Lane A: workflow-state, host → peers ────────────────────────────────────────────────
+    // Host deploys the fixture board into its OWN storage WITHOUT broadcasting. Workflow-state
+    // has no live delta at all, so before C3 this could NEVER reach the peers; with it in the
+    // digest + snapshot, the sweep reconciles it.
+    nodes[0].deploy_local(&group, /*dashboard*/ true, 1000).await.expect("deploy local-only on host");
+    assert_eq!(
+        nodes[0].count("deployed", &group).await.expect("count host deployed"),
+        1,
+        "host holds its own deploy; the peers cannot have it yet (no broadcast)"
+    );
+    converge_count(&mut nodes, "deployed", &group, 1, converge_timeout(n))
+        .await
+        .expect("the missed workflow deploy is reconciled on every peer by the AE sweep");
+
+    // ── Lane B: board-pin, host → peers (the headline dropped-`BoardPinned` repair) ──────────
+    nodes[0].set_board_pin(&group, true, 1000).await.expect("pin local-only on host");
+    assert_eq!(
+        nodes[0].count("board_pins", &group).await.expect("count host pins"),
+        1,
+        "host holds its own pin; nobody else can yet (the dropped delta)"
+    );
+    converge_count(&mut nodes, "board_pins", &group, 1, converge_timeout(n))
+        .await
+        .expect("the dropped board-pin is reconciled on every peer by the AE sweep");
+
+    // ── Both directions + NO stale-clock clobber ────────────────────────────────────────────
+    // A DIFFERENT peer now unpins at a NEWER clock, again local-only. The mesh must converge to
+    // UNPINNED everywhere: the newer unpin@2000 wins on every peer (the peer→host direction),
+    // and the older pin@1000 it races must never clobber it back (LWW no-stale-clobber, end to
+    // end across processes — the apply guard proven deterministically in the Tier-1 lane test).
+    nodes[1].set_board_pin(&group, false, 2000).await.expect("newer unpin local-only on a peer");
+    converge_count(&mut nodes, "board_pins", &group, 0, converge_timeout(n))
+        .await
+        .expect("newer unpin wins on every peer; the older pin never clobbers it back");
+
+    // The repairs rode bounded, debounced pulls — not a per-message storm (same oracle as the
+    // element dropped-delta test): every peer's repair count is small, and at least one fired.
+    let mut total_repairs = 0u64;
+    for node in nodes.iter_mut() {
+        let m = node.metrics().await.expect("read metrics");
+        total_repairs += m.ae_repair;
+        assert!(
+            m.ae_repair < 50,
+            "{} ran {} repair pulls — debounce should keep this bounded",
+            node.name,
+            m.ae_repair
+        );
+    }
+    assert!(total_repairs >= 1, "expected at least one anti-entropy repair pull to carry the lanes");
+
+    quit_all(nodes).await;
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════
 // G. Anti-entropy at scale: live deltas from EVERY peer converge under load at the N that
 //    previously PLATEAUED at partial, divergent state (the measured ceiling was N≈8; N=12 was
 //    shown stuck at divergent counts for 100s+ in STATUS_STRESS_FABRIC). With the sweep it now

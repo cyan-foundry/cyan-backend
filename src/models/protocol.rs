@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::models::core::{Group, Workspace};
 use crate::models::dto::{
     BoardMetadataDTO, ChatDTO, FileDTO, IntegrationBindingDTO,
-    NotebookCellDTO, NoteDTO, PinDTO, WhiteboardDTO, WhiteboardElementDTO,
+    NotebookCellDTO, NoteDTO, PinDTO, WhiteboardDTO, WhiteboardElementDTO, WorkflowStateDTO,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -76,6 +76,12 @@ pub enum SnapshotFrame {
         /// ROUND8 §W4 pinned-workflow state. Same wire-compat contract as `notes`.
         #[serde(default)]
         pins: Vec<PinDTO>,
+        /// R12 D2/E1 per-board workflow lifecycle state (deployed/dashboard/locked, LWW on
+        /// `updated_at`). Same wire-compat contract as `notes`/`pins`: an older holder omits it
+        /// (a newer peer fills an empty vec), a newer holder's extra field is ignored by older
+        /// peers — so adding it never breaks a mixed-version snapshot transfer.
+        #[serde(default)]
+        workflow_states: Vec<WorkflowStateDTO>,
     },
     /// Signals transfer complete
     Complete,

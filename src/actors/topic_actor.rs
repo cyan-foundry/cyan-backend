@@ -1748,11 +1748,11 @@ async fn download_snapshot_since(
                 }
             }
 
-            SnapshotFrame::Metadata { chats, files, integrations, board_metadata, notes, pins } => {
+            SnapshotFrame::Metadata { chats, files, integrations, board_metadata, notes, pins, workflow_states } => {
                 eprintln!(
-                    "📥 [SNAP-DL-9] METADATA: chats={} files={} integ={} meta={} notes={} pins={}",
+                    "📥 [SNAP-DL-9] METADATA: chats={} files={} integ={} meta={} notes={} pins={} wf={}",
                     chats.len(), files.len(), integrations.len(),
-                    board_metadata.len(), notes.len(), pins.len()
+                    board_metadata.len(), notes.len(), pins.len(), workflow_states.len()
                 );
                 if !files.is_empty() && !quiet {
                     let _ = event_tx.send(SwiftEvent::SyncFilesReceived {

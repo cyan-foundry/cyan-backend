@@ -464,6 +464,29 @@ impl MpNode {
             .map(|_| ())
     }
 
+    /// R12 C3: set the BOARD-PIN lane (`board_metadata.is_pinned` @ `clock`, the C1/C2 convergent
+    /// delta) into THIS node's storage WITHOUT broadcasting — the stand-in for a dropped
+    /// `BoardPinned`. Only anti-entropy can carry it. `clock` is the explicit LWW timestamp so a
+    /// test can prove a stale clock never clobbers a newer pin. Targets the fixture `<gid>-board`.
+    pub async fn set_board_pin(&mut self, group_id: &str, pinned: bool, clock: i64) -> Result<()> {
+        let flag = if pinned { 1 } else { 0 };
+        let board = format!("{group_id}-board");
+        self.request(&format!("set_board_pin {group_id} {flag} {board} {clock}"), REQ_TIMEOUT)
+            .await
+            .map(|_| ())
+    }
+
+    /// R12 C3 (D2/E1 lane): deploy a workflow (`board_workflow_state` @ `clock`) into THIS node's
+    /// storage WITHOUT broadcasting — the stand-in for a deploy a peer missed. Only the digest +
+    /// snapshot repair carries it. Targets the fixture `<gid>-board`.
+    pub async fn deploy_local(&mut self, group_id: &str, dashboard: bool, clock: i64) -> Result<()> {
+        let flag = if dashboard { 1 } else { 0 };
+        let board = format!("{group_id}-board");
+        self.request(&format!("deploy_local {group_id} {flag} {board} {clock}"), REQ_TIMEOUT)
+            .await
+            .map(|_| ())
+    }
+
     /// Seed (hold + announce) a deterministic blob of `size` bytes into `group_id`'s swarm.
     /// Returns `(file_id, blake3_hex)`.
     pub async fn seed_blob(&mut self, group_id: &str, size: usize) -> Result<(String, String)> {

@@ -772,6 +772,54 @@ async fn handle_verb(
             Ok(format!("ok set_pin {}", pinned as i32))
         }
 
+        // R12 C3: set the BOARD-PIN lane (`board_metadata.is_pinned` + `pin_updated_at`, the C1/C2
+        // convergent delta — distinct from the ROUND8 workflow-pin `set_pin` above) into THIS node's
+        // storage WITHOUT broadcasting — the deterministic stand-in for a dropped `BoardPinned`. With
+        // the board-pin lane now in the digest + snapshot, ONLY anti-entropy can reconcile it. The
+        // optional explicit `clock` lets a test assert LWW (a stale clock must not clobber a newer pin).
+        // `set_board_pin <gid> <0|1> [board] [clock]` → `ok set_board_pin <is_pinned> <clock>`.
+        "set_board_pin" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?;
+            let pinned = rest
+                .get(1)
+                .map(|s| *s == "1" || s.eq_ignore_ascii_case("true"))
+                .ok_or_else(|| anyhow!("pinned flag required"))?;
+            let board = rest
+                .get(2)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{gid}-board"));
+            let clock = rest
+                .get(3)
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or_else(|| chrono::Utc::now().timestamp());
+            storage::board_meta_set_pinned(&board, pinned, clock)
+                .map_err(|e| anyhow!("board_meta_set_pinned: {e}"))?;
+            Ok(format!("ok set_board_pin {} {clock}", pinned as i32))
+        }
+
+        // R12 C3 (D2/E1 lane): deploy a workflow (`board_workflow_state` deployed/dashboard/locked)
+        // into THIS node's storage WITHOUT broadcasting — the stand-in for a deploy a peer missed.
+        // With workflow-state now in the digest + snapshot, anti-entropy reconciles it on the next
+        // sweep / cold-join. `deploy_local <gid> <0|1 dashboard> [board] [clock]` → `ok deploy_local <clock>`.
+        "deploy_local" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?;
+            let dashboard = rest
+                .get(1)
+                .map(|s| *s == "1" || s.eq_ignore_ascii_case("true"))
+                .ok_or_else(|| anyhow!("dashboard flag required"))?;
+            let board = rest
+                .get(2)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{gid}-board"));
+            let clock = rest
+                .get(3)
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or_else(|| chrono::Utc::now().timestamp());
+            storage::workflow_state_set_deployed(&board, dashboard, clock)
+                .map_err(|e| anyhow!("workflow_state_set_deployed: {e}"))?;
+            Ok(format!("ok deploy_local {clock}"))
+        }
+
         // ── Live-harness behaviors (ROUND8 harness) ───────────────────────────────────────
         // Post `n` live board-chat messages to a group: insert each into THIS node's storage AND
         // broadcast a `ChatSent` over the group gossip, exactly as the app's send-chat path does
@@ -1578,6 +1626,27 @@ fn count_kind(kind: &str, group_id: &str) -> Result<usize> {
         "files" => storage::file_list_by_group(group_id)
             .map_err(|e| anyhow!("file_list_by_group: {e}"))?
             .len(),
+        // R12 C3: count boards PINNED via the board-pin lane (`board_metadata.is_pinned`, the C1/C2
+        // convergent delta) — the per-node oracle that a dropped `BoardPinned` was reconciled by
+        // anti-entropy. Distinct from the ROUND8 workflow-pin `pins` kind above.
+        "board_pins" => {
+            let board_ids = board_ids(&ws_ids)?;
+            storage::board_metadata_list_by_boards(&board_ids)
+                .map_err(|e| anyhow!("board_metadata_list_by_boards: {e}"))?
+                .iter()
+                .filter(|m| m.is_pinned)
+                .count()
+        }
+        // R12 C3 (D2/E1 lane): count DEPLOYED boards (`board_workflow_state.deployed`) — the oracle
+        // that a workflow deploy a peer missed was reconciled via the digest + snapshot repair.
+        "deployed" => {
+            let board_ids = board_ids(&ws_ids)?;
+            storage::workflow_state_list_by_boards(&board_ids)
+                .map_err(|e| anyhow!("workflow_state_list_by_boards: {e}"))?
+                .iter()
+                .filter(|s| s.deployed)
+                .count()
+        }
         // MESH_HARDENING §3: the PERSISTENT roster — every peer ever seen over the mesh,
         // online or not (the row is never deleted). The honest per-node oracle for "an offline
         // peer keeps its cached row" and "the roster survives reconnect".

@@ -111,9 +111,11 @@ pub enum AntiEntropyMsg {
 /// `(item_count, blake3_hex)` over the sorted per-item `(kind, id, version)` lines.
 ///
 /// Version columns: `created_at` for immutable rows (group/workspace/board),
-/// `updated_at` for mutable rows (elements/cells/notes), `timestamp` for chats, and the
-/// content `hash` for files (files are immutable by hash). Two peers with identical
-/// state produce identical `(count, hash)`; any divergence flips the hash.
+/// `updated_at` for mutable rows (elements/cells/notes/pins/workflow-state), the board-metadata
+/// LWW clocks (`meta_updated_at` + `pin_updated_at`) for board_metadata, `timestamp` for chats,
+/// and the content `hash` for files (files are immutable by hash). Two peers with identical
+/// state produce identical `(count, hash)`; any divergence flips the hash. Every lane the
+/// snapshot can repair is covered here, so the detector never misses what the repair could heal.
 ///
 /// This is the cheap detector the spec asks for — a hash over current rows, never a
 /// scan of the message history.
@@ -157,6 +159,22 @@ pub fn group_digest(group_id: &str) -> (u64, String) {
     // exactly like a note. The snapshot Metadata frame carries the `pinned` bool.
     for p in storage::pin_list_by_boards(&board_ids).unwrap_or_default() {
         entries.push(format!("p{SEP}{}{SEP}{}", p.board_id, p.updated_at));
+    }
+    // R12: board_metadata is per-board mutable with TWO independent LWW lanes — the descriptive
+    // lane (labels/rating/type/… on `meta_updated_at`) and the BOARD-PIN lane (`is_pinned` on
+    // `pin_updated_at`, the C1/C2 convergent delta). Versioning on BOTH clocks (the exact keys
+    // `board_metadata_upsert` merges on) means a dropped `BoardPinned` or `UpdateBoardMetadata`
+    // delta flips the hash, so the sweep detects it and the snapshot repair (which already carries
+    // board_metadata, applied via the same LWW) reconciles it — closing the pin-lane repair gap.
+    for m in storage::board_metadata_list_by_boards(&board_ids).unwrap_or_default() {
+        entries.push(format!("bm{SEP}{}{SEP}{}{SEP}{}", m.board_id, m.meta_updated_at, m.pin_updated_at));
+    }
+    // R12 D2/E1: per-board workflow lifecycle state (deployed/dashboard/locked), board-level +
+    // mutable (LWW on `updated_at`). With it in the digest AND the snapshot, a deploy/lock a peer
+    // missed (it was offline, or the state never had a live delta to begin with) reconciles on the
+    // next sweep / cold-join — exactly like a note. Default-authoring boards have no row ⇒ no line.
+    for ws in storage::workflow_state_list_by_boards(&board_ids).unwrap_or_default() {
+        entries.push(format!("wf{SEP}{}{SEP}{}", ws.board_id, ws.updated_at));
     }
     for f in storage::file_list_by_group(group_id).unwrap_or_default() {
         entries.push(format!("f{SEP}{}{SEP}{}", f.id, f.hash));

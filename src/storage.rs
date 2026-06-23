@@ -961,6 +961,62 @@ pub fn workflow_state_set_locked(board_id: &str, locked: bool, updated_at: i64) 
     Ok(())
 }
 
+/// List the workflow-lifecycle rows for `board_ids` (only boards that actually have a row —
+/// a default-authoring board contributes nothing, so two peers with no deployments produce
+/// identical lists). The version column the anti-entropy digest + snapshot use is `updated_at`.
+/// Used by the digest (detect a missed deploy/lock) and the snapshot (carry it for repair).
+pub fn workflow_state_list_by_boards(board_ids: &[String]) -> Result<Vec<WorkflowStateDTO>> {
+    if board_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    let placeholders = vec!["?"; board_ids.len()].join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT board_id, deployed, dashboard_available, locked, updated_at
+         FROM board_workflow_state WHERE board_id IN ({placeholders})"
+    ))?;
+    let params = rusqlite::params_from_iter(board_ids.iter());
+    let rows = stmt
+        .query_map(params, |r| {
+            Ok(WorkflowStateDTO {
+                board_id: r.get(0)?,
+                deployed: r.get::<_, i32>(1)? != 0,
+                dashboard_available: r.get::<_, i32>(2)? != 0,
+                locked: r.get::<_, i32>(3)? != 0,
+                updated_at: r.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Full-record **upsert-by-board_id** with **LWW on `updated_at`**: apply a whole workflow-state
+/// row (the shape the snapshot/anti-entropy repair carries), replacing the local row ONLY IF the
+/// incoming `updated_at` is **strictly newer**. Equal/older writes are no-ops, so re-applying the
+/// same state (a replayed snapshot frame, a debounced repair pull) never churns and a stale clock
+/// never clobbers a newer local deploy/lock — the same LWW guard as `pin_upsert`/`board_metadata_upsert`.
+pub fn workflow_state_upsert(s: &WorkflowStateDTO) -> Result<bool> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    let changed = conn.execute(
+        "INSERT INTO board_workflow_state (board_id, deployed, dashboard_available, locked, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(board_id) DO UPDATE SET
+            deployed            = excluded.deployed,
+            dashboard_available = excluded.dashboard_available,
+            locked              = excluded.locked,
+            updated_at          = excluded.updated_at
+         WHERE excluded.updated_at > board_workflow_state.updated_at",
+        params![
+            s.board_id,
+            s.deployed as i32,
+            s.dashboard_available as i32,
+            s.locked as i32,
+            s.updated_at
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // FILES
 // ═══════════════════════════════════════════════════════════════════════════
