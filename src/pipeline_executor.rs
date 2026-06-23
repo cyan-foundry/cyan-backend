@@ -330,12 +330,7 @@ pub async fn execute_step_via_lens(
 async fn execute_tool_locally(tool_call: &ToolCall) -> ToolResult {
     let timeout = if tool_call.timeout_seconds > 0 { tool_call.timeout_seconds } else { 60 };
     
-    let binary = match tool_call.tool_id.as_str() {
-        "ffprobe" => "ffprobe",
-        "ffmpeg" => "ffmpeg",
-        "whisper" => "whisper",
-        other => other,
-    };
+    let binary = tool_call.tool_id.as_str();
     
     match tokio::time::timeout(
         std::time::Duration::from_secs(timeout),
@@ -425,7 +420,7 @@ fn publish_pipeline_event(
     event_tx: &UnboundedSender<SwiftEvent>,
     event: PipelineEvent,
 ) {
-    eprintln!("📡 PIPELINE EVENT: {} [{}] step={}", event.event_type, event.board_id[..8].to_string(), event.step_id);
+    eprintln!("📡 PIPELINE EVENT: {} [{}] step={}", event.event_type, &event.board_id[..8], event.step_id);
     
     // Send as SwiftEvent::GenericEvent which gets routed to Iggy via the network actor
     let _ = event_tx.send(SwiftEvent::StatusUpdate { message: format!("📡 pipeline.{}: step={}", event.event_type, event.step_id) });
@@ -447,6 +442,33 @@ pub async fn execute_pipeline_step(
     command_tx: &UnboundedSender<CommandMsg>,
     event_tx: &UnboundedSender<SwiftEvent>,
 ) -> Result<(String, Vec<Finding>)> {
+
+    // ── LOCAL MCP PLUGIN TOOL: run on-device, NO cloud round-trip ───────
+    // A `local` step whose metadata names a plugin tool (`{ "mcp_tool": {
+    // plugin_id, tool, args } }`) is dispatched through the supervised cyan-mcp
+    // host on this device — the local mirror of the lens cloud `McpTool` path.
+    // Guarded: ordinary steps (no `mcp_tool`) fall straight through unchanged.
+    if executor_type == "local"
+        && let Some(step) = metadata.as_ref().and_then(parse_mcp_tool_step)
+    {
+        return execute_local_mcp_tool_step(board_id, step_id, step, command_tx, event_tx).await;
+    }
+
+    // ── LICENSE GATE: a genuinely-cloud (Lens) run is a paid surface ────
+    // Round 8 / W11. Local-placement steps (handled above and below) run
+    // unconditionally offline; only a cloud/Lens run consults the installed
+    // license. With NO gate installed this is a no-op, so existing behavior and
+    // the local test rigs are unchanged. A denied tenant gets a clear "needs a
+    // license" state without blocking the local steps.
+    if matches!(executor_type, "cloud" | "lens")
+        && let Err(reason) =
+            crate::licensing::gate_cloud_action(crate::licensing::CloudAction::RunWorkflow)
+    {
+        let _ = event_tx.send(SwiftEvent::StatusUpdate {
+            message: format!("🔒 Step '{step_id}' needs a license: {reason}"),
+        });
+        return Err(anyhow!("cloud step gated: {reason}"));
+    }
 
     // ── DEMO CACHE: Check for cached results first ──────────────────────
     // Remove this block when productionizing. It plays back pre-computed
@@ -538,7 +560,7 @@ async fn execute_step_locally(
     cell_content: &str,
     previous_outputs: Vec<serde_json::Value>,
     command_tx: &UnboundedSender<CommandMsg>,
-    event_tx: &UnboundedSender<SwiftEvent>,
+    _event_tx: &UnboundedSender<SwiftEvent>,
 ) -> Result<(String, Vec<Finding>)> {
     let registry = crate::skills::registry();
     let skill_match = registry.resolve_intent(cell_content);
@@ -617,6 +639,279 @@ async fn execute_step_locally(
         let prompt = format!("Execute this pipeline step:\n\n{}", cell_content);
         let response = crate::pipeline::call_vllm_public(&prompt, 800, 0.3).await?;
         Ok((response, vec![]))
+    }
+}
+
+// ============================================================================
+// Local MCP Plugin Tool Dispatch (device host — no cloud round-trip)
+// ============================================================================
+//
+// A `local` pipeline step can name a plugin tool to run ON-DEVICE through the
+// supervised cyan-mcp host (the local mirror of the lens cloud `McpTool` path).
+// The dispatch LOGIC (initialize → call_tool → thread the result, the external
+// cost rail, the approval gate) lives in `mcp_host.rs` and is unit-tested via
+// cyan-mcp's `ScriptedTransport`. THIS is the prod wiring: it resolves the tool
+// in the installed registry, reads the human-approval gate, spawns a real
+// `StdioTransport` from the bundle, and dispatches. (Cred injection at spawn and
+// the runtime→entrypoint mapping are the deferred device lifecycle; today the
+// bundle ships a `run` entrypoint.)
+
+use crate::mcp_host::{McpDispatch, McpTool, PluginHost, RunCostLedger, RunScope};
+use cyan_mcp::PluginTransport as _; // brings `spawn`/`send`/`recv` into scope
+use std::sync::Arc;
+
+/// Parse an optional `McpTool` step from a step's metadata:
+/// `{ "mcp_tool": { "plugin_id": ..., "tool": ..., "args": {...} } }`.
+/// `None` (the common case) means an ordinary step — the caller falls through.
+fn parse_mcp_tool_step(metadata: &serde_json::Value) -> Option<McpTool> {
+    let spec = metadata.get("mcp_tool")?;
+    Some(McpTool {
+        plugin_id: spec.get("plugin_id")?.as_str()?.to_string(),
+        tool: spec.get("tool")?.as_str()?.to_string(),
+        args: spec.get("args").cloned().unwrap_or(serde_json::Value::Null),
+    })
+}
+
+/// The device's installed-plugins root: one subdir per plugin (the unpacked
+/// `.cyanplugin` bundles the file-swarm fetched). Overridable for tests/ops.
+fn plugins_root() -> std::path::PathBuf {
+    if let Ok(root) = std::env::var("CYAN_PLUGINS_ROOT") {
+        return std::path::PathBuf::from(root);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home).join(".cyan").join("plugins")
+}
+
+/// The tenant this device acts as (carried on every external cost obs line).
+fn device_tenant() -> String {
+    std::env::var("CYAN_TENANT_ID").unwrap_or_else(|_| "device".to_string())
+}
+
+/// Whether the human-approval gate is open for this step. Reuses the existing
+/// pipeline approval path, which sets `pipeline.state.status = "human_approved"`
+/// (see `pipeline.rs::approve_step`).
+fn step_is_approved(board_id: &str, step_id: &str) -> bool {
+    let conn = match crate::storage::db().lock() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let mut stmt = match conn.prepare("SELECT metadata_json FROM notebook_cells WHERE board_id = ?1")
+    {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let rows = match stmt.query_map(rusqlite::params![board_id], |row| {
+        row.get::<_, Option<String>>(0)
+    }) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    for meta in rows.flatten().flatten() {
+        let v: serde_json::Value = match serde_json::from_str(&meta) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v["pipeline"]["step_id"] == json!(step_id)
+            && v["pipeline"]["state"]["status"] == json!("human_approved")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Dispatch a `local` plugin-tool step on-device through the cyan-mcp host.
+///
+/// Emits the same dashboard exec events the cloud (lens) path emits
+/// (`step_started` / `step_completed` / `finding_created`, or `step_needs_human`
+/// when gated) so the dashboard read-model lights up for on-device plugin steps
+/// exactly as it does for cloud steps (DASHBOARD_CONTRACT §A/§C). The plugin's
+/// JSON result becomes a finding so the step produces a reviewable result.
+async fn execute_local_mcp_tool_step(
+    board_id: &str,
+    step_id: &str,
+    step: McpTool,
+    command_tx: &UnboundedSender<CommandMsg>,
+    event_tx: &UnboundedSender<SwiftEvent>,
+) -> Result<(String, Vec<Finding>)> {
+    let run_id = format!(
+        "run_{}_{}",
+        &step_id[..step_id.len().min(8)],
+        chrono::Utc::now().timestamp() % 10000
+    );
+
+    let _ = event_tx.send(SwiftEvent::StatusUpdate {
+        message: format!(
+            "🔌 Step '{}' → local plugin {}.{}",
+            step_id, step.plugin_id, step.tool
+        ),
+    });
+
+    // Dashboard exec event: the step started (on-device, plugin actor).
+    publish_pipeline_event(event_tx, PipelineEvent {
+        event_type: "step_started".into(),
+        board_id: board_id.into(),
+        step_id: step_id.into(),
+        run_id: run_id.clone(),
+        timestamp: chrono::Utc::now().timestamp(),
+        data: json!({ "executor_type": "local", "plugin_id": step.plugin_id, "tool": step.tool }),
+    });
+
+    let root = plugins_root();
+    let tenant = device_tenant();
+
+    // Device plugin host. The tool call uses its own throwaway sink (relayed
+    // events are incidental here — the tool *result* threads back into the step).
+    let host = PluginHost::new(
+        Arc::new(cyan_mcp::RecordingSink::new()) as Arc<dyn cyan_mcp::EventSink>,
+        Arc::new(cyan_mcp::LogEmitter::new()) as Arc<dyn cyan_mcp::Emitter>,
+        Arc::new(cyan_mcp::SystemClock::new()) as Arc<dyn cyan_mcp::Clock>,
+        cyan_mcp::BackoffPolicy {
+            base: std::time::Duration::from_millis(500),
+            max: std::time::Duration::from_secs(30),
+            max_restarts: 3,
+        },
+        tenant.clone(),
+    );
+
+    // Resolve the tool in the installed registry → its manifest `side_effects`
+    // (which drive the gate). Not installed = a real, surfaced error.
+    let side_effects = host
+        .resolve_installed_tool(&root, &step.tool)
+        .map_err(|e| anyhow!("resolve plugin tool {}: {}", step.tool, e))?
+        .map(|(_, tb)| tb.side_effects)
+        .ok_or_else(|| {
+            anyhow!(
+                "tool '{}' is not installed (no bundle in {})",
+                step.tool,
+                root.display()
+            )
+        })?;
+
+    let approved = step_is_approved(board_id, step_id);
+    let scope = RunScope {
+        tenant_id: tenant,
+        run_id: step_id.to_string(),
+    };
+    let ledger = RunCostLedger::new();
+
+    // Spawn the plugin process LAZILY: a gated tool is never spawned (the closure
+    // only runs when `dispatch_mcp_tool` decides to execute).
+    let bundle_dir = root.join(&step.plugin_id);
+    let plugin_id = step.plugin_id.clone();
+    let connect = move || -> Result<Box<dyn cyan_mcp::PluginTransport>> {
+        let mut transport = cyan_mcp::StdioTransport::new();
+        let config = cyan_mcp::SpawnConfig {
+            plugin_id: plugin_id.clone(),
+            command: bundle_dir.join("run").to_string_lossy().to_string(),
+            args: vec![],
+            creds: vec![],
+        };
+        transport
+            .spawn(&config)
+            .map_err(|e| anyhow!("spawn plugin {}: {}", plugin_id, e))?;
+        Ok(Box::new(transport))
+    };
+
+    match host
+        .dispatch_mcp_tool(&scope, &step, &side_effects, approved, &ledger, connect)
+        .map_err(|e| anyhow!("local plugin dispatch failed: {}", e))?
+    {
+        McpDispatch::Ran(result) => {
+            let summary = serde_json::to_string(&result.result)
+                .unwrap_or_else(|_| result.result.to_string());
+
+            // The plugin's JSON result becomes a finding so the step produces a
+            // reviewable result (and a timecoded note, like every other step).
+            let finding = Finding {
+                timecode_seconds: 0.0,
+                content: summary.clone(),
+                finding_type: "plugin_result".to_string(),
+                severity: "info".to_string(),
+                suggested_action: None,
+            };
+            let note = crate::timecode_notes::TimecodeNote {
+                id: uuid::Uuid::new_v4().to_string(),
+                board_id: board_id.to_string(),
+                timecode_seconds: finding.timecode_seconds,
+                content: finding.content.clone(),
+                note_type: finding.finding_type.clone(),
+                author: format!("plugin/{}", step.plugin_id),
+                created_at: chrono::Utc::now().timestamp() as f64,
+                pipeline_step_id: Some(step_id.to_string()),
+                pipeline_phase: Some("during".to_string()),
+                ai_reviewed: true,
+                human_approved: false,
+                action_skill: None,
+                action_status: Some("complete".to_string()),
+                action_result: None,
+                action_model: Some(format!("{}.{}", step.plugin_id, step.tool)),
+                ai_flags_nearby: vec![],
+                reply_to: None,
+                thread_count: 0,
+            };
+            let _ = crate::timecode_notes::save_note(&note, command_tx);
+
+            let _ = event_tx.send(SwiftEvent::StatusUpdate {
+                message: format!("✅ Step '{}' plugin complete", step_id),
+            });
+
+            // Dashboard exec events: step completed + the finding it produced.
+            // `cost_usd` rides on the completion event so the cost rail can
+            // attribute the external (plugin) bill to this run/plugin.
+            publish_pipeline_event(event_tx, PipelineEvent {
+                event_type: "step_completed".into(),
+                board_id: board_id.into(),
+                step_id: step_id.into(),
+                run_id: run_id.clone(),
+                timestamp: chrono::Utc::now().timestamp(),
+                data: json!({
+                    "summary": summary,
+                    "findings_count": 1,
+                    "plugin_id": step.plugin_id,
+                    "tool": step.tool,
+                    "duration_ms": result.duration_ms,
+                    "cost_usd": result.cost_usd,
+                    "source": "external",
+                }),
+            });
+            publish_pipeline_event(event_tx, PipelineEvent {
+                event_type: "finding_created".into(),
+                board_id: board_id.into(),
+                step_id: step_id.into(),
+                run_id: run_id.clone(),
+                timestamp: chrono::Utc::now().timestamp(),
+                data: json!({
+                    "timecode_seconds": finding.timecode_seconds,
+                    "content": finding.content,
+                    "finding_type": finding.finding_type,
+                    "severity": finding.severity,
+                }),
+            });
+
+            Ok((summary, vec![finding]))
+        }
+        McpDispatch::Gated { side_effects } => {
+            // Reuse the human-approval path: surface needs_human so the user can
+            // approve the side-effecting call; a re-run then flips `approved`.
+            let effects = side_effects.join(", ");
+            let _ = event_tx.send(SwiftEvent::StatusUpdate {
+                message: format!("⏸️ Step '{}' needs approval (side effects: {})", step_id, effects),
+            });
+            publish_pipeline_event(event_tx, PipelineEvent {
+                event_type: "step_needs_human".into(),
+                board_id: board_id.into(),
+                step_id: step_id.into(),
+                run_id: run_id.clone(),
+                timestamp: chrono::Utc::now().timestamp(),
+                data: json!({ "side_effects": side_effects }),
+            });
+            Err(anyhow!(
+                "needs_human: plugin tool '{}' requires approval (side effects: {})",
+                step.tool,
+                effects
+            ))
+        }
     }
 }
 

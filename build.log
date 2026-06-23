@@ -2085,3 +2085,489 @@ warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` 
   * `integration-test` target `snapshot_protocol_test`
    Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
     Finished `release` profile [optimized] target(s) in 36.96s
+warning: Cargo.toml: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: Cargo.toml: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: Cargo.toml: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: `cyan-backend` (manifest) generated 3 warnings
+   Compiling proc-macro2 v1.0.95
+   Compiling unicode-ident v1.0.18
+   Compiling libc v0.2.172
+   Compiling cfg-if v1.0.0
+   Compiling serde_core v1.0.228
+   Compiling serde v1.0.228
+   Compiling memchr v2.7.4
+   Compiling pin-project-lite v0.2.16
+   Compiling portable-atomic v1.11.1
+   Compiling critical-section v1.2.0
+   Compiling getrandom v0.3.4
+   Compiling futures-core v0.3.31
+   Compiling parking_lot_core v0.9.12
+   Compiling typenum v1.19.0
+   Compiling scopeguard v1.2.0
+   Compiling log v0.4.27
+   Compiling shlex v1.3.0
+   Compiling lock_api v0.4.14
+   Compiling find-msvc-tools v0.1.5
+   Compiling futures-io v0.3.31
+   Compiling itoa v1.0.15
+   Compiling cc v1.2.49
+   Compiling stable_deref_trait v1.2.1
+   Compiling slab v0.4.11
+   Compiling semver v1.0.27
+   Compiling futures-sink v0.3.31
+   Compiling futures-channel v0.3.31
+   Compiling futures-task v0.3.31
+   Compiling core-foundation-sys v0.8.7
+   Compiling rustc_version v0.4.1
+   Compiling subtle v2.6.1
+   Compiling cfg_aliases v0.2.1
+   Compiling pin-utils v0.1.0
+   Compiling bitflags v2.10.0
+   Compiling heck v0.5.0
+   Compiling version_check v0.9.5
+   Compiling equivalent v1.0.2
+   Compiling allocator-api2 v0.2.21
+   Compiling foldhash v0.2.0
+   Compiling fnv v1.0.7
+   Compiling zerocopy v0.8.31
+   Compiling simd-adler32 v0.3.8
+   Compiling writeable v0.6.2
+   Compiling litemap v0.8.1
+   Compiling hashbrown v0.16.0
+   Compiling adler2 v2.0.1
+   Compiling icu_properties_data v2.1.1
+   Compiling ring v0.17.14
+   Compiling miniz_oxide v0.8.9
+   Compiling icu_normalizer_data v2.1.1
+   Compiling percent-encoding v2.3.2
+   Compiling fastrand v2.3.0
+   Compiling untrusted v0.9.0
+   Compiling indexmap v2.12.0
+   Compiling object v0.37.3
+   Compiling thiserror v2.0.17
+   Compiling gimli v0.32.3
+   Compiling rustls v0.23.35
+   Compiling unicode-xid v0.2.6
+   Compiling atomic-waker v1.1.2
+   Compiling const-oid v0.10.1
+   Compiling rustc-demangle v0.1.26
+   Compiling form_urlencoded v1.2.2
+   Compiling quote v1.0.40
+   Compiling system-configuration-sys v0.6.0
+   Compiling ipnet v2.11.0
+   Compiling utf8_iter v1.0.4
+   Compiling syn v2.0.101
+   Compiling base64 v0.22.1
+   Compiling httparse v1.10.1
+   Compiling anyhow v1.0.100
+   Compiling once_cell v1.21.3
+   Compiling parking v2.2.1
+   Compiling socket2 v0.6.1
+   Compiling signal-hook-registry v1.4.6
+   Compiling mio v1.1.0
+   Compiling rand_core v0.9.3
+   Compiling tracing-core v0.1.35
+   Compiling getrandom v0.2.16
+   Compiling core-foundation v0.9.4
+   Compiling security-framework-sys v2.15.0
+   Compiling system-configuration v0.6.1
+   Compiling futures-lite v2.6.1
+   Compiling cpufeatures v0.2.17
+   Compiling tinyvec_macros v0.1.1
+   Compiling try-lock v0.2.5
+   Compiling tower-service v0.3.3
+   Compiling base64ct v1.8.0
+   Compiling httpdate v1.0.3
+   Compiling want v0.3.1
+   Compiling tinyvec v1.10.0
+   Compiling addr2line v0.25.1
+   Compiling generic-array v0.14.7
+   Compiling powerfmt v0.2.0
+   Compiling pem-rfc7468 v1.0.0
+   Compiling diatomic-waker v0.2.3
+   Compiling cordyceps v0.3.4
+   Compiling spin v0.10.0
+   Compiling rustix v1.1.2
+   Compiling deranged v0.5.5
+   Compiling ppv-lite86 v0.2.21
+   Compiling futures-buffered v0.2.12
+   Compiling rand_core v0.6.4
+   Compiling errno v0.3.14
+   Compiling heapless v0.7.17
+   Compiling rand_chacha v0.9.0
+   Compiling curve25519-dalek v5.0.0-pre.1
+   Compiling ryu v1.0.20
+   Compiling winnow v0.7.13
+   Compiling time-core v0.1.6
+   Compiling byteorder v1.5.0
+   Compiling num-conv v0.1.0
+   Compiling hash32 v0.2.1
+   Compiling rand v0.9.2
+   Compiling socket2 v0.5.10
+   Compiling n0-future v0.3.1
+   Compiling iroh-quinn-udp v0.5.7
+   Compiling toml_datetime v0.7.3
+   Compiling crossbeam-utils v0.8.21
+   Compiling native-tls v0.2.14
+   Compiling rand_chacha v0.3.1
+   Compiling security-framework v2.11.1
+   Compiling core-foundation v0.10.1
+   Compiling serde_json v1.0.145
+   Compiling time v0.3.44
+   Compiling syn v1.0.109
+   Compiling tower-layer v0.3.3
+   Compiling data-encoding v2.9.0
+   Compiling signature v3.0.0-rc.5
+   Compiling security-framework v3.5.1
+   Compiling tempfile v3.23.0
+   Compiling rand v0.8.5
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling blake3 v1.8.2
+   Compiling sync_wrapper v1.0.2
+   Compiling toml_parser v1.0.4
+   Compiling encoding_rs v0.8.35
+   Compiling rustversion v1.0.21
+   Compiling synstructure v0.13.2
+   Compiling toml_edit v0.23.7
+   Compiling digest v0.10.7
+   Compiling backtrace v0.3.76
+   Compiling proc-macro-error-attr v0.4.12
+   Compiling proc-macro-crate v3.4.0
+   Compiling iroh-quinn v0.14.0
+   Compiling aho-corasick v1.1.3
+   Compiling arrayref v0.3.9
+   Compiling autocfg v1.4.0
+   Compiling moka v0.12.11
+   Compiling arrayvec v0.7.6
+   Compiling serde_derive v1.0.228
+   Compiling zeroize_derive v1.4.2
+   Compiling tokio-macros v2.6.0
+   Compiling futures-macro v0.3.31
+   Compiling zerofrom-derive v0.1.6
+   Compiling zeroize v1.8.2
+   Compiling yoke-derive v0.8.1
+   Compiling tracing-attributes v0.1.31
+   Compiling zerovec-derive v0.11.2
+   Compiling futures-util v0.3.31
+   Compiling displaydoc v0.2.5
+   Compiling hybrid-array v0.4.5
+   Compiling zerofrom v0.1.6
+   Compiling yoke v0.8.1
+   Compiling rustls-pki-types v1.13.0
+   Compiling zerotrie v0.2.3
+   Compiling zerovec v0.11.5
+   Compiling crypto-common v0.2.0-rc.4
+   Compiling tracing v0.1.43
+   Compiling rustls-webpki v0.103.8
+   Compiling block-buffer v0.11.0
+   Compiling thiserror-impl v2.0.17
+   Compiling pin-project-internal v1.1.10
+   Compiling derive_more-impl v2.0.1
+   Compiling tinystr v0.8.2
+   Compiling icu_locale_core v2.1.1
+   Compiling potential_utf v0.1.4
+   Compiling icu_collections v2.1.1
+   Compiling pin-project v1.1.10
+   Compiling digest v0.11.0-rc.3
+   Compiling spez v0.1.2
+   Compiling n0-error-macros v0.1.0
+   Compiling der v0.8.0-rc.10
+   Compiling derive_more-impl v1.0.0
+   Compiling inout v0.2.1
+   Compiling icu_provider v2.1.1
+   Compiling icu_properties v2.1.1
+   Compiling cobs v0.3.0
+   Compiling async-trait v0.1.89
+   Compiling postcard-derive v0.2.2
+   Compiling sha2 v0.11.0-rc.2
+   Compiling cipher v0.5.0-rc.1
+   Compiling webpki-roots v1.0.4
+   Compiling enum-as-inner v0.6.1
+   Compiling constant_time_eq v0.3.1
+   Compiling litrs v1.0.0
+   Compiling regex-syntax v0.8.5
+   Compiling rustc-hash v2.1.1
+   Compiling iri-string v0.7.9
+   Compiling smallvec v1.15.1
+   Compiling bytes v1.10.1
+   Compiling icu_normalizer v2.1.1
+   Compiling document-features v0.2.12
+   Compiling parking_lot v0.12.5
+   Compiling spki v0.8.0-rc.4
+   Compiling idna_adapter v1.2.1
+   Compiling idna v1.1.0
+   Compiling pkcs8 v0.11.0-rc.8
+   Compiling tokio v1.48.0
+   Compiling http v1.3.1
+   Compiling derive_more v2.0.1
+   Compiling derive_more v1.0.0
+   Compiling postcard v1.1.3
+   Compiling url v2.5.7
+   Compiling n0-error v0.1.0
+   Compiling ed25519 v3.0.0-rc.2
+   Compiling ed25519-dalek v3.0.0-pre.1
+   Compiling futures-executor v0.3.31
+   Compiling serde_urlencoded v0.7.1
+   Compiling universal-hash v0.6.0-rc.2
+   Compiling syn-mid v0.5.4
+   Compiling http-body v1.0.1
+   Compiling http-body-util v0.1.3
+   Compiling num-traits v0.2.19
+   Compiling iroh-metrics-derive v0.4.0
+   Compiling num_enum_derive v0.7.5
+   Compiling regex-automata v0.4.13
+   Compiling crossbeam-channel v0.5.15
+   Compiling crossbeam-epoch v0.9.18
+   Compiling uuid v1.19.0
+   Compiling proc-macro-error v0.4.12
+   Compiling acto v0.7.4
+   Compiling netwatch v0.12.0
+   Compiling pkarr v5.0.0
+   Compiling self_cell v1.2.1
+   Compiling lazy_static v1.5.0
+   Compiling proc-macro-hack v0.5.20+deprecated
+   Compiling mime v0.3.17
+   Compiling base32 v0.5.1
+   Compiling xml-rs v0.8.28
+   Compiling tagptr v0.2.0
+   Compiling ntimestamp v1.0.0
+   Compiling num_enum v0.7.5
+   Compiling xmltree v0.10.3
+   Compiling iroh-metrics v0.37.0
+   Compiling iroh-base v0.95.1
+   Compiling poly1305 v0.9.0-rc.2
+   Compiling attohttpc v0.30.1
+   Compiling futures v0.3.31
+   Compiling aead v0.6.0-rc.2
+   Compiling salsa20 v0.11.0-rc.1
+   Compiling chacha20 v0.10.0-rc.2
+   Compiling strum_macros v0.27.2
+   Compiling netdev v0.38.2
+   Compiling simple-dns v0.9.3
+   Compiling iroh-relay v0.95.1
+   Compiling lru v0.13.0
+   Compiling resolv-conf v0.7.5
+   Compiling simdutf8 v0.1.5
+   Compiling sha1_smol v1.0.1
+   Compiling ref-cast v1.0.25
+   Compiling base16ct v0.3.0
+   Compiling dyn-clone v1.0.20
+   Compiling crc32fast v1.5.0
+   Compiling smol_str v0.1.24
+   Compiling serdect v0.4.1
+   Compiling crypto_secretbox v0.2.0-pre.0
+   Compiling sharded-slab v0.1.7
+   Compiling sha1 v0.11.0-rc.2
+   Compiling ref-cast-impl v1.0.25
+   Compiling yasna v0.5.2
+   Compiling tracing-log v0.2.0
+   Compiling thread_local v1.1.8
+   Compiling serde_bytes v0.11.19
+   Compiling strum v0.27.2
+   Compiling pem v3.0.6
+   Compiling lru v0.16.2
+   Compiling curve25519-dalek v4.1.3
+   Compiling iroh v0.95.1
+   Compiling nu-ansi-term v0.50.3
+   Compiling vcpkg v0.2.15
+   Compiling z32 v1.3.0
+   Compiling tokio-util v0.7.17
+   Compiling tokio-rustls v0.26.4
+   Compiling tower v0.5.2
+   Compiling tokio-native-tls v0.3.1
+   Compiling async-compat v0.2.5
+   Compiling foldhash v0.1.5
+   Compiling utf8parse v0.2.2
+   Compiling matchers v0.2.0
+   Compiling pkg-config v0.3.32
+   Compiling tracing-subscriber v0.3.22
+   Compiling hashbrown v0.15.5
+   Compiling anstyle-parse v0.2.7
+   Compiling rcgen v0.14.5
+   Compiling tower-http v0.6.6
+   Compiling libsqlite3-sys v0.35.0
+   Compiling backon v1.6.0
+   Compiling h2 v0.4.12
+   Compiling tokio-websockets v0.12.3
+   Compiling tokio-stream v0.1.17
+   Compiling n0-watcher v0.5.0
+   Compiling genawaiter-proc-macro v0.99.1
+   Compiling crypto_box v0.10.0-pre.0
+   Compiling inplace-vec-builder v0.1.1
+   Compiling snafu-derive v0.8.9
+   Compiling irpc-derive v0.9.0
+   Compiling binary-merge v0.1.2
+   Compiling colorchoice v1.0.4
+   Compiling fixedbitset v0.5.7
+   Compiling anstyle-query v1.1.4
+   Compiling signature v2.2.0
+   Compiling hex v0.4.3
+   Compiling pom v1.1.0
+   Compiling genawaiter-macro v0.99.1
+   Compiling btparse v0.2.0
+   Compiling redb v2.6.3
+   Compiling anstyle v1.0.13
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling termcolor v1.4.1
+   Compiling minimal-lexical v0.2.1
+   Compiling anstream v0.6.21
+   Compiling tracing-error v0.2.1
+   Compiling nom v7.1.3
+   Compiling color-backtrace v0.7.2
+   Compiling genawaiter v0.99.1
+   Compiling ed25519 v2.2.3
+   Compiling range-collections v0.4.6
+   Compiling flate2 v1.1.5
+   Compiling iroh-io v0.6.2
+   Compiling sha2 v0.10.9
+   Compiling snafu v0.8.9
+   Compiling md-5 v0.10.6
+   Compiling positioned-io v0.3.5
+   Compiling iroh-blobs v0.97.0
+   Compiling iana-time-zone v0.1.63
+   Compiling strsim v0.11.1
+   Compiling option-ext v0.2.0
+   Compiling clap_lex v0.7.6
+   Compiling thiserror v1.0.69
+   Compiling weezl v0.1.12
+   Compiling rangemap v1.7.1
+   Compiling clap_builder v4.5.51
+   Compiling dirs-sys v0.4.1
+   Compiling lopdf v0.34.0
+   Compiling chrono v0.4.42
+   Compiling bao-tree v0.16.0
+   Compiling n0-snafu v0.2.2
+   Compiling ed25519-dalek v2.2.0
+   Compiling type1-encoding-parser v0.1.0
+   Compiling adobe-cmap-parser v0.4.1
+   Compiling futures-concurrency v7.6.3
+   Compiling hashlink v0.10.0
+   Compiling hyper v1.8.0
+   Compiling hickory-proto v0.25.2
+   Compiling euclid v0.20.14
+   Compiling iroh-tickets v0.2.0
+   Compiling thiserror-impl v1.0.69
+   Compiling clap_derive v4.5.49
+   Compiling hyper-util v0.1.17
+   Compiling nested_enum_utils v0.2.3
+   Compiling unicode-normalization v0.1.25
+   Compiling reflink-copy v0.1.28
+   Compiling bs58 v0.5.1
+   Compiling postscript v0.14.1
+   Compiling fallible-iterator v0.3.0
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling clap v4.5.51
+   Compiling pdf-extract v0.7.12
+   Compiling xaeroid v1.0.1 (/Users/anirudhvyas/xaeroid)
+   Compiling dirs v5.0.1
+   Compiling petgraph v0.8.3
+   Compiling regex v1.12.2
+   Compiling hyper-tls v0.6.0
+   Compiling hyper-rustls v0.27.7
+   Compiling hickory-resolver v0.25.2
+   Compiling igd-next v0.16.2
+   Compiling reqwest v0.12.24
+   Compiling swarm-discovery v0.4.1
+   Compiling portmapper v0.12.0
+   Compiling colored v2.2.0
+   Compiling glob v0.3.3
+   Compiling urlencoding v2.1.3
+   Compiling rustls-platform-verifier v0.5.3
+   Compiling iroh-quinn-proto v0.13.0
+   Compiling irpc v0.11.0
+   Compiling rusqlite v0.37.0
+   Compiling iroh-gossip v0.95.0
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 1m 59s
+warning: Cargo.toml: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: Cargo.toml: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: Cargo.toml: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: `cyan-backend` (manifest) generated 3 warnings
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 34.20s
+warning: Cargo.toml: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: Cargo.toml: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: Cargo.toml: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: `cyan-backend` (manifest) generated 3 warnings
+   Compiling ring v0.17.14
+   Compiling time-core v0.1.6
+   Compiling num-conv v0.1.0
+   Compiling num-traits v0.2.19
+   Compiling sha2 v0.10.9
+   Compiling secrecy v0.8.0
+   Compiling time-macros v0.2.24
+   Compiling ed25519-dalek v2.2.0
+   Compiling time v0.3.44
+   Compiling xaeroid v1.0.1 (/Users/anirudhvyas/xaeroid)
+   Compiling num-integer v0.1.46
+   Compiling chrono v0.4.42
+   Compiling euclid v0.20.14
+   Compiling num-bigint v0.4.6
+   Compiling netwatch v0.12.0
+   Compiling yasna v0.5.2
+   Compiling lopdf v0.34.0
+   Compiling simple_asn1 v0.6.3
+   Compiling portmapper v0.12.0
+   Compiling pdf-extract v0.7.12
+   Compiling rustls v0.23.35
+   Compiling rustls-webpki v0.103.8
+   Compiling rcgen v0.14.5
+   Compiling jsonwebtoken v9.3.1
+   Compiling tokio-rustls v0.26.4
+   Compiling hyper-rustls v0.27.7
+   Compiling hickory-proto v0.25.2
+   Compiling tokio-websockets v0.12.3
+   Compiling reqwest v0.12.24
+   Compiling pkarr v5.0.0
+   Compiling cyan-identity v0.1.0 (/Users/anirudhvyas/cyan-identity)
+   Compiling rustls-platform-verifier v0.5.3
+   Compiling hickory-resolver v0.25.2
+   Compiling swarm-discovery v0.4.1
+   Compiling iroh-quinn-proto v0.13.0
+   Compiling iroh-quinn v0.14.0
+   Compiling iroh-relay v0.95.1
+   Compiling irpc v0.11.0
+   Compiling iroh v0.95.1
+   Compiling iroh-gossip v0.95.0
+   Compiling iroh-blobs v0.97.0
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 1m 13s
+warning: Cargo.toml: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: Cargo.toml: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: Cargo.toml: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: `cyan-backend` (manifest) generated 3 warnings
+   Compiling reqwest v0.12.24
+   Compiling cyan-mcp v0.1.0 (/Users/anirudhvyas/cyan-mcp)
+   Compiling pkarr v5.0.0
+   Compiling cyan-identity v0.1.0 (/Users/anirudhvyas/cyan-identity)
+   Compiling iroh-relay v0.95.1
+   Compiling iroh v0.95.1
+   Compiling iroh-gossip v0.95.0
+   Compiling iroh-blobs v0.97.0
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 1m 01s

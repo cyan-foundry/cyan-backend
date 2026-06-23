@@ -1,0 +1,184 @@
+# PROGRESS — substrate hardening run (feat/substrate-e2e)
+
+Timestamped log for remote watching. One line at phase start + end with gate result.
+
+## PHASE 0 — branch safety + baseline
+
+- 2026-06-18 12:48 PDT — START. On branch `feat/substrate-e2e` (already created; NOT main).
+  `git status -s` shows only the expected untracked substrate files. `cargo build` ✅.
+  `cargo test --no-run` ✅ (all targets compile, including `tests/substrate_discovery`).
+- 2026-06-18 12:48 PDT — Baseline note: `cargo test --lib` = 19 passed, **1 pre-existing
+  FAILURE**: `diagram_gen::tests::test_parse_diagram_json`. Root cause: `parse_diagram_response`
+  hardcodes `svg: None` (src/diagram_gen.rs:543) while the test asserts `svg.is_some()`.
+  This is committed shipping code, **unrelated to the P2P substrate**, in enrichment-adjacent
+  diagram-generation code that the spec marks out of scope. Standing rules forbid touching it
+  ("never chase pre-existing red", "never change shipping behavior"). **Substrate-relevant
+  baseline is GREEN** (engine compiles; substrate scaffolds are the `todo!()` backlog this run
+  implements). Per-phase gates are scoped to substrate-relevant targets; the pre-existing
+  diagram red is excluded and re-noted at FINISH.
+- 2026-06-18 12:48 PDT — END. Gate: substrate-relevant baseline GREEN. Proceeding to PHASE 1.
+
+### Gate finding — `clippy -D warnings` is pre-existing-red (whole tree)
+`cargo clippy --all-targets -- -D warnings` is **not** green at baseline: the lib alone
+emits ~1027 warnings (unused imports across skills/bridges, plus a codebase-wide
+`disallowed_methods` lint that flags every `.unwrap()`), ~711–751 across all targets.
+These are pre-existing in shipping code unrelated to the substrate. Standing rules forbid
+fixing them ("never chase pre-existing red", "never change shipping behavior", "small
+reviewable diffs"). **Decision (documented, not a spec/test weakening):** the clippy gate
+is enforced as "my diff introduces ZERO new clippy warnings", verified per phase. Whole-tree
+`-D warnings` cannot be made green within scope; re-noted at FINISH as a real finding.
+
+### Major finding — storage is a process-global singleton (blocks in-process storage-oracle tests)
+`src/storage.rs` keys everything off `static DB: OnceLock<Mutex<Connection>>`; `init_db` errors
+on the 2nd call ("DB already initialized") and every `storage::*` fn uses the one global `db()`.
+So **N in-process nodes share ONE SQLite DB** — there is no per-node storage. This is why the
+existing engine tests (`network_test`/`snapshot_test`/`delta_test`) are separate-process bins.
+Consequences for the substrate suite:
+- **Discovery (G1, PHASE 2): FEASIBLE in-process** — asserts on per-node `peers_per_group`
+  (a per-node `Arc<Mutex<..>>` handed to each `NetworkActor`) and per-node `PeerJoined` events,
+  not storage. Shared DB is acceptable here.
+- **Snapshot/delta/chat/file storage-oracle tests (G3–G9, PHASE 3): NOT honestly isolatable
+  in-process** — a shared DB makes "receiver got the data" indistinguishable from the sender's
+  own writes, i.e. a fake pass. Per spec ("assert on the receiver's storage", "do not fake a
+  pass") these need per-node storage, which the engine lacks in-process. A storage refactor
+  (instance-based DB threaded through every actor + FFI) is far out of scope ("never change
+  shipping behavior", "small diffs"). **Action:** implement these test files but mark the
+  storage-asserting ones `#[ignore]` with this reason; they belong to the multi-process rig.
+
+## PHASE 1 — NodeConfig seam
+
+- 2026-06-18 12:55 PDT — START. Add `src/models/node_config.rs` (NodeConfig, RelayPolicy,
+  DiscoveryPolicy, pure `relay_mode_for`); thread `cfg: NodeConfig` into `NetworkActor::new`;
+  add `RelayMode::Disabled` branch; replace `RELAY_URL`/`DISCOVERY_KEY` reads with cfg fields;
+  build NodeConfig from globals at the FFI init site (seam, not change); update 2 test bins.
+- 2026-06-18 12:55 PDT — END. Gate: `cargo build` ✅; `cargo test --lib node_config` ✅ (4/4
+  relay_mode_for cases: Disabled→Disabled, Url→Custom, invalid Url→Default, Default→Default);
+  all test targets compile ✅; clippy = 0 new warnings from my diff (verified node_config.rs
+  clean; network_actor/lib warnings all pre-existing, line-shifted only). Shipping behavior
+  unchanged — production still derives NodeConfig from RELAY_URL/DISCOVERY_KEY/BOOTSTRAP_NODE_ID.
+  GREEN within scope. Committing.
+
+## PHASE 2 — MeshHarness + discovery green
+
+- 2026-06-18 13:30 PDT — START. Implement `tests/support/mod.rs` and make
+  `tests/substrate_discovery.rs::{two_nodes_meet_via_mdns_on_lan, two_nodes_meet_via_bootstrap}`
+  pass. Two engine seams were required (both additive, production behavior unchanged):
+  - **Per-node discovery bootstrap**: `NetworkActor::start` now derives the discovery-topic
+    gossip bootstrap from `cfg.discovery` (`Bootstrap(id)`→[id], `MdnsOnly`→[]); `DiscoveryActor::spawn`
+    takes it as a param instead of hardcoding the global default. Production passes
+    `Bootstrap(bootstrap_node_id())` → identical to before. Needed because `subscribe_and_join`
+    blocks on `joined()` until ≥1 neighbour, so an in-process node must be seeded off a real peer,
+    not the unreachable production default.
+  - **StaticProvider address seam**: the endpoint now also gets an (empty, inert) `StaticProvider`
+    discovery; `NetworkActor::endpoint()`/`static_discovery()` expose it. The harness reads each
+    node's loopback `EndpointAddr` and injects it into the others, so nodes dial by id **without
+    mDNS**. This was essential: in-process iroh mDNS multicast resolved only intermittently here
+    (flaky even single-threaded — see finding below), but static loopback addressing is 100%
+    reliable (5/5 runs, 0.17s).
+- Finding (mDNS): in-process `MdnsDiscovery` resolution is unreliable on this host (binary: works
+  in <1s or never within 15s; independent of test parallelism). With relay disabled it was the only
+  address-resolution path, so discovery was flaky until the StaticProvider seam bypassed it. mDNS is
+  still enabled (unchanged); the harness just no longer depends on it. The real mDNS-on-real-LAN
+  guarantee belongs to the multi-process/device rig.
+- Finding (PeerJoined): `gossip.subscribe_and_join(..).joined()` **consumes the first NeighborUp**
+  of a topic, so in a 2-node mesh the sole peer's `PeerJoined` is never surfaced by the TopicActor.
+  The harness therefore asserts mutual discovery on the per-node `peers_per_group` map (populated by
+  the discovery `groups_exchange` message), which the spec explicitly endorses ("PeerJoined/peers_per_group").
+- Harness notes: shared (leaked) global DB initialised once; unique per-test discovery key + group
+  id for isolation; a process-wide serial guard for node-spinning tests; bounded `wait_until` polling
+  of real oracles (never sleep-as-sync without a deadline); two-phase `meet` re-announce to beat the
+  discovery join-order race.
+- 2026-06-18 13:30 PDT — END. Gate: `cargo build` ✅; `cargo test --test substrate_discovery` ✅
+  (2/2, reliable across 5 runs); `cargo test --lib node_config` ✅ (4/4); all targets compile ✅;
+  0 new clippy warnings from my diff. GREEN within scope. Committing.
+
+## PHASE 3 — fan out the in-process suite
+
+- 2026-06-18 13:30–14:18 PDT — Built and greened, one file per commit:
+  - `substrate_sync.rs` (G3/G4): 4 delta tests green (board element, notebook cell, workspace
+    structure, three-node convergence) via the receiver's per-node `SwiftEvent::Network` channel.
+    `late_joiner_gets_full_snapshot` (G3) **#[ignore]** — snapshot needs per-node storage (engine
+    DB is a process-global singleton) and the blocking `subscribe_and_join` dead-locks a one-process
+    host-seeds-then-joiner-syncs ordering; belongs to the multi-process rig.
+  - `substrate_chat.rs` (G5/G7): 3 chat tests green (group/workspace/board via `ChatSent`).
+    `chat_with_attachment_shares_file_into_scope` (G7) **#[ignore]** — no `NetworkCommand` carries
+    an attachment (`DmAttachment` is never wired to a command).
+  - `substrate_files.rs` (G6/G8): file share at group/workspace/board scope, 100MB transfer, and a
+    throughput floor — all green, blake3-verified on the received bytes. Measured ~16 MB/s direct-QUIC
+    loopback (floor 3). `large_file_1gb_transfers_intact` **#[ignore]** (CI cost; runs on demand).
+  - `substrate_offline.rs` (G9): discovery+delta, chat-all-levels, file share + multi-MB transfer
+    re-run under `RelayPolicy::Disabled` + `MdnsOnly` — all green; guarded with `assert_offline`.
+- Reliability: root-caused an intrinsic ~25% meeting flake (discovery-topic groups_exchange drop) and
+  fixed it — `meet()` now gates on the group topic via a re-broadcast probe; `serial()` is a
+  cross-process file lock. Each binary 0 failures over 8–15 runs; full `cargo test --no-fail-fast`
+  clean except the pre-existing `diagram_gen` lib failure.
+
+## PHASE 4 — red scaffolds
+
+- 2026-06-18 14:00 PDT — `substrate_relay.rs` (6 tests), `substrate_swarm.rs` (4), `substrate_lens.rs`
+  (1): all `#[ignore]` + `unimplemented!()`, compile clean, stay ignored. Need the netns/docker relay
+  rig (relay), the swarming engine work (swarm), and `CyanLensClient` wiring (lens).
+- Gate: `cargo build` ✅; whole substrate suite green/ignored and reliable; 0 new clippy warnings from
+  my diff. The only red anywhere is the pre-existing, untouched `diagram_gen` lib test.
+
+## FINISH — see STATUS.md for the full per-test ledger and findings.
+
+---
+
+# OVERNIGHT RUN (additive-only) — reliability + multi-process snapshot rig
+
+This is a separate, strictly-additive run per `OVERNIGHT_RUN.md`. Its phase
+numbering is independent of the NodeConfig run above. Rules: stay on
+`feat/substrate-e2e`; ADD only under `tests/` + one new bin `src/bin/cyan_node.rs`
++ `Cargo.toml` `[[bin]]`/`[[test]]` entries; NO edits to `src/**` lib/FFI/storage.
+
+## PHASE 0 — branch + baseline
+- 2026-06-18 — START. Branch `feat/substrate-e2e` confirmed (not main). `git status`
+  clean except untracked `OVERNIGHT_RUN.md`. `cargo build` ✅.
+- 2026-06-18 — Baseline substrate suite GREEN via
+  `cargo test --no-fail-fast --test substrate_discovery --test substrate_sync
+   --test substrate_chat --test substrate_files --test substrate_offline`:
+  - substrate_chat: 3 passed, 1 ignored (attachment/G7)
+  - substrate_discovery: 2 passed, 0 ignored
+  - substrate_files: 5 passed, 1 ignored (1GB on-demand)
+  - substrate_offline: 3 passed, 0 ignored
+  - substrate_sync: 4 passed, 1 ignored (late_joiner — process-global DB)
+  Pre-existing `diagram_gen` unit failure + ~1000 clippy warnings left untouched (out of scope).
+- 2026-06-18 — END. Gate: baseline GREEN. Proceeding to PHASE 1 (reliability suite).
+
+## PHASE 1 — reliability suite
+- 2026-06-18 — START. Added `scripts/reliability.sh` (loops each green substrate binary
+  N times, default 20 / `RELIABILITY_N`, fails on first red, per-binary tally, bounded)
+  and `tests/substrate_reliability.rs` (`repeat_discovery_is_stable` 15×,
+  `concurrent_meshes_do_not_interfere` 3 meshes, `larger_mesh_converges` 5 nodes).
+- 2026-06-18 — New file green 3× in a row (~18s each, 3 passed/0 failed each run).
+- 2026-06-18 — `RELIABILITY_N=20 ./scripts/reliability.sh` = ALL GREEN:
+  substrate_discovery 20/20, substrate_sync 20/20, substrate_chat 20/20,
+  substrate_files 20/20, substrate_offline 20/20.
+- 2026-06-18 — Clippy: new files introduce zero new warnings.
+- 2026-06-18 — END. Gate GREEN. Committing PHASE 1; proceeding to PHASE 2 (multi-process rig).
+
+## PHASE 2 — multi-process rig (per-process DB snapshot truth)
+- 2026-06-19 — START. Added test-only bin `src/bin/cyan_node.rs` (boots a NetworkActor
+  against its OWN sqlite DB via env NODE_DB/DISCOVERY_KEY/RELAY/BOOTSTRAP_NODE_ID/
+  SEED_FIXTURE; driven by a `@@CYAN@@`-tagged stdin/stdout line protocol: node_id, addr,
+  add_peer, seed_fixture, join_group, wait_sync, count, quit; public API only), plus
+  `tests/support/multiprocess.rs` (spawns cyan_node children, exchanges serialized
+  EndpointAddr JSON into each other's StaticProvider, drives the protocol, asserts on each
+  process's own `count`) and `tests/substrate_snapshot_mp.rs` (`late_joiner_gets_full_snapshot`).
+  Added the `[[bin]]` entry to Cargo.toml. ADDITIVE ONLY — no engine/FFI/storage edits.
+- 2026-06-19 — ROOT CAUSE found via iroh tracing: the engine's startup group-load awaits
+  `gossip.subscribe_and_join([default_bootstrap]).await`, which BLOCKS until a neighbor
+  connects; with relay disabled the default bootstrap is unreachable. So a node that has
+  the group in its DB at startup blocks before its command loop. Fix (no engine change):
+  the HOST seeds the fixture BEFORE the actor starts (startup auto-hosts the group topic
+  and waits for the joiner — recovers when it connects); the JOINER starts with an EMPTY
+  db so its command loop processes JoinGroup with the reachable host as a bootstrap peer.
+- 2026-06-19 — GREEN. `late_joiner_gets_full_snapshot` passes (~2.5s): the joiner's OWN
+  process DB ends with workspaces=1, boards=1, elements=5, cells=3, chats=3, files=1 —
+  honest per-node snapshot truth. Stable across 6 consecutive runs. The in-process
+  `substrate_sync::late_joiner_gets_full_snapshot` stays #[ignore]d (shared process-global
+  DB), with this green multi-process version added alongside per the run plan.
+- 2026-06-19 — Clippy: new files introduce zero new warnings (fixed 2 lints in cyan_node).
+  Full `cargo test --no-run` compiles clean; PHASE 1 reliability suite still green (3/3).
+- 2026-06-19 — END. Gate GREEN. Committing PHASE 2.

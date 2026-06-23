@@ -11,9 +11,11 @@
 // - RegisterModel/InferModel → Local P2P model registry experiment
 //
 // HARDWIRED CLOUD URL - change this for deployment:
+#![allow(dead_code)] // AI/Lens enrichment scaffolding (analysis/inference/feedback types) for the in-progress MCP/workflow migration; see CLAUDE.md 'Out of scope'. Some types/fields are not yet wired up but are kept for shape parity.
+
 const CYAN_LENS_CLOUD_URL: &str = "http://localhost:8080";
 
-use crate::cyan_lens_client::{CyanLensClient, CyanLensConfig, CyanLensError};
+use crate::cyan_lens_client::{CyanLensClient, CyanLensConfig};
 use crate::SwiftEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -194,16 +196,6 @@ enum AICommand {
     GetAsks { group_id: String, limit: Option<i32> },
     GetDecisions { group_id: String, limit: Option<i32> },
     Summarize { query_type: String, topic: Option<String>, hours: Option<u64> },
-    // CANVAS: Diagram Generation via Claude API
-    GenerateDiagram {
-        source_type: String,
-        prompt: Option<String>,
-        github_url: Option<String>,
-        image_base64: Option<String>,
-        current_mermaid: Option<String>,
-        diagram_type: String,
-        board_id: String,
-    },
 }
 
 #[derive(Debug, Serialize)]
@@ -407,10 +399,6 @@ impl AIBridge {
             AICommand::InferModel { cell_id, input } => self.cmd_infer_model(&cell_id, input).await,
             AICommand::ListModels { group_id } => self.cmd_list_models(&group_id).await,
             AICommand::GetCellModel { cell_id, board_id } => self.cmd_get_cell_model(&cell_id, &board_id).await,
-            
-            // CANVAS: Diagram Generation
-            AICommand::GenerateDiagram { source_type, prompt, github_url, image_base64, current_mermaid, diagram_type, board_id } =>
-                self.cmd_generate_diagram(source_type, prompt, github_url, image_base64, current_mermaid, diagram_type, board_id).await,
         }
     }
 
@@ -481,11 +469,10 @@ impl AIBridge {
             None => return CommandResponse::err("Claude API key not configured. Set your API key in Settings."),
         };
 
-        // Detect media type from base64 header or default to png
+        // Detect media type from base64 header (JPEG magic), else default to png
+        // (covers the PNG "iVBOR" header and anything else).
         let media_type = if image_base64.starts_with("/9j/") {
             "image/jpeg"
-        } else if image_base64.starts_with("iVBOR") {
-            "image/png"
         } else {
             "image/png"
         };
@@ -542,7 +529,7 @@ Output the Mermaid code in a ```mermaid code block."#.to_string(),
                         success: false,
                         mermaid: None,
                         error: Some(format!("Claude API error {}: {}", status, error_text)),
-                    }).unwrap());
+                    }).unwrap_or_default());
                 }
 
                 match resp.json::<ClaudeResponse>().await {
@@ -570,95 +557,21 @@ Output the Mermaid code in a ```mermaid code block."#.to_string(),
                             success: true,
                             mermaid: Some(mermaid),
                             error: None,
-                        }).unwrap())
+                        }).unwrap_or_default())
                     }
                     Err(e) => CommandResponse::ok_with_data(serde_json::to_value(MermaidResult {
                         success: false,
                         mermaid: None,
                         error: Some(format!("Failed to parse Claude response: {}", e)),
-                    }).unwrap()),
+                    }).unwrap_or_default()),
                 }
             }
             Err(e) => CommandResponse::ok_with_data(serde_json::to_value(MermaidResult {
                 success: false,
                 mermaid: None,
                 error: Some(format!("Request failed: {}", e)),
-            }).unwrap()),
+            }).unwrap_or_default()),
         }
-    }
-
-    // ========================================================================
-    // CANVAS: Diagram Generation (SVG + Mermaid via Claude API)
-    // ========================================================================
-
-    async fn cmd_generate_diagram(
-        &self,
-        source_type: String,
-        prompt: Option<String>,
-        github_url: Option<String>,
-        image_base64: Option<String>,
-        current_mermaid: Option<String>,
-        diagram_type: String,
-        board_id: String,
-    ) -> CommandResponse {
-        let api_key = self.claude_api_key.read().await;
-        let api_key = match api_key.as_ref() {
-            Some(k) => k.clone(),
-            None => return CommandResponse::err("Claude API key not configured. Set your API key in Settings."),
-        };
-
-        let source = match source_type.as_str() {
-            "description" => {
-                crate::diagram_gen::DiagramSource::Description {
-                    prompt: prompt.unwrap_or_default(),
-                }
-            }
-            "github" => {
-                crate::diagram_gen::DiagramSource::Github {
-                    url: github_url.unwrap_or_default(),
-                    prompt,
-                }
-            }
-            "image" => {
-                crate::diagram_gen::DiagramSource::Image {
-                    image_base64: image_base64.unwrap_or_default(),
-                    prompt,
-                }
-            }
-            "edit" => {
-                crate::diagram_gen::DiagramSource::Edit {
-                    current_mermaid: current_mermaid.unwrap_or_default(),
-                    instruction: prompt.unwrap_or_default(),
-                }
-            }
-            _ => return CommandResponse::err(&format!("Unknown source type: {}", source_type)),
-        };
-
-        let dt = match diagram_type.as_str() {
-            "flowchart" => crate::diagram_gen::DiagramType::Flowchart,
-            "sequence" => crate::diagram_gen::DiagramType::Sequence,
-            "class_diagram" => crate::diagram_gen::DiagramType::ClassDiagram,
-            "architecture" => crate::diagram_gen::DiagramType::Architecture,
-            _ => crate::diagram_gen::DiagramType::Auto,
-        };
-
-        let request = crate::diagram_gen::DiagramRequest {
-            source,
-            diagram_type: dt,
-            board_id,
-        };
-
-        // TODO: get actual peer_id from system
-        let peer_id = "local";
-
-        let result = crate::diagram_gen::generate_diagram(
-            &self.claude_client,
-            &api_key,
-            &request,
-            peer_id,
-        ).await;
-
-        CommandResponse::ok_with_data(serde_json::to_value(result).unwrap())
     }
 
     // ========================================================================
@@ -784,7 +697,7 @@ Output the Mermaid code in a ```mermaid code block."#.to_string(),
         let client = self.cloud_client.read().await;
         match client.as_ref() {
             Some(c) => match c.get_nudges().await {
-                Ok(report) => CommandResponse::ok_with_data(serde_json::to_value(report).unwrap()),
+                Ok(report) => CommandResponse::ok_with_data(serde_json::to_value(report).unwrap_or_default()),
                 Err(e) => CommandResponse::err(format!("Failed to get nudges: {}", e)),
             },
             None => CommandResponse::err("Cloud client not initialized"),
@@ -828,7 +741,7 @@ Output the Mermaid code in a ```mermaid code block."#.to_string(),
         };
 
         match result {
-            Ok(summary) => CommandResponse::ok_with_data(serde_json::to_value(summary).unwrap()),
+            Ok(summary) => CommandResponse::ok_with_data(serde_json::to_value(summary).unwrap_or_default()),
             Err(e) => CommandResponse::err(format!("Summary failed: {}", e)),
         }
     }

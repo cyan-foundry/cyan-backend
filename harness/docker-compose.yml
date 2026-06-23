@@ -1,0 +1,54 @@
+# Infra layer for the relay/WebSocket rungs AND the mesh-hardening e2e scenarios
+# (MESH_HARDENING_SPEC §6/§7/§10/§12): just the iroh-relay fixture + the isolation networks.
+# ALL roles — ordinary peers, the thin bootstrap, and the durable super-peer holder — are
+# `cyan_node` CONTAINERS launched per-scenario by the Rust harness (tests/substrate_mesh_e2e.rs)
+# / Makefile with `docker run` onto the right networks, so this one file serves every layout.
+#
+# Why roles, not engine forks: `cyan_node` IS the real snapshot+delta engine. In the rig the
+# "super-peer" is a cyan_node that stays online and holds the group (the DURABLE-REPLICA substrate
+# role from STATUS_HEADLESS_SUPERPEER.md); the Lens-specific AI/entitlement/offline-message-hold
+# logic lives in cyan-lens and is tested there against fakes — out of this substrate rig's scope.
+# The "bootstrap" is a cyan_node reachable from both islands (the thin discovery rendezvous role).
+#
+# Netem/chaos is applied to those containers by the harness (host-side `docker`):
+#   offline   = `docker pause`/`unpause`          (process frozen; DB+state survive the return)
+#   partition = `docker network disconnect/connect` (loses reachability without dying)
+#   latency   = `tc qdisc … netem delay` via `docker exec` (needs iproute2 + NET_ADMIN, in-image)
+#
+# Networks model the connectivity ladder:
+#   lan      — peers here  -> a direct peer<->peer route exists (LAN/direct + sovereign rungs)
+#   mesh_a   — peer-a island (no route to mesh_b)        \  split bridges: the ONLY common
+#   mesh_b   — peer-b island (no route to mesh_a)        /  reachability is the relay/bootstrap
+#   relaynet — the relay lives here; peers also join it  -> forces the relay path
+#   airgap   — internal:true (no gateway, no relay)      -> offline rung
+name: cyan-rig
+
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile.relay
+      args:
+        IROH_RELAY_VERSION: ${IROH_RELAY_VERSION:-0.95.1}
+    image: cyan/relay:${IROH_RELAY_VERSION:-0.95.1}
+    container_name: cyan-rig-relay
+    # `--dev` = HTTP relay (no TLS), fine for a loopback rig. Exact flags/ports are
+    # confirmed by the Makefile `relay-info` target against the built binary.
+    command: ["--dev"]
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+    networks: [lan, mesh_a, mesh_b, relaynet]
+    healthcheck:
+      # iroh-relay --dev serves its HTTP relay on 3340; treat "port open" as healthy.
+      test: ["CMD", "sh", "-c", "nc -z localhost 3340 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+networks:
+  lan: {}
+  mesh_a: {}
+  mesh_b: {}
+  relaynet: {}
+  airgap:
+    internal: true   # no gateway -> genuinely offline

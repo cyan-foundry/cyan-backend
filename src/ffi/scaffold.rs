@@ -20,14 +20,14 @@ pub fn save_node_id_to_disk(id: &str) {
     }
 }
 
-pub unsafe fn cstr_arg(ptr: *const c_char) -> Option<String> {
+pub unsafe fn cstr_arg(ptr: *const c_char) -> Option<String> { unsafe {
     if ptr.is_null() {
         None
     } else {
         CStr::from_ptr(ptr).to_str().ok().map(|s| s.to_string())
     }
-}
+}}
 
 pub fn to_c_string(s: String) -> *const c_char {
-    CString::new(s).unwrap().into_raw()
+    CString::new(s).unwrap_or_default().into_raw()
 }

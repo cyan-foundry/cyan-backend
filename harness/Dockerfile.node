@@ -1,0 +1,37 @@
+# cyan_node peer image for the Docker rig.
+#
+# Builds the TEST-ONLY `cyan_node` bin (src/bin/cyan_node.rs) for Linux from an ASSEMBLED
+# build context produced by scripts/assemble-context.sh — the repo plus its three sibling
+# path-deps (xaeroai, xaeroid, cyan-backend-integrations), with `xaeroID` lowercased to
+# `xaeroid` so the case-sensitive Linux FS resolves the `../xaeroid` path dep.
+#
+# NOTE (documented blocker — see STATUS_DOCKER_RIG.md): `xaeroai` declares
+#   llama-cpp-2 = { version = "0.1.130", default-features = false, features = ["metal"] }
+# UNCONDITIONALLY (not target-gated). Metal is Apple-only, so this build can fail at the
+# llama-cpp-sys-2 stage on Linux. cmake/clang/libclang are installed to give it the best
+# chance; if it still fails that is the real finding, not a rig defect.
+FROM rust:1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      cmake clang libclang-dev pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+# The assembled context places sibling crates next to cyan-backend so `../xaeroid` resolves.
+COPY xaeroid/        /src/xaeroid/
+COPY cyan-backend-integrations/ /src/cyan-backend-integrations/
+COPY cyan-mcp/       /src/cyan-mcp/
+COPY cyan-identity/  /src/cyan-identity/
+COPY cyan-backend/   /src/cyan-backend/
+WORKDIR /src/cyan-backend
+RUN cargo build --release --bin cyan_node \
+    && cp target/release/cyan_node /usr/local/bin/cyan_node
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates netcat-openbsd iptables iproute2 curl && rm -rf /var/lib/apt/lists/*
+COPY --from=build /usr/local/bin/cyan_node /usr/local/bin/cyan_node
+COPY ws-entrypoint.sh /usr/local/bin/ws-entrypoint.sh
+COPY shape.sh /usr/local/bin/shape.sh
+RUN chmod +x /usr/local/bin/ws-entrypoint.sh /usr/local/bin/shape.sh && mkdir -p /data
+ENV BIN=cyan_node
+# Default entrypoint runs cyan_node directly (stdin/stdout line protocol). The WebSocket
+# rung overrides the entrypoint with ws-entrypoint.sh to black-hole outbound UDP first.
+ENTRYPOINT ["/usr/local/bin/cyan_node"]

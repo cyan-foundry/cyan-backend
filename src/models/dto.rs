@@ -48,6 +48,16 @@ pub struct BoardMetadataDTO {
     pub last_accessed: i64,
     #[serde(default)]
     pub is_pinned: bool,
+    /// LWW clock for the **descriptive** lane (labels/rating/contains_model/contains_skills/
+    /// board_type) — the fields edited together by `UpdateBoardMetadata`. The merge applies
+    /// these only when this is strictly newer, so a stale snapshot never clobbers them
+    /// (R11 §9/PATTERN — per-field convergent LWW, never whole-record replace).
+    #[serde(default)]
+    pub meta_updated_at: i64,
+    /// LWW clock for the **pin** lane (`is_pinned`) — set independently of the descriptive
+    /// fields, so pins from multiple peers MERGE rather than clobber (R11 §9b).
+    #[serde(default)]
+    pub pin_updated_at: i64,
 }
 
 fn default_board_type() -> String {
@@ -106,11 +116,120 @@ pub struct FileDTO {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatDTO {
     pub id: String,
+    /// The board this chat belongs to (R11 §1 — chat is board-scoped). `#[serde(default)]`
+    /// so a snapshot from a pre-R11 peer (no `board_id`) still deserializes; the migration
+    /// and apply path back-fill it.
+    #[serde(default)]
+    pub board_id: String,
     pub workspace_id: String,
     pub message: String,
     pub author: String,
     pub parent_id: Option<String>,
     pub timestamp: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NOTE (ROUND8 §W2 — board-level, authored, LWW ledger)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A board-level, authored note. Its own store + own sync stream — NOT a notebook
+/// cell. Editable; conflict resolution is LWW on `updated_at`; the store upserts by
+/// `id` (idempotent, so snapshot apply / anti-entropy repair converge without churn).
+/// `author_name` is resolved from the author's XaeroID profile at authoring time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteDTO {
+    pub id: String,
+    pub board_id: String,
+    pub tenant_id: String,
+    pub author_id: String,
+    pub author_name: String,
+    pub text: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TEMPLATE (ROUND8 §W4 — a pre-written English workflow cloned into a board)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// One pre-written workflow step inside a template: the plain-English step `text`
+/// (the W1 authoring primitive) plus an optional **bound plugin** (the `@plugin` the
+/// step runs on). Cloning a template materializes one real `step` cell per step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplateStep {
+    pub text: String,
+    /// The plugin bound to this step (e.g. `"contido"`), if any. `None` ⇒ unbound.
+    #[serde(default)]
+    pub plugin: Option<String>,
+}
+
+/// A workflow **template** — a pre-written English workflow (steps + bound plugins)
+/// you clone into a board. Two sources: built-in **media seeds** (`source =
+/// "builtin"`, tenant-agnostic) and user **save-as-template** results (`source =
+/// "user"`, tenant-scoped). Cloning never mutates the template.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Template {
+    pub id: String,
+    /// The tenant (group) that owns a user template. Empty for built-in seeds, which
+    /// are global defaults surfaced to every tenant.
+    pub tenant_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// `"builtin"` (seed) or `"user"` (save-as-template).
+    pub source: String,
+    pub steps: Vec<TemplateStep>,
+    pub created_at: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PIN (ROUND8 §W4 — board-level pinned-workflow state; replicated, LWW)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Pinned-workflow state for a board: a pinned workflow surfaces for fast cloning.
+/// Its own store (NOT board_metadata), so it rides the existing anti-entropy digest +
+/// snapshot path exactly like a note. Replicated team state; conflict resolution is
+/// **LWW on `updated_at`**, idempotent upsert-by-`board_id`, so unpin/pin converge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PinDTO {
+    pub board_id: String,
+    pub tenant_id: String,
+    pub pinned: bool,
+    pub updated_at: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WORKFLOW LIFECYCLE STATE (R12 D2/E1)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Per-board workflow lifecycle state — the engine-side support state iOS gates the board
+/// face on (R12 D2/E1). `deployed` + `dashboard_available` let the app surface the running
+/// DASHBOARD instead of the editor; `locked` (set on deploy) means edits are frozen and an
+/// UNLOCK requires an org-XaeroID grant (W17). Defaults (no row) = authoring/editable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowStateDTO {
+    pub board_id: String,
+    /// The workflow has been deployed (it is running / live), not just authored.
+    pub deployed: bool,
+    /// A live dashboard exists for this workflow → iOS shows the dashboard, not the editor.
+    pub dashboard_available: bool,
+    /// Edits are locked (set on deploy). Unlocking mid-flight requires an org grant.
+    pub locked: bool,
+    pub updated_at: i64,
+}
+
+impl WorkflowStateDTO {
+    /// The default authoring state for a board with no deployment yet: editable, unlocked,
+    /// no dashboard.
+    pub fn authoring(board_id: &str) -> Self {
+        WorkflowStateDTO {
+            board_id: board_id.to_string(),
+            deployed: false,
+            dashboard_available: false,
+            locked: false,
+            updated_at: 0,
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -1,39 +1,13 @@
 use crate::ffi::scaffold::*;
+use crate::util::MutexExt;
 use crate::models::commands::*;
 use crate::models::core::*;
 use crate::models::dto::*;
 use crate::models::events::*;
 use crate::storage;
-use serde::{Deserialize, Serialize};
 
-pub use crate::integration_bridge::IntegrationBridge;
-
-pub use crate::ai_bridge::AIBridge;
 use crate::core::*;
-use crate::models::commands::NetworkCommand::RequestSnapshot;
-use anyhow::{anyhow, Result};
-use bytes::Bytes;
-use futures::StreamExt;
-use iroh::discovery::mdns::MdnsDiscovery;
-use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey};
-use iroh_blobs::store::fs::FsStore as BlobStore;
-use iroh_gossip::{
-    api::{Event as GossipEvent, GossipTopic},
-    proto::state::TopicId,
-    Gossip,
-};
-use once_cell::sync::OnceCell;
-use rand_chacha::rand_core::SeedableRng;
-use rand_chacha::ChaCha8Rng;
-use rusqlite::{Connection, OptionalExtension};
-use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::{
-    collections::HashSet,
-    time::Duration,
-};
-use tokio::sync::{mpsc, mpsc::error::SendError};
+use rusqlite::OptionalExtension;
 // ---------- FFI: lifecycle ----------
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_set_data_dir(path: *const c_char) -> bool {
@@ -81,6 +55,11 @@ pub extern "C" fn cyan_init(db_path: *const c_char) -> bool {
         CStr::from_ptr(db_path).to_string_lossy().to_string()
     };
     let res = std::thread::spawn(|| {
+        // §5: resolve the bootstrap/relay/discovery_key from the signed rendezvous config BEFORE the
+        // tokio runtime exists (so the best-effort blocking fetch runs outside any async context).
+        // No-op unless CYAN_RENDEZVOUS_URL is set ⇒ identical to pre-§5 behavior offline.
+        crate::rendezvous::fetch_and_apply_if_configured();
+
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().expect("runtime");
         RUNTIME.set(runtime).ok();
 
@@ -106,7 +85,7 @@ pub extern "C" fn cyan_init(db_path: *const c_char) -> bool {
 
 use crate::{CyanSystem, AI_RESPONSE_QUEUE, DATA_DIR, DISCOVERY_KEY, NODE_ID, RELAY_URL, RUNTIME, SYSTEM};
 use rusqlite::params;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, CStr, CString};
 use std::path::{Path, PathBuf};
 // Initialize tracing (only once)
@@ -204,30 +183,38 @@ pub extern "C" fn cyan_init_with_identity(
             }
         };
 
-        bytes.try_into().unwrap()
+        match bytes.try_into() {
+            Ok(arr) => arr,
+            Err(_) => return false,
+        }
     };
 
     // Parse optional relay_url
-    if !relay_url.is_null() {
-        if let Ok(url) = unsafe { CStr::from_ptr(relay_url) }.to_str() {
-            if !url.is_empty() {
-                let _ = RELAY_URL.set(url.to_string());
-                eprintln!("🌐 Relay URL set: {}", url);
-            }
-        }
+    if !relay_url.is_null()
+        && let Ok(url) = unsafe { CStr::from_ptr(relay_url) }.to_str()
+        && !url.is_empty()
+    {
+        let _ = RELAY_URL.set(url.to_string());
+        eprintln!("🌐 Relay URL set: {}", url);
     }
 
     // Parse optional discovery_key
-    if !discovery_key.is_null() {
-        if let Ok(key) = unsafe { CStr::from_ptr(discovery_key) }.to_str() {
-            if !key.is_empty() {
-                let _ = DISCOVERY_KEY.set(key.to_string());
-                eprintln!("🔑 Discovery key set: {}", key);
-            }
-        }
+    if !discovery_key.is_null()
+        && let Ok(key) = unsafe { CStr::from_ptr(discovery_key) }.to_str()
+        && !key.is_empty()
+    {
+        let _ = DISCOVERY_KEY.set(key.to_string());
+        eprintln!("🔑 Discovery key set: {}", key);
     }
 
     let res = std::thread::spawn(move || {
+        // §5: resolve bootstrap/relay/discovery_key from the signed rendezvous config BEFORE the
+        // runtime is built. This runs AFTER the explicit FFI relay_url/discovery_key args above, and
+        // `OnceCell::set` is first-wins, so an FFI-provided value still wins — the config only fills
+        // in what FFI didn't set (notably the bootstrap id, replacing the old hardcode). No-op unless
+        // CYAN_RENDEZVOUS_URL is set, so the existing FFI init path is unchanged when none is provided.
+        crate::rendezvous::fetch_and_apply_if_configured();
+
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
@@ -235,7 +222,9 @@ pub extern "C" fn cyan_init_with_identity(
             .expect("runtime");
         RUNTIME.set(runtime).ok();
 
-        let rt = RUNTIME.get().unwrap();
+        let Some(rt) = RUNTIME.get() else {
+            return false;
+        };
         let sys = rt.block_on(async {
             CyanSystem::new(path, Some(secret_key_bytes)).await
         });
@@ -257,7 +246,7 @@ pub extern "C" fn cyan_init_with_identity(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_xaero_id() -> *const c_char {
-    let id = NODE_ID.get_or_init(|| compute_or_load_node_id());
+    let id = NODE_ID.get_or_init(compute_or_load_node_id);
     to_c_string(id.clone())
 }
 
@@ -279,10 +268,35 @@ pub extern "C" fn cyan_set_xaero_id(id: *const c_char) -> bool {
     if id.is_null() {
         return false;
     }
-    let s = unsafe { CStr::from_ptr(id) }.to_str().ok().unwrap().to_string();
+    let Ok(s) = unsafe { CStr::from_ptr(id) }.to_str() else {
+        return false;
+    };
+    let s = s.to_string();
 
     let _ = NODE_ID.set(s.clone());
     save_node_id_to_disk(&s);
+    true
+}
+
+/// Wipe the device's local identity key — the engine half of the iOS "delete
+/// identity" flow (W17 §B). Deletes the device XaeroID private key from the OS
+/// secure store (Keychain, or the headless fake) and best-effort removes the
+/// on-disk `node_id.txt`, so a fresh identity is created on the next launch.
+///
+/// Idempotent and panic-free: returns `true` once the key is gone (already-absent
+/// counts as success), `false` only if the vault delete itself errored. Local
+/// data/DB is untouched — this clears identity custody only.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_delete_identity() -> bool {
+    let vault = crate::device_vault();
+    if let Err(e) = crate::device_vault::delete_identity(vault.as_ref()) {
+        eprintln!("cyan_delete_identity: vault delete failed: {e}");
+        return false;
+    }
+    // Best-effort: drop the cached public node id so a new one is minted next run.
+    if let Some(dir) = DATA_DIR.get() {
+        let _ = std::fs::remove_file(dir.join("node_id.txt"));
+    }
     true
 }
 
@@ -312,10 +326,7 @@ pub extern "C" fn cyan_poll_events(component: *const c_char) -> *mut c_char {
         if component.is_null() {
             "unknown"
         } else {
-            match CStr::from_ptr(component).to_str() {
-                Ok(s) => s,
-                Err(_) => "unknown",
-            }
+            CStr::from_ptr(component).to_str().unwrap_or("unknown")
         }
     };
 
@@ -590,13 +601,16 @@ pub extern "C" fn cyan_is_board_owner(id: *const c_char) -> bool {
 }
 
 // ---------- FFI: chats ----------
+/// Send a chat to a **board** (R11 §1 — chat is board-scoped). The first argument is now a
+/// `board_id` (was `workspace_id`); the C ABI is unchanged (same arity/types), so iOS only
+/// changes which id it passes. The engine derives the board's workspace + group internally.
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_send_chat(
-    workspace_id: *const c_char,
+    board_id: *const c_char,
     message: *const c_char,
     parent_id: *const c_char,
 ) {
-    let Some(wid) = (unsafe { cstr_arg(workspace_id) }) else {
+    let Some(bid) = (unsafe { cstr_arg(board_id) }) else {
         return;
     };
     let Some(msg) = (unsafe { cstr_arg(message) }) else {
@@ -609,10 +623,23 @@ pub extern "C" fn cyan_send_chat(
         None => return,
     };
     let _ = sys.command_tx.send(CommandMsg::SendChat {
-        workspace_id: wid,
+        board_id: bid,
         message: msg,
         parent_id: parent,
     });
+}
+
+/// Load a **board's** chat history (R11 §1). Replays each stored message as a `ChatSent`
+/// onto the chat-panel event buffer, then emits `ChatHistoryComplete { board_id, .. }`.
+/// Additive FFI — iOS calls this on opening a board's chat panel.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_load_chat_history(board_id: *const c_char) {
+    let Some(bid) = (unsafe { cstr_arg(board_id) }) else {
+        return;
+    };
+    if let Some(sys) = SYSTEM.get() {
+        let _ = sys.command_tx.send(CommandMsg::LoadChatHistory { board_id: bid });
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -625,6 +652,161 @@ pub extern "C" fn cyan_delete_chat(id: *const c_char) {
         None => return,
     };
     let _ = sys.command_tx.send(CommandMsg::DeleteChat { id });
+}
+
+// ---------- FFI: notes (ROUND8 §W2 — board-level authored LWW ledger) ----------
+/// Author or edit a note on a board. `note_id` null ⇒ create a new note; non-null ⇒
+/// edit that note (LWW on `updated_at`). `tenant_id` null ⇒ derive from the board's
+/// group. Additive verb — never replaces any existing FFI.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_note_put(
+    board_id: *const c_char,
+    note_id: *const c_char,
+    tenant_id: *const c_char,
+    text: *const c_char,
+) {
+    let Some(board) = (unsafe { cstr_arg(board_id) }) else {
+        return;
+    };
+    let Some(text) = (unsafe { cstr_arg(text) }) else {
+        return;
+    };
+    let note_id = unsafe { cstr_arg(note_id) }; // null ⇒ new note
+    let tenant_id = unsafe { cstr_arg(tenant_id) }; // null ⇒ derive from board's group
+
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let _ = sys.command_tx.send(CommandMsg::PutNote {
+        board_id: board,
+        note_id,
+        tenant_id,
+        text,
+    });
+}
+
+/// List a board's notes as a JSON array of `NoteDTO`, tenant-scoped to the board's
+/// group. Caller owns the returned string and must free it with `cyan_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_note_list(board_id: *const c_char) -> *mut c_char {
+    let Some(board) = (unsafe { cstr_arg(board_id) }) else {
+        return std::ptr::null_mut();
+    };
+    // Tenant is the board's group (group == tenant); fall back to the board id so an
+    // un-grouped board still returns its own notes rather than nothing.
+    let tenant = storage::board_get_group_id(&board).unwrap_or_else(|| board.clone());
+    let notes = storage::note_list_by_board(&board, &tenant).unwrap_or_default();
+    let json = serde_json::to_string(&notes).unwrap_or_else(|_| "[]".to_string());
+    match CString::new(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Delete a note by id.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_note_delete(id: *const c_char) {
+    let Some(id) = (unsafe { cstr_arg(id) }) else {
+        return;
+    };
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let _ = sys.command_tx.send(CommandMsg::DeleteNote { id });
+}
+
+// ---------- FFI: templates + pinned workflows (ROUND8 §W4) ----------
+/// List the templates visible to a tenant as a JSON array of `Template`: the built-in
+/// media seeds (always) plus the tenant's own save-as-template results. `tenant_id`
+/// null ⇒ seeds only. Caller owns the returned string; free with `cyan_free_string`.
+/// Additive verb — never replaces any existing FFI.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_template_list(tenant_id: *const c_char) -> *mut c_char {
+    let tenant = unsafe { cstr_arg(tenant_id) }.unwrap_or_default();
+    let templates = crate::templates::list_templates(&tenant);
+    let json = serde_json::to_string(&templates).unwrap_or_else(|_| "[]".to_string());
+    match CString::new(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Clone a template into a board as real W1 step cells (the cloned steps are authorable
+/// workflow steps that compile + sync like any cell). `tenant_id` null ⇒ derive from the
+/// board's group. Runs through the command actor so each cloned step broadcasts.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_workflow_from_template(
+    template_id: *const c_char,
+    board_id: *const c_char,
+    tenant_id: *const c_char,
+) {
+    let Some(template_id) = (unsafe { cstr_arg(template_id) }) else {
+        return;
+    };
+    let Some(board_id) = (unsafe { cstr_arg(board_id) }) else {
+        return;
+    };
+    let tenant_id = unsafe { cstr_arg(tenant_id) }; // null ⇒ derive from board's group
+
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let _ = sys.command_tx.send(CommandMsg::WorkflowFromTemplate {
+        template_id,
+        board_id,
+        tenant_id,
+    });
+}
+
+/// Save a board's steps as a reusable user template, tenant-scoped. `steps_json` is a
+/// JSON array of `TemplateStep` (`{ "text": ..., "plugin": ... }`). Returns the created
+/// `Template` as JSON (caller frees with `cyan_free_string`), or null on bad input.
+/// Additive verb the iOS save-as-template flow consumes.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_template_save(
+    tenant_id: *const c_char,
+    name: *const c_char,
+    description: *const c_char,
+    steps_json: *const c_char,
+) -> *mut c_char {
+    let Some(tenant) = (unsafe { cstr_arg(tenant_id) }) else {
+        return std::ptr::null_mut();
+    };
+    let Some(name) = (unsafe { cstr_arg(name) }) else {
+        return std::ptr::null_mut();
+    };
+    let description = unsafe { cstr_arg(description) }.unwrap_or_default();
+    let Some(steps_json) = (unsafe { cstr_arg(steps_json) }) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(steps) = serde_json::from_str::<Vec<crate::models::dto::TemplateStep>>(&steps_json) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(template) = crate::templates::save_as_template(&tenant, &name, &description, steps) else {
+        return std::ptr::null_mut();
+    };
+    let json = serde_json::to_string(&template).unwrap_or_else(|_| "{}".to_string());
+    match CString::new(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Set a board's pinned-workflow state (a pinned workflow surfaces for fast cloning).
+/// Replicated team state (LWW); runs through the command actor so it broadcasts.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_pin_set(board_id: *const c_char, pinned: bool) {
+    let Some(board_id) = (unsafe { cstr_arg(board_id) }) else {
+        return;
+    };
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let _ = sys.command_tx.send(CommandMsg::SetPin { board_id, pinned });
 }
 
 // ---------- FFI: direct chats ----------
@@ -678,6 +860,7 @@ pub extern "C" fn cyan_send_direct_chat(
         workspace_id: wid,
         message: msg,
         parent_id: parent,
+        attachment: None,
     });
 }
 
@@ -718,10 +901,83 @@ pub extern "C" fn cyan_upload_file_to_workspace(workspace_id: *const c_char, pat
     });
 }
 
+/// R10FB §D: demo seeding has been REMOVED. This symbol is kept (inert) only so the C ABI
+/// stays stable until iOS stops calling it — the command it sends is a no-op and a fresh
+/// DB never gets a "Demo Group"/"Demo Board".
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_seed_demo_if_empty() {
     if let Some(sys) = SYSTEM.get() {
         let _ = sys.command_tx.send(CommandMsg::SeedDemoIfEmpty);
+    }
+}
+
+// ---------- FFI: unread / notifications (R10FB §N) ----------
+
+/// Unread counts as a JSON object `{board_id: count}` — **board-level only** (R11 §3). One
+/// message counts once on its board (no workspace/group rollup, which killed the doubled
+/// counts). The app looks up its board-card id in this map; sum the map for the dock badge
+/// total. Caller frees with `cyan_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_unread_counts() -> *mut c_char {
+    let counts = storage::unread_counts().unwrap_or_default();
+    let json = serde_json::to_string(&counts).unwrap_or_else(|_| "{}".to_string());
+    match CString::new(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Mark a **board** read (R11 §3/§5) — `scope_id` is a board id. Clears that board's unread
+/// items, then emits `UnreadChanged` so iOS + the dock badge update live. Opening a chat is a
+/// READ (this), never a write that increments.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_mark_read(scope_id: *const c_char) {
+    let Some(scope_id) = (unsafe { cstr_arg(scope_id) }) else {
+        return;
+    };
+    if let Some(sys) = SYSTEM.get() {
+        let _ = sys.command_tx.send(CommandMsg::MarkRead { scope_id });
+    }
+}
+
+// ---------- FFI: files — delete + handle resolver (R10FB §F) ----------
+
+/// User-initiated file delete (R10FB §F4): soft-delete/tombstone locally and gossip the
+/// deletion so it converges to peers. No hard delete in the engine.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_delete_file(file_id: *const c_char) {
+    let Some(file_id) = (unsafe { cstr_arg(file_id) }) else {
+        return;
+    };
+    if let Some(sys) = SYSTEM.get() {
+        let _ = sys.command_tx.send(CommandMsg::DeleteFile { file_id });
+    }
+}
+
+/// Resolve a file by its stable workflow handle `group_id:workspace_id:board_id:file_name`
+/// (R10FB §F3). Returns the file as JSON, or `null` if no active file matches. Caller frees
+/// with `cyan_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_resolve_file_handle(
+    group_id: *const c_char,
+    workspace_id: *const c_char,
+    board_id: *const c_char,
+    file_name: *const c_char,
+) -> *mut c_char {
+    let (Some(g), Some(w), Some(b), Some(name)) = (
+        unsafe { cstr_arg(group_id) },
+        unsafe { cstr_arg(workspace_id) },
+        unsafe { cstr_arg(board_id) },
+        unsafe { cstr_arg(file_name) },
+    ) else {
+        return std::ptr::null_mut();
+    };
+    match storage::file_resolve_handle(&g, &w, &b, &name) {
+        Some(file) => match serde_json::to_string(&file).ok().and_then(|j| CString::new(j).ok()) {
+            Some(s) => s.into_raw(),
+            None => std::ptr::null_mut(),
+        },
+        None => std::ptr::null_mut(),
     }
 }
 
@@ -737,14 +993,14 @@ pub extern "C" fn cyan_get_group_peers(group_id: *const c_char) -> *mut c_char {
     };
 
     let peers: Vec<String> = {
-        let peers_map = sys.peers_per_group.lock().unwrap();
+        let peers_map = sys.peers_per_group.lock_safe();
         peers_map.get(&gid)
             .map(|set| set.iter().map(|pk| pk.to_string()).collect())
             .unwrap_or_default()
     };
 
     match serde_json::to_string(&peers) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -757,14 +1013,14 @@ pub extern "C" fn cyan_get_all_peers() -> *mut c_char {
     };
 
     let all_peers: HashMap<String, Vec<String>> = {
-        let peers_map = sys.peers_per_group.lock().unwrap();
+        let peers_map = sys.peers_per_group.lock_safe();
         peers_map.iter()
             .map(|(gid, set)| (gid.clone(), set.iter().map(|pk| pk.to_string()).collect()))
             .collect()
     };
 
     match serde_json::to_string(&all_peers) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -779,7 +1035,7 @@ pub extern "C" fn cyan_get_group_peer_count(group_id: *const c_char) -> i32 {
         return 0;
     };
 
-    let peers_map = sys.peers_per_group.lock().unwrap();
+    let peers_map = sys.peers_per_group.lock_safe();
     peers_map.get(&gid)
         .map(|set| set.len() as i32)
         .unwrap_or(0)
@@ -792,10 +1048,68 @@ pub extern "C" fn cyan_get_total_peer_count() -> i32 {
         return 0;
     };
 
-    let peers_map = sys.peers_per_group.lock().unwrap();
+    let peers_map = sys.peers_per_group.lock_safe();
     peers_map.values()
         .map(|set| set.len())
         .sum::<usize>() as i32
+}
+
+/// Get the persistent presence ROSTER for a group (MESH_HARDENING §3) as a JSON array:
+/// `[{"peer_id","name","avatar","online","last_seen"}, ...]`.
+///
+/// Distinct from `cyan_get_group_peers` (which returns only the LIVE neighbor set): this returns
+/// every member ever seen in the group — online members in green, offline members greyed with their
+/// cached name + last-seen (chat-style roster). `online` is overlaid from the live neighbor set, so
+/// a member currently in `peers_per_group` reports `true`. `name`/`avatar` come from the profile
+/// store (null until a profile is seen). Tenant-scoped by `group_id`. Caller frees via `cyan_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_group_members(group_id: *const c_char) -> *mut c_char {
+    let Some(gid) = (unsafe { cstr_arg(group_id) }) else {
+        return std::ptr::null_mut();
+    };
+    let Some(sys) = SYSTEM.get() else {
+        return std::ptr::null_mut();
+    };
+
+    // Live neighbor set for the online overlay (the same map the live-peer FFI reads). No `unwrap`
+    // on the lock (engine/FFI path): a poisoned lock degrades to an empty overlay, never a crash.
+    let online: HashSet<String> = sys
+        .peers_per_group
+        .lock()
+        .ok()
+        .and_then(|peers_map| {
+            peers_map
+                .get(&gid)
+                .map(|set| set.iter().map(|pk| pk.to_string()).collect())
+        })
+        .unwrap_or_default();
+
+    let members: Vec<serde_json::Value> = crate::storage::group_members_list(&gid)
+        .into_iter()
+        .map(|(peer_id, name, avatar, last_seen)| {
+            let mut m = serde_json::Map::new();
+            m.insert("peer_id".to_string(), serde_json::Value::String(peer_id.clone()));
+            m.insert(
+                "name".to_string(),
+                name.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+            );
+            m.insert(
+                "avatar".to_string(),
+                avatar.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+            );
+            m.insert("online".to_string(), serde_json::Value::Bool(online.contains(&peer_id)));
+            m.insert("last_seen".to_string(), serde_json::Value::Number(last_seen.into()));
+            serde_json::Value::Object(m)
+        })
+        .collect();
+
+    match serde_json::to_string(&serde_json::Value::Array(members)) {
+        Ok(json) => match CString::new(json) {
+            Ok(c) => c.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+        Err(_) => std::ptr::null_mut(),
+    }
 }
 
 /// Get total object count (whiteboards + files)
@@ -805,7 +1119,7 @@ pub extern "C" fn cyan_get_object_count() -> i32 {
         return 0;
     };
 
-    let db = sys.db.lock().unwrap();
+    let db = sys.db.lock_safe();
     let count: i32 = db.query_row(
         "SELECT COUNT(*) FROM objects WHERE type IN ('whiteboard', 'file')",
         [],
@@ -822,27 +1136,26 @@ pub extern "C" fn cyan_get_object_count() -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_boards_for_group(group_id: *const c_char) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let gid = unsafe { CStr::from_ptr(group_id) }.to_string_lossy().to_string();
 
-    let boards: Vec<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+    let boards: Vec<serde_json::Value> = (|| -> rusqlite::Result<Vec<serde_json::Value>> {
+        let db = sys.db.lock_safe();
 
         // First get all workspace IDs for this group
         let mut ws_stmt = db.prepare(
             "SELECT id FROM workspaces WHERE group_id = ?1"
-        ).unwrap();
+        )?;
 
         let workspace_ids: Vec<String> = ws_stmt
-            .query_map(params![gid.clone()], |row| row.get::<_, String>(0))
-            .unwrap()
+            .query_map(params![gid.clone()], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
             .collect();
 
         if workspace_ids.is_empty() {
-            return CString::new("[]").unwrap().into_raw();
+            return Ok(Vec::new());
         }
 
         // Query boards for all workspaces in this group
@@ -852,7 +1165,7 @@ pub extern "C" fn cyan_get_boards_for_group(group_id: *const c_char) -> *mut c_c
                 "SELECT id, workspace_id, name, created_at FROM objects
                  WHERE type = 'whiteboard' AND workspace_id = ?1
                  ORDER BY created_at DESC"
-            ).unwrap();
+            )?;
 
             let boards_iter = stmt.query_map(params![wid], |row| {
                 Ok(serde_json::json!({
@@ -863,18 +1176,18 @@ pub extern "C" fn cyan_get_boards_for_group(group_id: *const c_char) -> *mut c_c
                     "created_at": row.get::<_, i64>(3)?,
                     "element_count": 0
                 }))
-            }).unwrap();
+            })?;
 
             for board in boards_iter.filter_map(|r| r.ok()) {
                 all_boards.push(board);
             }
         }
-        all_boards
-    };
+        Ok(all_boards)
+    })().unwrap_or_default();
 
     match serde_json::to_string(&boards) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -883,13 +1196,13 @@ pub extern "C" fn cyan_get_boards_for_group(group_id: *const c_char) -> *mut c_c
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_boards_for_workspace(workspace_id: *const c_char) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let wid = unsafe { CStr::from_ptr(workspace_id) }.to_string_lossy().to_string();
 
-    let boards: Vec<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+    let boards: Vec<serde_json::Value> = (|| -> rusqlite::Result<Vec<serde_json::Value>> {
+        let db = sys.db.lock_safe();
 
         // Get group_id for this workspace
         let group_id: String = db.query_row(
@@ -902,9 +1215,9 @@ pub extern "C" fn cyan_get_boards_for_workspace(workspace_id: *const c_char) -> 
             "SELECT id, workspace_id, name, created_at FROM objects
              WHERE type = 'whiteboard' AND workspace_id = ?1
              ORDER BY created_at DESC"
-        ).unwrap();
+        )?;
 
-        stmt.query_map(params![wid], |row| {
+        Ok(stmt.query_map(params![wid], |row| {
             Ok(serde_json::json!({
                 "id": row.get::<_, String>(0)?,
                 "workspace_id": row.get::<_, String>(1)?,
@@ -913,12 +1226,12 @@ pub extern "C" fn cyan_get_boards_for_workspace(workspace_id: *const c_char) -> 
                 "created_at": row.get::<_, i64>(3)?,
                 "element_count": 0
             }))
-        }).unwrap().filter_map(|r| r.ok()).collect()
-    };
+        })?.filter_map(|r| r.ok()).collect())
+    })().unwrap_or_default();
 
     match serde_json::to_string(&boards) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -927,11 +1240,11 @@ pub extern "C" fn cyan_get_boards_for_workspace(workspace_id: *const c_char) -> 
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_all_boards() -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
-    let boards: Vec<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+    let boards: Vec<serde_json::Value> = (|| -> rusqlite::Result<Vec<serde_json::Value>> {
+        let db = sys.db.lock_safe();
 
         let mut stmt = db.prepare(
             "SELECT o.id, o.workspace_id, w.group_id, o.name, o.created_at,
@@ -944,9 +1257,9 @@ pub extern "C" fn cyan_get_all_boards() -> *mut c_char {
              LEFT JOIN board_metadata m ON o.id = m.board_id
              WHERE o.type = 'whiteboard'
              ORDER BY COALESCE(m.is_pinned, 0) DESC, o.created_at DESC"
-        ).unwrap();
+        )?;
 
-        stmt.query_map([], |row| {
+        Ok(stmt.query_map([], |row| {
             Ok(serde_json::json!({
                 "id": row.get::<_, String>(0)?,
                 "workspace_id": row.get::<_, String>(1)?,
@@ -959,12 +1272,12 @@ pub extern "C" fn cyan_get_all_boards() -> *mut c_char {
                 "rating": row.get::<_, i32>(7)?,
                 "last_accessed": row.get::<_, i64>(8)?
             }))
-        }).unwrap().filter_map(|r| r.ok()).collect()
-    };
+        })?.filter_map(|r| r.ok()).collect())
+    })().unwrap_or_default();
 
     match serde_json::to_string(&boards) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -975,13 +1288,13 @@ pub extern "C" fn cyan_get_all_boards() -> *mut c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_load_whiteboard_elements(board_id: *const c_char) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
 
-    let elements: Vec<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+    let elements: Vec<serde_json::Value> = (|| -> rusqlite::Result<Vec<serde_json::Value>> {
+        let db = sys.db.lock_safe();
 
         let mut stmt = db.prepare(
             "SELECT id, board_id, element_type, x, y, width, height, z_index,
@@ -989,9 +1302,9 @@ pub extern "C" fn cyan_load_whiteboard_elements(board_id: *const c_char) -> *mut
              FROM whiteboard_elements
              WHERE board_id = ?1
              ORDER BY z_index ASC, created_at ASC"
-        ).unwrap();
+        )?;
 
-        stmt.query_map(params![bid], |row| {
+        Ok(stmt.query_map(params![bid], |row| {
             Ok(serde_json::json!({
                 "id": row.get::<_, String>(0)?,
                 "board_id": row.get::<_, String>(1)?,
@@ -1006,12 +1319,12 @@ pub extern "C" fn cyan_load_whiteboard_elements(board_id: *const c_char) -> *mut
                 "created_at": row.get::<_, i64>(10)?,
                 "updated_at": row.get::<_, i64>(11)?
             }))
-        }).unwrap().filter_map(|r| r.ok()).collect()
-    };
+        })?.filter_map(|r| r.ok()).collect())
+    })().unwrap_or_default();
 
     match serde_json::to_string(&elements) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -1056,7 +1369,7 @@ pub extern "C" fn cyan_save_whiteboard_element(element_json: *const c_char) -> b
     let group_id: String;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         // Check if exists
         is_new = db.query_row(
@@ -1138,7 +1451,7 @@ pub extern "C" fn cyan_delete_whiteboard_element(element_id: *const c_char) -> b
     let group_id: String;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         // Get board_id before deleting
         board_id = db.query_row(
@@ -1200,7 +1513,7 @@ pub extern "C" fn cyan_clear_whiteboard(board_id: *const c_char) -> bool {
     let group_id: String;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         // Get group_id via board -> workspace -> group
         group_id = db.query_row(
@@ -1243,7 +1556,7 @@ pub extern "C" fn cyan_get_whiteboard_element_count(board_id: *const c_char) -> 
 
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
 
-    let db = sys.db.lock().unwrap();
+    let db = sys.db.lock_safe();
     db.query_row(
         "SELECT COUNT(*) FROM whiteboard_elements WHERE board_id = ?1",
         params![bid],
@@ -1256,27 +1569,26 @@ pub extern "C" fn cyan_get_whiteboard_element_count(board_id: *const c_char) -> 
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_workspaces_for_group(group_id: *const c_char) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let gid = unsafe { CStr::from_ptr(group_id) }.to_string_lossy().to_string();
 
-    let workspace_ids: Vec<String> = {
-        let db = sys.db.lock().unwrap();
+    let workspace_ids: Vec<String> = (|| -> rusqlite::Result<Vec<String>> {
+        let db = sys.db.lock_safe();
 
         let mut stmt = db.prepare(
             "SELECT id FROM workspaces WHERE group_id = ?1"
-        ).unwrap();
+        )?;
 
-        stmt.query_map(params![gid], |row| row.get::<_, String>(0))
-            .unwrap()
+        Ok(stmt.query_map(params![gid], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
-            .collect()
-    };
+            .collect())
+    })().unwrap_or_default();
 
     match serde_json::to_string(&workspace_ids) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -1290,15 +1602,15 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
     eprintln!("🦀 cyan_upload_file called!");
     let Some(file_path) = (unsafe { cstr_arg(path) }) else {
         eprintln!("🦀 cyan_upload_file: invalid path");
-        return CString::new(r#"{"success":false,"error":"Invalid path"}"#).unwrap().into_raw();
+        return CString::new(r#"{"success":false,"error":"Invalid path"}"#).unwrap_or_default().into_raw();
     };
     eprintln!("🦀 cyan_upload_file: path = {}", file_path);
     let Some(scope_str) = (unsafe { cstr_arg(scope_json) }) else {
-        return CString::new(r#"{"success":false,"error":"Invalid scope"}"#).unwrap().into_raw();
+        return CString::new(r#"{"success":false,"error":"Invalid scope"}"#).unwrap_or_default().into_raw();
     };
     let Some(sys) = SYSTEM.get() else {
         eprintln!("🦀 cyan_upload_file: invalid scope");
-        return CString::new(r#"{"success":false,"error":"System not initialized"}"#).unwrap().into_raw();
+        return CString::new(r#"{"success":false,"error":"System not initialized"}"#).unwrap_or_default().into_raw();
     };
 
     eprintln!("🦀 cyan_upload_file: scope = {}", scope_str);
@@ -1308,7 +1620,7 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
         Err(e) => {
             eprintln!("🦀failed to parse scope due to : {e:?}");
             return CString::new(format!(r#"{{"success":false,"error":"Invalid scope JSON: {}"}}"#, e))
-                .unwrap().into_raw();
+                .unwrap_or_default().into_raw();
         }
     };
 
@@ -1318,7 +1630,7 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
         Err(e) => {
             eprintln!("🦀failed to read file path due to : {e:?}");
             return CString::new(format!(r#"{{"success":false,"error":"Failed to read file: {}"}}"#, e))
-                .unwrap().into_raw();
+                .unwrap_or_default().into_raw();
         }
     };
 
@@ -1340,13 +1652,13 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
     if let Err(e) = std::fs::create_dir_all(&files_dir) {
         eprintln!("🦀 failed to create dir due to : {e:?}");
         return CString::new(format!(r#"{{"success":false,"error":"Failed to create files dir at {:?}: {}"}}"#, files_dir, e))
-            .unwrap().into_raw();
+            .unwrap_or_default().into_raw();
     }
     let local_path = files_dir.join(&hash);
     if let Err(e) = std::fs::write(&local_path, &bytes) {
         eprintln!("🦀 failed to write file due  to : {e:?}");
         return CString::new(format!(r#"{{"success":false,"error":"Failed to store file: {}"}}"#, e))
-            .unwrap().into_raw();
+            .unwrap_or_default().into_raw();
     }
 
     // Determine scope and IDs
@@ -1361,7 +1673,7 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
         }
         "Workspace" => {
             workspace_id = scope["workspace_id"].as_str().map(|s| s.to_string());
-            let db = sys.db.lock().unwrap();
+            let db = sys.db.lock_safe();
             group_id = workspace_id.as_ref().and_then(|wid| {
                 db.query_row(
                     "SELECT group_id FROM workspaces WHERE id = ?1",
@@ -1373,7 +1685,7 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
         }
         "Board" => {
             board_id = scope["board_id"].as_str().map(|s| s.to_string());
-            let db = sys.db.lock().unwrap();
+            let db = sys.db.lock_safe();
             let ids: Option<(String, String)> = board_id.as_ref().and_then(|bid| {
                 db.query_row(
                     "SELECT o.workspace_id, w.group_id FROM objects o
@@ -1389,7 +1701,7 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
         scope_type => {
             eprintln!("🦀 invalid scope type error  {scope_type:?}");
             return CString::new(r#"{"success":false,"error":"Unknown scope type"}"#)
-                .unwrap().into_raw();
+                .unwrap_or_default().into_raw();
         }
     }
 
@@ -1397,18 +1709,18 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
         Some(g) => g.clone(),
         None => {
             return CString::new(r#"{"success":false,"error":"Could not determine group"}"#)
-                .unwrap().into_raw();
+                .unwrap_or_default().into_raw();
         }
     };
 
     // Generate file ID
-    let file_id = blake3::hash(format!("file:{}:{}:{}", &gid, &file_name, now).as_bytes())
+    let file_id = blake3::hash(format!("file:{}:{}:{}", gid, file_name, now).as_bytes())
         .to_hex()
         .to_string();
 
     // Insert into database
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         let result = db.execute(
             "INSERT OR REPLACE INTO objects (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, local_path, created_at)
              VALUES (?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -1428,7 +1740,7 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
 
         if let Err(e) = result {
             return CString::new(format!(r#"{{"success":false,"error":"DB error: {}"}}"#, e))
-                .unwrap().into_raw();
+                .unwrap_or_default().into_raw();
         }
     }
 
@@ -1457,6 +1769,19 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
         Err(e) => eprintln!("📤 [FILE-UPLOAD] 🔴 Broadcast FAILED: {}", e),
     }
 
+    // Plugin distribution (G10): a `.cyanplugin` artifact (the files that land in a group's Plugins
+    // workspace) is additionally seeded into this node's content-addressed swarm and announced to the
+    // group, so members distribute it peer-to-peer. Reuses the existing file scope/storage + the
+    // FileAvailable broadcast above — no new client `cyan_*` FFI; normal files are unaffected.
+    if file_name.ends_with(".cyanplugin") {
+        eprintln!("🧩 [FILE-UPLOAD] Plugin detected — seeding into swarm + announcing to group");
+        let _ = sys.network_tx.send(NetworkCommand::SeedAndAnnounceBlob {
+            group_id: gid.clone(),
+            hash: hash.clone(),
+            path: local_path.to_string_lossy().to_string(),
+        });
+    }
+
     // Return success
     let result = serde_json::json!({
         "success": true,
@@ -1465,7 +1790,7 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
         "size": size
     });
 
-    CString::new(result.to_string()).unwrap().into_raw()
+    CString::new(result.to_string()).unwrap_or_default().into_raw()
 }
 
 /// Request download of a file from its source peer
@@ -1480,7 +1805,7 @@ pub extern "C" fn cyan_request_file_download(file_id: *const c_char) -> bool {
 
     // Look up file info
     let file_info: Option<(String, String)> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         db.query_row(
             "SELECT hash, source_peer FROM objects WHERE id = ?1 AND type = 'file'",
             params![fid],
@@ -1495,7 +1820,7 @@ pub extern "C" fn cyan_request_file_download(file_id: *const c_char) -> bool {
 
     // Check if already downloaded
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         let local_path: Option<String> = db
             .query_row(
                 "SELECT local_path FROM objects WHERE id = ?1",
@@ -1505,16 +1830,16 @@ pub extern "C" fn cyan_request_file_download(file_id: *const c_char) -> bool {
             .ok()
             .flatten();
 
-        if let Some(path) = local_path {
-            if Path::new(&path).exists() {
-                return true; // Already have it locally
-            }
+        if let Some(path) = local_path
+            && Path::new(&path).exists()
+        {
+            return true; // Already have it locally
         }
     }
 
     // Check for existing partial transfer
     let resume_offset = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         db.query_row(
             "SELECT bytes_received FROM file_transfers WHERE file_id = ?1 AND status = 'in_progress'",
             params![fid],
@@ -1538,13 +1863,13 @@ pub extern "C" fn cyan_request_file_download(file_id: *const c_char) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_file_status(file_id: *const c_char) -> *mut c_char {
     let Some(fid) = (unsafe { cstr_arg(file_id) }) else {
-        return CString::new(r#"{"status":"unknown"}"#).unwrap().into_raw();
+        return CString::new(r#"{"status":"unknown"}"#).unwrap_or_default().into_raw();
     };
     let Some(sys) = SYSTEM.get() else {
-        return CString::new(r#"{"status":"unknown"}"#).unwrap().into_raw();
+        return CString::new(r#"{"status":"unknown"}"#).unwrap_or_default().into_raw();
     };
 
-    let db = sys.db.lock().unwrap();
+    let db = sys.db.lock_safe();
     let local_path: Option<String> = db
         .query_row(
             "SELECT local_path FROM objects WHERE id = ?1 AND type = 'file'",
@@ -1568,7 +1893,7 @@ pub extern "C" fn cyan_get_file_status(file_id: *const c_char) -> *mut c_char {
         }
     };
 
-    CString::new(status.to_string()).unwrap().into_raw()
+    CString::new(status.to_string()).unwrap_or_default().into_raw()
 }
 
 /// Get files for a scope
@@ -1577,15 +1902,15 @@ pub extern "C" fn cyan_get_file_status(file_id: *const c_char) -> *mut c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_files(scope_json: *const c_char) -> *mut c_char {
     let Some(scope_str) = (unsafe { cstr_arg(scope_json) }) else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let scope: serde_json::Value = match serde_json::from_str(&scope_str) {
         Ok(v) => v,
-        Err(_) => return CString::new("[]").unwrap().into_raw(),
+        Err(_) => return CString::new("[]").unwrap_or_default().into_raw(),
     };
 
     let scope_type = scope["type"].as_str().unwrap_or("");
@@ -1595,8 +1920,8 @@ pub extern "C" fn cyan_get_files(scope_json: *const c_char) -> *mut c_char {
         .or_else(|| scope["board_id"].as_str())
         .unwrap_or("");
 
-    let files: Vec<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+    let files: Vec<serde_json::Value> = (|| -> rusqlite::Result<Vec<serde_json::Value>> {
+        let db = sys.db.lock_safe();
 
         let query = match scope_type {
             "Group" => {
@@ -1611,11 +1936,11 @@ pub extern "C" fn cyan_get_files(scope_json: *const c_char) -> *mut c_char {
                 "SELECT id, group_id, workspace_id, board_id, name, hash, size, source_peer, local_path, created_at
                  FROM objects WHERE type = 'file' AND board_id = ?1"
             }
-            _ => return CString::new("[]").unwrap().into_raw(),
+            _ => return Ok(Vec::new()),
         };
 
-        let mut stmt = db.prepare(query).unwrap();
-        stmt.query_map(params![id], |row| {
+        let mut stmt = db.prepare(query)?;
+        Ok(stmt.query_map(params![id], |row| {
             let local_path: Option<String> = row.get(8)?;
             let is_local = local_path
                 .as_ref()
@@ -1635,15 +1960,14 @@ pub extern "C" fn cyan_get_files(scope_json: *const c_char) -> *mut c_char {
                 "created_at": row.get::<_, i64>(9)?,
                 "is_local": is_local
             }))
-        })
-            .unwrap()
+        })?
             .filter_map(|r| r.ok())
-            .collect()
-    };
+            .collect())
+    })().unwrap_or_default();
 
     match serde_json::to_string(&files) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -1658,7 +1982,7 @@ pub extern "C" fn cyan_get_file_local_path(file_id: *const c_char) -> *mut c_cha
         return std::ptr::null_mut();
     };
 
-    let db = sys.db.lock().unwrap();
+    let db = sys.db.lock_safe();
     let local_path: Option<String> = db
         .query_row(
             "SELECT local_path FROM objects WHERE id = ?1 AND type = 'file'",
@@ -1670,170 +1994,11 @@ pub extern "C" fn cyan_get_file_local_path(file_id: *const c_char) -> *mut c_cha
 
     match local_path {
         Some(path) if Path::new(&path).exists() => {
-            CString::new(path).unwrap().into_raw()
+            CString::new(path).unwrap_or_default().into_raw()
         }
         _ => std::ptr::null_mut(),
     }
 }
-
-// ---------- FFI: Integration Bridge ----------
-
-/// Handle integration commands via JSON dispatch
-/// Swift sends: {"cmd": "start", "scope_type": "workspace", ...}
-/// Returns JSON response: {"success": true, ...}
-#[unsafe(no_mangle)]
-pub extern "C" fn cyan_integration_command(json: *const c_char) -> *mut c_char {
-    let Some(cmd_json) = (unsafe { cstr_arg(json) }) else {
-        return CString::new(r#"{"success":false,"error":"Invalid JSON"}"#).unwrap().into_raw();
-    };
-    let Some(sys) = SYSTEM.get() else {
-        return CString::new(r#"{"success":false,"error":"System not initialized"}"#).unwrap().into_raw();
-    };
-    let Some(runtime) = RUNTIME.get() else {
-        return CString::new(r#"{"success":false,"error":"Runtime not initialized"}"#).unwrap().into_raw();
-    };
-
-    let result = runtime.block_on(async {
-        sys.integration_bridge.handle_command(&cmd_json).await
-    });
-
-    CString::new(result).unwrap_or_else(|_| {
-        CString::new(r#"{"success":false,"error":"CString conversion failed"}"#).unwrap()
-    }).into_raw()
-}
-
-/// Poll for integration events (uses same buffer as cyan_poll_events)
-/// Returns integration events only, filtering out other event types
-/// NOW: Uses dedicated integration_event_buffer to avoid race condition with FileTree polling
-#[unsafe(no_mangle)]
-pub extern "C" fn cyan_poll_integration_events() -> *mut c_char {
-    let Some(cyan) = SYSTEM.get() else {
-        return std::ptr::null_mut();
-    };
-
-    let integration_buffer = cyan.integration_event_buffer.clone();
-    let buffer = integration_buffer.lock();
-    match buffer {
-        Ok(mut buff) => match buff.pop_front() {
-            None => std::ptr::null_mut(),
-            Some(event_json) => CString::new(event_json).unwrap().into_raw(),
-        },
-        Err(e) => {
-            tracing::error!("failed to lock integration buffer due to {e:?}");
-            std::ptr::null_mut()
-        }
-    }
-}
-
-// ---------- FFI: Integration Graph ----------
-
-/// Get list of connected integrations for a scope
-/// Returns JSON array: ["slack", "jira", ...]
-#[unsafe(no_mangle)]
-pub extern "C" fn cyan_get_connected_integrations(scope_id: *const c_char) -> *mut c_char {
-    let Some(sid) = (unsafe { cstr_arg(scope_id) }) else {
-        return CString::new("[]").unwrap().into_raw();
-    };
-    let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
-    };
-    let Some(runtime) = RUNTIME.get() else {
-        return CString::new("[]").unwrap().into_raw();
-    };
-
-    // Use the get_graph command to get connected integrations
-    let cmd = serde_json::json!({
-        "cmd": "get_graph",
-        "scope_id": sid
-    });
-
-    let result = runtime.block_on(async {
-        sys.integration_bridge.handle_command(&cmd.to_string()).await
-    });
-
-    // Parse result and extract connected_integrations
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
-        if let Some(data) = parsed.get("data") {
-            if let Some(integrations) = data.get("connected_integrations") {
-                return CString::new(integrations.to_string())
-                    .unwrap_or_else(|_| CString::new("[]").unwrap())
-                    .into_raw();
-            }
-        }
-    }
-
-    CString::new("[]").unwrap().into_raw()
-}
-
-/// Get the full integration graph for a scope
-/// Returns JSON: { "nodes": [...], "edges": [...], ... }
-#[unsafe(no_mangle)]
-pub extern "C" fn cyan_get_integration_graph(scope_id: *const c_char) -> *mut c_char {
-    let Some(sid) = (unsafe { cstr_arg(scope_id) }) else {
-        return CString::new("{}").unwrap().into_raw();
-    };
-    let Some(sys) = SYSTEM.get() else {
-        return CString::new("{}").unwrap().into_raw();
-    };
-    let Some(runtime) = RUNTIME.get() else {
-        return CString::new("{}").unwrap().into_raw();
-    };
-
-    let cmd = serde_json::json!({
-        "cmd": "get_graph",
-        "scope_id": sid
-    });
-
-    let result = runtime.block_on(async {
-        sys.integration_bridge.handle_command(&cmd.to_string()).await
-    });
-
-    // Parse and return just the data portion (the graph)
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
-        if parsed.get("success").and_then(|v| v.as_bool()) == Some(true) {
-            if let Some(data) = parsed.get("data") {
-                return CString::new(data.to_string())
-                    .unwrap_or_else(|_| CString::new("{}").unwrap())
-                    .into_raw();
-            }
-        }
-    }
-
-    CString::new("{}").unwrap().into_raw()
-}
-
-/// Set focus node for graph visualization
-/// node_id can be null to clear focus
-#[unsafe(no_mangle)]
-pub extern "C" fn cyan_set_graph_focus(scope_id: *const c_char, node_id: *const c_char) -> *mut c_char {
-    let Some(sid) = (unsafe { cstr_arg(scope_id) }) else {
-        return CString::new(r#"{"success":false,"error":"Invalid scope_id"}"#).unwrap().into_raw();
-    };
-    let Some(sys) = SYSTEM.get() else {
-        return CString::new(r#"{"success":false,"error":"System not initialized"}"#).unwrap().into_raw();
-    };
-    let Some(runtime) = RUNTIME.get() else {
-        return CString::new(r#"{"success":false,"error":"Runtime not initialized"}"#).unwrap().into_raw();
-    };
-
-    // node_id can be null to clear focus
-    let nid = unsafe { cstr_arg(node_id) };
-
-    let cmd = serde_json::json!({
-        "cmd": "set_focus",
-        "scope_id": sid,
-        "node_id": nid
-    });
-
-    let result = runtime.block_on(async {
-        sys.integration_bridge.handle_command(&cmd.to_string()).await
-    });
-
-    CString::new(result).unwrap_or_else(|_| {
-        CString::new(r#"{"success":false,"error":"CString conversion failed"}"#).unwrap()
-    }).into_raw()
-}
-
 
 // ==================== NOTEBOOK CELLS FFI ====================
 
@@ -1841,13 +2006,13 @@ pub extern "C" fn cyan_set_graph_focus(scope_id: *const c_char, node_id: *const 
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_load_notebook_cells(board_id: *const c_char) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
 
     let cells: Vec<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         let mut stmt = match db.prepare(
             "SELECT id, board_id, cell_type, cell_order, content, output,
@@ -1857,7 +2022,7 @@ pub extern "C" fn cyan_load_notebook_cells(board_id: *const c_char) -> *mut c_ch
              ORDER BY cell_order ASC"
         ) {
             Ok(s) => s,
-            Err(_) => return CString::new("[]").unwrap().into_raw(),
+            Err(_) => return CString::new("[]").unwrap_or_default().into_raw(),
         };
 
         stmt.query_map(params![bid], |row| {
@@ -1874,12 +2039,12 @@ pub extern "C" fn cyan_load_notebook_cells(board_id: *const c_char) -> *mut c_ch
                 "created_at": row.get::<_, i64>(9)?,
                 "updated_at": row.get::<_, i64>(10)?
             }))
-        }).unwrap().filter_map(|r| r.ok()).collect()
+        }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     };
 
     match serde_json::to_string(&cells) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -1898,7 +2063,12 @@ pub extern "C" fn cyan_save_notebook_cell(cell_json: *const c_char) -> bool {
 
     let id = cell["id"].as_str().unwrap_or("").to_string();
     let board_id = cell["board_id"].as_str().unwrap_or("").to_string();
-    let cell_type = cell["cell_type"].as_str().unwrap_or("markdown").to_string();
+    // ROUND8 §W1: the step is the only authorable kind. Collapse any (legacy) kind
+    // an older client still sends into the single step primitive; system kinds pass
+    // through. Default missing kind to step.
+    let cell_type = crate::workflow::coerce_authoring_cell_type(
+        cell["cell_type"].as_str().unwrap_or(crate::workflow::STEP_KIND),
+    );
     let cell_order = cell["cell_order"].as_i64().unwrap_or(0) as i32;
     let content = cell["content"].as_str().map(|s| s.to_string());
     let output = cell["output"].as_str().map(|s| s.to_string());
@@ -1921,7 +2091,7 @@ pub extern "C" fn cyan_save_notebook_cell(cell_json: *const c_char) -> bool {
     let group_id: String;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         // Check if exists
         is_new = db.query_row(
@@ -1998,7 +2168,7 @@ pub extern "C" fn cyan_delete_notebook_cell(cell_id: *const c_char) -> bool {
     let group_id: String;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         // Get board_id and group_id before delete
         let ids: Option<(String, String)> = db.query_row(
@@ -2062,7 +2232,7 @@ pub extern "C" fn cyan_reorder_notebook_cells(board_id: *const c_char, cell_ids_
     let group_id: String;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         group_id = db.query_row(
             "SELECT w.group_id FROM objects o
@@ -2104,13 +2274,13 @@ pub extern "C" fn cyan_reorder_notebook_cells(board_id: *const c_char, cell_ids_
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_board_mode(board_id: *const c_char) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("canvas").unwrap().into_raw();
+        return CString::new("canvas").unwrap_or_default().into_raw();
     };
 
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
 
     let mode: String = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         let raw_mode: String = db.query_row(
             "SELECT COALESCE(board_mode, 'canvas') FROM objects WHERE id = ?1",
             params![bid],
@@ -2125,7 +2295,7 @@ pub extern "C" fn cyan_get_board_mode(board_id: *const c_char) -> *mut c_char {
         }
     };
 
-    CString::new(mode).unwrap().into_raw()
+    CString::new(mode).unwrap_or_default().into_raw()
 }
 
 /// Set board mode (canvas, notebook, or notes)
@@ -2154,7 +2324,7 @@ pub extern "C" fn cyan_set_board_mode(board_id: *const c_char, mode: *const c_ch
     let group_id: String;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         group_id = db.query_row(
             "SELECT w.group_id FROM objects o
@@ -2191,13 +2361,13 @@ pub extern "C" fn cyan_set_board_mode(board_id: *const c_char, mode: *const c_ch
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_load_cell_elements(cell_id: *const c_char) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let cid = unsafe { CStr::from_ptr(cell_id) }.to_string_lossy().to_string();
 
     let elements: Vec<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         let mut stmt = match db.prepare(
             "SELECT id, board_id, element_type, x, y, width, height, z_index,
@@ -2207,7 +2377,7 @@ pub extern "C" fn cyan_load_cell_elements(cell_id: *const c_char) -> *mut c_char
              ORDER BY z_index ASC, created_at ASC"
         ) {
             Ok(s) => s,
-            Err(_) => return CString::new("[]").unwrap().into_raw(),
+            Err(_) => return CString::new("[]").unwrap_or_default().into_raw(),
         };
 
         stmt.query_map(params![cid], |row| {
@@ -2226,12 +2396,12 @@ pub extern "C" fn cyan_load_cell_elements(cell_id: *const c_char) -> *mut c_char
                 "updated_at": row.get::<_, i64>(11)?,
                 "cell_id": row.get::<_, Option<String>>(12)?
             }))
-        }).unwrap().filter_map(|r| r.ok()).collect()
+        }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     };
 
     match serde_json::to_string(&elements) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -2317,7 +2487,7 @@ pub extern "C" fn cyan_poll_ai_insights() -> *mut c_char {
 
     match runtime.block_on(sys.ai_bridge.poll_insights()) {
         Some(insight) => match serde_json::to_string(&insight) {
-            Ok(json) => CString::new(json).unwrap().into_raw(),
+            Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
             Err(_) => std::ptr::null_mut(),
         },
         None => std::ptr::null_mut(),
@@ -2336,11 +2506,12 @@ pub extern "C" fn cyan_get_board_metadata(board_id: *const c_char) -> *mut c_cha
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
 
     let metadata: Option<BoardMetadataDTO> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         db.query_row(
             "SELECT board_id, labels, rating, view_count, contains_model,
-                    contains_skills, board_type, last_accessed, COALESCE(is_pinned, 0)
+                    contains_skills, board_type, last_accessed, COALESCE(is_pinned, 0),
+                    COALESCE(meta_updated_at, 0), COALESCE(pin_updated_at, 0)
              FROM board_metadata WHERE board_id = ?1",
             params![&bid],
             |row| {
@@ -2357,13 +2528,15 @@ pub extern "C" fn cyan_get_board_metadata(board_id: *const c_char) -> *mut c_cha
                     board_type: row.get(6)?,
                     last_accessed: row.get(7)?,
                     is_pinned: row.get::<_, i32>(8)? != 0,
+                    meta_updated_at: row.get(9)?,
+                    pin_updated_at: row.get(10)?,
                 })
             }
         ).ok()
     };
 
     let result = metadata.unwrap_or_else(|| {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         let board_type: String = db.query_row(
             "SELECT COALESCE(board_mode, 'canvas') FROM objects WHERE id = ?1",
             params![&bid],
@@ -2379,7 +2552,7 @@ pub extern "C" fn cyan_get_board_metadata(board_id: *const c_char) -> *mut c_cha
     });
 
     match serde_json::to_string(&result) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -2389,14 +2562,14 @@ pub extern "C" fn cyan_get_board_metadata(board_id: *const c_char) -> *mut c_cha
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_boards_metadata(scope_type: *const c_char, scope_id: *const c_char) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let stype = unsafe { CStr::from_ptr(scope_type) }.to_string_lossy().to_string();
     let sid = unsafe { CStr::from_ptr(scope_id) }.to_string_lossy().to_string();
 
     let results: Vec<BoardMetadataDTO> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         let query = match stype.as_str() {
             "workspace" => {
@@ -2435,7 +2608,7 @@ pub extern "C" fn cyan_get_boards_metadata(scope_type: *const c_char, scope_id: 
 
         let mut stmt = match db.prepare(query) {
             Ok(s) => s,
-            Err(_) => return CString::new("[]").unwrap().into_raw(),
+            Err(_) => return CString::new("[]").unwrap_or_default().into_raw(),
         };
 
         let param = if stype == "all" { "" } else { &sid };
@@ -2454,13 +2627,17 @@ pub extern "C" fn cyan_get_boards_metadata(scope_type: *const c_char, scope_id: 
                 board_type: row.get(6)?,
                 last_accessed: row.get(7)?,
                 is_pinned: row.get::<_, i32>(8)? != 0,
+                // UI list read — the LWW clocks aren't surfaced here (sync uses the
+                // board_metadata_list_by_boards path which carries them).
+                meta_updated_at: 0,
+                pin_updated_at: 0,
             })
-        }).unwrap().filter_map(|r| r.ok()).collect()
+        }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     };
 
     match serde_json::to_string(&results) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -2468,14 +2645,14 @@ pub extern "C" fn cyan_get_boards_metadata(scope_type: *const c_char, scope_id: 
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_top_boards(group_id: *const c_char, limit: i32) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let gid = unsafe { CStr::from_ptr(group_id) }.to_string_lossy().to_string();
     let lim = if limit <= 0 { 10 } else { limit.min(50) };
 
     let results: Vec<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         let mut stmt = match db.prepare(
             "SELECT o.id, o.name, o.workspace_id, w.name as workspace_name,
@@ -2489,7 +2666,7 @@ pub extern "C" fn cyan_get_top_boards(group_id: *const c_char, limit: i32) -> *m
              LIMIT ?2"
         ) {
             Ok(s) => s,
-            Err(_) => return CString::new("[]").unwrap().into_raw(),
+            Err(_) => return CString::new("[]").unwrap_or_default().into_raw(),
         };
 
         stmt.query_map(params![&gid, lim], |row| {
@@ -2506,12 +2683,12 @@ pub extern "C" fn cyan_get_top_boards(group_id: *const c_char, limit: i32) -> *m
                 "board_type": row.get::<_, String>(6)?,
                 "contains_model": row.get::<_, Option<String>>(7)?
             }))
-        }).unwrap().filter_map(|r| r.ok()).collect()
+        }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     };
 
     match serde_json::to_string(&results) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -2533,7 +2710,7 @@ pub extern "C" fn cyan_set_board_labels(board_id: *const c_char, labels_json: *c
     let group_id: String;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         group_id = db.query_row(
             "SELECT w.group_id FROM objects o
@@ -2583,7 +2760,7 @@ pub extern "C" fn cyan_add_board_label(board_id: *const c_char, label: *const c_
     let updated_labels: Vec<String>;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         group_id = db.query_row(
             "SELECT w.group_id FROM objects o
@@ -2647,7 +2824,7 @@ pub extern "C" fn cyan_remove_board_label(board_id: *const c_char, label: *const
     let updated_labels: Vec<String>;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         group_id = db.query_row(
             "SELECT w.group_id FROM objects o
@@ -2701,7 +2878,7 @@ pub extern "C" fn cyan_rate_board(board_id: *const c_char, rating: i32) -> bool 
     let group_id: String;
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         group_id = db.query_row(
             "SELECT w.group_id FROM objects o
@@ -2746,7 +2923,7 @@ pub extern "C" fn cyan_record_board_view(board_id: *const c_char) -> bool {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let db = sys.db.lock().unwrap();
+    let db = sys.db.lock_safe();
 
     db.execute(
         "INSERT INTO board_metadata (board_id, view_count, last_accessed) VALUES (?1, 1, ?2)
@@ -2770,7 +2947,7 @@ pub extern "C" fn cyan_set_board_model(board_id: *const c_char, model_name: *con
         if m.is_empty() { None } else { Some(m) }
     };
 
-    let db = sys.db.lock().unwrap();
+    let db = sys.db.lock_safe();
 
     db.execute(
         "INSERT INTO board_metadata (board_id, contains_model) VALUES (?1, ?2)
@@ -2794,7 +2971,7 @@ pub extern "C" fn cyan_set_board_skills(board_id: *const c_char, skills_json: *c
         return false;
     }
 
-    let db = sys.db.lock().unwrap();
+    let db = sys.db.lock_safe();
 
     db.execute(
         "INSERT INTO board_metadata (board_id, contains_skills) VALUES (?1, ?2)
@@ -2813,7 +2990,7 @@ pub extern "C" fn cyan_get_board_link(board_id: *const c_char) -> *mut c_char {
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
 
     let link: Option<String> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         db.query_row(
             "SELECT w.group_id, o.workspace_id
@@ -2830,8 +3007,8 @@ pub extern "C" fn cyan_get_board_link(board_id: *const c_char) -> *mut c_char {
     };
 
     match link {
-        Some(url) => CString::new(url).unwrap().into_raw(),
-        None => CString::new(format!("cyan://board/{}", bid)).unwrap().into_raw(),
+        Some(url) => CString::new(url).unwrap_or_default().into_raw(),
+        None => CString::new(format!("cyan://board/{}", bid)).unwrap_or_default().into_raw(),
     }
 }
 
@@ -2839,14 +3016,14 @@ pub extern "C" fn cyan_get_board_link(board_id: *const c_char) -> *mut c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_search_boards_by_label(label: *const c_char) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("[]").unwrap().into_raw();
+        return CString::new("[]").unwrap_or_default().into_raw();
     };
 
     let search_label = unsafe { CStr::from_ptr(label) }.to_string_lossy().to_string();
     let pattern = format!("%\"{}%", search_label); // JSON contains pattern
 
     let results: Vec<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         let mut stmt = match db.prepare(
             "SELECT o.id, o.name, o.workspace_id, w.name, w.group_id,
@@ -2859,7 +3036,7 @@ pub extern "C" fn cyan_search_boards_by_label(label: *const c_char) -> *mut c_ch
              LIMIT 50"
         ) {
             Ok(s) => s,
-            Err(_) => return CString::new("[]").unwrap().into_raw(),
+            Err(_) => return CString::new("[]").unwrap_or_default().into_raw(),
         };
 
         stmt.query_map(params![&pattern], |row| {
@@ -2876,12 +3053,12 @@ pub extern "C" fn cyan_search_boards_by_label(label: *const c_char) -> *mut c_ch
                 "link": format!("cyan://group/{}/workspace/{}/board/{}",
                     row.get::<_, String>(4)?, row.get::<_, String>(2)?, row.get::<_, String>(0)?)
             }))
-        }).unwrap().filter_map(|r| r.ok()).collect()
+        }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     };
 
     match serde_json::to_string(&results) {
-        Ok(json) => CString::new(json).unwrap().into_raw(),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(json) => CString::new(json).unwrap_or_default().into_raw(),
+        Err(_) => CString::new("[]").unwrap_or_default().into_raw(),
     }
 }
 
@@ -2889,45 +3066,38 @@ pub extern "C" fn cyan_search_boards_by_label(label: *const c_char) -> *mut c_ch
 // BOARD PINNING FFI FUNCTIONS
 // ============================================================
 
-/// Pin a board (show at top of grid)
+/// Pin a board (show at top of grid).
+///
+/// R12 C1/C2: pin is a SYNCED, convergent board property. Route through the command
+/// actor (`SetBoardPinned`) so it (a) stamps a real `pin_updated_at` clock for per-board
+/// LWW merge and (b) gossips `BoardPinned` to peers — the previous direct-SQL write set
+/// no clock (LWW could never converge) and never left the device (pin/unpin invisible on
+/// the other peer until a full group re-fetch). Returns whether the command was enqueued.
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_pin_board(board_id: *const c_char) -> bool {
-    let Some(sys) = SYSTEM.get() else {
-        return false;
-    };
-
-    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
-
-    let result = {
-        let db = sys.db.lock().unwrap();
-        db.execute(
-            "INSERT INTO board_metadata (board_id, is_pinned) VALUES (?1, 1)
-             ON CONFLICT(board_id) DO UPDATE SET is_pinned = 1",
-            params![bid],
-        )
-    };
-
-    result.is_ok()
+    set_board_pinned_via_command(board_id, true)
 }
 
-/// Unpin a board
+/// Unpin a board. See [`cyan_pin_board`] — same convergent command path (R12 C1/C2).
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_unpin_board(board_id: *const c_char) -> bool {
-    let Some(sys) = SYSTEM.get() else {
+    set_board_pinned_via_command(board_id, false)
+}
+
+/// Shared helper for [`cyan_pin_board`]/[`cyan_unpin_board`]: enqueue the convergent
+/// `SetBoardPinned` command (LWW clock + `BoardPinned` gossip + `BoardMetadataUpdated`
+/// UI signal, all handled in the command actor).
+fn set_board_pinned_via_command(board_id: *const c_char, is_pinned: bool) -> bool {
+    let Some(board_id) = (unsafe { cstr_arg(board_id) }) else {
         return false;
     };
-
-    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
-
-    let result = {
-        let db = sys.db.lock().unwrap();
-        db.execute(
-            "UPDATE board_metadata SET is_pinned = 0 WHERE board_id = ?1",
-            params![bid],
-        )
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return false,
     };
-
-    result.is_ok()
+    sys.command_tx
+        .send(CommandMsg::SetBoardPinned { board_id, is_pinned })
+        .is_ok()
 }
 
 /// Check if a board is pinned
@@ -2939,13 +3109,30 @@ pub extern "C" fn cyan_is_board_pinned(board_id: *const c_char) -> bool {
 
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
 
-    let db = sys.db.lock().unwrap();
+    let db = sys.db.lock_safe();
     db.query_row(
         "SELECT COALESCE(is_pinned, 0) FROM board_metadata WHERE board_id = ?1",
         params![bid],
         |row| row.get::<_, i32>(0),
     )
         .unwrap_or(0) != 0
+}
+
+/// R12 D2/E1: read a board's workflow lifecycle state as JSON so iOS can gate the board face.
+/// Shape: `{"board_id","deployed","dashboard_available","locked","updated_at"}`. A board with
+/// no deployment returns the default authoring state (deployed=false, locked=false). Additive,
+/// read-only — the unlock approval (org grant) is engine-side (`workflow::request_unlock`).
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_board_workflow_state(board_id: *const c_char) -> *mut c_char {
+    let Some(bid) = (unsafe { cstr_arg(board_id) }) else {
+        return std::ptr::null_mut();
+    };
+    let state = crate::storage::workflow_state_get(&bid);
+    let json = serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string());
+    match CString::new(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
 }
 
 // ============================================================
@@ -2965,7 +3152,7 @@ pub extern "C" fn cyan_get_user_profile(node_id: *const c_char) -> *mut c_char {
     };
 
     let profile: Option<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         db.query_row(
             "SELECT node_id, display_name, avatar_hash, status, last_seen, updated_at
              FROM user_profiles WHERE node_id = ?1",
@@ -2984,7 +3171,7 @@ pub extern "C" fn cyan_get_user_profile(node_id: *const c_char) -> *mut c_char {
     };
 
     match profile {
-        Some(p) => CString::new(p.to_string()).unwrap().into_raw(),
+        Some(p) => CString::new(p.to_string()).unwrap_or_default().into_raw(),
         None => {
             let fallback = serde_json::json!({
                 "node_id": nid,
@@ -2993,7 +3180,7 @@ pub extern "C" fn cyan_get_user_profile(node_id: *const c_char) -> *mut c_char {
                 "status": "unknown",
                 "last_seen": null
             });
-            CString::new(fallback.to_string()).unwrap().into_raw()
+            CString::new(fallback.to_string()).unwrap_or_default().into_raw()
         }
     }
 }
@@ -3004,22 +3191,22 @@ pub extern "C" fn cyan_get_user_profile(node_id: *const c_char) -> *mut c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_profiles_batch(node_ids_json: *const c_char) -> *mut c_char {
     let Some(json_str) = (unsafe { cstr_arg(node_ids_json) }) else {
-        return CString::new("{}").unwrap().into_raw();
+        return CString::new("{}").unwrap_or_default().into_raw();
     };
 
     let node_ids: Vec<String> = match serde_json::from_str(&json_str) {
         Ok(ids) => ids,
-        Err(_) => return CString::new("{}").unwrap().into_raw(),
+        Err(_) => return CString::new("{}").unwrap_or_default().into_raw(),
     };
 
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("{}").unwrap().into_raw();
+        return CString::new("{}").unwrap_or_default().into_raw();
     };
 
     let mut result = serde_json::Map::new();
 
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
 
         for nid in &node_ids {
             let profile: Option<serde_json::Value> = db.query_row(
@@ -3049,7 +3236,7 @@ pub extern "C" fn cyan_get_profiles_batch(node_ids_json: *const c_char) -> *mut 
         }
     }
 
-    CString::new(serde_json::Value::Object(result).to_string()).unwrap().into_raw()
+    CString::new(serde_json::Value::Object(result).to_string()).unwrap_or_default().into_raw()
 }
 
 /// Set my profile (display name and optional avatar)
@@ -3089,7 +3276,7 @@ pub extern "C" fn cyan_set_my_profile(
             Err(_) => None,
         }
     } else {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         db.query_row(
             "SELECT avatar_hash FROM user_profiles WHERE node_id = ?1",
             params![&node_id],
@@ -3099,7 +3286,7 @@ pub extern "C" fn cyan_set_my_profile(
 
     // Upsert profile
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         let _ = db.execute(
             "INSERT INTO user_profiles (node_id, display_name, avatar_hash, status, updated_at)
              VALUES (?1, ?2, ?3, 'online', ?4)
@@ -3113,14 +3300,13 @@ pub extern "C" fn cyan_set_my_profile(
     }
 
     // Broadcast to all groups
-    let group_ids: Vec<String> = {
-        let db = sys.db.lock().unwrap();
-        let mut stmt = db.prepare("SELECT id FROM groups").unwrap();
-        stmt.query_map([], |row| row.get(0))
-            .unwrap()
+    let group_ids: Vec<String> = (|| -> rusqlite::Result<Vec<String>> {
+        let db = sys.db.lock_safe();
+        let mut stmt = db.prepare("SELECT id FROM groups")?;
+        Ok(stmt.query_map([], |row| row.get(0))?
             .filter_map(|r| r.ok())
-            .collect()
-    };
+            .collect())
+    })().unwrap_or_default();
 
     let evt = NetworkEvent::ProfileUpdated {
         node_id: node_id.clone(),
@@ -3147,7 +3333,7 @@ pub extern "C" fn cyan_get_my_node_id() -> *mut c_char {
         return std::ptr::null_mut();
     };
 
-    CString::new(sys.node_id.clone()).unwrap().into_raw()
+    CString::new(sys.node_id.clone()).unwrap_or_default().into_raw()
 }
 
 /// Get my own profile
@@ -3160,7 +3346,7 @@ pub extern "C" fn cyan_get_my_profile() -> *mut c_char {
     let node_id = sys.node_id.clone();
 
     let profile: Option<serde_json::Value> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         db.query_row(
             "SELECT node_id, display_name, avatar_hash, status, last_seen, updated_at
              FROM user_profiles WHERE node_id = ?1",
@@ -3179,7 +3365,7 @@ pub extern "C" fn cyan_get_my_profile() -> *mut c_char {
     };
 
     match profile {
-        Some(p) => CString::new(p.to_string()).unwrap().into_raw(),
+        Some(p) => CString::new(p.to_string()).unwrap_or_default().into_raw(),
         None => {
             let fallback = serde_json::json!({
                 "node_id": node_id,
@@ -3188,7 +3374,7 @@ pub extern "C" fn cyan_get_my_profile() -> *mut c_char {
                 "status": "online",
                 "last_seen": null
             });
-            CString::new(fallback.to_string()).unwrap().into_raw()
+            CString::new(fallback.to_string()).unwrap_or_default().into_raw()
         }
     }
 }
@@ -3209,7 +3395,7 @@ pub extern "C" fn cyan_update_peer_status(node_id: *const c_char, status: *const
 
     let now = chrono::Utc::now().timestamp();
 
-    let db = sys.db.lock().unwrap();
+    let db = sys.db.lock_safe();
     let result = db.execute(
         "INSERT INTO user_profiles (node_id, status, last_seen, updated_at)
          VALUES (?1, ?2, ?3, ?3)
@@ -3247,6 +3433,15 @@ pub extern "C" fn xaero_join_group_from_invite(invite_json: *const c_char) -> *m
         Err(e) => return json_result_ptr(false, None, None, Some(&format!("Parse error: {}", e))),
     };
 
+    join_from_invite(&invite)
+}
+
+/// Shared join-from-invite worker, used by `xaero_join_group_from_invite` and the
+/// signed-grant `cyan_scan_grant_qr`. Behavior is identical to the original extern
+/// fn body — extracting a seam, not a rewrite. The optional `grant` field (signed
+/// capability-grant QR payload) is forwarded to the snapshot holder for the
+/// per-group snapshot read gate (unchanged from before).
+fn join_from_invite(invite: &serde_json::Value) -> *mut c_char {
     // Extract required fields
     let group_id = match invite.get("group_id").and_then(|v| v.as_str()) {
         Some(id) => id.to_string(),
@@ -3276,6 +3471,22 @@ pub extern "C" fn xaero_join_group_from_invite(invite_json: *const c_char) -> *m
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // Inviter's full resolvable address (MESH_HARDENING §2.2): a serialized `EndpointAddr` the QR
+    // optionally carries. When present we seed it into the group topic on join (below) so the joiner
+    // dials the inviter directly with no relay/bootstrap/mDNS — air-gapped first-join forms a mesh.
+    let inviter_addr = invite
+        .get("inviter_addr")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Optional signed capability-grant QR payload (additive). When present, it is forwarded
+    // with the JoinGroup so the snapshot holder can authorize the per-group snapshot read for
+    // an enforced group. Absent ⇒ unchanged behavior (fail-open / un-enforced groups).
+    let grant = invite
+        .get("grant")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     // Get system
     let sys = match SYSTEM.get() {
         Some(s) => s,
@@ -3284,7 +3495,7 @@ pub extern "C" fn xaero_join_group_from_invite(invite_json: *const c_char) -> *m
 
     // Check if group already exists
     let exists: bool = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         db.query_row(
             "SELECT 1 FROM groups WHERE id = ?1",
             params![&group_id],
@@ -3301,7 +3512,7 @@ pub extern "C" fn xaero_join_group_from_invite(invite_json: *const c_char) -> *m
     // Insert group into database
     let now = chrono::Utc::now().timestamp();
     {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         if let Err(e) = db.execute(
             "INSERT INTO groups (id, name, icon, color, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![&group_id, &group_name, &group_icon, &group_color, now],
@@ -3318,8 +3529,20 @@ pub extern "C" fn xaero_join_group_from_invite(invite_json: *const c_char) -> *m
     let _ = sys.network_tx.send(NetworkCommand::JoinGroup {
         group_id: group_id.clone(),
         bootstrap_peer: inviter_node_id,
+        grant,
     });
     println!("🔵 [SYNC-4] JoinGroup command sent");
+
+    // Seed the inviter's full address into the group topic (MESH_HARDENING §2.2). Additive: only
+    // when the QR carried `inviter_addr`. This is the ONE seeding pipeline (engine `SeedGroupPeer`)
+    // — it makes the inviter resolvable and routes it into the topic so `NeighborUp` fires on first
+    // join with no relay/bootstrap reachable. Absent ⇒ unchanged (dial inviter_node_id via discovery).
+    if let Some(addr_json) = inviter_addr {
+        let _ = sys.network_tx.send(NetworkCommand::SeedGroupPeer {
+            group_id: group_id.clone(),
+            addr_json,
+        });
+    }
 
     // Emit event for UI refresh
     let group = Group {
@@ -3339,11 +3562,12 @@ pub extern "C" fn xaero_join_group_from_invite(invite_json: *const c_char) -> *m
 }
 
 // Helper function for error responses
+#[allow(dead_code)] // pre-existing FFI error helper kept for future call sites
 fn json_error_ptr(msg: &str) -> *mut c_char {
     let result = serde_json::json!({
         "error": msg
     });
-    CString::new(result.to_string()).unwrap().into_raw()
+    CString::new(result.to_string()).unwrap_or_default().into_raw()
 }
 
 // Helper function for join result responses
@@ -3360,8 +3584,266 @@ fn json_result_ptr(success: bool, group_id: Option<&str>, group_name: Option<&st
             "error": error.unwrap_or("Unknown error")
         })
     };
-    CString::new(result.to_string()).unwrap().into_raw()
+    CString::new(result.to_string()).unwrap_or_default().into_raw()
 }
+
+// ============================================================================
+// Signed-grant QR FFI (the mesh-half capability grant, surfaced to iOS)
+// ============================================================================
+//
+// ADDITIVE client verbs over the existing `identity::Grant` primitive (signed,
+// expiring, revocable — STATUS_IDENTITY_GRANTS). They light up the app's
+// `issueGrantQR` / `scanGrantQR` seam (cyan-iOS STATUS_IOS_LOGIN_PRESENCE), which
+// returned "unavailable" until this verb shipped. The signed grant is the only
+// secret here (it is not a credential); nothing sensitive is logged.
+
+/// Issue a signed, role-carrying grant QR for a group — **Admin/Owner only**.
+/// iOS: `issueGrantQR`. Returns `{"success":true,"qr":"<payload>","nonce":...,
+/// "expiry":...,"role":...}` or `{"success":false,"error":...}`. The QR encodes a
+/// `GrantInvite` (signed grant + group identity + this node as bootstrap peer) that
+/// `cyan_scan_grant_qr` joins from.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_issue_grant_qr(
+    group_id: *const c_char,
+    role: *const c_char,
+    ttl_seconds: u64,
+) -> *mut c_char {
+    use crate::identity::{issue_grant_qr, pubkey_hex, GroupRoster, Role};
+
+    let Some(gid) = (unsafe { cstr_arg(group_id) }) else {
+        return json_result_ptr(false, None, None, Some("Invalid group_id"));
+    };
+    let role_str = (unsafe { cstr_arg(role) }).unwrap_or_else(|| "member".into());
+    let Some(role) = Role::parse(&role_str) else {
+        return json_result_ptr(false, None, None, Some("Unknown role (owner|admin|member|viewer|guest)"));
+    };
+    let Some(sys) = SYSTEM.get() else {
+        return json_result_ptr(false, None, None, Some("System not initialized"));
+    };
+
+    // Authority gate: only the group's Owner/Admin may mint a grant. The persisted
+    // mesh authority is group ownership (`group_is_owner`), which maps to Owner.
+    if !storage::group_is_owner(&gid, &sys.node_id) {
+        return json_result_ptr(false, None, None, Some("Only the group Owner/Admin may issue a grant"));
+    }
+
+    // Group display fields for the invite envelope (best-effort).
+    let (group_name, group_icon, group_color) = match storage::group_get(&gid) {
+        Ok(Some(g)) => (g.name, g.icon, g.color),
+        _ => (gid.clone(), "folder.fill".to_string(), "#00AEEF".to_string()),
+    };
+
+    // Sign with this node's identity; trust its own pubkey as Owner so the grant is
+    // self-consistent (the FFI authority gate above is the real check).
+    let secret = sys.secret_key.to_bytes();
+    let issuer_pk = pubkey_hex(&secret);
+    let mut roster = GroupRoster::new();
+    roster.set_role(&gid, &issuer_pk, Role::Owner);
+
+    let now = chrono::Utc::now().timestamp() as u64;
+    let ttl = if ttl_seconds == 0 { 24 * 3600 } else { ttl_seconds };
+    let expiry = now + ttl;
+    let nonce = uuid::Uuid::new_v4().to_string();
+
+    match issue_grant_qr(
+        &gid,
+        &group_name,
+        Some(&group_icon),
+        Some(&group_color),
+        role,
+        &secret,
+        &sys.node_id,
+        now,
+        expiry,
+        &nonce,
+        &roster,
+    ) {
+        Ok(qr) => {
+            // Stamp this node's full resolvable address into the invite (MESH_HARDENING §2.2) so the
+            // joiner can dial us directly with no relay/bootstrap. Additive: if we have no published
+            // address yet, the field stays absent and the QR is byte-identical to before.
+            let qr = match crate::local_endpoint_addr() {
+                Some(addr_json) => match crate::identity::GrantInvite::from_qr_payload(&qr) {
+                    Ok(mut invite) => {
+                        invite.inviter_addr = Some(addr_json);
+                        invite.to_qr_payload()
+                    }
+                    Err(_) => qr,
+                },
+                None => qr,
+            };
+            // Build the success body without `json!` (its expansion trips the
+            // workspace `unwrap` lint) — a plain map → string is panic-free.
+            let mut out = serde_json::Map::new();
+            out.insert("success".to_string(), serde_json::Value::Bool(true));
+            out.insert("qr".to_string(), serde_json::Value::String(qr));
+            out.insert("nonce".to_string(), serde_json::Value::String(nonce));
+            out.insert("expiry".to_string(), serde_json::Value::Number(expiry.into()));
+            out.insert("role".to_string(), serde_json::Value::String(role_str));
+            match CString::new(serde_json::Value::Object(out).to_string()) {
+                Ok(c) => c.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+        Err(e) => json_result_ptr(false, None, None, Some(&format!("Failed to issue grant: {}", e))),
+    }
+}
+
+/// Scan a signed grant QR: pre-verify (signature · expiry · group) locally, then JOIN
+/// the group (the snapshot holder runs the authoritative issuer-admin / revocation /
+/// replay checks and serves the per-group snapshot). iOS: `scanGrantQR`. Returns the
+/// same JSON shape as `xaero_join_group_from_invite` on success, or
+/// `{"success":false,"error":...}` for a malformed / forged / expired QR.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_scan_grant_qr(qr_payload: *const c_char) -> *mut c_char {
+    use crate::identity::scan_grant_qr_at;
+
+    let Some(payload) = (unsafe { cstr_arg(qr_payload) }) else {
+        return json_result_ptr(false, None, None, Some("Invalid QR payload"));
+    };
+    let now = chrono::Utc::now().timestamp() as u64;
+    let invite = match scan_grant_qr_at(&payload, now) {
+        Ok(inv) => inv,
+        Err(e) => return json_result_ptr(false, None, None, Some(&format!("Grant rejected: {}", e))),
+    };
+
+    // Build the invite the join path consumes, carrying the signed grant so the
+    // holder can authorize the per-group snapshot read. Plain map (no `json!`).
+    let mut invite_json = serde_json::Map::new();
+    let s = serde_json::Value::String;
+    invite_json.insert("group_id".to_string(), s(invite.group_id));
+    invite_json.insert("group_name".to_string(), s(invite.group_name));
+    invite_json.insert("group_icon".to_string(), s(invite.group_icon.unwrap_or_else(|| "folder.fill".to_string())));
+    invite_json.insert("group_color".to_string(), s(invite.group_color.unwrap_or_else(|| "#00AEEF".to_string())));
+    invite_json.insert("inviter_node_id".to_string(), s(invite.inviter_node_id));
+    // Forward the inviter's full address (§2.2) when the QR carried it, so the join path seeds it.
+    if let Some(addr_json) = invite.inviter_addr {
+        invite_json.insert("inviter_addr".to_string(), s(addr_json));
+    }
+    invite_json.insert("grant".to_string(), s(invite.grant.to_qr_payload()));
+    join_from_invite(&serde_json::Value::Object(invite_json))
+}
+
+// ============================================================================
+// §11 Portable Group Export bundle FFI
+// ============================================================================
+
+/// This node's X25519 bundle public key (hex) — the recipient key an inviter passes to
+/// `cyan_export_group` so the `.cyangroup` is sealed TO this device. Derived deterministically
+/// from this node's XaeroID identity (see `group_bundle::invitee_pubkey_hex`); stable across
+/// launches. iOS: `bundlePublicKey`. Returns the hex string, or null if not initialized.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_bundle_pubkey() -> *mut c_char {
+    let Some(sys) = SYSTEM.get() else {
+        return std::ptr::null_mut();
+    };
+    let secret = sys.secret_key.to_bytes();
+    let pk = crate::group_bundle::invitee_pubkey_hex(&secret);
+    match CString::new(pk) {
+        Ok(c) => c.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Export a group to a signed, invitee-encrypted `.cyangroup` bundle (MESH_HARDENING §11) —
+/// **group Owner only**. `invitee_pubkey` is the invitee's X25519 bundle pubkey (from
+/// `cyan_bundle_pubkey` on their device). The bundle is STRICTLY scoped to this one group, files
+/// are metadata-only (no media bytes), and the whole thing is XaeroID-signed by this node.
+///
+/// iOS: `exportGroup`. Returns `{"success":true,"group_id":...,"bundle":"<json>","path":"<file>"}`
+/// (the bundle body is also written under the data dir) or `{"success":false,"error":...}`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_export_group(
+    group_id: *const c_char,
+    invitee_pubkey: *const c_char,
+) -> *mut c_char {
+    use crate::identity::{pubkey_hex, GroupRoster, Role};
+
+    let Some(gid) = (unsafe { cstr_arg(group_id) }) else {
+        return json_result_ptr(false, None, None, Some("Invalid group_id"));
+    };
+    let Some(invitee) = (unsafe { cstr_arg(invitee_pubkey) }) else {
+        return json_result_ptr(false, None, None, Some("Invalid invitee_pubkey"));
+    };
+    let Some(sys) = SYSTEM.get() else {
+        return json_result_ptr(false, None, None, Some("System not initialized"));
+    };
+
+    // Authority: only the group Owner/Admin may export it (same gate as issuing a grant).
+    if !storage::group_is_owner(&gid, &sys.node_id) {
+        return json_result_ptr(false, None, None, Some("Only the group Owner/Admin may export it"));
+    }
+
+    // Mint the invitee's scope grant for THIS group (role Member), signed by this node. The
+    // export embeds it as the bundle's strict scope; import re-checks it matches the group.
+    let secret = sys.secret_key.to_bytes();
+    let issuer_pk = pubkey_hex(&secret);
+    let mut roster = GroupRoster::new();
+    roster.set_role(&gid, &issuer_pk, Role::Owner);
+    let now = chrono::Utc::now().timestamp();
+    let expiry = (now + 365 * 24 * 3600) as u64;
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let grant = match crate::identity::Grant::issue(
+        &gid, Role::Member, &secret, now as u64, expiry, &nonce, &roster,
+    ) {
+        Ok(g) => g,
+        Err(e) => return json_result_ptr(false, None, None, Some(&format!("Grant: {e}"))),
+    };
+
+    let bundle = match crate::group_bundle::export_group(&gid, &grant, &invitee, &secret, now) {
+        Ok(b) => b,
+        Err(e) => return json_result_ptr(false, None, None, Some(&format!("Export failed: {e}"))),
+    };
+    let body = bundle.to_json();
+
+    // Best-effort: also drop the bundle on disk so the app can share the file directly.
+    let path = DATA_DIR.get().map(|d| d.join("exports").join(format!("{gid}.cyangroup")));
+    if let Some(ref p) = path {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(p, &body);
+    }
+
+    let mut out = serde_json::Map::new();
+    out.insert("success".to_string(), serde_json::Value::Bool(true));
+    out.insert("group_id".to_string(), serde_json::Value::String(gid));
+    out.insert("bundle".to_string(), serde_json::Value::String(body));
+    if let Some(p) = path.and_then(|p| p.to_str().map(|s| s.to_string())) {
+        out.insert("path".to_string(), serde_json::Value::String(p));
+    }
+    match CString::new(serde_json::Value::Object(out).to_string()) {
+        Ok(c) => c.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Import a `.cyangroup` bundle (MESH_HARDENING §11) — verifies the signature + grant scope,
+/// decrypts to THIS device's key, seeds the baseline into storage (works fully offline), and
+/// stamps "synced as of T" so §5 catch-up reconciles the gap on first online contact.
+///
+/// `bundle` is the JSON bundle body (from `cyan_export_group`). iOS: `importGroup`. Returns
+/// `{"success":true,"group_id":...}` or `{"success":false,"error":...}` for an unsigned, forged,
+/// out-of-scope, or undecryptable bundle.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_import_group(bundle: *const c_char) -> *mut c_char {
+    let Some(body) = (unsafe { cstr_arg(bundle) }) else {
+        return json_result_ptr(false, None, None, Some("Invalid bundle"));
+    };
+    let Some(sys) = SYSTEM.get() else {
+        return json_result_ptr(false, None, None, Some("System not initialized"));
+    };
+    let parsed = match crate::group_bundle::GroupBundle::from_json(&body) {
+        Ok(b) => b,
+        Err(e) => return json_result_ptr(false, None, None, Some(&format!("{e}"))),
+    };
+    let secret = sys.secret_key.to_bytes();
+    match crate::group_bundle::import_group(&parsed, &secret) {
+        Ok(gid) => json_result_ptr(true, Some(&gid), None, None),
+        Err(e) => json_result_ptr(false, None, None, Some(&format!("{e}"))),
+    }
+}
+
 // ============================================================================
 // Lens Commands FFI
 // ============================================================================
@@ -3683,174 +4165,6 @@ pub extern "C" fn cyan_pin_summary_as_board(
     }
 }
 
-/// Execute an import command asynchronously.
-/// Input: JSON from cyan_parse_lens_command with type "import"
-/// The import runs on the tokio runtime and sends progress via event_tx.
-/// Returns immediately with "started" or error.
-#[unsafe(no_mangle)]
-pub extern "C" fn cyan_import(
-    source: *const c_char,
-    target: *const c_char,
-    workspace_id: *const c_char,
-    token: *const c_char,
-) -> *mut c_char {
-    let source_str = match unsafe { CStr::from_ptr(source) }.to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return std::ptr::null_mut(),
-    };
-    let target_str = if target.is_null() {
-        None
-    } else {
-        unsafe { CStr::from_ptr(target) }.to_str().ok().map(|s| s.to_string())
-    };
-    let ws_id = match unsafe { CStr::from_ptr(workspace_id) }.to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return std::ptr::null_mut(),
-    };
-    let token_str = match unsafe { CStr::from_ptr(token) }.to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return std::ptr::null_mut(),
-    };
-    
-    let Some(sys) = SYSTEM.get() else {
-        return json_cstring(r#"{"success":false,"error":"System not initialized"}"#);
-    };
-    
-    let Some(rt) = RUNTIME.get() else {
-        return json_cstring(r#"{"success":false,"error":"Runtime not available"}"#);
-    };
-    
-    let command_tx = sys.command_tx.clone();
-    let event_tx = sys.event_tx.clone();
-    
-    // If no target, list available projects/spaces
-    if target_str.is_none() || target_str.as_deref() == Some("") {
-        let result = rt.block_on(async {
-            match source_str.as_str() {
-                "jira" => {
-                    match crate::import_orchestrator::list_jira_projects(&token_str, &event_tx).await {
-                        Ok(projects) => serde_json::json!({
-                            "success": true,
-                            "action": "list",
-                            "source": "jira",
-                            "projects": projects
-                        }),
-                        Err(e) => serde_json::json!({
-                            "success": false,
-                            "error": e.to_string()
-                        }),
-                    }
-                }
-                "confluence" => {
-                    match crate::import_orchestrator::list_confluence_spaces(&token_str, &event_tx).await {
-                        Ok(spaces) => serde_json::json!({
-                            "success": true,
-                            "action": "list",
-                            "source": "confluence",
-                            "projects": spaces
-                        }),
-                        Err(e) => serde_json::json!({
-                            "success": false,
-                            "error": e.to_string()
-                        }),
-                    }
-                }
-                "gdocs" | "googledocs" => {
-                    match crate::import_orchestrator::list_google_docs(&token_str, &event_tx).await {
-                        Ok(docs) => serde_json::json!({
-                            "success": true,
-                            "action": "list",
-                            "source": "googledocs",
-                            "projects": docs
-                        }),
-                        Err(e) => serde_json::json!({
-                            "success": false,
-                            "error": e.to_string()
-                        }),
-                    }
-                }
-                "github" => {
-                    match crate::import_orchestrator::list_github_repos(&token_str, &event_tx).await {
-                        Ok(repos) => serde_json::json!({
-                            "success": true,
-                            "action": "list",
-                            "source": "github",
-                            "projects": repos
-                        }),
-                        Err(e) => serde_json::json!({
-                            "success": false,
-                            "error": e.to_string()
-                        }),
-                    }
-                }
-                _ => serde_json::json!({
-                    "success": false,
-                    "error": format!("Unknown import source: {}. Use: jira, confluence, gdocs", source_str)
-                }),
-            }
-        });
-        
-        return json_cstring(&result.to_string());
-    }
-    
-    // Has target — run the import synchronously so errors are returned
-    let target = target_str.unwrap();
-    
-    let source_for_json = source_str.clone();
-    let import_result = rt.block_on(async {
-        match source_str.as_str() {
-            "jira" => {
-                if target.to_lowercase() == "all" {
-                    crate::import_orchestrator::import_all_jira(&ws_id, &token_str, &command_tx, &event_tx).await
-                } else {
-                    crate::import_orchestrator::import_jira_project(&target, &ws_id, &token_str, &command_tx, &event_tx).await
-                }
-            }
-            "confluence" => {
-                if target.to_lowercase() == "all" {
-                    crate::import_orchestrator::import_all_confluence(&ws_id, &token_str, &command_tx, &event_tx).await
-                } else {
-                    crate::import_orchestrator::import_confluence_space(&target, &ws_id, &token_str, &command_tx, &event_tx).await
-                }
-            }
-            "gdocs" | "googledocs" => {
-                if target.to_lowercase() == "all" {
-                    crate::import_orchestrator::import_all_google_docs(&ws_id, &token_str, &command_tx, &event_tx).await
-                } else {
-                    crate::import_orchestrator::import_google_doc(&target, &ws_id, &token_str, &command_tx, &event_tx).await
-                }
-            }
-            "github" => {
-                if target.to_lowercase() == "all" {
-                    crate::import_orchestrator::import_all_github(&ws_id, &token_str, &command_tx, &event_tx).await
-                } else {
-                    crate::import_orchestrator::import_github_repo(&target, &ws_id, &token_str, &command_tx, &event_tx).await
-                }
-            }
-            _ => Err(anyhow::anyhow!("Unknown source: {}", source_str)),
-        }
-    });
-    
-    match import_result {
-        Ok(r) => {
-            json_cstring(&serde_json::json!({
-                "success": true,
-                "action": "completed",
-                "source": source_for_json,
-                "boards_created": r.boards_created,
-                "items_imported": r.items_imported,
-                "errors": r.errors
-            }).to_string())
-        }
-        Err(e) => {
-            json_cstring(&serde_json::json!({
-                "success": false,
-                "error": e.to_string()
-            }).to_string())
-        }
-    }
-}
-
 fn json_cstring(s: &str) -> *mut c_char {
     match CString::new(s) {
         Ok(cs) => cs.into_raw(),
@@ -3874,7 +4188,7 @@ pub extern "C" fn cyan_pipeline_compile(
     
     let system = match SYSTEM.get() {
         Some(s) => s,
-        None => return json_cstring(&r#"{"error":"System not initialized"}"#),
+        None => return json_cstring(r#"{"error":"System not initialized"}"#),
     };
     
     // Spawn compile as background task — returns immediately
@@ -3884,7 +4198,7 @@ pub extern "C" fn cyan_pipeline_compile(
     
     let rt = match crate::RUNTIME.get() {
         Some(rt) => rt,
-        None => return json_cstring(&r#"{"error":"Runtime not available"}"#),
+        None => return json_cstring(r#"{"error":"Runtime not available"}"#),
     };
     
     rt.spawn(async move {
@@ -3924,7 +4238,7 @@ pub extern "C" fn cyan_run_pipeline(
     
     let system = match SYSTEM.get() {
         Some(s) => s,
-        None => return json_cstring(&r#"{"error":"System not initialized"}"#),
+        None => return json_cstring(r#"{"error":"System not initialized"}"#),
     };
     
     // Spawn pipeline run as background task — returns immediately
@@ -3934,7 +4248,7 @@ pub extern "C" fn cyan_run_pipeline(
     
     let rt = match crate::RUNTIME.get() {
         Some(rt) => rt,
-        None => return json_cstring(&r#"{"error":"Runtime not available"}"#),
+        None => return json_cstring(r#"{"error":"Runtime not available"}"#),
     };
     
     rt.spawn(async move {
@@ -3981,7 +4295,14 @@ pub extern "C" fn cyan_pipeline_approve(
         None => return false,
     };
     
-    crate::pipeline::approve_step(board_id_str, step_id_str, None, &system.command_tx).is_ok()
+    crate::pipeline::approve_step(
+        board_id_str,
+        step_id_str,
+        None,
+        &system.command_tx,
+        Some(&system.event_tx),
+    )
+    .is_ok()
 }
 
 
@@ -4118,25 +4439,22 @@ pub extern "C" fn cyan_autocomplete_path(
         // g\ → list all groups
         0 | 1 if cleaned.is_empty() || !cleaned.contains('\\') => {
             let filter = if cleaned.is_empty() { "" } else { parts[0] };
-            let mut stmt = conn.prepare(
-                "SELECT name FROM groups WHERE name LIKE ?1 ORDER BY name LIMIT 10"
-            ).unwrap_or_else(|_| conn.prepare("SELECT '' LIMIT 0").unwrap());
-            
             let pattern = format!("{}%", filter);
-            stmt.query_map(rusqlite::params![pattern], |row| {
-                let name: String = row.get(0)?;
-                Ok(name)
-            })
-            .ok()
-            .map(|rows| {
-                rows.filter_map(|r| r.ok())
+            conn.prepare(
+                "SELECT name FROM groups WHERE name LIKE ?1 ORDER BY name LIMIT 10"
+            )
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map(rusqlite::params![pattern], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                Ok(rows.filter_map(|r| r.ok())
                     .map(|name| {
                         serde_json::json!({
                             "name": name,
                             "path": format!("g\\{}", name)
                         })
                     })
-                    .collect()
+                    .collect::<Vec<_>>())
             })
             .unwrap_or_default()
         }
@@ -4151,31 +4469,28 @@ pub extern "C" fn cyan_autocomplete_path(
             ).ok();
             
             if let Some(gid) = gid {
-                let mut stmt = conn.prepare(
+                conn.prepare(
                     "SELECT name FROM workspaces WHERE group_id = ?1 ORDER BY name LIMIT 10"
-                ).unwrap_or_else(|_| conn.prepare("SELECT '' LIMIT 0").unwrap());
-                
-                stmt.query_map(rusqlite::params![gid], |row| {
-                    let name: String = row.get(0)?;
-                    Ok(name)
-                })
-                .ok()
-                .map(|rows| {
-                    rows.filter_map(|r| r.ok())
+                )
+                .and_then(|mut stmt| {
+                    let rows = stmt.query_map(rusqlite::params![gid], |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                    Ok(rows.filter_map(|r| r.ok())
                         .map(|name| {
                             serde_json::json!({
                                 "name": name,
                                 "path": format!("g\\{}\\{}", group_name, name)
                             })
                         })
-                        .collect()
+                        .collect::<Vec<_>>())
                 })
                 .unwrap_or_default()
             } else {
                 vec![]
             }
         }
-        
+
         // g\GroupName\Partial → filter workspaces
         2 => {
             let group_name = parts[0];
@@ -4188,24 +4503,21 @@ pub extern "C" fn cyan_autocomplete_path(
             
             if let Some(gid) = gid {
                 let pattern = format!("{}%", ws_filter);
-                let mut stmt = conn.prepare(
+                conn.prepare(
                     "SELECT name FROM workspaces WHERE group_id = ?1 AND name LIKE ?2 COLLATE NOCASE ORDER BY name LIMIT 10"
-                ).unwrap_or_else(|_| conn.prepare("SELECT '' LIMIT 0").unwrap());
-                
-                stmt.query_map(rusqlite::params![gid, pattern], |row| {
-                    let name: String = row.get(0)?;
-                    Ok(name)
-                })
-                .ok()
-                .map(|rows| {
-                    rows.filter_map(|r| r.ok())
+                )
+                .and_then(|mut stmt| {
+                    let rows = stmt.query_map(rusqlite::params![gid, pattern], |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                    Ok(rows.filter_map(|r| r.ok())
                         .map(|name| {
                             serde_json::json!({
                                 "name": name,
                                 "path": format!("g\\{}\\{}", group_name, name)
                             })
                         })
-                        .collect()
+                        .collect::<Vec<_>>())
                 })
                 .unwrap_or_default()
             } else {
@@ -4231,24 +4543,21 @@ pub extern "C" fn cyan_autocomplete_path(
                 ).ok();
                 
                 if let Some(wid) = wid {
-                    let mut stmt = conn.prepare(
+                    conn.prepare(
                         "SELECT name FROM objects WHERE workspace_id = ?1 AND type = 'whiteboard' ORDER BY name LIMIT 10"
-                    ).unwrap_or_else(|_| conn.prepare("SELECT '' LIMIT 0").unwrap());
-                    
-                    stmt.query_map(rusqlite::params![wid], |row| {
-                        let name: String = row.get(0)?;
-                        Ok(name)
-                    })
-                    .ok()
-                    .map(|rows| {
-                        rows.filter_map(|r| r.ok())
+                    )
+                    .and_then(|mut stmt| {
+                        let rows = stmt.query_map(rusqlite::params![wid], |row| {
+                            row.get::<_, String>(0)
+                        })?;
+                        Ok(rows.filter_map(|r| r.ok())
                             .map(|name| {
                                 serde_json::json!({
                                     "name": name,
                                     "path": format!("g\\{}\\{}\\{}", group_name, ws_name, name)
                                 })
                             })
-                            .collect()
+                            .collect::<Vec<_>>())
                     })
                     .unwrap_or_default()
                 } else {
@@ -4364,7 +4673,10 @@ pub extern "C" fn cyan_reveal_anonymous_identity(scope_id: *const c_char) -> *mu
     
     let secret_bytes = sys.secret_key.to_bytes();
     let eph_secret_bytes: [u8; 32] = match hex::decode(&eph_secret) {
-        Ok(b) if b.len() == 32 => b.try_into().unwrap(),
+        Ok(b) if b.len() == 32 => match b.try_into() {
+            Ok(arr) => arr,
+            Err(_) => return std::ptr::null_mut(),
+        },
         _ => return std::ptr::null_mut(),
     };
     
@@ -4372,7 +4684,7 @@ pub extern "C" fn cyan_reveal_anonymous_identity(scope_id: *const c_char) -> *mu
     let real_pubkey = xaeroid::XaeroID::ed25519_pubkey(&secret_bytes);
     
     let display_name: Option<String> = {
-        let db = sys.db.lock().unwrap();
+        let db = sys.db.lock_safe();
         db.query_row(
             "SELECT display_name FROM user_profiles WHERE node_id = ?1",
             rusqlite::params![&sys.node_id],

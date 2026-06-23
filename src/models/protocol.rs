@@ -7,8 +7,35 @@ use serde::{Deserialize, Serialize};
 use crate::models::core::{Group, Workspace};
 use crate::models::dto::{
     BoardMetadataDTO, ChatDTO, FileDTO, IntegrationBindingDTO,
-    NotebookCellDTO, WhiteboardDTO, WhiteboardElementDTO,
+    NotebookCellDTO, NoteDTO, PinDTO, WhiteboardDTO, WhiteboardElementDTO, WorkflowStateDTO,
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SNAPSHOT REQUEST - the joiner's opening message on SNAPSHOT_ALPN
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// What a joining peer sends (length-prefixed JSON) to ask a holder for a group's
+/// snapshot. `grant` is the signed capability-grant QR payload the joiner scanned
+/// (`identity::Grant::to_qr_payload`); the holder verifies it before serving when the
+/// group is enforced.
+///
+/// **Backward-compatible wire:** older peers sent the raw `group_id` bytes with no JSON
+/// envelope. The server first tries to parse these bytes as a `SnapshotRequest`; if that
+/// fails it falls back to treating the whole payload as a bare `group_id` (grant `None`).
+/// So an un-enforced group keeps serving legacy clients unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotRequest {
+    pub group_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<String>,
+    /// MESH_HARDENING §5 incremental catch-up: the requester's high-water mark (unix
+    /// seconds). When `Some(t)`, the holder serves ONLY rows newer than `t` (the missing
+    /// range) instead of a full re-snapshot. Absent (`None`) ⇒ a full snapshot, the
+    /// cold-start / no-common-base fallback. Additive + `skip_serializing_if`, so an older
+    /// holder ignores it (serves full) and an older joiner never sends it — fully wire-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<i64>,
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SNAPSHOT FRAME - Used for peer-to-peer state sync
@@ -35,12 +62,26 @@ pub enum SnapshotFrame {
         elements: Vec<WhiteboardElementDTO>,
         cells: Vec<NotebookCellDTO>,
     },
-    /// All metadata - chats, files, integrations, board metadata
+    /// All metadata - chats, files, integrations, board metadata, notes
     Metadata {
         chats: Vec<ChatDTO>,
         files: Vec<FileDTO>,
         integrations: Vec<IntegrationBindingDTO>,
         board_metadata: Vec<BoardMetadataDTO>,
+        /// ROUND8 §W2 notes. `#[serde(default)]` keeps the frame wire-compatible: an
+        /// older holder serializes Metadata without this field, a newer peer fills it
+        /// with an empty vec; a newer holder's extra field is ignored by older peers.
+        #[serde(default)]
+        notes: Vec<NoteDTO>,
+        /// ROUND8 §W4 pinned-workflow state. Same wire-compat contract as `notes`.
+        #[serde(default)]
+        pins: Vec<PinDTO>,
+        /// R12 D2/E1 per-board workflow lifecycle state (deployed/dashboard/locked, LWW on
+        /// `updated_at`). Same wire-compat contract as `notes`/`pins`: an older holder omits it
+        /// (a newer peer fills an empty vec), a newer holder's extra field is ignored by older
+        /// peers — so adding it never breaks a mixed-version snapshot transfer.
+        #[serde(default)]
+        workflow_states: Vec<WorkflowStateDTO>,
     },
     /// Signals transfer complete
     Complete,

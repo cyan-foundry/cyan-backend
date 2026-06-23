@@ -20,13 +20,11 @@ use futures_lite::StreamExt;
 use iroh::PublicKey;
 use iroh_gossip::api::{Event as GossipEvent, GossipReceiver, GossipSender};
 use iroh_gossip::net::Gossip;
-use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::{
     actors::{make_topic_id, ActorHandle, ActorMessage, SystemCommand},
-    bootstrap_node_id,
     models::events::SwiftEvent,
     storage,
 };
@@ -91,6 +89,9 @@ pub enum DiscoveryNetworkCmd {
 
 pub struct DiscoveryActor {
     node_id: String,
+    /// Discovery namespace this actor was constructed with. Retained for parity
+    /// with the seed/config path; not read on the gossip hot path.
+    #[allow(dead_code)]
     discovery_key: String,
     sender: GossipSender,
 
@@ -115,6 +116,7 @@ impl DiscoveryActor {
     pub async fn spawn(
         node_id: String,
         discovery_key: String,
+        bootstrap_peers: Vec<PublicKey>,
         gossip: Arc<Gossip>,
         network_tx: UnboundedSender<DiscoveryNetworkCmd>,
         event_tx: UnboundedSender<SwiftEvent>,
@@ -125,14 +127,9 @@ impl DiscoveryActor {
         let topic_str = format!("cyan/discovery/{}", discovery_key);
         let topic_id = make_topic_id(&topic_str)?;
 
-        // Get bootstrap peer
-        let bootstrap_peers: Vec<PublicKey> = match PublicKey::from_str(bootstrap_node_id()) {
-            Ok(pk) => vec![pk],
-            Err(_) => {
-                tracing::warn!("⚠️ Invalid bootstrap node ID, starting without bootstrap");
-                vec![]
-            }
-        };
+        // Bootstrap peers for the discovery topic are chosen by the caller from the
+        // node's DiscoveryPolicy (Bootstrap(id) → [id]; MdnsOnly → []). Production
+        // passes the default bootstrap node id, so behavior is unchanged.
 
         tracing::info!(
             "🔍 [DISCOVERY] Subscribing to topic: {} with {} bootstrap peers",
@@ -140,10 +137,14 @@ impl DiscoveryActor {
             bootstrap_peers.len()
         );
 
-        // Subscribe to discovery topic
-        let topic = gossip
-            .subscribe_and_join(topic_id, bootstrap_peers.clone())
-            .await?;
+        // Subscribe to the discovery topic WITHOUT awaiting `joined()`. `subscribe_and_join`
+        // parks until ≥1 neighbour connects; offline (MdnsOnly → empty bootstrap, or an
+        // unreachable bootstrap) that never happens, so awaiting it here would block
+        // `NetworkActor::start` before it reaches its command loop. The join proceeds in the
+        // background — `run` broadcasts our groups on startup and again on every `NeighborUp`
+        // (`handle_gossip_event`) — so a cold offline start is non-blocking and discovery
+        // recovers the moment a neighbour appears.
+        let topic = gossip.subscribe(topic_id, bootstrap_peers.clone()).await?;
         let (sender, receiver) = topic.split();
 
         // Load my groups from DB
@@ -177,11 +178,10 @@ impl DiscoveryActor {
         mut receiver: GossipReceiver,
     ) {
         // Initial broadcast of our groups
-        if !self.my_groups.is_empty() {
-            if let Err(e) = self.broadcast_groups_exchange().await {
+        if !self.my_groups.is_empty()
+            && let Err(e) = self.broadcast_groups_exchange().await {
                 tracing::error!("🔴 [DISCOVERY] Initial broadcast failed: {}", e);
             }
-        }
 
         loop {
             tokio::select! {

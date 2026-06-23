@@ -1,0 +1,17 @@
+# iroh-relay fixture for the local Docker rig.
+# Pinned to the SAME iroh-relay version the engine links (Cargo.toml: iroh-relay = "0.95.1"),
+# so the relay protocol matches the peers' iroh 0.95 client exactly. No engine code here —
+# this is the public `iroh-relay` binary from crates.io.
+FROM rust:1-bookworm AS build
+ARG IROH_RELAY_VERSION=0.95.1
+RUN cargo install iroh-relay --locked --version "=${IROH_RELAY_VERSION}" --features server \
+    && cp "$(command -v iroh-relay)" /usr/local/bin/iroh-relay
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates netcat-openbsd curl && rm -rf /var/lib/apt/lists/*
+COPY --from=build /usr/local/bin/iroh-relay /usr/local/bin/iroh-relay
+# `--dev` runs an HTTP (no-TLS) relay suitable for a loopback rig; it also enables the
+# QUIC/STUN paths. The exact listen ports are asserted by the Makefile healthcheck.
+ENTRYPOINT ["/usr/local/bin/iroh-relay"]
+CMD ["--dev"]

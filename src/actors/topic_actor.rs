@@ -11,10 +11,13 @@
 // - Handle snapshot requests AND downloads
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     str::FromStr,
-    sync::Arc,
-    time::Duration,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Result};
@@ -24,19 +27,20 @@ use iroh::endpoint::Connection;
 use iroh::{Endpoint, PublicKey};
 use iroh_gossip::api::{Event as GossipEvent, GossipReceiver, GossipSender};
 use iroh_gossip::net::Gossip;
-use iroh_gossip::proto::TopicId;
-use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::{
     actors::{make_group_topic_id, ActorHandle, ActorMessage, SystemCommand, TopicNetworkCmd, FILE_TRANSFER_ALPN},
+    anti_entropy::{self, AntiEntropyMsg},
     bootstrap_node_id,
+    identity::{MeshAuthorizer, WriteDecision},
     models::{
         commands::NetworkCommand,
         events::{NetworkEvent, SwiftEvent},
         protocol::{FileTransferMsg, SnapshotFrame},
     },
     storage,
+    swarm::{BlobSwarm, Hash, SwarmMessage},
 };
 
 /// ALPN for snapshot transfer protocol
@@ -65,8 +69,18 @@ pub enum TopicCommand {
     DownloadSnapshot {
         source_peer: String,
     },
+    /// MESH_HARDENING §5 incremental catch-up: pull ONLY rows newer than `since` from
+    /// `source_peer` (a quiet merge, no join-time `Sync*` UI churn). `since=None` is a full pull.
+    CatchUp {
+        source_peer: String,
+        since: Option<i64>,
+    },
     /// Mark snapshot as needed or received
     SetNeedSnapshot(bool),
+    /// Announce (over gossip) that this node holds the blob with this Blake3 hash (`IHave`).
+    AnnounceBlob { hash: String },
+    /// Ask the group (over gossip) who holds the blob with this Blake3 hash (`WhoHas`).
+    QueryBlob { hash: String },
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -82,6 +96,13 @@ pub struct TopicActor {
     /// Known peers in this topic
     known_peers: HashSet<PublicKey>,
 
+    /// The shared, FFI-visible presence map (`group_id → set of connected peers`), read by
+    /// `cyan_get_group_peers` / `cyan_get_*_peer_count`. We keep THIS group's entry in lock-step
+    /// with the live gossip neighbor set: a `NeighborUp` adds the peer, a `NeighborDown` removes it.
+    /// That makes presence honest — it reflects the same gossip channel that carries the group's
+    /// data, instead of only the (best-effort) discovery peer-intro layer. Additive, receive-only.
+    peers_per_group: Arc<Mutex<HashMap<String, HashSet<PublicKey>>>>,
+
     /// Local flag: do we need a snapshot for this group?
     need_snapshot: bool,
 
@@ -90,10 +111,44 @@ pub struct TopicActor {
 
     /// Event channel to Swift
     event_tx: UnboundedSender<SwiftEvent>,
+
+    /// Shared blob swarm (G10): incoming i-have/who-has gossip is fed to `swarm.on_message`, and
+    /// `AnnounceBlob`/`QueryBlob` commands broadcast the negotiation messages onto this group topic.
+    swarm: Arc<BlobSwarm>,
+
+    /// Per-node mesh-write authority (identity/RBAC mesh half), shared with the NetworkActor.
+    /// Inbound writes from a peer are gated by `authorize_write(group, from_peer)`. Fail-open
+    /// unless this group has been enforced — so it does not change behavior for un-enforced groups.
+    authorizer: Arc<std::sync::Mutex<MeshAuthorizer>>,
+
+    /// The signed capability-grant QR payload this node scanned to join the group (if any).
+    /// Presented to the snapshot holder so it can authorize the per-group snapshot read when the
+    /// group is enforced. `None` for groups created locally or joined without a grant (fail-open).
+    grant: Option<String>,
+
+    /// Anti-entropy repair debounce: at most one repair pull in flight per group, so a divergent
+    /// digest seen from several peers in one sweep triggers a single merge, not a thundering pull.
+    /// Shared with the spawned pull task, which clears it on completion. Bounds repair traffic.
+    repairing: Arc<AtomicBool>,
+
+    /// Multi-source snapshot pick: snapshot offers (`GroupSnapshotAvailable` sources) collected for
+    /// a short window before a holder is chosen at random, so concurrent cold-joiners spread across
+    /// holders instead of all hammering the host (the "snapshot under load" fix).
+    snapshot_offers: HashSet<String>,
+
+    /// Deadline at which the collected `snapshot_offers` are resolved into one pick. `None` when no
+    /// pick is pending.
+    snapshot_pick_at: Option<Instant>,
+
+    /// Drain offload: inbound, authorized `NetworkEvent`s are handed to a single FIFO worker that
+    /// does the SQLite write + Swift forward, so the gossip select loop is never blocked on disk I/O
+    /// and drains the receiver promptly (makes `Lagged` rarer). FIFO preserves per-id ordering.
+    persist_tx: UnboundedSender<NetworkEvent>,
 }
 
 impl TopicActor {
     /// Spawn a new TopicActor for a group
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         node_id: String,
         group_id: String,
@@ -102,6 +157,10 @@ impl TopicActor {
         initial_peers: Vec<PublicKey>,
         network_tx: UnboundedSender<TopicNetworkCmd>,
         event_tx: UnboundedSender<SwiftEvent>,
+        swarm: Arc<BlobSwarm>,
+        authorizer: Arc<std::sync::Mutex<MeshAuthorizer>>,
+        grant: Option<String>,
+        peers_per_group: Arc<Mutex<HashMap<String, HashSet<PublicKey>>>>,
     ) -> Result<ActorHandle<TopicCommand>> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
@@ -110,10 +169,10 @@ impl TopicActor {
 
         // Get bootstrap peer
         let mut peers = initial_peers;
-        if let Ok(bootstrap_pk) = PublicKey::from_str(bootstrap_node_id()) {
-            if !peers.contains(&bootstrap_pk) {
-                peers.push(bootstrap_pk);
-            }
+        if let Ok(bootstrap_pk) = PublicKey::from_str(bootstrap_node_id())
+            && !peers.contains(&bootstrap_pk)
+        {
+            peers.push(bootstrap_pk);
         }
 
         eprintln!("🎯 [TOPIC] ════════════════════════════════════════════════════════");
@@ -128,8 +187,14 @@ impl TopicActor {
             peers.len()
         );
 
-        // Subscribe to topic
-        let topic = gossip.subscribe_and_join(topic_id, peers.clone()).await?;
+        // Subscribe to the topic WITHOUT awaiting `joined()`. `subscribe_and_join` parks
+        // until ≥1 neighbour connects; with only an unreachable bootstrap (the relay-only
+        // default, offline) that never happens, so awaiting it here would block the caller
+        // (`NetworkActor::start`/`handle JoinGroup`) and wedge the command loop. The join
+        // proceeds in the background — `run`'s gossip stream surfaces the first `NeighborUp`
+        // via `handle_gossip_event` exactly like every subsequent one — so startup is
+        // non-blocking and the topic recovers the moment a neighbour appears.
+        let topic = gossip.subscribe(topic_id, peers.clone()).await?;
         let (sender, receiver) = topic.split();
 
         // Signal to NetworkActor that we need a snapshot
@@ -138,15 +203,46 @@ impl TopicActor {
         });
         eprintln!("📤 [TOPIC] Sent NeedSnapshot to NetworkActor");
 
+        // Drain offload: a single FIFO worker persists authorized NetworkEvents off the select loop.
+        // One consumer ⇒ per-id ordering preserved (an add then an update for the same id stay
+        // ordered); same SwiftEvents emitted in the same order, so the FFI event stream is unchanged.
+        let (persist_tx, mut persist_rx) = mpsc::unbounded_channel::<NetworkEvent>();
+        let persist_event_tx = event_tx.clone();
+        let persist_node_id = node_id.clone();
+        tokio::spawn(async move {
+            while let Some(evt) = persist_rx.recv().await {
+                Self::persist_event(&evt);
+                // R10FB §N: count an incoming non-author chat as unread (once, ever) and
+                // emit UnreadChanged BEFORE the event itself so badges update live.
+                if let Some(changed) = Self::account_unread(&evt, &persist_node_id) {
+                    let _ = persist_event_tx.send(changed);
+                }
+                // R12 B1: a file from another peer fires a distinct board-scoped FileReceived
+                // (a "file received" notification), separate from the chat-message event.
+                if let Some(received) = Self::file_received_event(&evt, &persist_node_id) {
+                    let _ = persist_event_tx.send(received);
+                }
+                let _ = persist_event_tx.send(SwiftEvent::Network(evt));
+            }
+        });
+
         let actor = Self {
             node_id: node_id.clone(),
             group_id: group_id.clone(),
             endpoint,
             sender,
             known_peers: peers.into_iter().collect(),
+            peers_per_group,
             need_snapshot: true,  // New groups always need snapshot
             network_tx,
             event_tx,
+            swarm,
+            authorizer,
+            grant,
+            repairing: Arc::new(AtomicBool::new(false)),
+            snapshot_offers: HashSet::new(),
+            snapshot_pick_at: None,
+            persist_tx,
         };
 
         let join_handle = tokio::spawn(actor.run(cmd_rx, receiver));
@@ -171,6 +267,10 @@ impl TopicActor {
             "🎧 [TOPIC] Listener started for group {}",
             &self.group_id[..16.min(self.group_id.len())]
         );
+
+        // Anti-entropy sweep clock: gossip our per-group digest on a bounded, jittered cadence so
+        // peers detect + repair anything live gossip dropped (the convergence guarantee).
+        let mut next_sweep = Instant::now() + anti_entropy::jittered_sweep();
 
         loop {
             tokio::select! {
@@ -206,6 +306,24 @@ impl TopicActor {
                             break;
                         }
                     }
+                }
+
+                // Anti-entropy sweep: broadcast this group's state digest, then re-arm the jittered
+                // clock. The branch never blocks the others — it just fires on its absolute deadline.
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_sweep)) => {
+                    self.do_sweep().await;
+                    next_sweep = Instant::now() + anti_entropy::jittered_sweep();
+                }
+
+                // Multi-source snapshot pick: when the offer-collection window elapses, choose one
+                // holder at random from the offers gathered and start the join-time snapshot pull.
+                _ = async {
+                    match self.snapshot_pick_at {
+                        Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if self.snapshot_pick_at.is_some() => {
+                    self.commit_snapshot_pick().await;
                 }
             }
         }
@@ -285,12 +403,52 @@ impl TopicActor {
                 }
             }
 
+            TopicCommand::AnnounceBlob { hash } => {
+                // Broadcast an `IHave` for a blob this node holds onto the group topic (G10).
+                match crate::swarm::Hash::from_str(&hash) {
+                    Ok(h) => self.broadcast_swarm_message(&self.swarm.announce(&h)).await,
+                    Err(e) => tracing::warn!("⚠️ [TOPIC] AnnounceBlob bad hash {}: {}", hash, e),
+                }
+            }
+
+            TopicCommand::QueryBlob { hash } => {
+                // Broadcast a `WhoHas` query onto the group topic; holders reply with `IHave` (G10).
+                match crate::swarm::Hash::from_str(&hash) {
+                    Ok(h) => self.broadcast_swarm_message(&self.swarm.query(&h)).await,
+                    Err(e) => tracing::warn!("⚠️ [TOPIC] QueryBlob bad hash {}: {}", hash, e),
+                }
+            }
+
             TopicCommand::DownloadFile { file_id, hash, source_peer, resume_offset } => {
                 let endpoint = self.endpoint.clone();
                 let event_tx = self.event_tx.clone();
                 let group_id = self.group_id.clone();
 
+                // Content-addressed swarm path (G10): if this node already knows holders for the
+                // blob (learned via `IHave` gossip — e.g. a `.cyanplugin` seeded by the uploader),
+                // fetch it multi-source with churn/resume + Blake3 verify. Falls back to the existing
+                // single-source file transfer when no holders are known, so non-swarm files (and
+                // plugins before any IHave is seen) behave exactly as before.
+                let swarm = self.swarm.clone();
                 tokio::spawn(async move {
+                    let holders = match Hash::from_str(&hash) {
+                        Ok(h) => swarm.holders(&h).await,
+                        Err(_) => Vec::new(),
+                    };
+                    if !holders.is_empty() {
+                        match swarm_download_file(&swarm, &file_id, &hash, &holders, event_tx.clone())
+                            .await
+                        {
+                            Ok(()) => return,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "⚠️ [TOPIC] swarm fetch for {} failed ({}); falling back to direct transfer",
+                                    &file_id[..16.min(file_id.len())],
+                                    e
+                                );
+                            }
+                        }
+                    }
                     if let Err(e) = download_file(
                         endpoint,
                         &file_id,
@@ -351,13 +509,16 @@ impl TopicActor {
                 let group_id = self.group_id.clone();
                 let event_tx = self.event_tx.clone();
                 let network_tx = self.network_tx.clone();
+                let grant = self.grant.clone();
 
                 tokio::spawn(async move {
                     match download_snapshot(
                         endpoint,
                         &source_peer,
                         &group_id,
+                        grant.as_deref(),
                         event_tx,
+                        false,
                     ).await {
                         Ok(_) => {
                             eprintln!("✅ [SNAP-DL] Snapshot download SUCCESS");
@@ -368,6 +529,49 @@ impl TopicActor {
                         Err(e) => {
                             eprintln!("🔴 [SNAP-DL] Snapshot download FAILED: {}", e);
                             tracing::error!("🔴 [SNAP-DL] Snapshot download failed: {}", e);
+                            let _ = network_tx.send(TopicNetworkCmd::SnapshotFailed {
+                                group_id,
+                                reason: e.to_string(),
+                            });
+                        }
+                    }
+                });
+            }
+
+            TopicCommand::CatchUp { source_peer, since } => {
+                // §5 incremental catch-up: a QUIET (no Sync* UI events) since-bounded merge from a
+                // chosen holder. Reuses the snapshot serve/apply path — same idempotent upsert, so
+                // a delta and a full pull converge identically. Bounded by download_snapshot's own
+                // connect/read timeouts.
+                eprintln!(
+                    "📥 [CATCHUP] group {}... from {}... since={:?}",
+                    &self.group_id[..16.min(self.group_id.len())],
+                    &source_peer[..16.min(source_peer.len())],
+                    since,
+                );
+                let endpoint = self.endpoint.clone();
+                let group_id = self.group_id.clone();
+                let event_tx = self.event_tx.clone();
+                let network_tx = self.network_tx.clone();
+                let grant = self.grant.clone();
+                tokio::spawn(async move {
+                    match download_snapshot_since(
+                        endpoint,
+                        &source_peer,
+                        &group_id,
+                        grant.as_deref(),
+                        since,
+                        event_tx,
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            let _ = network_tx
+                                .send(TopicNetworkCmd::SnapshotComplete { group_id });
+                        }
+                        Err(e) => {
+                            tracing::warn!("🔴 [CATCHUP] catch-up from peer failed: {}", e);
                             let _ = network_tx.send(TopicNetworkCmd::SnapshotFailed {
                                 group_id,
                                 reason: e.to_string(),
@@ -407,6 +611,27 @@ impl TopicActor {
                     return;
                 }
 
+                // Observability only (stress fabric "no message storm" oracle): count every
+                // inbound, non-self gossip message this node actually processes. Behavior-neutral.
+                crate::metrics::record_gossip_recv();
+
+                // Try parsing as a blob-swarm negotiation message FIRST (G10): its `{"type":"IHave"
+                // |"WhoHas"}` shape is disjoint from NetworkEvent/NetworkCommand. Record the holder /
+                // answer a WhoHas with our own IHave, broadcast over this same group topic.
+                if let Ok(reply) = self.swarm.on_message(&msg.content).await {
+                    if let Some(reply) = reply {
+                        self.broadcast_swarm_message(&reply).await;
+                    }
+                    return;
+                }
+
+                // Anti-entropy digest (`{"type":"Digest"}`) — disjoint from every other gossip
+                // shape. A divergent digest from a peer not behind us triggers a quiet repair pull.
+                if let Ok(ae) = serde_json::from_slice::<AntiEntropyMsg>(&msg.content) {
+                    self.handle_anti_entropy(ae).await;
+                    return;
+                }
+
                 // Try parsing as NetworkEvent
                 if let Ok(evt) = serde_json::from_slice::<NetworkEvent>(&msg.content) {
                     eprintln!("📩 [TOPIC] NetworkEvent from {}... on group {}...: {:?}",
@@ -414,7 +639,7 @@ impl TopicActor {
                         &self.group_id[..16.min(self.group_id.len())],
                         std::mem::discriminant(&evt)
                     );
-                    self.handle_network_event(evt).await;
+                    self.handle_network_event(evt, &from).await;
                 }
                 // Try parsing as NetworkCommand (for snapshot requests)
                 else if let Ok(cmd) = serde_json::from_slice::<NetworkCommand>(&msg.content) {
@@ -439,6 +664,23 @@ impl TopicActor {
                 );
 
                 self.known_peers.insert(peer);
+                crate::metrics::record_neighbor_up(); // observability only (gossip-degree gauge)
+
+                // Honest presence: reflect this REAL gossip neighbor in the FFI-visible map for
+                // THIS group (dedup via the set). `cyan_get_group_peers` / `cyan_get_*_peer_count`
+                // now report live mesh connectivity, not just the discovery peer-intro layer.
+                if let Ok(mut map) = self.peers_per_group.lock() {
+                    map.entry(self.group_id.clone()).or_default().insert(peer);
+                }
+
+                // Roster (MESH_HARDENING §3): record this peer as a persistent group MEMBER. The row
+                // survives restart and the peer going offline (greyed in the roster, online overlaid
+                // from the live neighbor set at read time). first_seen is set once; last_seen advances.
+                let _ = storage::member_seen(
+                    &self.group_id,
+                    &peer.to_string(),
+                    chrono::Utc::now().timestamp(),
+                );
 
                 // CRITICAL: Re-send snapshot request when peer joins
                 // The initial request may have been sent before mesh was ready
@@ -473,6 +715,7 @@ impl TopicActor {
                     group_id: self.group_id.clone(),
                     peer_id: peer_str,
                 });
+                self.emit_presence();
             }
 
             GossipEvent::NeighborDown(peer) => {
@@ -488,11 +731,21 @@ impl TopicActor {
                 );
 
                 self.known_peers.remove(&peer);
+                crate::metrics::record_neighbor_down(); // observability only (gossip-degree gauge)
+
+                // Honest presence: drop this peer from THIS group's FFI-visible set as its gossip
+                // connection goes away, so the count falls back toward 0 (the leave half).
+                if let Ok(mut map) = self.peers_per_group.lock()
+                    && let Some(set) = map.get_mut(&self.group_id)
+                {
+                    set.remove(&peer);
+                }
 
                 let _ = self.event_tx.send(SwiftEvent::PeerLeft {
                     group_id: self.group_id.clone(),
                     peer_id: peer_str,
                 });
+                self.emit_presence();
             }
 
             GossipEvent::Lagged => {
@@ -507,7 +760,12 @@ impl TopicActor {
         }
     }
 
-    async fn handle_network_event(&mut self, evt: NetworkEvent) {
+    async fn handle_network_event(&mut self, evt: NetworkEvent, from_peer: &str) {
+        // Roster (MESH_HARDENING §3): the author of any gossip event we receive is a group MEMBER —
+        // record them (deduped; `from_peer` is never self, self-messages are filtered upstream). This
+        // catches members who are present over gossip even if we never saw their NeighborUp directly.
+        let _ = storage::member_seen(&self.group_id, from_peer, chrono::Utc::now().timestamp());
+
         // Check for GroupSnapshotAvailable - this triggers snapshot download
         if let NetworkEvent::GroupSnapshotAvailable { ref source, ref group_id } = evt {
             eprintln!("═══════════════════════════════════════════════════════════════════");
@@ -527,40 +785,16 @@ impl TopicActor {
             eprintln!("📬 [SNAP-AVAIL-3] need_snapshot flag: {}", self.need_snapshot);
 
             if self.need_snapshot {
-                eprintln!("📬 [SNAP-AVAIL-4] ✓ We need snapshot - triggering download");
-
-                // Mark as no longer needing (prevent duplicate downloads)
-                self.need_snapshot = false;
-
-                // Spawn download task
-                let endpoint = self.endpoint.clone();
-                let group_id = self.group_id.clone();
-                let source_peer = source.clone();
-                let event_tx = self.event_tx.clone();
-                let network_tx = self.network_tx.clone();
-
-                tokio::spawn(async move {
-                    eprintln!("📥 [SNAP-DL-SPAWN] Download task started for {}...", &source_peer[..16]);
-                    match download_snapshot(
-                        endpoint,
-                        &source_peer,
-                        &group_id,
-                        event_tx,
-                    ).await {
-                        Ok(_) => {
-                            eprintln!("✅ [SNAP-DL-SPAWN] Download SUCCESS");
-                            let _ = network_tx.send(TopicNetworkCmd::SnapshotComplete { group_id });
-                        }
-                        Err(e) => {
-                            eprintln!("🔴 [SNAP-DL-SPAWN] Download FAILED: {}", e);
-                            tracing::error!("🔴 [SNAP-DL] Snapshot download failed: {}", e);
-                            let _ = network_tx.send(TopicNetworkCmd::SnapshotFailed {
-                                group_id,
-                                reason: e.to_string(),
-                            });
-                        }
-                    }
-                });
+                // Multi-source snapshot serving (the "snapshot under load" fix): instead of pulling
+                // from whichever holder happens to answer first (always the host → thundering herd),
+                // collect offers over a short jittered window and then pick one holder at random
+                // (`commit_snapshot_pick`). Many concurrent cold-joiners thus spread across all
+                // holders rather than overloading a single host.
+                eprintln!("📬 [SNAP-AVAIL-4] ✓ We need snapshot - recording holder offer");
+                self.snapshot_offers.insert(source.clone());
+                if self.snapshot_pick_at.is_none() {
+                    self.snapshot_pick_at = Some(Instant::now() + anti_entropy::jittered_pick_window());
+                }
             } else {
                 eprintln!("📬 [SNAP-AVAIL-4] ✗ We don't need snapshot - ignoring");
             }
@@ -574,17 +808,46 @@ impl TopicActor {
             std::mem::discriminant(&evt)
         );
 
-        // Persist to DB
-        Self::persist_event(&evt);
+        // MESH-WRITE ENFORCEMENT (identity/RBAC mesh half). An inbound NetworkEvent is a write to
+        // group state, so it must come from a peer this node has authorized via a valid capability
+        // grant. Fail-open until the group is enforced (`MeshAuthorizer::enforce_group`) — so this
+        // is inert for groups that have not opted into grant enforcement. Decided on the RECEIVER's
+        // own authorizer state; refused writes are NOT persisted or forwarded to Swift.
+        let decision = self
+            .authorizer
+            .lock()
+            .map(|a| a.authorize_write(&self.group_id, from_peer))
+            .unwrap_or(WriteDecision::Allow);
+        if let WriteDecision::Deny(reason) = decision {
+            // Flat obs (tenant = group_id) at the refusal point — never a substitute for the
+            // assertion oracle (tests assert on the authorizer state), just operator visibility.
+            tracing::warn!(
+                target: "obs",
+                tenant = %self.group_id,
+                peer = %from_peer,
+                action = "mesh_write",
+                decision = "deny",
+                reason = ?reason,
+                "refused mesh write from peer without a valid capability grant"
+            );
+            eprintln!(
+                "⛔ [TOPIC] Refused mesh write on group {}... from {}... ({:?})",
+                &self.group_id[..16.min(self.group_id.len())],
+                &from_peer[..16.min(from_peer.len())],
+                reason
+            );
+            return;
+        }
 
-        // Forward to Swift
-        eprintln!("📤 [TOPIC→SWIFT] Forwarding event: {:?}", std::mem::discriminant(&evt));
-        let _ = self.event_tx.send(SwiftEvent::Network(evt));
+        // Persist + forward off the select loop (single FIFO worker) so the gossip receiver keeps
+        // draining and `Lagged` stays rare. The worker does the SQLite write then forwards the same
+        // SwiftEvent in order; if the worker is gone (shutdown) we drop, same as a closed channel.
+        eprintln!("📤 [TOPIC→SWIFT] Queuing event for persist+forward: {:?}", std::mem::discriminant(&evt));
+        let _ = self.persist_tx.send(evt);
     }
 
-    async fn handle_network_command(&self, cmd: NetworkCommand, from_peer: PublicKey) {
-        match cmd {
-            NetworkCommand::RequestSnapshot { from_peer: requester } => {
+    async fn handle_network_command(&self, cmd: NetworkCommand, _from_peer: PublicKey) {
+        if let NetworkCommand::RequestSnapshot { from_peer: requester } = cmd {
                 // Don't respond to our own requests
                 if requester == self.node_id {
                     return;
@@ -618,9 +881,163 @@ impl TopicActor {
                 } else {
                     eprintln!("   ✓ SnapshotAvailable broadcast sent");
                 }
-            }
-            _ => {}
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ANTI-ENTROPY (delta repair) + MULTI-SOURCE SNAPSHOT PICK
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// One anti-entropy sweep: gossip this group's compact state digest so peers can detect and
+    /// repair anything live deltas dropped. Skipped when we have no neighbours (nobody to tell) or
+    /// no state yet (nothing to advertise). `O(1)` gossip; the digest is `O(state)` to compute.
+    async fn do_sweep(&self) {
+        if self.known_peers.is_empty() {
+            return;
+        }
+        let (count, hash) = anti_entropy::group_digest(&self.group_id);
+        if count == 0 {
+            return;
+        }
+        let msg = AntiEntropyMsg::Digest {
+            group_id: self.group_id.clone(),
+            node_id: self.node_id.clone(),
+            count,
+            hash,
+        };
+        match serde_json::to_vec(&msg) {
+            Ok(data) => {
+                if self.sender.broadcast(Bytes::from(data)).await.is_ok() {
+                    crate::metrics::record_ae_digest_sent();
+                }
+            }
+            Err(e) => tracing::error!("🔴 [TOPIC] anti-entropy digest serialize failed: {}", e),
+        }
+    }
+
+    /// Handle a peer's state digest. If it matches ours we are in sync; if the sender is strictly
+    /// behind us they will pull from us instead; otherwise the sender holds something we lack, so we
+    /// pull a **quiet** merge snapshot from them (idempotent upsert-by-id ⇒ a union merge). Debounced
+    /// to one repair in flight per group so a digest seen from many peers triggers a single pull.
+    async fn handle_anti_entropy(&mut self, ae: AntiEntropyMsg) {
+        let AntiEntropyMsg::Digest { group_id, node_id, count, hash } = ae;
+        if group_id != self.group_id || node_id == self.node_id {
+            return;
+        }
+        let (my_count, my_hash) = anti_entropy::group_digest(&self.group_id);
+        if hash == my_hash {
+            return; // in sync — nothing to repair
+        }
+        if count < my_count {
+            return; // sender is behind us; they will pull from our digest
+        }
+        // Debounce: claim the single in-flight repair slot for this group.
+        if self.repairing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        crate::metrics::record_ae_repair();
+
+        let endpoint = self.endpoint.clone();
+        let gid = self.group_id.clone();
+        let grant = self.grant.clone();
+        let event_tx = self.event_tx.clone();
+        let repairing = self.repairing.clone();
+        tokio::spawn(async move {
+            // Quiet pull: merge the sender's state into ours WITHOUT re-emitting join-time Sync*
+            // events. Reuses the snapshot serve/apply path — no new transfer protocol.
+            if let Err(e) =
+                download_snapshot(endpoint, &node_id, &gid, grant.as_deref(), event_tx, true).await
+            {
+                tracing::debug!(
+                    "🩹 [TOPIC] anti-entropy repair from {}... failed: {}",
+                    &node_id[..16.min(node_id.len())],
+                    e
+                );
+            }
+            repairing.store(false, Ordering::Release);
+        });
+    }
+
+    /// Resolve the collected snapshot offers into a single holder pick and start the join-time
+    /// snapshot pull. Picks at random so concurrent cold-joiners spread across holders (no single
+    /// host overload). No-op if we no longer need a snapshot or gathered no offers.
+    async fn commit_snapshot_pick(&mut self) {
+        self.snapshot_pick_at = None;
+        if !self.need_snapshot {
+            self.snapshot_offers.clear();
+            return;
+        }
+        let sources: Vec<String> = self.snapshot_offers.drain().collect();
+        if sources.is_empty() {
+            return;
+        }
+        // MESH_HARDENING §5 closest-holder preference: pick a holder that is a DIRECT LAN/mesh
+        // neighbor (lowest-latency, relay-free) over a remoter one. `known_peers` is this group's
+        // live gossip neighbor set, so an offerer in it is reachable on the LAN right now. With no
+        // LAN offerer we keep the original behavior (spread across whatever offered) — Lens, an HTTP
+        // leg, never appears here, so the mesh still repairs from device holders.
+        let lan_peers: HashSet<String> = self
+            .known_peers
+            .iter()
+            .map(|pk| pk.to_string())
+            .collect();
+        let source_peer = match crate::snapshot::pick_catchup_holder(&sources, &lan_peers, None) {
+            Some(p) if lan_peers.contains(&p) => p,
+            _ => {
+                // No LAN-direct offerer — fall back to the original random spread so concurrent
+                // cold-joiners don't all hammer one host (the "snapshot under load" fix).
+                let idx = {
+                    use rand::Rng;
+                    rand::thread_rng().gen_range(0..sources.len())
+                };
+                sources[idx].clone()
+            }
+        };
+        self.need_snapshot = false;
+
+        eprintln!(
+            "📥 [SNAP-PICK] Picked holder {}... of {} offer(s) for {}...",
+            &source_peer[..16.min(source_peer.len())],
+            sources.len(),
+            &self.group_id[..16.min(self.group_id.len())]
+        );
+
+        let endpoint = self.endpoint.clone();
+        let group_id = self.group_id.clone();
+        let event_tx = self.event_tx.clone();
+        let network_tx = self.network_tx.clone();
+        let grant = self.grant.clone();
+        tokio::spawn(async move {
+            match download_snapshot(endpoint, &source_peer, &group_id, grant.as_deref(), event_tx, false).await {
+                Ok(_) => {
+                    let _ = network_tx.send(TopicNetworkCmd::SnapshotComplete { group_id });
+                }
+                Err(e) => {
+                    tracing::error!("🔴 [SNAP-DL] Snapshot download failed: {}", e);
+                    let _ = network_tx.send(TopicNetworkCmd::SnapshotFailed {
+                        group_id,
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Emit the live presence/reachability status for this group off the topic's own peer set
+    /// (the honest oracle). Called after every NeighborUp/NeighborDown so the app's status bar
+    /// reflects the real connected-peer count and whether the group is reachable on the mesh
+    /// (`online`) or working against just this device's copy (`local_only`). Additive, receive-only.
+    fn emit_presence(&self) {
+        let count = self.known_peers.len() as u32;
+        let _ = self.event_tx.send(SwiftEvent::PeerCountChanged {
+            group_id: self.group_id.clone(),
+            count,
+        });
+        let state = if count == 0 { "local_only" } else { "online" };
+        let _ = self.event_tx.send(SwiftEvent::MeshReachability {
+            group_id: self.group_id.clone(),
+            state: state.to_string(),
+        });
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -629,6 +1046,18 @@ impl TopicActor {
 
     async fn broadcast_event(&self, event: &NetworkEvent) -> Result<()> {
         let data = serde_json::to_vec(event)?;
+
+        // MESH_HARDENING §4 offline-hold seam: persist every outgoing broadcast in the durable,
+        // content-addressed hold store BEFORE putting it on the (best-effort) gossip wire. Keyed by
+        // blake3(payload), so it is deliverable on reconnect and idempotent on re-broadcast. This is
+        // the clean seam the Lens super-peer consumes to hold/serve messages for offline peers —
+        // best-effort and behavior-neutral to the live path (a hold-store error never blocks a send).
+        let hash = blake3::hash(&data).to_hex().to_string();
+        let now = chrono::Utc::now().timestamp();
+        if let Err(e) = storage::hold_put(&self.group_id, &hash, &data, now) {
+            tracing::debug!("🪣 [HOLD] hold_put failed (non-fatal): {}", e);
+        }
+
         self.sender.broadcast(Bytes::from(data)).await?;
 
         tracing::debug!(
@@ -637,6 +1066,19 @@ impl TopicActor {
         );
 
         Ok(())
+    }
+
+    /// Broadcast a blob-swarm negotiation message (`IHave`/`WhoHas`) onto this group topic (G10).
+    /// Rides the existing gossip channel exactly like `NetworkEvent`/`NetworkCommand` do.
+    async fn broadcast_swarm_message(&self, msg: &SwarmMessage) {
+        match serde_json::to_vec(msg) {
+            Ok(data) => {
+                if let Err(e) = self.sender.broadcast(Bytes::from(data)).await {
+                    tracing::error!("🔴 [TOPIC] swarm message broadcast failed: {}", e);
+                }
+            }
+            Err(e) => tracing::error!("🔴 [TOPIC] swarm message serialize failed: {}", e),
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -721,18 +1163,55 @@ impl TopicActor {
                     Err(e) => eprintln!("💾 [PERSIST] 🔴 File insert FAILED: {}", e),
                 }
             }
-            NetworkEvent::ChatSent { id, workspace_id, message, author, parent_id, timestamp } => {
+            NetworkEvent::ChatSent { id, board_id, workspace_id, message, author, parent_id, timestamp } => {
                 eprintln!("💾 [PERSIST] ChatSent:");
                 eprintln!("   chat_id: {}...", &id[..16.min(id.len())]);
-                eprintln!("   workspace_id: {}...", &workspace_id[..16.min(workspace_id.len())]);
+                eprintln!("   board_id: {}...", &board_id[..16.min(board_id.len())]);
                 eprintln!("   author: {}...", &author[..16.min(author.len())]);
-                match storage::chat_insert(id, workspace_id, message, author, parent_id.as_deref(), *timestamp) {
+                // R11 §1: chat is board-scoped. If a pre-R11 peer omits board_id, fall back to
+                // the message's workspace so the row is never dropped.
+                let board_key = if board_id.is_empty() { workspace_id.as_str() } else { board_id.as_str() };
+                match storage::chat_insert(id, board_key, workspace_id, message, author, parent_id.as_deref(), *timestamp) {
                     Ok(_) => eprintln!("💾 [PERSIST] ✓ Chat inserted to DB"),
                     Err(e) => eprintln!("💾 [PERSIST] 🔴 Chat insert FAILED: {}", e),
                 }
             }
             NetworkEvent::ChatDeleted { id } => {
                 let _ = storage::chat_delete(id);
+            }
+            // ROUND8 §W2 notes — apply via idempotent LWW upsert-by-id; Added/Updated
+            // are handled identically (the split is informational for the UI).
+            NetworkEvent::NoteAdded {
+                id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at,
+            }
+            | NetworkEvent::NoteUpdated {
+                id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at,
+            } => {
+                let note = crate::models::dto::NoteDTO {
+                    id: id.clone(),
+                    board_id: board_id.clone(),
+                    tenant_id: tenant_id.clone(),
+                    author_id: author_id.clone(),
+                    author_name: author_name.clone(),
+                    text: text.clone(),
+                    created_at: *created_at,
+                    updated_at: *updated_at,
+                };
+                let _ = storage::note_upsert(&note);
+            }
+            NetworkEvent::NoteDeleted { id } => {
+                let _ = storage::note_delete(id);
+            }
+            // ROUND8 §W4 pin — apply via idempotent LWW upsert-by-board_id, so a stale
+            // PinSet is dropped and the latest pinned state wins.
+            NetworkEvent::PinSet { board_id, tenant_id, pinned, updated_at } => {
+                let pin = crate::models::dto::PinDTO {
+                    board_id: board_id.clone(),
+                    tenant_id: tenant_id.clone(),
+                    pinned: *pinned,
+                    updated_at: *updated_at,
+                };
+                let _ = storage::pin_upsert(&pin);
             }
             NetworkEvent::WhiteboardElementAdded {
                 id, board_id, element_type, x, y, width, height, z_index,
@@ -810,8 +1289,75 @@ impl TopicActor {
             NetworkEvent::ProfileUpdated { node_id, display_name, avatar_hash } => {
                 let _ = storage::profile_upsert(node_id, display_name, avatar_hash.as_deref());
             }
+            // R10FB §B3: pin sync — apply the synced board pinned flag (upsert, LWW by
+            // arrival; the single-FIFO persist worker preserves per-board order).
+            NetworkEvent::BoardPinned { board_id, is_pinned, updated_at } => {
+                // R11 §9b: per-board convergent LWW — a stale pin never clobbers a newer one.
+                let _ = storage::board_meta_set_pinned(board_id, *is_pinned, *updated_at);
+            }
+            // R10FB §F4: file delete — apply the tombstone so the deletion converges.
+            NetworkEvent::FileDeleted { id, deleted_at } => {
+                let _ = storage::file_soft_delete(id, *deleted_at);
+            }
+            // R10FB §L: BoardChanged is a transient activity signal — no storage write; the
+            // persist worker still forwards it as SwiftEvent::Network so the peer's preview
+            // refreshes and the activity marker updates.
+            NetworkEvent::BoardChanged { .. } => {}
             _ => {}
         }
+    }
+
+    /// R11 §2/§3 — **board-level** unread accounting for an inbound gossip event, run by the
+    /// persist worker. An incoming chat from a **non-author** reader counts once, ever
+    /// (idempotent by message_id; gossip echoes and re-syncs never re-increment). Opening a
+    /// chat is a read, never this write, so it cannot inflate the count. Chat is board-scoped
+    /// (R11 §1), so the unread dot/count lives on the **board only** — no workspace/group
+    /// rollup (that doubling was the bug). Returns `UnreadChanged` (the fresh counts map) only
+    /// on a real first-time increment.
+    fn account_unread(evt: &NetworkEvent, local_node_id: &str) -> Option<SwiftEvent> {
+        let NetworkEvent::ChatSent { id, board_id, workspace_id, author, timestamp, .. } = evt else {
+            return None;
+        };
+        if author == local_node_id {
+            return None; // our own message is never unread for us
+        }
+        // Board is the scope. A pre-R11 peer may omit board_id; fall back to the workspace so
+        // the message still counts somewhere (it re-keys on the next snapshot/migration).
+        let board_key = if board_id.is_empty() { workspace_id.as_str() } else { board_id.as_str() };
+        let newly = storage::unread_record(id, "chat", board_key, *timestamp).unwrap_or(false);
+        if !newly {
+            return None;
+        }
+        storage::unread_counts()
+            .ok()
+            .map(|counts| SwiftEvent::UnreadChanged { counts })
+    }
+
+    /// R12 B1 — translate an inbound `FileAvailable` into a distinct board-scoped
+    /// `FileReceived` (a "file received" notification), the file analog of an inbound chat.
+    /// Returns `None` for non-file events and for our OWN share echoing back (`source_peer`
+    /// is this device) — only a peer's file raises the notification.
+    fn file_received_event(evt: &NetworkEvent, local_node_id: &str) -> Option<SwiftEvent> {
+        let NetworkEvent::FileAvailable {
+            id, group_id, workspace_id, board_id, name, hash, size, source_peer, created_at,
+        } = evt
+        else {
+            return None;
+        };
+        if source_peer == local_node_id {
+            return None; // our own shared file never notifies us
+        }
+        Some(SwiftEvent::FileReceived {
+            id: id.clone(),
+            board_id: board_id.clone().unwrap_or_default(),
+            workspace_id: workspace_id.clone().unwrap_or_default(),
+            group_id: group_id.clone().unwrap_or_default(),
+            name: name.clone(),
+            hash: hash.clone(),
+            size: *size,
+            source_peer: source_peer.clone(),
+            created_at: *created_at,
+        })
     }
 }
 
@@ -819,13 +1365,59 @@ impl TopicActor {
 // FILE DOWNLOAD CLIENT
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Content-addressed swarm download (G10): fetch the blob multi-source from `holders` (churn/resume +
+/// Blake3 verify inside `BlobSwarm::fetch`), land it on disk under the downloads dir, record its
+/// `local_path`, and emit `FileDownloaded` — reusing the same storage rows and event as the direct
+/// path so the iOS app sees a plugin land exactly like any other file (no new client FFI).
+async fn swarm_download_file(
+    swarm: &Arc<BlobSwarm>,
+    file_id: &str,
+    hash: &str,
+    holders: &[String],
+    event_tx: UnboundedSender<SwiftEvent>,
+) -> Result<()> {
+    let parsed = Hash::from_str(hash).map_err(|e| anyhow!("bad blob hash {}: {}", hash, e))?;
+
+    let bytes = swarm.fetch(&parsed, holders).await?; // Blake3-verified on completion
+
+    // File name from the existing file row (registered via FileAvailable); fall back to the id.
+    let file_name = storage::file_get_for_transfer(file_id, hash)
+        .map(|(name, _, _)| name)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| file_id.to_string());
+
+    let data_dir = crate::DATA_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let downloads_dir = data_dir.join("downloads");
+    tokio::fs::create_dir_all(&downloads_dir).await?;
+    let final_path = downloads_dir.join(&file_name);
+    tokio::fs::write(&final_path, &bytes).await?;
+
+    let _ = storage::file_set_local_path(file_id, &final_path.to_string_lossy());
+    let _ = storage::transfer_set_status(file_id, "complete");
+
+    tracing::info!(
+        "✅ [FILE] Swarm download complete: {} ({} bytes from {} holders)",
+        file_name,
+        bytes.len(),
+        holders.len()
+    );
+    let _ = event_tx.send(SwiftEvent::FileDownloaded {
+        file_id: file_id.to_string(),
+        local_path: final_path.to_string_lossy().to_string(),
+    });
+    Ok(())
+}
+
 async fn download_file(
     endpoint: Endpoint,
     file_id: &str,
     hash: &str,
     source_peer: &str,
     resume_offset: u64,
-    group_id: &str,
+    _group_id: &str,
     event_tx: UnboundedSender<SwiftEvent>,
 ) -> Result<()> {
     let pk = PublicKey::from_str(source_peer)?;
@@ -992,13 +1584,41 @@ async fn download_file(
 // SNAPSHOT DOWNLOAD
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Download a snapshot from a peer
+/// Download a snapshot from a peer.
+///
+/// `quiet` distinguishes the two callers that share this one transfer path:
+/// - `false` — join-time snapshot: emit the user-facing `Sync*`/`StatusUpdate` events the iOS app
+///   drives its onboarding UI from (unchanged behavior).
+/// - `true`  — anti-entropy repair: silently merge the holder's state into ours (idempotent
+///   upsert-by-id) WITHOUT re-emitting those events, since this is a background reconciliation, not
+///   a join. The storage writes — the actual repair — happen in both modes.
 async fn download_snapshot(
     endpoint: Endpoint,
     source_peer: &str,
     group_id: &str,
+    grant: Option<&str>,
     event_tx: UnboundedSender<SwiftEvent>,
+    quiet: bool,
 ) -> Result<()> {
+    download_snapshot_since(endpoint, source_peer, group_id, grant, None, event_tx, quiet).await
+}
+
+/// MESH_HARDENING §5 incremental catch-up: like [`download_snapshot`] but requests only the
+/// rows newer than `since` (the requester's high-water mark). `since=None` is the full pull
+/// (the existing behavior `download_snapshot` forwards to). The apply is the SAME idempotent
+/// upsert-by-id path either way (via `snapshot::apply_snapshot_frame`), so a delta merge and a
+/// full snapshot converge to the identical state.
+#[allow(clippy::too_many_arguments)]
+async fn download_snapshot_since(
+    endpoint: Endpoint,
+    source_peer: &str,
+    group_id: &str,
+    grant: Option<&str>,
+    since: Option<i64>,
+    event_tx: UnboundedSender<SwiftEvent>,
+    quiet: bool,
+) -> Result<()> {
+    use crate::models::protocol::SnapshotRequest;
     use tokio::io::AsyncWriteExt;
 
     eprintln!("═══════════════════════════════════════════════════════════════════");
@@ -1008,9 +1628,11 @@ async fn download_snapshot(
     eprintln!("═══════════════════════════════════════════════════════════════════");
 
     // Emit status update
-    let _ = event_tx.send(SwiftEvent::StatusUpdate {
-        message: "Connecting to peer for sync...".to_string(),
-    });
+    if !quiet {
+        let _ = event_tx.send(SwiftEvent::StatusUpdate {
+            message: "Connecting to peer for sync...".to_string(),
+        });
+    }
 
     // Parse peer public key
     let pk = PublicKey::from_str(source_peer)
@@ -1032,18 +1654,27 @@ async fn download_snapshot(
 
     eprintln!("📥 [SNAP-DL-4] Sending group_id request...");
 
-    // Send group_id request
-    let group_id_bytes = group_id.as_bytes();
-    let len = (group_id_bytes.len() as u32).to_be_bytes();
+    // Send the request frame: JSON {group_id, grant?}. The holder verifies the grant before
+    // serving an enforced group; un-enforced groups ignore it (the holder also accepts a bare
+    // legacy group_id payload, so this stays interoperable).
+    let request = SnapshotRequest {
+        group_id: group_id.to_string(),
+        grant: grant.map(|g| g.to_string()),
+        since,
+    };
+    let req_bytes = serde_json::to_vec(&request)?;
+    let len = (req_bytes.len() as u32).to_be_bytes();
     send.write_all(&len).await?;
-    send.write_all(group_id_bytes).await?;
+    send.write_all(&req_bytes).await?;
     send.flush().await?;
 
     eprintln!("📥 [SNAP-DL-5] ✓ Request sent. Waiting for snapshot frames...");
 
-    let _ = event_tx.send(SwiftEvent::StatusUpdate {
-        message: "Receiving snapshot data...".to_string(),
-    });
+    if !quiet {
+        let _ = event_tx.send(SwiftEvent::StatusUpdate {
+            message: "Receiving snapshot data...".to_string(),
+        });
+    }
 
     // Receive frames until Complete
     let mut frame_count = 0;
@@ -1078,144 +1709,52 @@ async fn download_snapshot(
         let frame: SnapshotFrame = serde_json::from_slice(&frame_data)
             .map_err(|e| anyhow!("Failed to parse snapshot frame: {}", e))?;
 
+        // Apply the frame's rows via the SHARED idempotent upsert path (MESH_HARDENING §5),
+        // the same one the §11 bundle import uses — so a full snapshot, an incremental delta,
+        // and an air-gapped import all converge to the identical state. Then emit the per-node
+        // `Sync*` progress events (the substrate oracle) for the rows this frame carried.
+        if let Err(e) = crate::snapshot::apply_snapshot_frame(&frame) {
+            eprintln!("   ⚠️ Snapshot frame apply: {}", e);
+        }
+
         match frame {
             SnapshotFrame::Structure { group, workspaces, boards } => {
-                eprintln!("📥 [SNAP-DL-7] STRUCTURE frame received:");
-                eprintln!("   group: {} ({})", group.name, &group.id[..16.min(group.id.len())]);
-                eprintln!("   workspaces: {}", workspaces.len());
-                eprintln!("   boards: {}", boards.len());
-
-                // Emit sync started
-                let _ = event_tx.send(SwiftEvent::SyncStarted {
-                    group_id: group.id.clone(),
-                    group_name: group.name.clone(),
-                });
-
-                // Insert structure into DB
-                eprintln!("📥 [SNAP-DL-7a] Inserting structure into DB...");
-
-                // Insert/update group
-                if let Err(e) = storage::group_insert_simple(&group.id, &group.name, &group.icon, &group.color) {
-                    eprintln!("   ⚠️ Group insert: {}", e);
-                }
-
-                // Insert workspaces
-                for w in &workspaces {
-                    if let Err(e) = storage::workspace_insert_simple(&w.id, &w.group_id, &w.name) {
-                        eprintln!("   ⚠️ Workspace insert: {}", e);
-                    }
-                }
-
-                // Insert boards
-                for b in &boards {
-                    if let Err(e) = storage::board_insert_simple(&b.id, &b.workspace_id, &b.name, b.created_at) {
-                        eprintln!("   ⚠️ Board insert: {}", e);
-                    }
-                }
-
-                eprintln!("📥 [SNAP-DL-7b] ✓ Structure inserted");
+                eprintln!(
+                    "📥 [SNAP-DL-7] STRUCTURE: group {} ws={} boards={}",
+                    &group.id[..16.min(group.id.len())], workspaces.len(), boards.len()
+                );
                 structure_received = true;
-
-                // Emit structure received
-                let _ = event_tx.send(SwiftEvent::SyncStructureReceived {
-                    group_id: group_id.to_string(),
-                    workspace_count: workspaces.len() as u32,
-                    board_count: boards.len() as u32,
-                });
+                if !quiet {
+                    let _ = event_tx.send(SwiftEvent::SyncStarted {
+                        group_id: group.id.clone(),
+                        group_name: group.name.clone(),
+                    });
+                    let _ = event_tx.send(SwiftEvent::SyncStructureReceived {
+                        group_id: group_id.to_string(),
+                        workspace_count: workspaces.len() as u32,
+                        board_count: boards.len() as u32,
+                    });
+                }
             }
 
             SnapshotFrame::Content { elements, cells } => {
-                eprintln!("📥 [SNAP-DL-8] CONTENT frame received:");
-                eprintln!("   elements: {}", elements.len());
-                eprintln!("   cells: {}", cells.len());
-
-                // Insert elements
-                for elem in &elements {
-                    if let Err(e) = storage::element_insert_simple(
-                        &elem.id, &elem.board_id, &elem.element_type,
-                        elem.x, elem.y, elem.width, elem.height, elem.z_index,
-                        elem.style_json.as_deref(), elem.content_json.as_deref(),
-                        elem.created_at, elem.updated_at,
-                    ) {
-                        eprintln!("   ⚠️ Element insert: {}", e);
-                    }
+                eprintln!("📥 [SNAP-DL-8] CONTENT: elements={} cells={}", elements.len(), cells.len());
+                if !quiet {
+                    let _ = event_tx.send(SwiftEvent::SyncBoardReady {
+                        board_id: "all".to_string(),
+                        element_count: elements.len() as u32,
+                        cell_count: cells.len() as u32,
+                    });
                 }
-
-                // Insert cells
-                for cell in &cells {
-                    if let Err(e) = storage::cell_insert_simple(
-                        &cell.id, &cell.board_id, &cell.cell_type, cell.cell_order,
-                        cell.content.as_deref(), cell.output.as_deref(), cell.collapsed,
-                        cell.height, cell.metadata_json.as_deref(),
-                        cell.created_at, cell.updated_at,
-                    ) {
-                        eprintln!("   ⚠️ Cell insert: {}", e);
-                    }
-                }
-
-                eprintln!("📥 [SNAP-DL-8a] ✓ Content inserted");
-
-                // Emit board ready
-                let _ = event_tx.send(SwiftEvent::SyncBoardReady {
-                    board_id: "all".to_string(),
-                    element_count: elements.len() as u32,
-                    cell_count: cells.len() as u32,
-                });
             }
 
-            SnapshotFrame::Metadata { chats, files, integrations, board_metadata } => {
-                eprintln!("📥 [SNAP-DL-9] METADATA frame received:");
-                eprintln!("   chats: {}", chats.len());
-                eprintln!("   files: {}", files.len());
-                eprintln!("   integrations: {}", integrations.len());
-                eprintln!("   board_metadata: {}", board_metadata.len());
-
-                // Insert chats
-                for chat in &chats {
-                    if let Err(e) = storage::chat_insert_simple(
-                        &chat.id, &chat.workspace_id, &chat.message,
-                        &chat.author, chat.parent_id.as_deref(), chat.timestamp,
-                    ) {
-                        eprintln!("   ⚠️ Chat insert: {}", e);
-                    }
-                }
-
-                // Insert files (metadata only)
-                for file in &files {
-                    if let Err(e) = storage::file_insert_simple(
-                        &file.id, file.group_id.as_deref(), file.workspace_id.as_deref(),
-                        file.board_id.as_deref(), &file.name, &file.hash, file.size,
-                        file.source_peer.as_deref(), file.created_at,
-                    ) {
-                        eprintln!("   ⚠️ File insert: {}", e);
-                    }
-                }
-
-                // Insert integrations
-                for integ in &integrations {
-                    if let Err(e) = storage::integration_insert(
-                        &integ.id, &integ.scope_type, &integ.scope_id, &integ.integration_type,
-                        &integ.config, integ.created_at,
-                    ) {
-                        eprintln!("   ⚠️ Integration insert: {}", e);
-                    }
-                }
-
-                // Insert board metadata
-                for meta in &board_metadata {
-                    if let Err(e) = storage::board_metadata_upsert(
-                        &meta.board_id, &meta.labels, meta.rating, meta.view_count,
-                        meta.contains_model.as_deref(), &meta.contains_skills,
-                        Some(&meta.board_type), meta.last_accessed, meta.is_pinned,
-                    ) {
-                        eprintln!("   ⚠️ Board metadata insert: {}", e);
-                    }
-                }
-
-                eprintln!("📥 [SNAP-DL-9a] ✓ Metadata inserted");
-
-                // Emit files received
-                if !files.is_empty() {
+            SnapshotFrame::Metadata { chats, files, integrations, board_metadata, notes, pins, workflow_states } => {
+                eprintln!(
+                    "📥 [SNAP-DL-9] METADATA: chats={} files={} integ={} meta={} notes={} pins={} wf={}",
+                    chats.len(), files.len(), integrations.len(),
+                    board_metadata.len(), notes.len(), pins.len(), workflow_states.len()
+                );
+                if !files.is_empty() && !quiet {
                     let _ = event_tx.send(SwiftEvent::SyncFilesReceived {
                         group_id: group_id.to_string(),
                         file_count: files.len() as u32,
@@ -1229,13 +1768,15 @@ async fn download_snapshot(
                 eprintln!("═══════════════════════════════════════════════════════════════════");
 
                 // Emit sync complete (caller will notify NetworkActor)
-                let _ = event_tx.send(SwiftEvent::SyncComplete {
-                    group_id: group_id.to_string(),
-                });
+                if !quiet {
+                    let _ = event_tx.send(SwiftEvent::SyncComplete {
+                        group_id: group_id.to_string(),
+                    });
 
-                let _ = event_tx.send(SwiftEvent::StatusUpdate {
-                    message: "Sync complete!".to_string(),
-                });
+                    let _ = event_tx.send(SwiftEvent::StatusUpdate {
+                        message: "Sync complete!".to_string(),
+                    });
+                }
 
                 break;
             }

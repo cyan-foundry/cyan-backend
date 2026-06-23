@@ -13,6 +13,8 @@
 //   Machine B: ./target/release/network_test join <NODE_ID>
 //   Local:     ./target/release/network_test local (both in same process)
 
+#![allow(clippy::unwrap_used, unused_variables)] // dual-built as the `network_test` [[bin]] where allow-unwrap-in-tests doesn't apply; test code, unwrap == assertion.
+
 use anyhow::Result;
 use iroh::{PublicKey, SecretKey};
 use rand_chacha::rand_core::SeedableRng;
@@ -31,9 +33,11 @@ use tokio::sync::mpsc;
 
 use cyan_backend::{
     actors::NetworkActor,
+    bootstrap_node_id,
     models::{
         commands::NetworkCommand,
         events::SwiftEvent,
+        node_config::{DiscoveryPolicy, NodeConfig, RelayPolicy},
     },
     storage, DISCOVERY_KEY, RELAY_URL,
 };
@@ -240,7 +244,12 @@ async fn run_host() -> Result<()> {
 
     // Create and start NetworkActor
     println!("🚀 Starting NetworkActor...");
-    let actor = NetworkActor::new(secret_key, event_tx, peers_per_group).await?;
+    let node_cfg = NodeConfig {
+        relay: RelayPolicy::Url(RELAY_URL_CONST.to_string()),
+        discovery: DiscoveryPolicy::Bootstrap(bootstrap_node_id().to_string()),
+        discovery_key: DISCOVERY_KEY_CONST.to_string(),
+    };
+    let actor = NetworkActor::new(secret_key, event_tx, peers_per_group, node_cfg).await?;
 
     // Spawn actor in background
     tokio::spawn(async move {
@@ -341,7 +350,12 @@ async fn run_join() -> Result<()> {
     //   2. Load TEST_GROUP_ID from DB → spawn TopicActor
     //   3. DiscoveryActor broadcasts GroupsExchange with our groups
     println!("🚀 Starting NetworkActor...");
-    let actor = NetworkActor::new(secret_key, event_tx, peers_per_group).await?;
+    let node_cfg = NodeConfig {
+        relay: RelayPolicy::Url(RELAY_URL_CONST.to_string()),
+        discovery: DiscoveryPolicy::Bootstrap(bootstrap_node_id().to_string()),
+        discovery_key: DISCOVERY_KEY_CONST.to_string(),
+    };
+    let actor = NetworkActor::new(secret_key, event_tx, peers_per_group, node_cfg).await?;
 
     tokio::spawn(async move {
         actor.start(cmd_rx).await;
@@ -371,6 +385,7 @@ async fn run_join() -> Result<()> {
     cmd_tx.send(NetworkCommand::JoinGroup {
         group_id: TEST_GROUP_ID.to_string(),
         bootstrap_peer: None,  // Rely on discovery!
+        grant: None,
     })?;
 
     // Wait for SyncComplete event
@@ -506,6 +521,7 @@ fn create_test_data() -> Result<()> {
     for i in 0..3 {
         storage::chat_insert_simple(
             &format!("chat-{:03}", i),
+            TEST_BOARD_ID,
             TEST_WORKSPACE_ID,
             &format!("Test message {}", i),
             "test-author",

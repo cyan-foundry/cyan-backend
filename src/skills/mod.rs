@@ -19,7 +19,6 @@ pub mod ad_splice;
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::collections::HashMap;
 
 // ============================================================================
@@ -168,6 +167,12 @@ impl InferenceStatus {
 
 pub struct SkillRegistry {
     skills: HashMap<String, SkillDef>,
+}
+
+impl Default for SkillRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SkillRegistry {

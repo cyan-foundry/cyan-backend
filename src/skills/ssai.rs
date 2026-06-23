@@ -275,11 +275,10 @@ Respond as a compliance matrix."#,
 // ============================================================================
 
 fn extract_duration(probe_json: &str) -> f64 {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(probe_json) {
-        if let Some(dur) = v["format"]["duration"].as_str() {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(probe_json)
+        && let Some(dur) = v["format"]["duration"].as_str() {
             return dur.parse::<f64>().unwrap_or(600.0);
         }
-    }
     600.0 // default 10 min
 }
 

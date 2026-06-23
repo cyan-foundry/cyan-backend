@@ -285,7 +285,7 @@ pub fn get_ai_flags_near_timecode(
         .filter(|n| {
             n.ai_reviewed
                 && (n.timecode_seconds - timecode).abs() <= window_seconds
-                && step_id.map_or(true, |s| n.pipeline_step_id.as_deref() == Some(s))
+                && step_id.is_none_or(|s| n.pipeline_step_id.as_deref() == Some(s))
         })
         .map(|n| AiFlag {
             timecode_seconds: n.timecode_seconds,
@@ -392,7 +392,7 @@ pub fn export_notes_markdown(board_id: &str) -> Result<String> {
                 } else {
                     md.push_str(&format!("> 🤖 {}\n", &result[..result.len().min(200)]));
                 }
-                md.push_str("\n");
+                md.push('\n');
             }
             
             // Show thread replies
@@ -402,16 +402,14 @@ pub fn export_notes_markdown(board_id: &str) -> Result<String> {
             
             for reply in thread_replies {
                 md.push_str(&format!("> **{}**: {}\n", reply.author, reply.content));
-                if let Some(ref result) = reply.action_result {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(result) {
-                        if let Some(analysis) = json.get("analysis").and_then(|v| v.as_str()) {
+                if let Some(ref result) = reply.action_result
+                    && let Ok(json) = serde_json::from_str::<serde_json::Value>(result)
+                        && let Some(analysis) = json.get("analysis").and_then(|v| v.as_str()) {
                             md.push_str(&format!("> > 🤖 {}\n", analysis));
                         }
-                    }
-                }
             }
             
-            md.push_str("\n");
+            md.push('\n');
         }
     }
     

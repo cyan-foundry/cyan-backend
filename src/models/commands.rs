@@ -1,3 +1,4 @@
+use crate::actors::DmAttachment;
 use crate::models::events::NetworkEvent;
 use serde::{Deserialize, Serialize};
 
@@ -10,10 +11,44 @@ pub enum NetworkCommand {
     JoinGroup {
         group_id: String,
         bootstrap_peer: Option<String>,  // Node ID of peer to bootstrap from (e.g., inviter)
+        /// Signed capability-grant QR payload the joiner scanned to authorize this join
+        /// (see `identity::Grant::to_qr_payload`). Additive and optional: absent ⇒ identical
+        /// to the original join behavior. When the snapshot holder enforces the group, this
+        /// grant is what unlocks the per-group snapshot; an enforced group with no grant is
+        /// refused. Un-enforced groups ignore it (fail-open), so the FFI stays drop-in.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant: Option<String>,
     },
     Broadcast {
         group_id: String,
         event: NetworkEvent,
+    },
+    /// Seed a resolvable peer into ONE group's gossip topic (MESH_HARDENING §2). `addr_json` is a
+    /// serialized `iroh::EndpointAddr` (the full NodeAddr, not just a pubkey). The engine makes it
+    /// resolvable (`add_endpoint_info`), persists it for rejoin re-seeding, and routes the peer into
+    /// the group topic so `NeighborUp` fires. The ONE pipeline behind every seed source (QR/inviter,
+    /// persisted known-peers, bootstrap/Lens addr). Additive; absent sources simply don't send it.
+    SeedGroupPeer {
+        group_id: String,
+        addr_json: String,
+    },
+    /// Seed a resolvable peer into EVERY currently-joined group (MESH_HARDENING §2.1). Emitted by the
+    /// mDNS discovery task: a LAN-discovered peer's group membership isn't known yet, so it is offered
+    /// to all topics (gossip only forms a neighbor for genuinely shared topics). `addr_json` is a
+    /// serialized `iroh::EndpointAddr`. This is what makes single-laptop / same-WiFi mesh with no infra.
+    SeedDiscoveredPeer {
+        addr_json: String,
+    },
+    /// MESH_HARDENING §5 incremental catch-up: pull ONLY the missing range for `group_id` from
+    /// `source_peer` (a snapshot holder), starting at `since` (the requester's high-water mark;
+    /// `None` ⇒ a full snapshot fallback). Drives the bounded `download_snapshot_since` path —
+    /// used by a peer returning after offline/partition to reconcile without a full re-snapshot,
+    /// and by the §11 import path on first online contact. Additive; the live-join path is untouched.
+    CatchUp {
+        group_id: String,
+        source_peer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<i64>,
     },
     UploadToGroup {
         group_id: String,
@@ -41,12 +76,19 @@ pub enum NetworkCommand {
         peer_id: String,
         workspace_id: String,
     },
-    /// Send a message on an existing direct chat stream
+    /// Send a message on an existing direct chat stream.
+    ///
+    /// `attachment` is **optional and additive**: when present the message carries a file
+    /// reference (id + name + blake3 hash + size) and the receiver fetches that file into the
+    /// message's scope. Absent (the default) ⇒ identical to the original chat-send behavior, so
+    /// the FFI/wire stays drop-in for callers that don't set it.
     SendDirectChat {
         peer_id: String,
         workspace_id: String,
         message: String,
         parent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachment: Option<DmAttachment>,
     },
     /// Request file download from peer (with resume support)
     RequestFileDownload {
@@ -57,6 +99,17 @@ pub enum NetworkCommand {
     },
     /// Resume all pending file transfers
     ResumePendingTransfers,
+    /// Announce over a group's gossip that this node holds the content-addressed blob `hash`
+    /// (G10 swarm i-have). Engine-internal; not surfaced as a new client `cyan_*` FFI.
+    SwarmAnnounce { group_id: String, hash: String },
+    /// Ask a group (over gossip) which peers hold the content-addressed blob `hash`
+    /// (G10 swarm who-has). Engine-internal; not surfaced as a new client `cyan_*` FFI.
+    SwarmWhoHas { group_id: String, hash: String },
+    /// Seed a content-addressed blob into this node's swarm store from `path`, then announce it
+    /// (`IHave`) to `group_id` so members can swarm-fetch it. The engine's plugin-distribution hook:
+    /// a `.cyanplugin` upload sends this so the file distributes peer-to-peer (G10). Engine-internal —
+    /// emitted by the existing `cyan_upload_file` FFI, NOT a new client `cyan_*` function.
+    SeedAndAnnounceBlob { group_id: String, hash: String, path: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,16 +179,53 @@ pub enum CommandMsg {
     // ═══════════════════════════════════════════════════════════════════════
     // CHAT COMMANDS
     // ═══════════════════════════════════════════════════════════════════════
+    /// Send a chat to a **board** (R11 §1 — chat is board-scoped). The engine derives the
+    /// board's workspace + group for storage scoping and group gossip.
     SendChat {
-        workspace_id: String,
+        board_id: String,
         message: String,
         parent_id: Option<String>,
     },
     DeleteChat {
         id: String,
     },
+    /// Load a **board's** chat history (R11 §1).
     LoadChatHistory {
-        workspace_id: String,
+        board_id: String,
+    },
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // NOTE COMMANDS (ROUND8 §W2 — board-level, authored, LWW ledger)
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Author or edit a note. `note_id = None` creates a new note (id generated);
+    /// `Some(id)` edits that note (LWW bump of `updated_at`). `tenant_id = None`
+    /// derives the tenant from the board's group.
+    PutNote {
+        board_id: String,
+        note_id: Option<String>,
+        tenant_id: Option<String>,
+        text: String,
+    },
+    DeleteNote {
+        id: String,
+    },
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // TEMPLATE + PIN COMMANDS (ROUND8 §W4)
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Clone a template into a board as real W1 step cells, broadcasting each new
+    /// cell so peers converge. `tenant_id = None` derives the tenant from the board's
+    /// group.
+    WorkflowFromTemplate {
+        template_id: String,
+        board_id: String,
+        tenant_id: Option<String>,
+    },
+    /// Set a board's pinned-workflow state. Replicated (LWW on `updated_at`); the
+    /// tenant is derived from the board's group.
+    SetPin {
+        board_id: String,
+        pinned: bool,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -238,6 +328,20 @@ pub enum CommandMsg {
     SetBoardPinned {
         board_id: String,
         is_pinned: bool,
+    },
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // NOTIFICATION / FILE COMMANDS (R10FB §N / §F)
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Mark a scope (board / workspace / group id) read: clears its unread items and the
+    /// rollups, then emits `UnreadChanged` so badges update live (R10FB §N).
+    MarkRead {
+        scope_id: String,
+    },
+    /// User-initiated file delete: soft-delete/tombstone locally and gossip `FileDeleted`
+    /// so the deletion converges to peers (R10FB §F4).
+    DeleteFile {
+        file_id: String,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

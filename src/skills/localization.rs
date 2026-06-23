@@ -14,6 +14,8 @@
 //   - Check if ads have audio tracks, add anullsrc if missing
 //   - Adjust all timecodes after ad insertion by cumulative ad duration
 
+#![allow(dead_code)] // Skills scaffolding moving to the MCP/workflow model; see CLAUDE.md 'Out of scope'.
+
 use anyhow::{anyhow, Result};
 use serde_json::json;
 use crate::skills::{SkillExecutor, SkillDef, SkillContext, SkillResult, OutputType, Finding, InferenceStatus};
@@ -628,7 +630,7 @@ Respond ONLY as JSON, no markdown:
             // Check if this word is already in LLM findings (avoid duplicates)
             let already_found = findings.iter().any(|f| {
                 (f.timecode_seconds - start).abs() < 2.0 && 
-                f.content.to_lowercase().contains(&word.to_lowercase().trim_matches(|c: char| !c.is_alphanumeric()))
+                f.content.to_lowercase().contains(word.to_lowercase().trim_matches(|c: char| !c.is_alphanumeric()))
             });
 
             if !already_found {
