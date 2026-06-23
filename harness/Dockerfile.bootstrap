@@ -1,0 +1,39 @@
+# xaeroflux BOOTSTRAP image for the Docker rig — the discovery-rendezvous node.
+#
+# Builds the REAL `xaeroflux_bootstrap` binary (xaeroflux/src/bin/xaeroflux_bootstrap.rs) for
+# Linux from an ASSEMBLED context (scripts/assemble-bootstrap-context.sh copies just the crate's
+# build inputs — xaeroflux is self-contained, no sibling path-deps). xaeroflux is NEVER modified.
+#
+# At run time the bootstrap:
+#   - joins the iroh-gossip discovery mesh on DISCOVERY_KEY and acts as the cross-network
+#     gossip relay / peer-introducer (the role two isolated cyan_node peers need to find each
+#     other), and
+#   - SELF-PUBLISHES a signed rendezvous config (its own node_id + bound addrs + discovery_key +
+#     relay) to RENDEZVOUS_PATH — the file the rig serves at a well-known URL and the peers fetch.
+#
+# iroh 0.95 (matches cyan_node). rusqlite is `bundled`, so it compiles its own SQLite (needs cc);
+# iggy is pure-Rust and is disabled at run time (IGGY_ENABLED=0) so no broker is required.
+FROM rust:1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      cmake clang libclang-dev pkg-config libssl-dev build-essential \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY xaeroflux/ /src/xaeroflux/
+WORKDIR /src/xaeroflux
+RUN cargo build --release --bin xaeroflux_bootstrap \
+    && cp target/release/xaeroflux_bootstrap /usr/local/bin/xaeroflux_bootstrap
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates netcat-openbsd iproute2 curl && rm -rf /var/lib/apt/lists/*
+COPY --from=build /usr/local/bin/xaeroflux_bootstrap /usr/local/bin/xaeroflux_bootstrap
+RUN mkdir -p /opt/cyan/data
+# Sensible rig defaults; the harness overrides via -e at `docker run`.
+ENV DISCOVERY_KEY=cyan-rig \
+    DB_PATH=/opt/cyan/data/bootstrap.db \
+    RENDEZVOUS_PATH=/opt/cyan/data/rendezvous.json \
+    XAEROFLUX_ENV=rig \
+    IGGY_ENABLED=0 \
+    NO_N0=1 \
+    RUST_LOG=info
+ENTRYPOINT ["/usr/local/bin/xaeroflux_bootstrap"]

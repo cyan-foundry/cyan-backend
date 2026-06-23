@@ -27,6 +27,13 @@ build-node: ## assemble the minimal build context and build the cyan_node image
 	./scripts/assemble-context.sh
 	docker build -t $(NODE_IMG) -f Dockerfile.node .ctx
 
+BOOTSTRAP_IMG := cyan/bootstrap:rig
+export CYAN_BOOTSTRAP_IMAGE ?= $(BOOTSTRAP_IMG)
+
+build-bootstrap: ## assemble the context and build the REAL xaeroflux_bootstrap image
+	./scripts/assemble-bootstrap-context.sh
+	docker build -t $(BOOTSTRAP_IMG) -f Dockerfile.bootstrap .ctx-bootstrap
+
 # Each rung sets CYAN_RIG=1 and runs ONLY its named test(s) with --ignored --nocapture.
 # `cargo test` runs from the repo root so it picks up the workspace.
 RUN_RUNG = cd $(REPO_DIR) && CYAN_RIG=1 cargo test --test substrate_relay
@@ -76,11 +83,27 @@ mesh-e2e: up build-node ## §6/§10/§12 mesh e2e: all runnable scenarios (real 
 mesh-one: ## run ONE mesh scenario: make mesh-one T=all_infra_down_lan_sovereign_works
 	$(RUN_MESH) $(T) -- --ignored --nocapture --exact
 
-mesh-red: ## print the honest-red scenarios + why they need real infra (not faked)
-	@echo "bootstrap_seeded_cross_net_mesh — needs the xaeroflux bootstrap discovery container"
-	@echo "  (cross-net TRANSPORT is green via test-relay). xaeroflux is untouched by this batch."
+# ── Bootstrap cross-net discovery e2e (STATUS_BOOTSTRAP_DISCOVERY_E2E.md) ───────────────────────
+# A REAL xaeroflux_bootstrap container introduces two cyan_node peers on ISOLATED bridges (no
+# pre-shared peer addrs, mDNS not carried) → cross-net mesh; plus the §5 published-config rungs.
+# Each runs ONE AT A TIME (shared container names). Needs both the node + bootstrap images.
+BOOTSTRAP_SCENARIOS = \
+  bootstrap_seeded_cross_net_mesh \
+  discovery_via_published_config_forms_cross_net_mesh \
+  tampered_published_config_rejected_peer_uses_fallback \
+  bootstrap_redeploy_new_id_picked_up_no_app_change
+
+bootstrap-e2e: build-node build-bootstrap ## §5 cross-net discovery via the live xaeroflux bootstrap
+	@docker network create cyan-rig_mesh_a >/dev/null 2>&1 || true
+	@docker network create cyan-rig_mesh_b >/dev/null 2>&1 || true
+	@set -e; for t in $(BOOTSTRAP_SCENARIOS); do \
+	  echo "### $$t"; $(RUN_MESH) $$t -- --ignored --nocapture --exact; done; \
+	  echo "BOOTSTRAP DISCOVERY E2E DONE"
+
+mesh-red: ## print the remaining honest-red scenario + why it needs real infra (not faked)
 	@echo "offline_peer_message_held_by_superpeer_delivered_on_return — needs the headless-cyan"
 	@echo "  Lens super-peer binary (cyan-lens hold/redeliver logic is fakes-only). See STATUS."
+	@echo "(bootstrap_seeded_cross_net_mesh is now GREEN — see 'make bootstrap-e2e'.)"
 
 stress: ## run a stress scenario: make stress SCENARIO=swarm PEERS=6  (see ./stress.sh help)
 	./stress.sh $(SCENARIO) $(PEERS)
@@ -91,9 +114,10 @@ ps:    ; $(COMPOSE) ps
 down:  ## stop the relay
 	$(COMPOSE) down
 clean: down ## stop everything + remove networks/build context
-	-docker rm -f cyan-rig-peer-a cyan-rig-peer-b cyan-rig-superpeer >/dev/null 2>&1 || true
+	-docker rm -f cyan-rig-peer-a cyan-rig-peer-b cyan-rig-superpeer cyan-rig-bootstrap cyan-rig-config >/dev/null 2>&1 || true
 	$(COMPOSE) down -v --remove-orphans
-	-docker network rm cyan-rig_airgap >/dev/null 2>&1 || true
-	rm -rf .ctx .logs
-.PHONY: help relay-info up build-node test-lan test-relay test-ws test-offline test-all \
-        mesh-e2e mesh-one mesh-red stress logs ps down clean
+	-docker volume rm -f cyan-rig-rdv >/dev/null 2>&1 || true
+	-docker network rm cyan-rig_airgap cyan-rig_mesh_a cyan-rig_mesh_b >/dev/null 2>&1 || true
+	rm -rf .ctx .ctx-bootstrap .logs
+.PHONY: help relay-info up build-node build-bootstrap test-lan test-relay test-ws test-offline \
+        test-all mesh-e2e mesh-one mesh-red bootstrap-e2e stress logs ps down clean

@@ -24,6 +24,7 @@
 //! ## Control protocol (stdin → stdout, line oriented)
 //! Request (one per line)                 Response (`@@CYAN@@ ` prefixed)
 //! - `node_id`                            `@@CYAN@@ node_id <hex>`
+//! - `bootstrap_id`                        `@@CYAN@@ bootstrap_id <hex>`  (resolved bootstrap id)
 //! - `addr`                               `@@CYAN@@ addr <endpoint-addr-json>`
 //! - `add_peer <endpoint-addr-json>`      `@@CYAN@@ ok add_peer`
 //! - `seed_empty_group <gid>`             `@@CYAN@@ ok seed_empty_group`
@@ -132,13 +133,51 @@ async fn main() -> Result<()> {
     }
 
     let db_path = std::env::var("NODE_DB").context("NODE_DB env required")?;
-    let discovery_key = std::env::var("DISCOVERY_KEY").unwrap_or_else(|_| "cyan-test".to_string());
-    let relay = match std::env::var("RELAY").as_deref() {
-        Ok("disabled") | Err(_) => RelayPolicy::Disabled,
-        Ok(url) => RelayPolicy::Url(url.to_string()),
+
+    // §5 discoverable bootstrap config. An explicit `BOOTSTRAP_NODE_ID` env pins the global FIRST
+    // (`OnceCell::set` is first-wins) so the discovery topic AND every group topic agree on ONE
+    // live bootstrap — not the bundled hardcode (the bug that made cross-net meshes race-dependent).
+    if let Ok(id) = std::env::var("BOOTSTRAP_NODE_ID")
+        && !id.is_empty()
+    {
+        let _ = cyan_backend::BOOTSTRAP_NODE_ID.set(id);
+    }
+    // When `CYAN_RENDEZVOUS_URL` is set, fetch the org-signed (or self-signed bootstrap) rendezvous
+    // config, verify it against the pinned `CYAN_ORG_PUBKEY`, and adopt the LIVE bootstrap id /
+    // discovery_key / relay it carries — filling only what the env above didn't pin. This is the
+    // real discover→verify→pin path the iOS app uses. Untouched (no network) when no URL is set, so
+    // the offline / LAN / explicit-id paths behave exactly as before §5.
+    let rdv_source = if std::env::var("CYAN_RENDEZVOUS_URL").is_ok_and(|s| !s.is_empty()) {
+        Some(cyan_backend::rendezvous::fetch_and_apply_if_configured())
+    } else {
+        None
     };
-    let discovery = match std::env::var("BOOTSTRAP_NODE_ID") {
-        Ok(id) if !id.is_empty() => DiscoveryPolicy::Bootstrap(id),
+    eprintln!(
+        "🧭 [cyan_node] rendezvous source={:?} resolved bootstrap={}",
+        rdv_source,
+        cyan_backend::bootstrap_node_id()
+    );
+
+    // discovery_key: explicit env wins; else a config-resolved value; else the test default.
+    let discovery_key = std::env::var("DISCOVERY_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| cyan_backend::DISCOVERY_KEY.get().cloned())
+        .unwrap_or_else(|| "cyan-test".to_string());
+    // relay: explicit RELAY env wins; else a config-resolved RELAY_URL; else disabled.
+    let relay = match std::env::var("RELAY").as_deref() {
+        Ok("disabled") => RelayPolicy::Disabled,
+        Ok(url) => RelayPolicy::Url(url.to_string()),
+        Err(_) => match cyan_backend::RELAY_URL.get() {
+            Some(u) if !u.is_empty() => RelayPolicy::Url(u.clone()),
+            _ => RelayPolicy::Disabled,
+        },
+    };
+    // The resolved bootstrap id now drives discovery (whether it came from the env or the verified
+    // config); absent ⇒ MdnsOnly. `bootstrap_node_id()` returns the bundled fallback when nothing
+    // resolved, but we only switch to Bootstrap policy when a value was actually pinned/verified.
+    let discovery = match cyan_backend::BOOTSTRAP_NODE_ID.get() {
+        Some(id) if !id.is_empty() => DiscoveryPolicy::Bootstrap(id.clone()),
         _ => DiscoveryPolicy::MdnsOnly,
     };
 
@@ -363,6 +402,11 @@ async fn handle_verb(
 ) -> Result<String> {
     match verb {
         "node_id" => Ok(format!("node_id {node_id}")),
+
+        // The bootstrap id this node RESOLVED at startup (from `BOOTSTRAP_NODE_ID`, a verified
+        // rendezvous config, or the bundled fallback). Lets a test assert positively that a peer
+        // adopted the LIVE published id — or fell back to bundled when the config was tampered.
+        "bootstrap_id" => Ok(format!("bootstrap_id {}", cyan_backend::bootstrap_node_id())),
 
         // ── Identity / RBAC verbs (multi-process grant tests) ─────────────────────────────
         // This node's capability-grant (admin) Ed25519 pubkey hex.
