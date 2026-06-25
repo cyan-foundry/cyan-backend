@@ -29,6 +29,9 @@
 //! - `add_peer <endpoint-addr-json>`      `@@CYAN@@ ok add_peer`
 //! - `seed_empty_group <gid>`             `@@CYAN@@ ok seed_empty_group`
 //! - `seed_fixture <gid>`                 `@@CYAN@@ ok seed_fixture`
+//! - `seed_postprod <gid>`                `@@CYAN@@ ok seed_postprod <board>`  (S5 named demo
+//!   scenario: Post-Production group → default ws → Broadcast Delivery board → English
+//!   workflow (deployed+pinned) → asset artifacts; idempotent on re-run)
 //! - `join_group <gid> [bootstrap_hex]`   `@@CYAN@@ ok join_group`
 //! - `wait_sync <gid> <timeout_ms>`       `@@CYAN@@ ok wait_sync` | `@@CYAN@@ timeout wait_sync`
 //! - `count <kind> <gid>`                 `@@CYAN@@ count <kind> <n>`
@@ -517,6 +520,17 @@ async fn handle_verb(
             let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?;
             seed_fixture(gid)?;
             Ok("ok seed_fixture".to_string())
+        }
+
+        // S5 demo seed: a NAMED, broadcast-friendly "Post-Production" group → default
+        // workspace → "Broadcast Delivery" board → a sample English workflow (deployed +
+        // pinned, so the board's Dashboard FACE has real content) → a few asset artifacts.
+        // Idempotent (no-op once the group already has a board), so every bring-up converges.
+        // `seed_postprod <gid>` → `ok seed_postprod <board>`.
+        "seed_postprod" => {
+            let gid = rest.first().ok_or_else(|| anyhow!("group_id required"))?;
+            let board = seed_postprod(gid)?;
+            Ok(format!("ok seed_postprod {board}"))
         }
 
         "join_group" => {
@@ -1787,6 +1801,63 @@ fn seed_fixture(group_id: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// S5 demo seed (dev only — explicit external action, NOT engine auto-seed, which is
+/// deliberately removed per R10FB §D). Builds the named broadcast scenario Rick walks:
+/// a "Post-Production" group + its create-path workspaces, a "Broadcast Delivery" board
+/// carrying a sample English workflow (markdown step cells), deployed + pinned so the
+/// board's Dashboard FACE renders the running workflow, plus a few asset artifacts.
+/// Uses ONLY the public storage API. Idempotent: a no-op once the group has a board, so
+/// re-running on every bring-up converges to the same state. Returns the board id.
+fn seed_postprod(group_id: &str) -> Result<String> {
+    let now = chrono::Utc::now().timestamp();
+    let board = format!("{group_id}-broadcast-delivery");
+    // Idempotent guard: already seeded if the group has any board.
+    if count_kind("boards", group_id).unwrap_or(0) > 0 {
+        return Ok(board);
+    }
+    storage::group_insert_simple(group_id, "Post-Production", "film.stack", "#22D3EE")
+        .map_err(|e| anyhow!("group_insert_simple: {e}"))?;
+    // The create-path workspaces (default landing + system "Plugins"); the default is the
+    // board's home. `provision_group_workspaces` is INSERT OR IGNORE → idempotent.
+    let (default_ws, _plugins) = storage::provision_group_workspaces(group_id, None)
+        .map_err(|e| anyhow!("provision_group_workspaces: {e}"))?;
+    let ws = default_ws.id;
+    storage::board_insert_simple(&board, &ws, "Broadcast Delivery", now)
+        .map_err(|e| anyhow!("board_insert_simple: {e}"))?;
+    // The sample English workflow — the steps in plain English (the Notebook face authors
+    // these; compile/decompose turns them into the DAG). Markdown cells so they read as prose.
+    let steps = [
+        "Ingest **big-buck-bunny.mp4** from the broadcast watch folder",
+        "Run QC: probe resolution, codec, and loudness",
+        "Transcribe the dialogue (whisper) and attach the transcript",
+        "Package the master at **-14 LUFS** and write the delivery sidecar",
+    ];
+    for (i, text) in steps.iter().enumerate() {
+        storage::cell_insert_simple(
+            &format!("{board}-step-{i:02}"), &board, "markdown", i as i32,
+            Some(text), None, false, None, None, now, now,
+        )
+        .map_err(|e| anyhow!("cell_insert_simple: {e}"))?;
+    }
+    // Deploy (dashboard=true) + pin so the board's Dashboard FACE shows the running workflow.
+    storage::workflow_state_set_deployed(&board, true, now)
+        .map_err(|e| anyhow!("workflow_state_set_deployed: {e}"))?;
+    storage::board_meta_set_pinned(&board, true, now)
+        .map_err(|e| anyhow!("board_meta_set_pinned: {e}"))?;
+    // A few asset artifacts — the staged demo clips, attached to the board.
+    for (i, name) in ["big-buck-bunny.mp4", "bars-smpte-720p-15s.mp4", "rgb-480p-12s.mp4"]
+        .iter()
+        .enumerate()
+    {
+        storage::file_insert_simple(
+            &format!("{board}-asset-{i:02}"), Some(group_id), Some(&ws), Some(&board),
+            name, &format!("seed-asset-{i}"), 10_000_000, None, now,
+        )
+        .map_err(|e| anyhow!("file_insert_simple: {e}"))?;
+    }
+    Ok(board)
 }
 
 /// ROUND8 §W3: provision a group the way the create path does — a group record plus
