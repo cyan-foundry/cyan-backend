@@ -1287,6 +1287,18 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
         let step_id = generate_step_id(&cell.content, i);
         let (stage, media_tool) = infer_step(&cell.content);
 
+        // #5 — EDIT/RECOMPILE ROBUSTNESS: PRESERVE the persisted run state of an
+        // UNCHANGED step (same content ⇒ same generated step_id) so re-Review/recompile
+        // (after editing or ADDING steps) never wipes an in-progress run. An edited step
+        // (content changed ⇒ new step_id) or a brand-new step starts pending — it must
+        // re-run. Idempotent: recompiling an unrun board is a no-op on state.
+        let preserved_state = cell
+            .pipeline_config
+            .as_ref()
+            .filter(|c| c.step_id == step_id)
+            .map(|c| c.state.clone())
+            .unwrap_or_default();
+
         let config = PipelineStepConfig {
             step_id: step_id.clone(),
             depends_on: prev_step_id.clone().into_iter().collect(),
@@ -1301,7 +1313,7 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
             retry_count: Some(1),
             auto_advance: false,
             notifications: vec![],
-            state: PipelineStepState::default(),
+            state: preserved_state,
         };
 
         // Merge into cell metadata: the pipeline config AND, when a media verb was
