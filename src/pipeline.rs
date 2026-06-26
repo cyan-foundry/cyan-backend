@@ -796,6 +796,7 @@ async fn execute_sequential(
             step.clone(), command_tx.clone(), event_tx.clone(),
         ).await;
         let awaiting = outcome.obs.state == StepState::AwaitingApproval;
+        let failed = outcome.failed;
         acc.processed += 1;
         acc.fold(outcome);
         // LIVE cost/progress: push an incremental snapshot after EACH step so the
@@ -803,6 +804,13 @@ async fn execute_sequential(
         // (not just once at run end) — the "$0.00 stuck" fix.
         let snap = acc.obs.snapshot(now_ts(), acc.current_item.clone(), acc.current_stage.clone());
         let _ = event_tx.send(tags.stats(snap));
+        // S — FAILURE HALTS THE RUN: a failed step stops execution here. Downstream
+        // dependents do NOT run (no orphan parallel steps); the failed step is left
+        // red + actionable (Retry resumes from it, Reject aborts).
+        if failed {
+            tracing::info!("Run halted: step '{}' FAILED — downstream blocked", step_id);
+            break;
+        }
         // PER-STEP PAUSE: stop at the first step awaiting approval. Rick approves it
         // (cyan_pipeline_approve), which resumes the run at the next step.
         if awaiting {
@@ -832,9 +840,10 @@ async fn execute_waves(
     let mut peak = 0usize;
 
     for wave in plan.ordered_waves() {
-        // PER-STEP PAUSE: once a step is awaiting approval, stop launching further
-        // waves — the run resumes (next wave) when Rick approves.
-        if acc.any_awaiting {
+        // S — FAILURE HALTS THE RUN: once any step has failed, stop launching further
+        // waves so downstream dependents never run (Retry resumes, Reject aborts).
+        // PER-STEP PAUSE: likewise stop once a step is awaiting approval.
+        if acc.any_failed || acc.any_awaiting {
             break;
         }
         for batch in wave.ordered_batches() {
@@ -1480,6 +1489,22 @@ pub fn approve_step(
     metadata["pipeline"]["state"]["human_reviewer"] = json!(reviewer.unwrap_or("anonymous"));
     metadata["pipeline"]["state"]["human_approved_at"] = json!(chrono::Utc::now().timestamp());
 
+    // SYNCHRONOUS persist (N): the immediately-spawned resume-run must read
+    // `human_approved` NOW (not the stale `ai_complete`) so it advances to the next
+    // step instead of re-pausing here. The command_tx below still gossips to peers.
+    let _ = storage::cell_update(&crate::models::dto::NotebookCellDTO {
+        id: cell.cell_id.clone(),
+        board_id: board_id.to_string(),
+        cell_type: "markdown".to_string(),
+        cell_order,
+        content: Some(content.clone()),
+        output: None,
+        collapsed: false,
+        height: None,
+        metadata_json: Some(metadata.to_string()),
+        created_at: 0,
+        updated_at: 0,
+    });
     let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
         id: cell.cell_id.clone(),
         board_id: board_id.to_string(),
@@ -1639,6 +1664,21 @@ pub fn retry_step(
     let attempt = metadata["pipeline"]["state"]["attempt"].as_u64().unwrap_or(0);
     metadata["pipeline"]["state"]["attempt"] = json!(attempt + 1);
 
+    // SYNCHRONOUS persist (C/S): the resume-run spawned right after Retry must read the
+    // step as `pending` NOW so it re-executes it (resume from the failed step).
+    let _ = storage::cell_update(&crate::models::dto::NotebookCellDTO {
+        id: cell.cell_id.clone(),
+        board_id: board_id.to_string(),
+        cell_type: "markdown".to_string(),
+        cell_order,
+        content: Some(content.clone()),
+        output: None,
+        collapsed: false,
+        height: None,
+        metadata_json: Some(metadata.to_string()),
+        created_at: 0,
+        updated_at: 0,
+    });
     let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
         id: cell.cell_id.clone(),
         board_id: board_id.to_string(),
@@ -1950,6 +1990,23 @@ fn update_step_state_full(
         metadata["pipeline"]["state"]["duration"] = json!(dur);
     }
 
+    // SYNCHRONOUS persist (N/L/M): write the new state to storage NOW so the resume-run
+    // and the Dashboard reconstruct read the latest status immediately (the command_tx
+    // path below still gossips it to peers). Without this, a resume raced the async
+    // command and re-paused at the just-finished step, and reconstruct showed stale cost.
+    let _ = storage::cell_update(&crate::models::dto::NotebookCellDTO {
+        id: cell_id.to_string(),
+        board_id: board_id.to_string(),
+        cell_type: "markdown".to_string(),
+        cell_order,
+        content: Some(content.clone()),
+        output: ai_result.map(|s| s.to_string()),
+        collapsed: false,
+        height: None,
+        metadata_json: Some(metadata.to_string()),
+        created_at: now,
+        updated_at: now,
+    });
     let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
         id: cell_id.to_string(),
         board_id: board_id.to_string(),
