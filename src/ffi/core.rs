@@ -2328,8 +2328,15 @@ pub extern "C" fn cyan_set_board_mode(board_id: *const c_char, mode: *const c_ch
         mode_str.clone()
     };
 
-    // Validate mode
-    if normalized_mode != "canvas" && normalized_mode != "notebook" && normalized_mode != "notes" {
+    // Validate mode. Fix C: the board FACES are notebook / notes / dashboard / video
+    // (BoardFace enum on iOS); "canvas" is the legacy whiteboard mode kept for back-compat.
+    // "dashboard" + "video" were previously rejected here, so the app's
+    // setActiveFace(.dashboard) returned false and the Run button could not flip the board to
+    // the Dashboard face — it stayed on Workflow. Accept all real faces.
+    if !matches!(
+        normalized_mode.as_str(),
+        "canvas" | "notebook" | "notes" | "dashboard" | "video"
+    ) {
         tracing::warn!("Invalid board mode: {}", normalized_mode);
         return false;
     }
