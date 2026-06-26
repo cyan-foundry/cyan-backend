@@ -4295,14 +4295,33 @@ pub extern "C" fn cyan_pipeline_approve(
         None => return false,
     };
     
-    crate::pipeline::approve_step(
+    let approved = crate::pipeline::approve_step(
         board_id_str,
         step_id_str,
         None,
         &system.command_tx,
         Some(&system.event_tx),
     )
-    .is_ok()
+    .is_ok();
+
+    // RESUME the step-through: approving a step unblocks the next one, so re-run the
+    // pipeline (approved/skipped steps are skipped) to execute the next step, which
+    // then runs → awaits its own approval. This is what lets Rick step THROUGH the
+    // workflow one approval at a time, with cost incrementing across steps.
+    if approved {
+        let command_tx = system.command_tx.clone();
+        let event_tx = system.event_tx.clone();
+        let bid = board_id_str.to_string();
+        if let Some(rt) = crate::RUNTIME.get() {
+            rt.spawn(async move {
+                if let Err(e) = crate::pipeline::run_pipeline(&bid, &command_tx, &event_tx).await {
+                    tracing::warn!("resume-after-approve run failed: {}", e);
+                }
+            });
+        }
+    }
+
+    approved
 }
 
 
