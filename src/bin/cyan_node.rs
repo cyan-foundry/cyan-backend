@@ -1905,8 +1905,11 @@ struct SeedBoard {
     id: &'static str,
     name: &'static str,
     clip: &'static str,
-    /// true ⇒ the clip carries spoken dialogue, so a transcribe step is coherent.
-    dialogue: bool,
+    /// true ⇒ the clip has a real AUDIO track (verified via ffprobe on the lens box),
+    /// so transcribe + loudness QC are runtime-coherent. Audioless clips (sintel /
+    /// tears-of-steel / jellyfish / bars / rgb excerpts) get black/freeze QC only —
+    /// a loudness/transcribe step on them would fail ffmpeg at run time.
+    audio: bool,
 }
 struct SeedGroup {
     id: &'static str,
@@ -1935,10 +1938,10 @@ fn seed_demo() -> Result<String> {
             icon: "film.stack",
             color: "#22D3EE",
             boards: &[
-                SeedBoard { id: "pp-sintel-finish", name: "Sintel — Color & Finish", clip: "sintel-clip.mp4", dialogue: true },
-                SeedBoard { id: "pp-tos-online", name: "Tears of Steel — Online Edit", clip: "tears-of-steel-clip.mp4", dialogue: true },
-                SeedBoard { id: "pp-ed-dialogue", name: "Elephants Dream — Dialogue Pass", clip: "elephants-dream-30s.mp4", dialogue: true },
-                SeedBoard { id: "pp-bbb-master", name: "Big Buck Bunny — Feature Master", clip: "big-buck-bunny.mp4", dialogue: false },
+                SeedBoard { id: "pp-sintel-finish", name: "Sintel — Color & Finish", clip: "sintel-clip.mp4", audio: false },
+                SeedBoard { id: "pp-tos-online", name: "Tears of Steel — Online Edit", clip: "tears-of-steel-clip.mp4", audio: false },
+                SeedBoard { id: "pp-ed-dialogue", name: "Elephants Dream — Dialogue Pass", clip: "elephants-dream-30s.mp4", audio: true },
+                SeedBoard { id: "pp-bbb-master", name: "Big Buck Bunny — Feature Master", clip: "big-buck-bunny.mp4", audio: true },
             ],
         },
         SeedGroup {
@@ -1947,9 +1950,9 @@ fn seed_demo() -> Result<String> {
             icon: "megaphone.fill",
             color: "#A855F7",
             boards: &[
-                SeedBoard { id: "pr-sintel-teaser", name: "Sintel — Teaser Cut", clip: "sintel-clip.mp4", dialogue: false },
-                SeedBoard { id: "pr-tos-trailer", name: "Tears of Steel — Trailer", clip: "tears-of-steel-clip.mp4", dialogue: false },
-                SeedBoard { id: "pr-jelly-broll", name: "Jellyfish — Nature B-Roll", clip: "jellyfish-broll.mp4", dialogue: false },
+                SeedBoard { id: "pr-sintel-teaser", name: "Sintel — Teaser Cut", clip: "sintel-clip.mp4", audio: false },
+                SeedBoard { id: "pr-tos-trailer", name: "Tears of Steel — Trailer", clip: "tears-of-steel-clip.mp4", audio: false },
+                SeedBoard { id: "pr-jelly-broll", name: "Jellyfish — Nature B-Roll", clip: "jellyfish-broll.mp4", audio: false },
             ],
         },
         SeedGroup {
@@ -1958,9 +1961,9 @@ fn seed_demo() -> Result<String> {
             icon: "antenna.radiowaves.left.and.right",
             color: "#34D399",
             boards: &[
-                SeedBoard { id: "bc-smpte-qc", name: "SMPTE Bars — QC Gate", clip: "bars-smpte-720p-15s.mp4", dialogue: false },
-                SeedBoard { id: "bc-rgb-align", name: "RGB — Alignment Check", clip: "rgb-480p-12s.mp4", dialogue: false },
-                SeedBoard { id: "bc-bbb-package", name: "Big Buck Bunny — Broadcast Package", clip: "big-buck-bunny.mp4", dialogue: false },
+                SeedBoard { id: "bc-smpte-qc", name: "SMPTE Bars — QC Gate", clip: "bars-smpte-720p-15s.mp4", audio: false },
+                SeedBoard { id: "bc-rgb-align", name: "RGB — Alignment Check", clip: "rgb-480p-12s.mp4", audio: false },
+                SeedBoard { id: "bc-bbb-package", name: "Big Buck Bunny — Broadcast Package", clip: "big-buck-bunny.mp4", audio: true },
             ],
         },
     ];
@@ -1987,16 +1990,22 @@ fn seed_board(group_id: &str, ws: &str, b: &SeedBoard, now: i64) -> Result<()> {
         .map_err(|e| anyhow!("board_insert_simple({board}): {e}"))?;
     let clip = b.clip;
     // (cell text, step_id, executor, depends_on) — coherent per-board clip throughout.
+    // The QC step names the EXACT cyan-media tool(s) (qc_black_freeze / qc_loudness) so
+    // the 8B emits the right `mcp_tool` name instead of guessing (e.g. "blackdetect").
+    let qc_text = if b.audio {
+        format!("QC findings: call the cyan-media tool qc_black_freeze on {clip} (bare filename) for black/freeze time ranges, then call qc_loudness on {clip} with target_lufs -14. Report the timecoded black ranges, freeze ranges, and the integrated LUFS.")
+    } else {
+        format!("QC findings: call the cyan-media tool qc_black_freeze on {clip} (bare filename) for black/freeze time ranges and report them. This clip has no audio track, so skip loudness.")
+    };
     let mut steps: Vec<(String, &str, &str, Vec<&str>)> = vec![
         (format!("Ingest the broadcast master: the local file {clip} (in the media root)."),
          "ingest", "lens", vec![]),
         (format!("QC / probe: run the cyan-media probe tool on {clip} — pass the bare filename as input (not a URL) — and report container, video codec, resolution, and duration."),
          "qc-probe", "lens", vec!["ingest"]),
-        (format!("QC findings: run cyan-media black/freeze/loudness detection on {clip} and report the timecoded black ranges, freeze ranges, and the integrated LUFS."),
-         "qc-findings", "lens", vec!["qc-probe"]),
+        (qc_text, "qc-findings", "lens", vec!["qc-probe"]),
     ];
     let mut last = "qc-findings";
-    if b.dialogue {
+    if b.audio {
         steps.push((
             format!("Transcribe: run the cyan-media transcribe tool on {clip} (bare filename, not a URL) to capture the spoken dialogue and subtitles."),
             "transcribe", "lens", vec!["qc-findings"],
