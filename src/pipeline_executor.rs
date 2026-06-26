@@ -919,15 +919,123 @@ async fn execute_local_mcp_tool_step(
 // Helpers (imported from pipeline.rs)
 // ============================================================================
 
+/// Resolve the board's video asset to a URI the cyan-media probe (ffprobe) can open.
+///
+/// Fix B: the seeded steps reference the clip by BARE FILENAME (e.g. "sintel-clip.mp4"),
+/// not an http URL, so the old `starts_with("http")`-only filter returned `None` and the
+/// local cyan-media probe threw "No video URI provided". This now resolves, in priority:
+///   1. an explicit http/https/s3/file URL in ANY step cell (the old path, widened);
+///   2. a bound asset whose `local_path` points at a real file on disk → probe it directly;
+///   3. a bare media filename (from the bound asset, else mentioned in a cell) joined to the
+///      configured media root `CYAN_MEDIA_ROOT` (a local dir OR an http base).
+/// Returns `None` only when nothing resolvable is found AND no media root is configured —
+/// the caller then surfaces the same clear error instead of probing garbage.
 fn find_video_uri(board_id: &str) -> Option<String> {
+    // Read everything we need under ONE lock, then release before resolving (the storage
+    // helpers below lock independently — never hold the lock across them).
+    let (cell_texts, bound_files): (Vec<String>, Vec<(String, Option<String>)>) = {
+        let conn = crate::storage::db().lock().ok()?;
+        let cells = {
+            let mut stmt = conn.prepare(
+                "SELECT content FROM notebook_cells WHERE board_id = ?1 AND cell_type = 'markdown' ORDER BY cell_order"
+            ).ok()?;
+            let rows = stmt
+                .query_map(rusqlite::params![board_id], |row| row.get::<_, Option<String>>(0))
+                .ok()?;
+            rows.filter_map(|r| r.ok()).flatten().collect::<Vec<_>>()
+        };
+        let files = {
+            let mut stmt = conn.prepare(
+                "SELECT name, local_path FROM objects WHERE type='file' AND board_id = ?1 AND COALESCE(deleted,0)=0 ORDER BY created_at"
+            ).ok()?;
+            let rows = stmt
+                .query_map(rusqlite::params![board_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .ok()?;
+            rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
+        };
+        (cells, files)
+    };
+
+    // (1) explicit URL in any cell.
+    for c in &cell_texts {
+        if let Some(u) = c.split_whitespace().find(|w| {
+            (w.starts_with("http://") || w.starts_with("https://") || w.starts_with("s3://") || w.starts_with("file://"))
+                && is_media_filename(w.trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | ')' | '"' | '\'')))
+        }) {
+            return Some(u.trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | ')' | '"' | '\'')).to_string());
+        }
+    }
+
+    // (2) a bound asset with a real local file → probe it directly.
+    for (_name, local_path) in &bound_files {
+        if let Some(p) = local_path {
+            if !p.is_empty() && std::path::Path::new(p).exists() {
+                return Some(p.clone());
+            }
+        }
+    }
+
+    // (3) a bare media filename — bound asset first, else mentioned in a cell — joined to
+    //     the configured media root.
+    let candidate = bound_files
+        .iter()
+        .map(|(n, _)| n.clone())
+        .find(|n| is_media_filename(n))
+        .or_else(|| cell_texts.iter().find_map(|c| extract_media_filename(c)));
+    candidate.and_then(|name| resolve_media_uri(&name))
+}
+
+/// True if `s` ends with a recognized video container extension (case-insensitive).
+fn is_media_filename(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    [".mp4", ".mov", ".mxf", ".mkv", ".webm", ".m4v"].iter().any(|e| l.ends_with(e))
+}
+
+/// Pull the first bare media filename out of free-text cell content (e.g. the seed line
+/// "the local file sintel-clip.mp4 (in the media root)." → "sintel-clip.mp4").
+fn extract_media_filename(content: &str) -> Option<String> {
+    content
+        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | '"' | '\''))
+        .map(|tok| tok.trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | ')' | '*' | '`')))
+        .find(|tok| is_media_filename(tok))
+        .map(|s| s.to_string())
+}
+
+/// Turn a bare clip filename into a probeable URI. Pass-through for things that already are
+/// a URI or an existing absolute path; otherwise join to `CYAN_MEDIA_ROOT` (the same env the
+/// cyan-media plugin confines paths to). Returns `None` when it's a bare name and no media
+/// root is configured — there is nothing safe to hand ffprobe.
+fn resolve_media_uri(name: &str) -> Option<String> {
+    if name.starts_with("http://") || name.starts_with("https://") || name.starts_with("s3://") || name.starts_with("file://") {
+        return Some(name.to_string());
+    }
+    if name.starts_with('/') && std::path::Path::new(name).exists() {
+        return Some(name.to_string());
+    }
+    let root = std::env::var("CYAN_MEDIA_ROOT").ok().filter(|r| !r.trim().is_empty())?;
+    let root = root.trim_end_matches('/');
+    // Works for both a local dir ("/opt/cyan/media") and an http base ("http://host/media").
+    Some(format!("{root}/{name}"))
+}
+
+/// The board's bound primary clip filename: the seed inserts one file row named after the
+/// clip; fall back to a bare media filename mentioned in any step cell.
+fn board_bound_asset(board_id: &str) -> Option<String> {
+    if let Ok(files) = crate::storage::file_list_by_board(board_id) {
+        if let Some(f) = files.into_iter().find(|f| is_media_filename(&f.name)) {
+            return Some(f.name);
+        }
+    }
     let conn = crate::storage::db().lock().ok()?;
-    let mut stmt = conn.prepare(
-        "SELECT content FROM notebook_cells WHERE board_id = ?1 AND cell_type = 'markdown' ORDER BY cell_order LIMIT 1"
-    ).ok()?;
-    
-    let content: Option<String> = stmt.query_row(rusqlite::params![board_id], |row| row.get(0)).ok();
-    
-    content.filter(|c| c.starts_with("http") && (c.contains(".mp4") || c.contains(".mov") || c.contains(".mxf")))
+    let mut stmt = conn
+        .prepare("SELECT content FROM notebook_cells WHERE board_id = ?1 AND cell_type='markdown' ORDER BY cell_order")
+        .ok()?;
+    let rows = stmt
+        .query_map(rusqlite::params![board_id], |row| row.get::<_, Option<String>>(0))
+        .ok()?;
+    rows.filter_map(|r| r.ok()).flatten().find_map(|c| extract_media_filename(&c))
 }
 
 fn find_scope_id(board_id: &str) -> Option<String> {
@@ -939,29 +1047,38 @@ fn find_scope_id(board_id: &str) -> Option<String> {
     stmt.query_row(rusqlite::params![board_id], |row| row.get::<_, String>(0)).ok()
 }
 
-pub fn find_asset_metadata(_board_id: &str) -> Option<serde_json::Value> {
-    // For demo: return BigBuckBunny metadata
-    // In production: read from first cell or MAM API
-    Some(json!({
-        "title": "Tears of Steel",
-        "source_url": "https://download.blender.org/demo/movies/ToS/tears_of_steel_720p.mov",
-        "content_type": "sci_fi_drama",
-        "genre": ["sci-fi", "drama", "action"],
-        "source_language": "en",
-        "target_languages": ["hi", "ta", "te"],
-        "target_markets": ["IN", "SG", "AE"],
-        "resolution": "HD",
-        "duration_seconds": 734.0,
-        "rating": "M18",
-        "ad_tier": "premium",
-        "historical_cpm": 300.0,
-        "engagement_curve": [0.95, 0.88, 0.82, 0.85, 0.88, 0.91, 0.89, 0.82, 0.78, 0.75],
-        "delivery_platforms": [
-            {"platform": "JioStar", "format": "HEVC_1080p"},
-            {"platform": "YouTube India", "format": "H264_HD"},
-            {"platform": "Hotstar", "format": "ABR_ladder"}
-        ]
-    }))
+/// Fix B: the board's REAL bound-asset metadata. Was a hardcoded "Tears of Steel" stub that
+/// labeled every board's run with the same wrong asset (and a bogus source_url). Now derives
+/// `title` from the board name, `asset` from the bound clip filename, and `source_url` from
+/// the resolved probe URI when a media root is configured. None of the old localization
+/// fields (target_languages/markets/cpm/…) were read by the engine or the lens, so dropping
+/// them is safe; add real per-asset fields here when a MAM lookup exists.
+pub fn find_asset_metadata(board_id: &str) -> Option<serde_json::Value> {
+    let asset = board_bound_asset(board_id);
+
+    // Board name (objects.type='whiteboard'); fall back to the asset filename, then the id.
+    let board_name: Option<String> = {
+        crate::storage::db().lock().ok().and_then(|conn| {
+            conn.query_row(
+                "SELECT name FROM objects WHERE id = ?1 AND type = 'whiteboard' LIMIT 1",
+                rusqlite::params![board_id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        })
+    };
+    let title = board_name
+        .or_else(|| asset.clone())
+        .unwrap_or_else(|| board_id.to_string());
+
+    let mut m = json!({ "title": title });
+    if let Some(a) = asset {
+        m["asset"] = json!(a);
+        if let Some(uri) = resolve_media_uri(&a) {
+            m["source_url"] = json!(uri);
+        }
+    }
+    Some(m)
 }
 
 // ============================================================================
@@ -1012,4 +1129,51 @@ fn load_cached_step_result(step_id: &str) -> Option<CachedStepResult> {
         Err(e) => { eprintln!("📺 CACHE DEBUG: JSON parse FAILED: {}", e); return None; },
     };
     Some(cached)
+}
+
+#[cfg(test)]
+mod video_uri_tests {
+    use super::{extract_media_filename, is_media_filename, resolve_media_uri};
+
+    #[test]
+    fn detects_media_extensions() {
+        assert!(is_media_filename("sintel-clip.mp4"));
+        assert!(is_media_filename("A.MOV"));
+        assert!(is_media_filename("bars-smpte-720p-15s.mkv"));
+        assert!(!is_media_filename("notes.txt"));
+        assert!(!is_media_filename("sintel-clip"));
+    }
+
+    #[test]
+    fn pulls_bare_filename_from_seed_cell_text() {
+        let cell = "Ingest the broadcast master: the local file sintel-clip.mp4 (in the media root).";
+        assert_eq!(extract_media_filename(cell).as_deref(), Some("sintel-clip.mp4"));
+        // trailing sentence punctuation must not eat the extension
+        let cell2 = "run probe on tears-of-steel-clip.mov.";
+        assert_eq!(extract_media_filename(cell2).as_deref(), Some("tears-of-steel-clip.mov"));
+        assert_eq!(extract_media_filename("no clip here, just words.").as_deref(), None);
+    }
+
+    #[test]
+    fn resolves_bare_name_against_media_root_and_passes_urls_through() {
+        // URL pass-through regardless of env
+        assert_eq!(
+            resolve_media_uri("https://x/y.mp4").as_deref(),
+            Some("https://x/y.mp4")
+        );
+        // bare name joins CYAN_MEDIA_ROOT (local dir or http base), trailing slash trimmed
+        unsafe { std::env::set_var("CYAN_MEDIA_ROOT", "/opt/cyan/media/"); }
+        assert_eq!(
+            resolve_media_uri("sintel-clip.mp4").as_deref(),
+            Some("/opt/cyan/media/sintel-clip.mp4")
+        );
+        unsafe { std::env::set_var("CYAN_MEDIA_ROOT", "http://lens:9080/media"); }
+        assert_eq!(
+            resolve_media_uri("sintel-clip.mp4").as_deref(),
+            Some("http://lens:9080/media/sintel-clip.mp4")
+        );
+        // no media root + bare name → None (caller surfaces a clear error, not garbage)
+        unsafe { std::env::remove_var("CYAN_MEDIA_ROOT"); }
+        assert_eq!(resolve_media_uri("sintel-clip.mp4"), None);
+    }
 }
