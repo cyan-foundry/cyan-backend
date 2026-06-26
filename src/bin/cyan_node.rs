@@ -1929,6 +1929,9 @@ fn seed_demo() -> Result<String> {
     for gid in SEED_MANAGED_GROUP_IDS {
         let _ = storage::group_delete(gid);
     }
+    // group_delete doesn't cascade board_workflow_state — prune the orphaned deploy-state
+    // rows so a re-seed leaves NO stale rows (the board-card deploy gate reads this table).
+    let _ = storage::workflow_state_prune_orphans();
     // 2) The coherent set: 3 distinctly-named groups, 10 distinctly-named boards, each
     //    bound to ONE real staged clip. No two groups/boards share a name.
     let groups: [SeedGroup; 3] = [

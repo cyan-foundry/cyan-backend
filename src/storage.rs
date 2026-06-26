@@ -945,6 +945,19 @@ pub fn workflow_state_set_deployed(
     Ok(())
 }
 
+/// Delete `board_workflow_state` rows whose board no longer exists (orphans left by a
+/// truncate-then-seed that doesn't cascade this table). Keeps the deploy-state table in
+/// lockstep with the boards — no stale rows after a re-seed.
+pub fn workflow_state_prune_orphans() -> Result<usize> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    let n = conn.execute(
+        "DELETE FROM board_workflow_state WHERE board_id NOT IN \
+         (SELECT id FROM objects WHERE type='whiteboard')",
+        [],
+    )?;
+    Ok(n)
+}
+
 /// Set just the `locked` lane (LWW on `updated_at`). Unlocking is gated upstream by an org
 /// grant (see `workflow::request_unlock`); this is the storage primitive it calls on success.
 pub fn workflow_state_set_locked(board_id: &str, locked: bool, updated_at: i64) -> Result<()> {

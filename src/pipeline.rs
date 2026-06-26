@@ -1299,11 +1299,23 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
             .map(|c| c.state.clone())
             .unwrap_or_default();
 
+        // S5 — PRESERVE the authored executor (esp. "manual", the human-approval gate) so a
+        // Run/recompile never drops it to "lens" (which made the package/human step EXECUTE
+        // forever instead of pausing as a gate). A cell with a bound config keeps its
+        // executor; a brand-new/unconfigured cell defaults to "lens". Stable across recompiles
+        // because compile writes this executor back into the cell's pipeline config below.
+        let executor = cell
+            .pipeline_config
+            .as_ref()
+            .map(|c| c.executor.clone())
+            .filter(|e| !e.is_empty())
+            .unwrap_or_else(|| "lens".to_string());
+
         let config = PipelineStepConfig {
             step_id: step_id.clone(),
             depends_on: prev_step_id.clone().into_iter().collect(),
             stage: Some(stage),
-            executor: "lens".to_string(),
+            executor: executor.clone(),
             model: Some("cyan-lens".to_string()),
             model_config: None,
             tools: media_tool.iter().cloned().collect(),
