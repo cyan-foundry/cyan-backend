@@ -1828,19 +1828,40 @@ fn seed_postprod(group_id: &str) -> Result<String> {
         .map_err(|e| anyhow!("board_insert_simple: {e}"))?;
     // The sample English workflow — the steps in plain English (the Notebook face authors
     // these; compile/decompose turns them into the DAG). Markdown cells so they read as prose.
-    // Phrased so the cloud orchestrator (8B ReAct over cyan-media) reliably calls the
-    // right tool with the BARE local filename — vague cells make the 8B hallucinate a URL.
-    // The QC/probe step is the real-output star (ffprobe); the bare-filename hint is load-bearing.
-    let steps = [
-        "Ingest the broadcast master: the local file big-buck-bunny.mp4 (in the media root).",
-        "QC / probe: run the cyan-media probe tool on big-buck-bunny.mp4 — pass the bare filename as input (not a URL) — and report container, video codec, resolution, and duration.",
-        "Transcribe: run the cyan-media transcribe tool on big-buck-bunny-30s.mp4 (bare filename, not a URL) to capture dialogue and subtitles.",
-        "Package: deliver the master at -14 LUFS and write the delivery sidecar.",
+    // Each cell carries a BOUND pipeline config in metadata_json (`{"pipeline":{…}}`) so
+    // the Dashboard shows real steps immediately (no "0 steps") AND Run executes them
+    // deterministically. executor="lens" routes to the cloud orchestrator → cyan-media on
+    // the box (probe/transcribe over the staged clips); the asset is bound in the cell text
+    // (the bare filename) so the 8B doesn't author a path. "manual" = a human approval gate.
+    // (cell text, step_id, executor, depends_on)
+    let steps: [(&str, &str, &str, &[&str]); 4] = [
+        ("Ingest the broadcast master: the local file big-buck-bunny.mp4 (in the media root).",
+         "ingest", "lens", &[]),
+        ("QC / probe: run the cyan-media probe tool on big-buck-bunny.mp4 — pass the bare filename as input (not a URL) — and report container, video codec, resolution, and duration.",
+         "qc-probe", "lens", &["ingest"]),
+        ("Transcribe: run the cyan-media transcribe tool on big-buck-bunny-30s.mp4 (bare filename, not a URL) to capture dialogue and subtitles.",
+         "transcribe", "lens", &["qc-probe"]),
+        ("Package: deliver the master at -14 LUFS and write the delivery sidecar.",
+         "package", "manual", &["transcribe"]),
     ];
-    for (i, text) in steps.iter().enumerate() {
+    for (i, (text, step_id, executor, deps)) in steps.iter().enumerate() {
+        let meta = serde_json::json!({
+            "pipeline": {
+                "step_id": step_id,
+                "depends_on": deps,
+                "executor": executor,
+                "model": "cyan-lens",
+                "timeout_seconds": 300,
+                "retry_count": 1,
+                "auto_advance": false,
+                "notifications": [],
+                "state": { "status": "pending", "attempt": 0 }
+            }
+        })
+        .to_string();
         storage::cell_insert_simple(
-            &format!("{board}-step-{i:02}"), &board, "markdown", i as i32,
-            Some(text), None, false, None, None, now, now,
+            &format!("{board}-{step_id}"), &board, "markdown", i as i32,
+            Some(text), None, false, None, Some(&meta), now, now,
         )
         .map_err(|e| anyhow!("cell_insert_simple: {e}"))?;
     }
