@@ -1828,11 +1828,14 @@ fn seed_postprod(group_id: &str) -> Result<String> {
         .map_err(|e| anyhow!("board_insert_simple: {e}"))?;
     // The sample English workflow — the steps in plain English (the Notebook face authors
     // these; compile/decompose turns them into the DAG). Markdown cells so they read as prose.
+    // Phrased so the cloud orchestrator (8B ReAct over cyan-media) reliably calls the
+    // right tool with the BARE local filename — vague cells make the 8B hallucinate a URL.
+    // The QC/probe step is the real-output star (ffprobe); the bare-filename hint is load-bearing.
     let steps = [
-        "Ingest **big-buck-bunny.mp4** from the broadcast watch folder",
-        "Run QC: probe resolution, codec, and loudness",
-        "Transcribe the dialogue (whisper) and attach the transcript",
-        "Package the master at **-14 LUFS** and write the delivery sidecar",
+        "Ingest the broadcast master: the local file big-buck-bunny.mp4 (in the media root).",
+        "QC / probe: run the cyan-media probe tool on big-buck-bunny.mp4 — pass the bare filename as input (not a URL) — and report container, video codec, resolution, and duration.",
+        "Transcribe: run the cyan-media transcribe tool on big-buck-bunny-30s.mp4 (bare filename, not a URL) to capture dialogue and subtitles.",
+        "Package: deliver the master at -14 LUFS and write the delivery sidecar.",
     ];
     for (i, text) in steps.iter().enumerate() {
         storage::cell_insert_simple(
