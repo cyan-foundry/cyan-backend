@@ -1423,6 +1423,20 @@ impl CommandActor {
                     // stability — never creates a "Demo Group"/"Demo Board".
                     tracing::debug!("SeedDemoIfEmpty is a no-op (demo seeding removed)");
                 }
+
+                CommandMsg::SeedDemo => {
+                    // Fix A: seed the coherent demo set IN-PROCESS under THIS engine's
+                    // identity, so the seeded groups are stamped with our node_id (owned +
+                    // manageable) and land in the db the app actually opened — no separate
+                    // node process, no db-path/identity divergence. Then emit a fresh tree
+                    // snapshot so the Explorer repopulates immediately.
+                    match seed::seed_demo(&self.node_id) {
+                        Ok(summary) => tracing::info!("SeedDemo (in-process) ok: {summary}"),
+                        Err(e) => tracing::error!("SeedDemo failed: {e}"),
+                    }
+                    let tree_json = dump_tree_json(&self.db);
+                    let _ = self.event_tx.send(SwiftEvent::TreeLoaded(tree_json));
+                }
             }
         }
     }
@@ -1869,6 +1883,7 @@ pub mod tests {
 }
 
 pub mod pipeline;
+pub mod seed;
 pub mod workflow;
 pub mod templates;
 pub mod timecode_notes;

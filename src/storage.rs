@@ -240,6 +240,18 @@ pub fn group_get_owner(group_id: &str) -> Option<String> {
     ).ok().flatten()
 }
 
+/// Stamp the owner identity on a group (mirrors the `owner_node_id` the CreateGroup path
+/// writes on INSERT). Used by the in-process demo seed so seeded groups are owned by the
+/// app identity and pass the owner-gated rename/delete/deploy checks.
+pub fn group_set_owner(group_id: &str, owner_node_id: &str) -> Result<()> {
+    let conn = db().lock_safe();
+    conn.execute(
+        "UPDATE groups SET owner_node_id=?1 WHERE id=?2",
+        params![owner_node_id, group_id],
+    )?;
+    Ok(())
+}
+
 /// Get owner_node_id of a workspace
 pub fn workspace_get_owner(workspace_id: &str) -> Option<String> {
     let conn = db().lock_safe();

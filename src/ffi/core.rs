@@ -911,6 +911,19 @@ pub extern "C" fn cyan_seed_demo_if_empty() {
     }
 }
 
+/// Fix A: actively seed the coherent demo set (3 groups / 10 boards) IN-PROCESS under the
+/// app's OWN engine identity, then refresh the tree. Additive to the no-op
+/// `cyan_seed_demo_if_empty` — this one really seeds. The seed is idempotent
+/// (truncate-then-seed of the managed group ids) so calling it repeatedly converges to
+/// exactly the intended set. Fire-and-forget: the handler emits `TreeLoaded` when done, so
+/// the app's FileTree refreshes via its normal snapshot event path.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_seed_demo() {
+    if let Some(sys) = SYSTEM.get() {
+        let _ = sys.command_tx.send(CommandMsg::SeedDemo);
+    }
+}
+
 // ---------- FFI: unread / notifications (R10FB §N) ----------
 
 /// Unread counts as a JSON object `{board_id: count}` — **board-level only** (R11 §3). One
