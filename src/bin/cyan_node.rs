@@ -533,6 +533,17 @@ async fn handle_verb(
             Ok(format!("ok seed_postprod {board}"))
         }
 
+        // Coherent, IDEMPOTENT demo scale-seed: 3 distinctly-NAMED groups, 10 boards,
+        // each board bound to ONE real staged clip (clip + thumbnail both on the lens
+        // box, verified 200 on /api/v1/media/thumbnail). Every step in a board names
+        // THAT board's own clip → the per-step asset frame is coherent (item #1) and no
+        // two groups/boards share a name (item #27 / STEP2). Idempotent by truncate-then-
+        // seed of the managed group ids: re-running yields EXACTLY this set, zero dups.
+        "seed_demo" => {
+            let summary = seed_demo()?;
+            Ok(format!("ok seed_demo {summary}"))
+        }
+
         "join_group" => {
             let gid = rest
                 .first()
@@ -1882,6 +1893,152 @@ fn seed_postprod(group_id: &str) -> Result<String> {
         .map_err(|e| anyhow!("file_insert_simple: {e}"))?;
     }
     Ok(board)
+}
+
+/// The group ids the demo scale-seed OWNS. `seed_demo` deletes every one of these
+/// before re-creating its set, so a re-seed converges to EXACTLY the intended groups
+/// with zero duplicates — and it also reaps the prior botched seed (three groups that
+/// all reused the name "Post-Production": post-production / promos / trailers).
+const SEED_MANAGED_GROUP_IDS: [&str; 4] = ["post-production", "promos", "trailers", "broadcast"];
+
+struct SeedBoard {
+    id: &'static str,
+    name: &'static str,
+    clip: &'static str,
+    /// true ⇒ the clip carries spoken dialogue, so a transcribe step is coherent.
+    dialogue: bool,
+}
+struct SeedGroup {
+    id: &'static str,
+    name: &'static str,
+    icon: &'static str,
+    color: &'static str,
+    boards: &'static [SeedBoard],
+}
+
+/// Coherent, idempotent demo scale-seed (items #1/#27/STEP2). See the `seed_demo`
+/// dispatch comment. Every clip below is a real file staged in the lens media root with
+/// a matching thumbnail (`/api/v1/media/thumbnail?asset=<clip>` ⇒ 200 image/jpeg).
+fn seed_demo() -> Result<String> {
+    let now = chrono::Utc::now().timestamp();
+    // 1) Truncate the managed groups (cascades workspaces/boards/cells/files) so any
+    //    prior or duplicate seed data is gone before we re-seed → idempotent, no dups.
+    for gid in SEED_MANAGED_GROUP_IDS {
+        let _ = storage::group_delete(gid);
+    }
+    // 2) The coherent set: 3 distinctly-named groups, 10 distinctly-named boards, each
+    //    bound to ONE real staged clip. No two groups/boards share a name.
+    let groups: [SeedGroup; 3] = [
+        SeedGroup {
+            id: "post-production",
+            name: "Post-Production",
+            icon: "film.stack",
+            color: "#22D3EE",
+            boards: &[
+                SeedBoard { id: "pp-sintel-finish", name: "Sintel — Color & Finish", clip: "sintel-clip.mp4", dialogue: true },
+                SeedBoard { id: "pp-tos-online", name: "Tears of Steel — Online Edit", clip: "tears-of-steel-clip.mp4", dialogue: true },
+                SeedBoard { id: "pp-ed-dialogue", name: "Elephants Dream — Dialogue Pass", clip: "elephants-dream-30s.mp4", dialogue: true },
+                SeedBoard { id: "pp-bbb-master", name: "Big Buck Bunny — Feature Master", clip: "big-buck-bunny.mp4", dialogue: false },
+            ],
+        },
+        SeedGroup {
+            id: "promos",
+            name: "Trailers & Promos",
+            icon: "megaphone.fill",
+            color: "#A855F7",
+            boards: &[
+                SeedBoard { id: "pr-sintel-teaser", name: "Sintel — Teaser Cut", clip: "sintel-clip.mp4", dialogue: false },
+                SeedBoard { id: "pr-tos-trailer", name: "Tears of Steel — Trailer", clip: "tears-of-steel-clip.mp4", dialogue: false },
+                SeedBoard { id: "pr-jelly-broll", name: "Jellyfish — Nature B-Roll", clip: "jellyfish-broll.mp4", dialogue: false },
+            ],
+        },
+        SeedGroup {
+            id: "broadcast",
+            name: "Broadcast Delivery",
+            icon: "antenna.radiowaves.left.and.right",
+            color: "#34D399",
+            boards: &[
+                SeedBoard { id: "bc-smpte-qc", name: "SMPTE Bars — QC Gate", clip: "bars-smpte-720p-15s.mp4", dialogue: false },
+                SeedBoard { id: "bc-rgb-align", name: "RGB — Alignment Check", clip: "rgb-480p-12s.mp4", dialogue: false },
+                SeedBoard { id: "bc-bbb-package", name: "Big Buck Bunny — Broadcast Package", clip: "big-buck-bunny.mp4", dialogue: false },
+            ],
+        },
+    ];
+    let mut n_boards = 0usize;
+    for g in &groups {
+        storage::group_insert_simple(g.id, g.name, g.icon, g.color)
+            .map_err(|e| anyhow!("group_insert_simple({}): {e}", g.id))?;
+        let (default_ws, _plugins) = storage::provision_group_workspaces(g.id, None)
+            .map_err(|e| anyhow!("provision_group_workspaces({}): {e}", g.id))?;
+        let ws = default_ws.id;
+        for b in g.boards {
+            seed_board(g.id, &ws, b, now)?;
+            n_boards += 1;
+        }
+    }
+    Ok(format!("{} groups / {} boards (no dups)", groups.len(), n_boards))
+}
+
+/// Seed one board: a deployed+pinned workflow whose EVERY step names the board's own
+/// clip (so the per-step asset frame is coherent), plus the bound clip as a file asset.
+fn seed_board(group_id: &str, ws: &str, b: &SeedBoard, now: i64) -> Result<()> {
+    let board = b.id;
+    storage::board_insert_simple(board, ws, b.name, now)
+        .map_err(|e| anyhow!("board_insert_simple({board}): {e}"))?;
+    let clip = b.clip;
+    // (cell text, step_id, executor, depends_on) — coherent per-board clip throughout.
+    let mut steps: Vec<(String, &str, &str, Vec<&str>)> = vec![
+        (format!("Ingest the broadcast master: the local file {clip} (in the media root)."),
+         "ingest", "lens", vec![]),
+        (format!("QC / probe: run the cyan-media probe tool on {clip} — pass the bare filename as input (not a URL) — and report container, video codec, resolution, and duration."),
+         "qc-probe", "lens", vec!["ingest"]),
+        (format!("QC findings: run cyan-media black/freeze/loudness detection on {clip} and report the timecoded black ranges, freeze ranges, and the integrated LUFS."),
+         "qc-findings", "lens", vec!["qc-probe"]),
+    ];
+    let mut last = "qc-findings";
+    if b.dialogue {
+        steps.push((
+            format!("Transcribe: run the cyan-media transcribe tool on {clip} (bare filename, not a URL) to capture the spoken dialogue and subtitles."),
+            "transcribe", "lens", vec!["qc-findings"],
+        ));
+        last = "transcribe";
+    }
+    steps.push((
+        format!("Package: deliver {clip} at -14 LUFS and write the delivery sidecar."),
+        "package", "manual", vec![last],
+    ));
+    for (i, (text, step_id, executor, deps)) in steps.iter().enumerate() {
+        let meta = serde_json::json!({
+            "pipeline": {
+                "step_id": step_id,
+                "depends_on": deps,
+                "executor": executor,
+                "model": "cyan-lens",
+                "timeout_seconds": 300,
+                "retry_count": 1,
+                "auto_advance": false,
+                "notifications": [],
+                "state": { "status": "pending", "attempt": 0 }
+            }
+        })
+        .to_string();
+        storage::cell_insert_simple(
+            &format!("{board}-{step_id}"), board, "markdown", i as i32,
+            Some(text), None, false, None, Some(&meta), now, now,
+        )
+        .map_err(|e| anyhow!("cell_insert_simple({board}-{step_id}): {e}"))?;
+    }
+    storage::workflow_state_set_deployed(board, true, now)
+        .map_err(|e| anyhow!("workflow_state_set_deployed({board}): {e}"))?;
+    storage::board_meta_set_pinned(board, true, now)
+        .map_err(|e| anyhow!("board_meta_set_pinned({board}): {e}"))?;
+    // The bound clip as the board's primary asset artifact (coherent with the steps).
+    storage::file_insert_simple(
+        &format!("{board}-asset"), Some(group_id), Some(ws), Some(board),
+        b.clip, &format!("seed-{board}"), 10_000_000, None, now,
+    )
+    .map_err(|e| anyhow!("file_insert_simple({board}-asset): {e}"))?;
+    Ok(())
 }
 
 /// ROUND8 §W3: provision a group the way the create path does — a group record plus
