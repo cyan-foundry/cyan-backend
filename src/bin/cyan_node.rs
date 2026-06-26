@@ -1839,7 +1839,7 @@ fn seed_postprod(group_id: &str) -> Result<String> {
          "ingest", "lens", &[]),
         ("QC / probe: run the cyan-media probe tool on big-buck-bunny.mp4 — pass the bare filename as input (not a URL) — and report container, video codec, resolution, and duration.",
          "qc-probe", "lens", &["ingest"]),
-        ("Transcribe: run the cyan-media transcribe tool on big-buck-bunny-30s.mp4 (bare filename, not a URL) to capture dialogue and subtitles.",
+        ("Transcribe: run the cyan-media transcribe tool on elephants-dream-30s.mp4 (bare filename, not a URL) to capture the spoken dialogue and subtitles.",
          "transcribe", "lens", &["qc-probe"]),
         ("Package: deliver the master at -14 LUFS and write the delivery sidecar.",
          "package", "manual", &["transcribe"]),
