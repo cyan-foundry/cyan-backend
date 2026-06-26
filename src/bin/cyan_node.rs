@@ -2037,8 +2037,10 @@ fn seed_board(group_id: &str, ws: &str, b: &SeedBoard, now: i64) -> Result<()> {
         )
         .map_err(|e| anyhow!("cell_insert_simple({board}-{step_id}): {e}"))?;
     }
-    storage::workflow_state_set_deployed(board, true, now)
-        .map_err(|e| anyhow!("workflow_state_set_deployed({board}): {e}"))?;
+    // Mark the board DEPLOYED via the workflow API so the LOCAL deploy state is accurate
+    // (the board-card living-wall reads this through the cyan_board_workflow_state FFI).
+    cyan_backend::workflow::mark_deployed(board, true, now)
+        .map_err(|e| anyhow!("mark_deployed({board}): {e}"))?;
     storage::board_meta_set_pinned(board, true, now)
         .map_err(|e| anyhow!("board_meta_set_pinned({board}): {e}"))?;
     // The bound clip as the board's primary asset artifact (coherent with the steps).
