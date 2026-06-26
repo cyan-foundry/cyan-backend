@@ -4345,7 +4345,51 @@ pub extern "C" fn cyan_pipeline_retry(
         None => return false,
     };
     
-    crate::pipeline::retry_step(board_id_str, step_id_str, &system.command_tx).is_ok()
+    let retried = crate::pipeline::retry_step(board_id_str, step_id_str, &system.command_tx).is_ok();
+    // RESUME after retry: the step was reset to pending — re-run the pipeline so it
+    // executes again (and the run continues), instead of just sitting reset.
+    if retried {
+        let command_tx = system.command_tx.clone();
+        let event_tx = system.event_tx.clone();
+        let bid = board_id_str.to_string();
+        if let Some(rt) = crate::RUNTIME.get() {
+            rt.spawn(async move {
+                if let Err(e) = crate::pipeline::run_pipeline(&bid, &command_tx, &event_tx).await {
+                    tracing::warn!("resume-after-retry run failed: {}", e);
+                }
+            });
+        }
+    }
+    retried
+}
+
+/// Reject a pipeline step: mark it failed so the run STOPS at the gate (the operator
+/// rejected the step's output). Mirror of approve; surfaces via the dashboard events.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_pipeline_reject(
+    board_id: *const c_char,
+    step_id: *const c_char,
+) -> bool {
+    let board_id_str = match unsafe { CStr::from_ptr(board_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let step_id_str = match unsafe { CStr::from_ptr(step_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let system = match SYSTEM.get() {
+        Some(s) => s,
+        None => return false,
+    };
+    crate::pipeline::reject_step(
+        board_id_str,
+        step_id_str,
+        None,
+        &system.command_tx,
+        Some(&system.event_tx),
+    )
+    .is_ok()
 }
 
 
@@ -4365,6 +4409,26 @@ pub extern "C" fn cyan_pipeline_reset(
     };
     
     crate::pipeline::reset_pipeline(board_id_str, &system.command_tx).is_ok()
+}
+
+
+/// Load the PERSISTED run state for a board (the single-run state machine). Returns
+/// the reconstructed run as JSON — run_id, derived status, per-step states + costs,
+/// monotonic total_cost_usd, the awaiting-approval step. The iOS Dashboard calls this
+/// on appear so a run + its progress RELOAD after navigating away (no more vanishing),
+/// and so cost is one source of truth. Pure read; never mutates.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_pipeline_status(
+    board_id: *const c_char,
+) -> *mut c_char {
+    let board_id_str = match unsafe { CStr::from_ptr(board_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match crate::pipeline::pipeline_status(board_id_str) {
+        Ok(data) => json_cstring(&data.to_string()),
+        Err(e) => json_cstring(&serde_json::json!({ "error": e.to_string() }).to_string()),
+    }
 }
 
 // ============================================================================

@@ -545,6 +545,34 @@ pub async fn run_pipeline(
     run_pipeline_with_plan(board_id, plan, command_tx, event_tx).await
 }
 
+/// The run a board is CURRENTLY executing — the keystone of the single-run state
+/// machine. ONE run-id spans the whole step-through: it is the id stamped on any step
+/// that has already run, REUSED on every resume (approve → run the next step), and it
+/// lives in the persisted cell state so leaving the board and returning reloads the
+/// SAME run. Returns `None` (⇒ a fresh run-id) only when no step has run yet, or when
+/// every step is fully resolved (the prior run finished → the next Run is new).
+fn active_run_id(steps: &[(&PipelineCell, &PipelineStepConfig)]) -> Option<String> {
+    let resolved = |s: &str| matches!(s, "human_approved" | "skipped" | "failed");
+    let touched = steps.iter().any(|(_, c)| {
+        let s = c.state.status.as_str();
+        !s.is_empty() && s != "pending"
+    });
+    if !touched {
+        return None; // fresh run
+    }
+    if steps.iter().all(|(_, c)| resolved(&c.state.status)) {
+        return None; // prior run fully resolved → next Run is a new run
+    }
+    steps.iter().find_map(|(_, c)| {
+        let s = c.state.status.as_str();
+        if !s.is_empty() && s != "pending" {
+            c.state.run_id.clone()
+        } else {
+            None
+        }
+    })
+}
+
 /// The executor core. `plan = Some(..)` ⇒ wave-concurrent; `None` ⇒ sequential
 /// toposort fallback. Exposed so tests (and a future compile path) can hand the
 /// plan in directly without the storage round-trip.
@@ -605,7 +633,9 @@ pub async fn run_pipeline_with_plan(
     let order = toposort(&graph, None)
         .map_err(|_| anyhow!("Pipeline has circular dependencies"))?;
 
-    let run_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    // Single-run state machine: REUSE the active run-id (resume) or mint a fresh one.
+    let run_id = active_run_id(&steps)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string());
     let total_steps = order.len() as u32;
 
     // ── Dashboard producer: tag this run and announce it (DASHBOARD_CONTRACT §A). ──
@@ -628,13 +658,13 @@ pub async fn run_pipeline_with_plan(
         current_item: None,
     };
 
-    // CUMULATIVE COST across a step-through: seed already-approved steps' cost into
-    // this run's obs so each segment's live snapshot includes the steps approved in
-    // earlier segments — the Dashboard cost keeps GROWING as Rick approves through
-    // the workflow instead of resetting to the current step. (Approved steps are
-    // skipped by the executors, so this never double-counts.)
+    // CUMULATIVE COST (single source of truth): seed every ALREADY-RUN step's cost
+    // into this run's obs from its persisted duration, so the live snapshot total is
+    // the SAME monotonic sum `pipeline_status` reconstructs — and matches across the
+    // step-through (it grows, never resets). Already-run steps are skipped/paused-at by
+    // the executor, so this is counted exactly ONCE (no double-charge).
     for (cell, config) in &steps {
-        if config.state.status == "human_approved" {
+        if matches!(config.state.status.as_str(), "human_approved" | "ai_complete" | "skipped" | "done") {
             if let Some(dur) = config.state.duration {
                 let gpu_ms = (dur * 1000.0) as u64;
                 acc.obs.record(StepObs {
@@ -719,8 +749,26 @@ async fn execute_sequential(
         let step_id = &graph[*node_idx];
         let Some(step) = exec_steps.get(step_id) else { continue };
 
+        // Already resolved → skip. Its cost is seeded from the persisted duration so
+        // the run total stays CUMULATIVE and is never double-counted by resuming.
         if step.status == "human_approved" || step.status == "skipped" {
             tracing::info!("Step {} already {}, skipping", step_id, step.status);
+            continue;
+        }
+        // Already ran, AWAITING approval → this is the current gate. Do NOT re-execute
+        // it (re-running double-charged its cost — the $0.30→$0.60 bug). Re-surface the
+        // gate and PAUSE the run here; approving it RESUMES the SAME run at the next step.
+        if step.status == "ai_complete" {
+            let now = now_ts();
+            let _ = event_tx.send(tags.step_state(&step.step_id, &step.name, &step.stage, StepState::AwaitingApproval, Actor::Ai, step.plugin.clone(), now));
+            let _ = event_tx.send(tags.approval_requested(&step.step_id, &step.name, &step.stage, now));
+            acc.any_awaiting = true;
+            tracing::info!("Run paused: step '{}' awaiting approval (resume)", step_id);
+            break;
+        }
+        // A failed step stays failed until an explicit Retry resets it to pending.
+        if step.status == "failed" {
+            acc.any_failed = true;
             continue;
         }
 
@@ -1321,6 +1369,10 @@ pub fn pipeline_status(board_id: &str) -> Result<serde_json::Value> {
     let mut running = 0;
     let mut failed = 0;
     let mut pending = 0;
+    // Single-run identity + monotonic cost reconstructed from the persisted cells.
+    let mut run_id: Option<String> = None;
+    let mut total_cost_usd = 0.0_f64;
+    let mut awaiting_step: Option<String> = None;
 
     for cell in &cells {
         if let Some(ref config) = cell.pipeline_config {
@@ -1332,22 +1384,49 @@ pub fn pipeline_status(board_id: &str) -> Result<serde_json::Value> {
                 "failed" => failed += 1,
                 _ => pending += 1,
             }
+            // The run-id stamped on any step that has run (the active run).
+            if run_id.is_none() {
+                if let Some(rid) = config.state.run_id.as_ref().filter(|s| !s.is_empty()) {
+                    run_id = Some(rid.clone());
+                }
+            }
+            // The first step awaiting approval (the current gate) — drives the UI.
+            if awaiting_step.is_none() && config.state.status == "ai_complete" {
+                awaiting_step = Some(config.step_id.clone());
+            }
+            // Monotonic cost: ONE source of truth = Σ(step wall-seconds × GPU rate),
+            // identical to the live dashboard rail (gpu_ms = duration×1000).
+            let step_cost = config.state.duration.unwrap_or(0.0) * 1000.0
+                * crate::dashboard::USD_PER_GPU_MS;
+            total_cost_usd += step_cost;
 
             steps.push(json!({
                 "step_id": config.step_id,
                 "title": first_line(&cell.content),
                 "status": config.state.status,
+                "stage": config.stage.clone().unwrap_or_else(|| config.step_id.clone()),
                 "executor": config.executor,
                 "depends_on": config.depends_on,
                 "ai_result": config.state.ai_result,
                 "error": config.state.error,
                 "duration": config.state.duration,
+                "cost_usd": step_cost,
             }));
         }
     }
 
+    // Derived run-level status (the keystone): failed > awaiting > running > done > idle.
+    let status = if failed > 0 { "failed" }
+        else if awaiting_step.is_some() { "awaiting_approval" }
+        else if running > 0 { "running" }
+        else if total > 0 && human_approved == total { "done" }
+        else if human_approved > 0 || ai_complete > 0 { "in_progress" }
+        else { "idle" };
+
     Ok(json!({
         "board_id": board_id,
+        "run_id": run_id,
+        "status": status,
         "total_steps": total,
         "ai_complete": ai_complete,
         "human_approved": human_approved,
@@ -1355,6 +1434,8 @@ pub fn pipeline_status(board_id: &str) -> Result<serde_json::Value> {
         "failed": failed,
         "pending": pending,
         "progress_pct": if total > 0 { (human_approved * 100) / total } else { 0 },
+        "total_cost_usd": total_cost_usd,
+        "awaiting_step": awaiting_step,
         "steps": steps
     }))
 }
@@ -1439,6 +1520,81 @@ pub fn approve_step(
             at: now,
         });
         let _ = tx.send(tags.step_state(step_id, &name, &stage, StepState::Approved, Actor::Human, None, now));
+    }
+    Ok(())
+}
+
+/// Reject a pipeline step (item C): mark it FAILED so the run stops at the gate. The
+/// operator rejected the step's output. Surfaces via ApprovalResolved(rejected) +
+/// StepStateChanged(Failed) + run_finished(failed). A later Retry resets it to pending.
+pub fn reject_step(
+    board_id: &str,
+    step_id: &str,
+    reviewer: Option<&str>,
+    command_tx: &UnboundedSender<CommandMsg>,
+    event_tx: Option<&UnboundedSender<SwiftEvent>>,
+) -> Result<()> {
+    let cells = load_pipeline_cells(board_id)?;
+    let cell = cells.iter()
+        .find(|c| c.pipeline_config.as_ref().map(|p| p.step_id.as_str()) == Some(step_id))
+        .ok_or_else(|| anyhow!("Step {} not found", step_id))?;
+    let stage = cell.pipeline_config.as_ref().map(step_stage).unwrap_or_else(|| step_id.to_string());
+    let name = first_line(&cell.content);
+
+    let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
+    let (content, cell_order, current_metadata_json): (String, i32, Option<String>) = conn.query_row(
+        "SELECT content, cell_order, metadata_json FROM notebook_cells WHERE id = ?1",
+        rusqlite::params![cell.cell_id],
+        |row| Ok((
+            row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            row.get(1)?,
+            row.get(2)?,
+        )),
+    ).map_err(|e| anyhow!("Cell not found: {}", e))?;
+    drop(conn);
+
+    let mut metadata: serde_json::Value = current_metadata_json.as_ref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(json!({}));
+    metadata["pipeline"]["state"]["status"] = json!("failed");
+    metadata["pipeline"]["state"]["error"] = json!("Rejected by reviewer");
+    metadata["pipeline"]["state"]["human_reviewer"] = json!(reviewer.unwrap_or("anonymous"));
+
+    let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
+        id: cell.cell_id.clone(),
+        board_id: board_id.to_string(),
+        cell_type: "markdown".to_string(),
+        cell_order,
+        content: Some(content),
+        output: None,
+        collapsed: false,
+        height: None,
+        metadata_json: Some(metadata.to_string()),
+    });
+    tracing::info!("Step {} rejected by {}", step_id, reviewer.unwrap_or("anonymous"));
+
+    if let Some(tx) = event_tx {
+        let by = reviewer.unwrap_or("anonymous").to_string();
+        let now = chrono::Utc::now().timestamp();
+        let tags = RunTags {
+            tenant_id: workflow_tenant(board_id),
+            run_id: String::new(),
+            board_id: board_id.to_string(),
+            workflow_id: board_id.to_string(),
+        };
+        let _ = tx.send(SwiftEvent::ApprovalResolved {
+            tenant_id: tags.tenant_id.clone(),
+            run_id: tags.run_id.clone(),
+            board_id: tags.board_id.clone(),
+            workflow_id: tags.workflow_id.clone(),
+            step_id: step_id.to_string(),
+            stage: stage.clone(),
+            decision: "rejected".to_string(),
+            by,
+            at: now,
+        });
+        let _ = tx.send(tags.step_state(step_id, &name, &stage, StepState::Failed, Actor::Human, None, now));
+        let _ = tx.send(tags.run_finished("failed", now));
     }
     Ok(())
 }
