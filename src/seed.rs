@@ -44,8 +44,14 @@ struct SeedGroup {
     boards: &'static [SeedBoard],
 }
 
-/// Coherent, idempotent demo scale-seed (items #1/#27/STEP2). Every clip below is a real
-/// file staged in the lens media root with a matching thumbnail
+/// Coherent, idempotent demo scale-seed (items #1/#27/STEP2). Every clip below is
+/// materialized into the lens media root by the canonical provisioner — the single
+/// source of truth is `cyan-iac/modules/lens/media/clips.json` (provisioned via
+/// `modules/lens/scripts/provision-media.sh`, verified by `verify-media.sh`). The
+/// `media_manifest_covers_seed_clips` test (tests/seed_media_drift.rs) asserts every
+/// clip named below appears in that manifest, so a new board clip can never silently
+/// ship without a provisioned file (which would halt its run at the cyan-media probe
+/// step). Each clip also has a matching thumbnail
 /// (`/api/v1/media/thumbnail?asset=<clip>` ⇒ 200 image/jpeg).
 ///
 /// `owner_node_id` — when non-empty, every seeded group is stamped with this identity
