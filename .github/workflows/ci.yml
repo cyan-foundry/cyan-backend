@@ -1,0 +1,108 @@
+name: CI
+
+# cyan-backend has cross-repo `../` path-deps in Cargo.toml:
+#   xaeroid       = { path = "../xaeroid" }
+#   cyan-mcp      = { path = "../cyan-mcp" }
+#   cyan-identity = { path = "../cyan-identity" }   (deps + dev-deps[testing])
+# CI must reconstruct that sibling layout under $GITHUB_WORKSPACE or the build
+# won't even resolve the path-deps. We check the main repo and each sibling out
+# into peer directories so the `../` deps resolve from the main repo's dir.
+#
+# Layout reconstructed in $GITHUB_WORKSPACE:
+#   cyan-backend/   <- this repo
+#   xaeroid/        <- sibling (cyan-foundry/XaeroID @ main)  *** see note ***
+#   cyan-mcp/       <- sibling (cyan-foundry/cyan-mcp @ main)
+#   cyan-identity/  <- sibling (cyan-foundry/cyan-identity @ main)
+#
+# *** CASE-SENSITIVITY: the Cargo path is `../xaeroid` (lowercase) but the repo
+# is named cyan-foundry/XaeroID. Linux is case-sensitive, so the checkout `path`
+# MUST be the literal lowercase `xaeroid` even though `repository` is XaeroID.
+#
+# Siblings are PRIVATE repos in the cyan-foundry org; the default GITHUB_TOKEN
+# cannot read other repos. Their checkout steps use ${{ secrets.CI_PAT }}.
+# HUMAN STEP REQUIRED: add a repo/org secret named CI_PAT (a PAT or fine-grained
+# token with read access to XaeroID + cyan-mcp + cyan-identity). Without it,
+# sibling checkout fails.
+
+on:
+  push:
+    branches: [ "main", "feat/**", "fix/**", "ci/**" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    # Staggered nightly (cyan-backend: 05:17 UTC) to avoid colliding with the other repos.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout cyan-backend (main repo)
+        uses: actions/checkout@v4
+        with:
+          path: cyan-backend
+
+      # CASE-SENSITIVE: repository is XaeroID, but the Cargo path-dep is
+      # ../xaeroid (lowercase) -> check out into a dir literally named xaeroid.
+      - name: Checkout XaeroID -> xaeroid (sibling path-dep)
+        uses: actions/checkout@v4
+        with:
+          repository: cyan-foundry/XaeroID
+          ref: main
+          token: ${{ secrets.CI_PAT }}
+          path: xaeroid
+
+      - name: Checkout cyan-mcp (sibling path-dep)
+        uses: actions/checkout@v4
+        with:
+          repository: cyan-foundry/cyan-mcp
+          ref: main
+          token: ${{ secrets.CI_PAT }}
+          path: cyan-mcp
+
+      - name: Checkout cyan-identity (sibling path-dep)
+        uses: actions/checkout@v4
+        with:
+          repository: cyan-foundry/cyan-identity
+          ref: main
+          token: ${{ secrets.CI_PAT }}
+          path: cyan-identity
+
+      # cyan-backend pins nightly via rust-toolchain.toml; honor it explicitly.
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cyan-backend
+
+      - name: Build
+        working-directory: cyan-backend
+        run: cargo build --all-targets
+
+      # RUST_MIN_STACK preserved from the prior Rust workflow (the substrate /
+      # network tests need a larger stack). Tests run against fakes / loopback;
+      # real-infra (relay/WebSocket) rungs stay #[ignore], so NO --ignored.
+      - name: Test
+        working-directory: cyan-backend
+        run: cargo test
+        env:
+          RUST_MIN_STACK: 8388608
+
+      - name: Clippy
+        working-directory: cyan-backend
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Non-blocking: pre-existing formatting may not be clean and we can't run
+      # cargo here to verify. Kept advisory so it never red-bars the build.
+      - name: Format check (advisory)
+        working-directory: cyan-backend
+        run: cargo fmt -- --check
+        continue-on-error: true
