@@ -410,6 +410,40 @@ fn step_stage(config: &PipelineStepConfig) -> String {
     config.stage.clone().unwrap_or_else(|| config.step_id.clone())
 }
 
+/// Deterministic step inference (WORKFLOW_MATERIALIZATION): map an English step's
+/// text to a (stage, cyan-media tool) without an LLM round-trip. The English still
+/// drives the lens ReAct at RUN time; this only materializes the DAG so Compile is
+/// instant and reliable (never "0 steps"). Returns the pipeline stage and, when a
+/// media verb is recognized, the cyan-media tool the step should bind to.
+fn infer_step(content: &str) -> (String, Option<String>) {
+    let c = content.to_lowercase();
+    let has = |kws: &[&str]| kws.iter().any(|k| c.contains(k));
+    // Order matters: most specific verbs first.
+    if has(&["transcribe", "caption", "subtitle", "transcript"]) {
+        ("analyze".into(), Some("transcribe".into()))
+    } else if has(&["loudness", "lufs", "audio qc", "qc audio", "-14"]) {
+        ("analyze".into(), Some("qc_loudness".into()))
+    } else if has(&["black", "freeze"]) {
+        ("analyze".into(), Some("qc_black_freeze".into()))
+    } else if has(&["thumbnail", "poster", "frame grab", "framegrab", "keyframe"]) {
+        ("deliver".into(), Some("thumbnail".into()))
+    } else if has(&["proxy", "preview"]) {
+        ("transform".into(), Some("proxy".into()))
+    } else if has(&["transcode", "convert", "codec", "rewrap", "container"]) {
+        ("transform".into(), Some("transcode".into()))
+    } else if has(&["extract audio", "split audio", "demux"]) {
+        ("transform".into(), Some("extract_audio".into()))
+    } else if has(&["ingest", "probe", "qc", "inspect", "metadata", "format", "resolution", "duration", "codec check"]) {
+        ("ingest".into(), Some("probe".into()))
+    } else if has(&["package", "deliver", "master", "export", "wrap up", "ship"]) {
+        // Delivery/packaging has no direct cyan-media tool — a lens summary step.
+        ("deliver".into(), None)
+    } else {
+        // Generic analysis step (lens ReAct over the English, no fixed tool).
+        ("analyze".into(), None)
+    }
+}
+
 /// The plugin a step dispatches to on-device, if it is an `mcp_tool` step.
 fn step_plugin(cell: &PipelineCell) -> Option<String> {
     cell.metadata_json
@@ -473,6 +507,7 @@ struct RunAccum {
     obs: RunObs,
     results: Vec<serde_json::Value>,
     any_failed: bool,
+    any_awaiting: bool,
     processed: u64,
     current_stage: Option<String>,
     current_item: Option<String>,
@@ -484,6 +519,9 @@ impl RunAccum {
         self.current_item = Some(o.name);
         if o.failed {
             self.any_failed = true;
+        }
+        if o.obs.state == StepState::AwaitingApproval {
+            self.any_awaiting = true;
         }
         self.obs.record(o.obs);
         if let Some(r) = o.result {
@@ -505,6 +543,34 @@ pub async fn run_pipeline(
 ) -> Result<serde_json::Value> {
     let plan = load_physical_plan(board_id);
     run_pipeline_with_plan(board_id, plan, command_tx, event_tx).await
+}
+
+/// The run a board is CURRENTLY executing — the keystone of the single-run state
+/// machine. ONE run-id spans the whole step-through: it is the id stamped on any step
+/// that has already run, REUSED on every resume (approve → run the next step), and it
+/// lives in the persisted cell state so leaving the board and returning reloads the
+/// SAME run. Returns `None` (⇒ a fresh run-id) only when no step has run yet, or when
+/// every step is fully resolved (the prior run finished → the next Run is new).
+fn active_run_id(steps: &[(&PipelineCell, &PipelineStepConfig)]) -> Option<String> {
+    let resolved = |s: &str| matches!(s, "human_approved" | "skipped" | "failed");
+    let touched = steps.iter().any(|(_, c)| {
+        let s = c.state.status.as_str();
+        !s.is_empty() && s != "pending"
+    });
+    if !touched {
+        return None; // fresh run
+    }
+    if steps.iter().all(|(_, c)| resolved(&c.state.status)) {
+        return None; // prior run fully resolved → next Run is a new run
+    }
+    steps.iter().find_map(|(_, c)| {
+        let s = c.state.status.as_str();
+        if !s.is_empty() && s != "pending" {
+            c.state.run_id.clone()
+        } else {
+            None
+        }
+    })
 }
 
 /// The executor core. `plan = Some(..)` ⇒ wave-concurrent; `None` ⇒ sequential
@@ -567,7 +633,9 @@ pub async fn run_pipeline_with_plan(
     let order = toposort(&graph, None)
         .map_err(|_| anyhow!("Pipeline has circular dependencies"))?;
 
-    let run_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    // Single-run state machine: REUSE the active run-id (resume) or mint a fresh one.
+    let run_id = active_run_id(&steps)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string());
     let total_steps = order.len() as u32;
 
     // ── Dashboard producer: tag this run and announce it (DASHBOARD_CONTRACT §A). ──
@@ -584,10 +652,36 @@ pub async fn run_pipeline_with_plan(
         obs: RunObs::new(tags.tenant_id.clone(), board_id, run_id.clone(), board_id, label, total_steps as u64),
         results: Vec::new(),
         any_failed: false,
+        any_awaiting: false,
         processed: 0,
         current_stage: None,
         current_item: None,
     };
+
+    // CUMULATIVE COST (single source of truth): seed every ALREADY-RUN step's cost
+    // into this run's obs from its persisted duration, so the live snapshot total is
+    // the SAME monotonic sum `pipeline_status` reconstructs — and matches across the
+    // step-through (it grows, never resets). Already-run steps are skipped/paused-at by
+    // the executor, so this is counted exactly ONCE (no double-charge).
+    for (cell, config) in &steps {
+        if matches!(config.state.status.as_str(), "human_approved" | "ai_complete" | "skipped" | "done") {
+            if let Some(dur) = config.state.duration {
+                let gpu_ms = (dur * 1000.0) as u64;
+                acc.obs.record(StepObs {
+                    step_id: config.step_id.clone(),
+                    name: first_line(&cell.content),
+                    stage: step_stage(config),
+                    actor: Actor::Ai,
+                    plugin: step_plugin(cell),
+                    state: StepState::Approved,
+                    wall_ms: gpu_ms,
+                    gate_ms: 0,
+                    cost: StepCost { gpu_ms, ..StepCost::default() },
+                });
+                acc.processed += 1;
+            }
+        }
+    }
 
     let (mode, peak) = match plan {
         Some(plan) => {
@@ -615,7 +709,15 @@ pub async fn run_pipeline_with_plan(
     let finished_at = now_ts();
     let snapshot = acc.obs.snapshot(finished_at, acc.current_item.clone(), acc.current_stage.clone());
     let _ = event_tx.send(tags.stats(snapshot));
-    let run_state = if acc.any_failed { "failed" } else { "done" };
+    // "awaiting_approval" = the run PAUSED at a per-step gate (Rick approves to
+    // resume). Only truly "done" when no step is still awaiting and none failed.
+    let run_state = if acc.any_failed {
+        "failed"
+    } else if acc.any_awaiting {
+        "awaiting_approval"
+    } else {
+        "done"
+    };
     let _ = event_tx.send(tags.run_finished(run_state, finished_at));
 
     Ok(json!({
@@ -647,8 +749,26 @@ async fn execute_sequential(
         let step_id = &graph[*node_idx];
         let Some(step) = exec_steps.get(step_id) else { continue };
 
+        // Already resolved → skip. Its cost is seeded from the persisted duration so
+        // the run total stays CUMULATIVE and is never double-counted by resuming.
         if step.status == "human_approved" || step.status == "skipped" {
             tracing::info!("Step {} already {}, skipping", step_id, step.status);
+            continue;
+        }
+        // Already ran, AWAITING approval → this is the current gate. Do NOT re-execute
+        // it (re-running double-charged its cost — the $0.30→$0.60 bug). Re-surface the
+        // gate and PAUSE the run here; approving it RESUMES the SAME run at the next step.
+        if step.status == "ai_complete" {
+            let now = now_ts();
+            let _ = event_tx.send(tags.step_state(&step.step_id, &step.name, &step.stage, StepState::AwaitingApproval, Actor::Ai, step.plugin.clone(), now));
+            let _ = event_tx.send(tags.approval_requested(&step.step_id, &step.name, &step.stage, now));
+            acc.any_awaiting = true;
+            tracing::info!("Run paused: step '{}' awaiting approval (resume)", step_id);
+            break;
+        }
+        // A failed step stays failed until an explicit Retry resets it to pending.
+        if step.status == "failed" {
+            acc.any_failed = true;
             continue;
         }
 
@@ -675,8 +795,28 @@ async fn execute_sequential(
             board_id.to_string(), tags.clone(), total_steps, snapshot,
             step.clone(), command_tx.clone(), event_tx.clone(),
         ).await;
+        let awaiting = outcome.obs.state == StepState::AwaitingApproval;
+        let failed = outcome.failed;
         acc.processed += 1;
         acc.fold(outcome);
+        // LIVE cost/progress: push an incremental snapshot after EACH step so the
+        // Dashboard's this-workflow cost + step counts INCREMENT step-by-step
+        // (not just once at run end) — the "$0.00 stuck" fix.
+        let snap = acc.obs.snapshot(now_ts(), acc.current_item.clone(), acc.current_stage.clone());
+        let _ = event_tx.send(tags.stats(snap));
+        // S — FAILURE HALTS THE RUN: a failed step stops execution here. Downstream
+        // dependents do NOT run (no orphan parallel steps); the failed step is left
+        // red + actionable (Retry resumes from it, Reject aborts).
+        if failed {
+            tracing::info!("Run halted: step '{}' FAILED — downstream blocked", step_id);
+            break;
+        }
+        // PER-STEP PAUSE: stop at the first step awaiting approval. Rick approves it
+        // (cyan_pipeline_approve), which resumes the run at the next step.
+        if awaiting {
+            tracing::info!("Run paused: step '{}' awaiting approval", step_id);
+            break;
+        }
     }
     1
 }
@@ -700,6 +840,12 @@ async fn execute_waves(
     let mut peak = 0usize;
 
     for wave in plan.ordered_waves() {
+        // S — FAILURE HALTS THE RUN: once any step has failed, stop launching further
+        // waves so downstream dependents never run (Retry resumes, Reject aborts).
+        // PER-STEP PAUSE: likewise stop once a step is awaiting approval.
+        if acc.any_failed || acc.any_awaiting {
+            break;
+        }
         for batch in wave.ordered_batches() {
             // Classify each step: skip / cache-hit / gate / stalled-behind-gate /
             // execute. Only "execute" steps are spawned concurrently.
@@ -766,6 +912,10 @@ async fn execute_waves(
                     Ok(outcome) => {
                         acc.processed += 1;
                         acc.fold(outcome);
+                        // LIVE cost/progress: incremental snapshot after each step
+                        // completes so the Dashboard cost INCREMENTS step-by-step.
+                        let snap = acc.obs.snapshot(now_ts(), acc.current_item.clone(), acc.current_stage.clone());
+                        let _ = event_tx.send(tags.stats(snap));
                     }
                     Err(e) => tracing::error!("wave step task failed to join: {}", e),
                 }
@@ -828,20 +978,32 @@ async fn exec_one_step(
     match result {
         Ok(output) => {
             tracing::info!("Step {} completed in {:.1}s", step.step_id, duration);
-            if let Err(e) = update_step_state_full(&board_id, &step.cell_id, "ai_complete", Some(&output), None, &tags.run_id, Some(duration), &command_tx) {
+            // PER-STEP HUMAN-IN-THE-LOOP: the AI work is done; with per-step gating
+            // ON (auto_advance=false, the compile default) the step then AWAITS human
+            // approval before the run advances — so Rick steps THROUGH the workflow,
+            // seeing each step's output and Approve/Reject. auto_advance=true ⇒ Done.
+            let needs_approval = !step.auto_advance;
+            let cell_status = if needs_approval { "ai_complete" } else { "human_approved" };
+            if let Err(e) = update_step_state_full(&board_id, &step.cell_id, cell_status, Some(&output), None, &tags.run_id, Some(duration), &command_tx) {
                 tracing::error!("step {} done-state write failed: {}", step.step_id, e);
             }
             let _ = event_tx.send(SwiftEvent::StatusUpdate {
                 message: format!("Pipeline: step '{}' complete ({:.1}s)", step.step_id, duration),
             });
-            let _ = event_tx.send(tags.step_state(&step.step_id, &step.name, &step.stage, StepState::Done, actor, step.plugin.clone(), now_ts()));
+            let now = now_ts();
+            let state = if needs_approval { StepState::AwaitingApproval } else { StepState::Done };
+            let _ = event_tx.send(tags.step_state(&step.step_id, &step.name, &step.stage, state, actor, step.plugin.clone(), now));
+            if needs_approval {
+                // Surface the per-step gate (the step's output is already persisted).
+                let _ = event_tx.send(tags.approval_requested(&step.step_id, &step.name, &step.stage, now));
+            }
             fire_notifications(&step.notifications, "ai_complete", &board_id, &step.step_id, &event_tx);
             StepOutcome {
                 obs: StepObs {
                     step_id: step.step_id.clone(), name: step.name.clone(), stage: step.stage.clone(),
-                    actor, plugin: step.plugin.clone(), state: StepState::Done, wall_ms, gate_ms: 0, cost,
+                    actor, plugin: step.plugin.clone(), state, wall_ms, gate_ms: 0, cost,
                 },
-                result: Some(json!({ "step_id": step.step_id, "status": "ai_complete", "duration": duration, "output_length": output.len() })),
+                result: Some(json!({ "step_id": step.step_id, "status": cell_status, "duration": duration, "output_length": output.len() })),
                 failed: false,
                 stage: step.stage,
                 name: step.name,
@@ -1109,73 +1271,72 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
         return Err(anyhow!("No pipeline steps found (only asset references)"));
     }
 
-    // Build prompt
-    let mut prompt = String::from(
-        "Return ONLY a JSON array of pipeline step configs. No explanation, no markdown, just the JSON array.\n\n\
-         Steps:\n"
-    );
+    // DETERMINISTIC compile (WORKFLOW_MATERIALIZATION): materialize each English step
+    // cell into a physical step config with NO LLM round-trip — so Compile is instant
+    // and never yields "0 steps" when the 8B is slow or returns unparseable JSON. The
+    // English content still drives the lens ReAct at RUN time; compile only lays out
+    // the DAG: a linear chain (each step depends on the previous), executor=lens, an
+    // inferred stage + cyan-media tool hint, and auto_advance=false so the operator
+    // can step THROUGH the workflow with per-step approval.
+    tracing::info!("Pipeline compile (deterministic): materializing {} steps", step_cells.len());
+    let mut applied: u64 = 0;
+    let mut prev_step_id: Option<String> = None;
+    let mut configs: Vec<serde_json::Value> = Vec::new();
 
     for (i, cell) in step_cells.iter().enumerate() {
-        let title = first_line(&cell.content);
-        prompt.push_str(&format!("{}. {}\n", i + 1, title));
-    }
+        let step_id = generate_step_id(&cell.content, i);
+        let (stage, media_tool) = infer_step(&cell.content);
 
-    prompt.push_str(
-        "\nEach object needs: step_id (snake_case string), depends_on (array of step_id strings that must complete first), \
-         executor (one of: local, lens, cloud, manual), command (string or null), timeout_seconds (integer)"
-    );
+        // #5 — EDIT/RECOMPILE ROBUSTNESS: PRESERVE the persisted run state of an
+        // UNCHANGED step (same content ⇒ same generated step_id) so re-Review/recompile
+        // (after editing or ADDING steps) never wipes an in-progress run. An edited step
+        // (content changed ⇒ new step_id) or a brand-new step starts pending — it must
+        // re-run. Idempotent: recompiling an unrun board is a no-op on state.
+        let preserved_state = cell
+            .pipeline_config
+            .as_ref()
+            .filter(|c| c.step_id == step_id)
+            .map(|c| c.state.clone())
+            .unwrap_or_default();
 
-    tracing::info!("Pipeline compile: sending {} steps to vLLM", step_cells.len());
-
-    // Call vLLM
-    let response = call_vllm(&prompt, 1000, 0.1).await?;
-
-    // Parse JSON array from response (might have markdown fences)
-    let cleaned = response
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
-
-    let configs: Vec<serde_json::Value> = serde_json::from_str(cleaned)
-        .map_err(|e| anyhow!("Failed to parse vLLM response as JSON: {}. Raw: {}", e, &cleaned[..cleaned.len().min(300)]))?;
-
-    tracing::info!("Pipeline compile: got {} step configs from vLLM", configs.len());
-
-    // Apply configs to cells
-    let mut applied = 0;
-    for (i, config_val) in configs.iter().enumerate() {
-        if i >= step_cells.len() { break; }
-        let cell = step_cells[i];
-
-        let step_id = config_val["step_id"].as_str().unwrap_or(&format!("step_{}", i)).to_string();
+        // S5 — PRESERVE the authored executor (esp. "manual", the human-approval gate) so a
+        // Run/recompile never drops it to "lens" (which made the package/human step EXECUTE
+        // forever instead of pausing as a gate). A cell with a bound config keeps its
+        // executor; a brand-new/unconfigured cell defaults to "lens". Stable across recompiles
+        // because compile writes this executor back into the cell's pipeline config below.
+        let executor = cell
+            .pipeline_config
+            .as_ref()
+            .map(|c| c.executor.clone())
+            .filter(|e| !e.is_empty())
+            .unwrap_or_else(|| "lens".to_string());
 
         let config = PipelineStepConfig {
             step_id: step_id.clone(),
-            depends_on: config_val["depends_on"].as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default(),
-            stage: config_val["stage"].as_str().map(String::from),
-            executor: config_val["executor"].as_str().unwrap_or("lens").to_string(),
+            depends_on: prev_step_id.clone().into_iter().collect(),
+            stage: Some(stage),
+            executor: executor.clone(),
             model: Some("cyan-lens".to_string()),
             model_config: None,
-            tools: vec![],
+            tools: media_tool.iter().cloned().collect(),
             output_format: "markdown".to_string(),
-            command: config_val["command"].as_str().map(String::from),
-            timeout_seconds: config_val["timeout_seconds"].as_u64(),
+            command: None,
+            timeout_seconds: Some(300),
             retry_count: Some(1),
             auto_advance: false,
             notifications: vec![],
-            state: PipelineStepState::default(),
+            state: preserved_state,
         };
 
-        // Merge into cell metadata
+        // Merge into cell metadata: the pipeline config AND, when a media verb was
+        // recognized, the mcp_tool hint the run path binds cyan-media through.
         let mut metadata: serde_json::Value = cell.metadata_json.as_ref()
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or(json!({}));
-
         metadata["pipeline"] = serde_json::to_value(&config)?;
+        if let Some(tool) = &media_tool {
+            metadata["mcp_tool"] = json!({ "plugin_id": "cyan-media", "tool": tool });
+        }
 
         let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
             id: cell.cell_id.clone(),
@@ -1189,11 +1350,16 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
             metadata_json: Some(metadata.to_string()),
         });
 
+        configs.push(serde_json::to_value(&config)?);
+        prev_step_id = Some(step_id);
         applied += 1;
     }
 
+    // NOTE: the FFI (cyan_pipeline_compile) reads data["applied"] for its status line —
+    // emit BOTH keys so the "N steps configured" message is correct (was always 0).
     Ok(json!({
         "success": true,
+        "applied": applied,
         "steps_compiled": applied,
         "configs": configs
     }))
@@ -1236,6 +1402,10 @@ pub fn pipeline_status(board_id: &str) -> Result<serde_json::Value> {
     let mut running = 0;
     let mut failed = 0;
     let mut pending = 0;
+    // Single-run identity + monotonic cost reconstructed from the persisted cells.
+    let mut run_id: Option<String> = None;
+    let mut total_cost_usd = 0.0_f64;
+    let mut awaiting_step: Option<String> = None;
 
     for cell in &cells {
         if let Some(ref config) = cell.pipeline_config {
@@ -1247,22 +1417,49 @@ pub fn pipeline_status(board_id: &str) -> Result<serde_json::Value> {
                 "failed" => failed += 1,
                 _ => pending += 1,
             }
+            // The run-id stamped on any step that has run (the active run).
+            if run_id.is_none() {
+                if let Some(rid) = config.state.run_id.as_ref().filter(|s| !s.is_empty()) {
+                    run_id = Some(rid.clone());
+                }
+            }
+            // The first step awaiting approval (the current gate) — drives the UI.
+            if awaiting_step.is_none() && config.state.status == "ai_complete" {
+                awaiting_step = Some(config.step_id.clone());
+            }
+            // Monotonic cost: ONE source of truth = Σ(step wall-seconds × GPU rate),
+            // identical to the live dashboard rail (gpu_ms = duration×1000).
+            let step_cost = config.state.duration.unwrap_or(0.0) * 1000.0
+                * crate::dashboard::USD_PER_GPU_MS;
+            total_cost_usd += step_cost;
 
             steps.push(json!({
                 "step_id": config.step_id,
                 "title": first_line(&cell.content),
                 "status": config.state.status,
+                "stage": config.stage.clone().unwrap_or_else(|| config.step_id.clone()),
                 "executor": config.executor,
                 "depends_on": config.depends_on,
                 "ai_result": config.state.ai_result,
                 "error": config.state.error,
                 "duration": config.state.duration,
+                "cost_usd": step_cost,
             }));
         }
     }
 
+    // Derived run-level status (the keystone): failed > awaiting > running > done > idle.
+    let status = if failed > 0 { "failed" }
+        else if awaiting_step.is_some() { "awaiting_approval" }
+        else if running > 0 { "running" }
+        else if total > 0 && human_approved == total { "done" }
+        else if human_approved > 0 || ai_complete > 0 { "in_progress" }
+        else { "idle" };
+
     Ok(json!({
         "board_id": board_id,
+        "run_id": run_id,
+        "status": status,
         "total_steps": total,
         "ai_complete": ai_complete,
         "human_approved": human_approved,
@@ -1270,6 +1467,8 @@ pub fn pipeline_status(board_id: &str) -> Result<serde_json::Value> {
         "failed": failed,
         "pending": pending,
         "progress_pct": if total > 0 { (human_approved * 100) / total } else { 0 },
+        "total_cost_usd": total_cost_usd,
+        "awaiting_step": awaiting_step,
         "steps": steps
     }))
 }
@@ -1314,6 +1513,22 @@ pub fn approve_step(
     metadata["pipeline"]["state"]["human_reviewer"] = json!(reviewer.unwrap_or("anonymous"));
     metadata["pipeline"]["state"]["human_approved_at"] = json!(chrono::Utc::now().timestamp());
 
+    // SYNCHRONOUS persist (N): the immediately-spawned resume-run must read
+    // `human_approved` NOW (not the stale `ai_complete`) so it advances to the next
+    // step instead of re-pausing here. The command_tx below still gossips to peers.
+    let _ = storage::cell_update(&crate::models::dto::NotebookCellDTO {
+        id: cell.cell_id.clone(),
+        board_id: board_id.to_string(),
+        cell_type: "markdown".to_string(),
+        cell_order,
+        content: Some(content.clone()),
+        output: None,
+        collapsed: false,
+        height: None,
+        metadata_json: Some(metadata.to_string()),
+        created_at: 0,
+        updated_at: 0,
+    });
     let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
         id: cell.cell_id.clone(),
         board_id: board_id.to_string(),
@@ -1358,6 +1573,81 @@ pub fn approve_step(
     Ok(())
 }
 
+/// Reject a pipeline step (item C): mark it FAILED so the run stops at the gate. The
+/// operator rejected the step's output. Surfaces via ApprovalResolved(rejected) +
+/// StepStateChanged(Failed) + run_finished(failed). A later Retry resets it to pending.
+pub fn reject_step(
+    board_id: &str,
+    step_id: &str,
+    reviewer: Option<&str>,
+    command_tx: &UnboundedSender<CommandMsg>,
+    event_tx: Option<&UnboundedSender<SwiftEvent>>,
+) -> Result<()> {
+    let cells = load_pipeline_cells(board_id)?;
+    let cell = cells.iter()
+        .find(|c| c.pipeline_config.as_ref().map(|p| p.step_id.as_str()) == Some(step_id))
+        .ok_or_else(|| anyhow!("Step {} not found", step_id))?;
+    let stage = cell.pipeline_config.as_ref().map(step_stage).unwrap_or_else(|| step_id.to_string());
+    let name = first_line(&cell.content);
+
+    let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
+    let (content, cell_order, current_metadata_json): (String, i32, Option<String>) = conn.query_row(
+        "SELECT content, cell_order, metadata_json FROM notebook_cells WHERE id = ?1",
+        rusqlite::params![cell.cell_id],
+        |row| Ok((
+            row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            row.get(1)?,
+            row.get(2)?,
+        )),
+    ).map_err(|e| anyhow!("Cell not found: {}", e))?;
+    drop(conn);
+
+    let mut metadata: serde_json::Value = current_metadata_json.as_ref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(json!({}));
+    metadata["pipeline"]["state"]["status"] = json!("failed");
+    metadata["pipeline"]["state"]["error"] = json!("Rejected by reviewer");
+    metadata["pipeline"]["state"]["human_reviewer"] = json!(reviewer.unwrap_or("anonymous"));
+
+    let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
+        id: cell.cell_id.clone(),
+        board_id: board_id.to_string(),
+        cell_type: "markdown".to_string(),
+        cell_order,
+        content: Some(content),
+        output: None,
+        collapsed: false,
+        height: None,
+        metadata_json: Some(metadata.to_string()),
+    });
+    tracing::info!("Step {} rejected by {}", step_id, reviewer.unwrap_or("anonymous"));
+
+    if let Some(tx) = event_tx {
+        let by = reviewer.unwrap_or("anonymous").to_string();
+        let now = chrono::Utc::now().timestamp();
+        let tags = RunTags {
+            tenant_id: workflow_tenant(board_id),
+            run_id: String::new(),
+            board_id: board_id.to_string(),
+            workflow_id: board_id.to_string(),
+        };
+        let _ = tx.send(SwiftEvent::ApprovalResolved {
+            tenant_id: tags.tenant_id.clone(),
+            run_id: tags.run_id.clone(),
+            board_id: tags.board_id.clone(),
+            workflow_id: tags.workflow_id.clone(),
+            step_id: step_id.to_string(),
+            stage: stage.clone(),
+            decision: "rejected".to_string(),
+            by,
+            at: now,
+        });
+        let _ = tx.send(tags.step_state(step_id, &name, &stage, StepState::Failed, Actor::Human, None, now));
+        let _ = tx.send(tags.run_finished("failed", now));
+    }
+    Ok(())
+}
+
 /// Retry a pipeline step — reset to pending while preserving all metadata
 pub fn retry_step(
     board_id: &str,
@@ -1398,6 +1688,21 @@ pub fn retry_step(
     let attempt = metadata["pipeline"]["state"]["attempt"].as_u64().unwrap_or(0);
     metadata["pipeline"]["state"]["attempt"] = json!(attempt + 1);
 
+    // SYNCHRONOUS persist (C/S): the resume-run spawned right after Retry must read the
+    // step as `pending` NOW so it re-executes it (resume from the failed step).
+    let _ = storage::cell_update(&crate::models::dto::NotebookCellDTO {
+        id: cell.cell_id.clone(),
+        board_id: board_id.to_string(),
+        cell_type: "markdown".to_string(),
+        cell_order,
+        content: Some(content.clone()),
+        output: None,
+        collapsed: false,
+        height: None,
+        metadata_json: Some(metadata.to_string()),
+        created_at: 0,
+        updated_at: 0,
+    });
     let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
         id: cell.cell_id.clone(),
         board_id: board_id.to_string(),
@@ -1709,6 +2014,23 @@ fn update_step_state_full(
         metadata["pipeline"]["state"]["duration"] = json!(dur);
     }
 
+    // SYNCHRONOUS persist (N/L/M): write the new state to storage NOW so the resume-run
+    // and the Dashboard reconstruct read the latest status immediately (the command_tx
+    // path below still gossips it to peers). Without this, a resume raced the async
+    // command and re-paused at the just-finished step, and reconstruct showed stale cost.
+    let _ = storage::cell_update(&crate::models::dto::NotebookCellDTO {
+        id: cell_id.to_string(),
+        board_id: board_id.to_string(),
+        cell_type: "markdown".to_string(),
+        cell_order,
+        content: Some(content.clone()),
+        output: ai_result.map(|s| s.to_string()),
+        collapsed: false,
+        height: None,
+        metadata_json: Some(metadata.to_string()),
+        created_at: now,
+        updated_at: now,
+    });
     let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
         id: cell_id.to_string(),
         board_id: board_id.to_string(),

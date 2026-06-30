@@ -153,14 +153,18 @@ pub struct ReasoningStep {
     pub observation: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+// Tolerant: the live /pulse payload carries `request` + `text` + `generated_at` but
+// no `context` — a strict deser here errored the whole Lens-AI panel. Default fills it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct SummaryResponse {
     pub text: String,
     pub generated_at: u64,
     pub context: SummaryContext,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct SummaryContext {
     pub nodes_examined: usize,
     pub key_decisions: Vec<DecisionBrief>,
@@ -259,7 +263,8 @@ pub struct JiraBrief {
     pub priority: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct NudgeReport {
     pub group_id: String,
     pub generated_at: u64,
@@ -278,7 +283,8 @@ pub struct Nudge {
     pub source_node_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct NudgeSummary {
     pub stale_asks: usize,
     pub stale_blockers: usize,
@@ -315,7 +321,8 @@ pub struct GraphEdge {
     pub confidence: Option<f32>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct AsksResponse {
     pub asks: Vec<AskRow>,
 }
@@ -332,7 +339,8 @@ pub struct AskRow {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct DecisionsResponse {
     pub decisions: Vec<DecisionRow>,
 }
@@ -348,12 +356,20 @@ pub struct DecisionRow {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Tolerant by design: the lens health `data` shape drifts (it dropped `iggy` from
+/// the payload and added `commit`), and a STRICT deser here made the whole app show
+/// "Lens offline" against a perfectly live lens. `#[serde(default)]` + Default means a
+/// missing field is a default (never a parse error); unknown fields are ignored by
+/// serde already. Mirrors the lens-side "tolerant deser" invariant.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct HealthResponse {
     pub postgres: bool,
     pub iggy: bool,
     pub vllm: bool,
     pub lens: bool,
+    /// The deployed lens build sha (added by the lens; absent on older lenses).
+    pub commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -674,5 +690,41 @@ mod tests {
         let config = CyanLensConfig::default();
         assert_eq!(config.base_url, "http://localhost:8080");
         assert_eq!(config.group_id, "default");
+    }
+
+    // Contract tests: the EXACT live lens payloads (captured 2026-06-25 from the
+    // deployed c3b809f lens) must parse — these are the shapes that made a strict
+    // deser show "Lens offline" / Lens-AI "Error" against a live lens.
+
+    #[test]
+    fn health_parses_live_shape_without_iggy_and_with_commit() {
+        // Live: no `iggy`, plus a `commit` the old struct didn't know about.
+        let live = r#"{"success":true,"data":{"postgres":true,"vllm":true,"lens":true,"commit":"c3b809f"}}"#;
+        let r: ApiResponse<HealthResponse> = serde_json::from_str(live).unwrap();
+        let h = r.data.expect("health data parsed");
+        assert!(h.vllm && h.lens && h.postgres);
+        assert!(!h.iggy, "missing iggy defaults to false, never a parse error");
+        assert_eq!(h.commit.as_deref(), Some("c3b809f"));
+    }
+
+    #[test]
+    fn pulse_parses_live_shape_without_context() {
+        // Live /pulse carries request+text+generated_at but NO `context`.
+        let live = r#"{"success":true,"data":{"request":{"group_id":"default"},"generated_at":1782427784,"text":"summary"}}"#;
+        let r: ApiResponse<SummaryResponse> = serde_json::from_str(live).unwrap();
+        let s = r.data.expect("pulse data parsed");
+        assert_eq!(s.text, "summary");
+        assert_eq!(s.context.nodes_examined, 0, "missing context defaults");
+    }
+
+    #[test]
+    fn nudges_asks_decisions_parse_live_shapes() {
+        let n = r#"{"success":true,"data":{"tenant_id":"default","group_id":"default","generated_at":1,"nudges":[],"summary":{"stale_asks":0,"stale_blockers":0,"unanswered_mentions":0,"unimplemented_decisions":0,"total":0}}}"#;
+        let nr: ApiResponse<NudgeReport> = serde_json::from_str(n).unwrap();
+        assert_eq!(nr.data.unwrap().summary.total, 0);
+        let a: ApiResponse<AsksResponse> = serde_json::from_str(r#"{"success":true,"data":{"asks":[]}}"#).unwrap();
+        assert!(a.data.unwrap().asks.is_empty());
+        let d: ApiResponse<DecisionsResponse> = serde_json::from_str(r#"{"success":true,"data":{"decisions":[]}}"#).unwrap();
+        assert!(d.data.unwrap().decisions.is_empty());
     }
 }

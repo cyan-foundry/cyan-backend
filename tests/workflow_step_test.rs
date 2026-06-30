@@ -340,3 +340,44 @@ fn autocomplete_index_query_returns_tools_artifacts_actions() {
         "tenant B file must not appear in tenant A index"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// S5 — compile MUST preserve executor="manual" (the human-approval gate).
+// The LLM/deterministic recompile (compile_via_llm) used to hardcode executor="lens",
+// dropping the manual gate so the package/human step EXECUTED forever instead of pausing.
+// This drives the REAL compile_via_llm and asserts the manual executor survives.
+// ════════════════════════════════════════════════════════════════════════════
+#[tokio::test]
+async fn compile_preserves_manual_executor() {
+    ensure_db();
+    let (group, board) = ("wf-manual-grp", "wf-manual-board");
+    seed_board(group, board);
+    let now = 1_700_000_000i64;
+
+    let lens_meta = r#"{"pipeline":{"step_id":"ingest","depends_on":[],"executor":"lens","model":"cyan-lens","timeout_seconds":300,"retry_count":1,"auto_advance":false,"notifications":[],"state":{"status":"pending","attempt":0}}}"#;
+    let manual_meta = r#"{"pipeline":{"step_id":"package","depends_on":["ingest"],"executor":"manual","model":"cyan-lens","timeout_seconds":300,"retry_count":1,"auto_advance":false,"notifications":[],"state":{"status":"pending","attempt":0}}}"#;
+    storage::cell_insert_simple(
+        &format!("{board}-ingest"), board, "markdown", 0,
+        Some("Ingest the master big-buck-bunny.mp4"), None, false, None, Some(lens_meta), now, now,
+    ).expect("ingest cell");
+    storage::cell_insert_simple(
+        &format!("{board}-package"), board, "markdown", 1,
+        Some("Package: deliver big-buck-bunny.mp4 at -14 LUFS and write the sidecar"),
+        None, false, None, Some(manual_meta), now, now,
+    ).expect("package cell");
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<cyan_backend::models::commands::CommandMsg>();
+    pipeline::compile_via_llm(board, &tx).await.expect("compile_via_llm");
+
+    // After compile, the package (human) step's executor MUST still be "manual".
+    let cells = storage::cell_list_by_boards(&[board.to_string()]).expect("cells");
+    let pkg = cells.iter().find(|c| c.id.ends_with("-package")).expect("package cell present");
+    let meta: serde_json::Value =
+        serde_json::from_str(pkg.metadata_json.as_deref().unwrap_or("{}")).expect("meta json");
+    assert_eq!(
+        meta["pipeline"]["executor"].as_str(), Some("manual"),
+        "compile dropped the manual gate to '{}' — the human step would run forever",
+        meta["pipeline"]["executor"].as_str().unwrap_or("?")
+    );
+    println!("S5-PROOF package executor after compile = {}", meta["pipeline"]["executor"]);
+}

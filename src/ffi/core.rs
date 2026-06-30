@@ -911,6 +911,19 @@ pub extern "C" fn cyan_seed_demo_if_empty() {
     }
 }
 
+/// Fix A: actively seed the coherent demo set (3 groups / 10 boards) IN-PROCESS under the
+/// app's OWN engine identity, then refresh the tree. Additive to the no-op
+/// `cyan_seed_demo_if_empty` — this one really seeds. The seed is idempotent
+/// (truncate-then-seed of the managed group ids) so calling it repeatedly converges to
+/// exactly the intended set. Fire-and-forget: the handler emits `TreeLoaded` when done, so
+/// the app's FileTree refreshes via its normal snapshot event path.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_seed_demo() {
+    if let Some(sys) = SYSTEM.get() {
+        let _ = sys.command_tx.send(CommandMsg::SeedDemo);
+    }
+}
+
 // ---------- FFI: unread / notifications (R10FB §N) ----------
 
 /// Unread counts as a JSON object `{board_id: count}` — **board-level only** (R11 §3). One
@@ -2315,8 +2328,15 @@ pub extern "C" fn cyan_set_board_mode(board_id: *const c_char, mode: *const c_ch
         mode_str.clone()
     };
 
-    // Validate mode
-    if normalized_mode != "canvas" && normalized_mode != "notebook" && normalized_mode != "notes" {
+    // Validate mode. Fix C: the board FACES are notebook / notes / dashboard / video
+    // (BoardFace enum on iOS); "canvas" is the legacy whiteboard mode kept for back-compat.
+    // "dashboard" + "video" were previously rejected here, so the app's
+    // setActiveFace(.dashboard) returned false and the Run button could not flip the board to
+    // the Dashboard face — it stayed on Workflow. Accept all real faces.
+    if !matches!(
+        normalized_mode.as_str(),
+        "canvas" | "notebook" | "notes" | "dashboard" | "video"
+    ) {
         tracing::warn!("Invalid board mode: {}", normalized_mode);
         return false;
     }
@@ -4295,14 +4315,33 @@ pub extern "C" fn cyan_pipeline_approve(
         None => return false,
     };
     
-    crate::pipeline::approve_step(
+    let approved = crate::pipeline::approve_step(
         board_id_str,
         step_id_str,
         None,
         &system.command_tx,
         Some(&system.event_tx),
     )
-    .is_ok()
+    .is_ok();
+
+    // RESUME the step-through: approving a step unblocks the next one, so re-run the
+    // pipeline (approved/skipped steps are skipped) to execute the next step, which
+    // then runs → awaits its own approval. This is what lets Rick step THROUGH the
+    // workflow one approval at a time, with cost incrementing across steps.
+    if approved {
+        let command_tx = system.command_tx.clone();
+        let event_tx = system.event_tx.clone();
+        let bid = board_id_str.to_string();
+        if let Some(rt) = crate::RUNTIME.get() {
+            rt.spawn(async move {
+                if let Err(e) = crate::pipeline::run_pipeline(&bid, &command_tx, &event_tx).await {
+                    tracing::warn!("resume-after-approve run failed: {}", e);
+                }
+            });
+        }
+    }
+
+    approved
 }
 
 
@@ -4326,7 +4365,51 @@ pub extern "C" fn cyan_pipeline_retry(
         None => return false,
     };
     
-    crate::pipeline::retry_step(board_id_str, step_id_str, &system.command_tx).is_ok()
+    let retried = crate::pipeline::retry_step(board_id_str, step_id_str, &system.command_tx).is_ok();
+    // RESUME after retry: the step was reset to pending — re-run the pipeline so it
+    // executes again (and the run continues), instead of just sitting reset.
+    if retried {
+        let command_tx = system.command_tx.clone();
+        let event_tx = system.event_tx.clone();
+        let bid = board_id_str.to_string();
+        if let Some(rt) = crate::RUNTIME.get() {
+            rt.spawn(async move {
+                if let Err(e) = crate::pipeline::run_pipeline(&bid, &command_tx, &event_tx).await {
+                    tracing::warn!("resume-after-retry run failed: {}", e);
+                }
+            });
+        }
+    }
+    retried
+}
+
+/// Reject a pipeline step: mark it failed so the run STOPS at the gate (the operator
+/// rejected the step's output). Mirror of approve; surfaces via the dashboard events.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_pipeline_reject(
+    board_id: *const c_char,
+    step_id: *const c_char,
+) -> bool {
+    let board_id_str = match unsafe { CStr::from_ptr(board_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let step_id_str = match unsafe { CStr::from_ptr(step_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let system = match SYSTEM.get() {
+        Some(s) => s,
+        None => return false,
+    };
+    crate::pipeline::reject_step(
+        board_id_str,
+        step_id_str,
+        None,
+        &system.command_tx,
+        Some(&system.event_tx),
+    )
+    .is_ok()
 }
 
 
@@ -4346,6 +4429,26 @@ pub extern "C" fn cyan_pipeline_reset(
     };
     
     crate::pipeline::reset_pipeline(board_id_str, &system.command_tx).is_ok()
+}
+
+
+/// Load the PERSISTED run state for a board (the single-run state machine). Returns
+/// the reconstructed run as JSON — run_id, derived status, per-step states + costs,
+/// monotonic total_cost_usd, the awaiting-approval step. The iOS Dashboard calls this
+/// on appear so a run + its progress RELOAD after navigating away (no more vanishing),
+/// and so cost is one source of truth. Pure read; never mutates.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_pipeline_status(
+    board_id: *const c_char,
+) -> *mut c_char {
+    let board_id_str = match unsafe { CStr::from_ptr(board_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match crate::pipeline::pipeline_status(board_id_str) {
+        Ok(data) => json_cstring(&data.to_string()),
+        Err(e) => json_cstring(&serde_json::json!({ "error": e.to_string() }).to_string()),
+    }
 }
 
 // ============================================================================

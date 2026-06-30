@@ -240,6 +240,18 @@ pub fn group_get_owner(group_id: &str) -> Option<String> {
     ).ok().flatten()
 }
 
+/// Stamp the owner identity on a group (mirrors the `owner_node_id` the CreateGroup path
+/// writes on INSERT). Used by the in-process demo seed so seeded groups are owned by the
+/// app identity and pass the owner-gated rename/delete/deploy checks.
+pub fn group_set_owner(group_id: &str, owner_node_id: &str) -> Result<()> {
+    let conn = db().lock_safe();
+    conn.execute(
+        "UPDATE groups SET owner_node_id=?1 WHERE id=?2",
+        params![owner_node_id, group_id],
+    )?;
+    Ok(())
+}
+
 /// Get owner_node_id of a workspace
 pub fn workspace_get_owner(workspace_id: &str) -> Option<String> {
     let conn = db().lock_safe();
@@ -943,6 +955,19 @@ pub fn workflow_state_set_deployed(
         params![board_id, dashboard_available as i32, updated_at],
     )?;
     Ok(())
+}
+
+/// Delete `board_workflow_state` rows whose board no longer exists (orphans left by a
+/// truncate-then-seed that doesn't cascade this table). Keeps the deploy-state table in
+/// lockstep with the boards — no stale rows after a re-seed.
+pub fn workflow_state_prune_orphans() -> Result<usize> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    let n = conn.execute(
+        "DELETE FROM board_workflow_state WHERE board_id NOT IN \
+         (SELECT id FROM objects WHERE type='whiteboard')",
+        [],
+    )?;
+    Ok(n)
 }
 
 /// Set just the `locked` lane (LWW on `updated_at`). Unlocking is gated upstream by an org

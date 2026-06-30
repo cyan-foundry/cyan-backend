@@ -370,4 +370,9 @@ pub enum CommandMsg {
     // ═══════════════════════════════════════════════════════════════════════
     Snapshot {},
     SeedDemoIfEmpty,
+    /// Run the coherent demo scale-seed IN-PROCESS under the running engine's identity
+    /// (Fix A). Unlike the inert `SeedDemoIfEmpty`, this actually seeds and then emits a
+    /// fresh `TreeLoaded` so the Explorer refreshes. Idempotent (truncate-then-seed of the
+    /// managed group ids).
+    SeedDemo,
 }
