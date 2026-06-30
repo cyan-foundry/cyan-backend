@@ -4452,6 +4452,28 @@ pub extern "C" fn cyan_pipeline_status(
 }
 
 // ============================================================================
+// ChangeList store FFI (CYAN_CHANGELIST_STORE_AND_REVIEW_LOOP §Part 1)
+// ============================================================================
+
+/// Drive the content-addressed ChangeList store. Additive `cyan_*` surface for the
+/// Frame.io review-&-conform loop; both the iOS review rail and Cyan Lens call the
+/// same ops through this one JSON entrypoint.
+///
+/// `cmd_json` is `{ "op": <name>, ... }` where `op` is one of: append, set_state,
+/// set_active, supersede, snapshot, branch, diff, conform_plan, get, get_version,
+/// set_outcome. Returns a JSON string the caller owns and must free with
+/// `cyan_free_string`; errors surface as `{ "error": "<msg>" }` — never a panic
+/// across the boundary.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_changelist_command(cmd_json: *const c_char) -> *mut c_char {
+    let json_str = match unsafe { cstr_arg(cmd_json) } {
+        Some(s) => s,
+        None => return json_cstring(&serde_json::json!({ "error": "null command" }).to_string()),
+    };
+    json_cstring(&crate::changelist::command(&json_str))
+}
+
+// ============================================================================
 // Timecoded Notes FFI
 // ============================================================================
 

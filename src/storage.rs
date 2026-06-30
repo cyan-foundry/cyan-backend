@@ -2498,6 +2498,15 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         Err(e) => tracing::warn!("Migration: chat re-key failed: {e}"),
     }
 
+    // ChangeList store (CYAN_CHANGELIST_STORE_AND_REVIEW_LOOP §Part 1): the durable,
+    // content-addressed per-asset change-list artifact the Frame.io review-&-conform
+    // loop operates on. Creates change_entry / change_version / change_branch /
+    // change_audit. Idempotent (CREATE TABLE IF NOT EXISTS); additive — no existing
+    // table or behavior changes.
+    if let Err(e) = crate::changelist::migrate(conn) {
+        tracing::warn!("Migration: changelist tables failed: {e}");
+    }
+
     Ok(())
 }
 
