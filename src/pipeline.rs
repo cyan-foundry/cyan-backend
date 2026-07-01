@@ -664,8 +664,8 @@ pub async fn run_pipeline_with_plan(
     // step-through (it grows, never resets). Already-run steps are skipped/paused-at by
     // the executor, so this is counted exactly ONCE (no double-charge).
     for (cell, config) in &steps {
-        if matches!(config.state.status.as_str(), "human_approved" | "ai_complete" | "skipped" | "done") {
-            if let Some(dur) = config.state.duration {
+        if matches!(config.state.status.as_str(), "human_approved" | "ai_complete" | "skipped" | "done")
+            && let Some(dur) = config.state.duration {
                 let gpu_ms = (dur * 1000.0) as u64;
                 acc.obs.record(StepObs {
                     step_id: config.step_id.clone(),
@@ -680,7 +680,6 @@ pub async fn run_pipeline_with_plan(
                 });
                 acc.processed += 1;
             }
-        }
     }
 
     let (mode, peak) = match plan {
@@ -1418,11 +1417,10 @@ pub fn pipeline_status(board_id: &str) -> Result<serde_json::Value> {
                 _ => pending += 1,
             }
             // The run-id stamped on any step that has run (the active run).
-            if run_id.is_none() {
-                if let Some(rid) = config.state.run_id.as_ref().filter(|s| !s.is_empty()) {
+            if run_id.is_none()
+                && let Some(rid) = config.state.run_id.as_ref().filter(|s| !s.is_empty()) {
                     run_id = Some(rid.clone());
                 }
-            }
             // The first step awaiting approval (the current gate) — drives the UI.
             if awaiting_step.is_none() && config.state.status == "ai_complete" {
                 awaiting_step = Some(config.step_id.clone());

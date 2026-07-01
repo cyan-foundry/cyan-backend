@@ -928,6 +928,7 @@ async fn execute_local_mcp_tool_step(
 ///   2. a bound asset whose `local_path` points at a real file on disk → probe it directly;
 ///   3. a bare media filename (from the bound asset, else mentioned in a cell) joined to the
 ///      configured media root `CYAN_MEDIA_ROOT` (a local dir OR an http base).
+///
 /// Returns `None` only when nothing resolvable is found AND no media root is configured —
 /// the caller then surfaces the same clear error instead of probing garbage.
 fn find_video_uri(board_id: &str) -> Option<String> {
@@ -962,19 +963,18 @@ fn find_video_uri(board_id: &str) -> Option<String> {
     for c in &cell_texts {
         if let Some(u) = c.split_whitespace().find(|w| {
             (w.starts_with("http://") || w.starts_with("https://") || w.starts_with("s3://") || w.starts_with("file://"))
-                && is_media_filename(w.trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | ')' | '"' | '\'')))
+                && is_media_filename(w.trim_end_matches(['.', ',', ';', ':', ')', '"', '\'']))
         }) {
-            return Some(u.trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | ')' | '"' | '\'')).to_string());
+            return Some(u.trim_end_matches(['.', ',', ';', ':', ')', '"', '\'']).to_string());
         }
     }
 
     // (2) a bound asset with a real local file → probe it directly.
     for (_name, local_path) in &bound_files {
-        if let Some(p) = local_path {
-            if !p.is_empty() && std::path::Path::new(p).exists() {
+        if let Some(p) = local_path
+            && !p.is_empty() && std::path::Path::new(p).exists() {
                 return Some(p.clone());
             }
-        }
     }
 
     // (3) a bare media filename — bound asset first, else mentioned in a cell — joined to
@@ -998,7 +998,7 @@ fn is_media_filename(s: &str) -> bool {
 fn extract_media_filename(content: &str) -> Option<String> {
     content
         .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | '"' | '\''))
-        .map(|tok| tok.trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | ')' | '*' | '`')))
+        .map(|tok| tok.trim_end_matches(['.', ',', ';', ':', ')', '*', '`']))
         .find(|tok| is_media_filename(tok))
         .map(|s| s.to_string())
 }
@@ -1023,11 +1023,10 @@ fn resolve_media_uri(name: &str) -> Option<String> {
 /// The board's bound primary clip filename: the seed inserts one file row named after the
 /// clip; fall back to a bare media filename mentioned in any step cell.
 fn board_bound_asset(board_id: &str) -> Option<String> {
-    if let Ok(files) = crate::storage::file_list_by_board(board_id) {
-        if let Some(f) = files.into_iter().find(|f| is_media_filename(&f.name)) {
+    if let Ok(files) = crate::storage::file_list_by_board(board_id)
+        && let Some(f) = files.into_iter().find(|f| is_media_filename(&f.name)) {
             return Some(f.name);
         }
-    }
     let conn = crate::storage::db().lock().ok()?;
     let mut stmt = conn
         .prepare("SELECT content FROM notebook_cells WHERE board_id = ?1 AND cell_type='markdown' ORDER BY cell_order")

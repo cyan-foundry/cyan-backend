@@ -198,8 +198,6 @@ pub fn compute_entry_hash(e: &ChangeEntry) -> String {
         "author": e.author,
         "role": e.role,
         "proposed_by": e.proposed_by,
-        "created_at": e.created_at,
-        "seq": e.seq,
         "depends_on": e.depends_on,
     });
     // serde_json::Value serializes object keys in a stable (sorted) order, so this
