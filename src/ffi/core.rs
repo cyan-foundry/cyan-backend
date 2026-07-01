@@ -4474,6 +4474,31 @@ pub extern "C" fn cyan_changelist_command(cmd_json: *const c_char) -> *mut c_cha
 }
 
 // ============================================================================
+// Review-loop state machine FFI (CYAN_REVIEW_LOOP_TRANSITION_CONTRACT)
+// ============================================================================
+
+/// Drive the review-loop state machine + editable-proposal lifecycle. Additive
+/// `cyan_*` surface layered on the ChangeList store; the iOS review rail and Cyan
+/// Lens fire transitions through this one JSON entrypoint.
+///
+/// `cmd_json` is `{ "op": <name>, "actor": "auto|agent|human", ... }`. Ops:
+/// get, start_draft, publish, notes_arrived, version_approved, confirm_notes,
+/// conform_run, conform_failed, publish_proxy, finish, delivered, reopen_branch,
+/// propose_op, confirm_op, escalate_note, nudges_for. The three-actor authority
+/// model is enforced inside: an AGENT may only PROPOSE, and every gated /
+/// external_send transition requires `actor=human`. Returns a JSON string the
+/// caller owns and must free with `cyan_free_string`; errors surface as
+/// `{ "error": "<msg>" }` — never a panic across the boundary.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_review_command(cmd_json: *const c_char) -> *mut c_char {
+    let json_str = match unsafe { cstr_arg(cmd_json) } {
+        Some(s) => s,
+        None => return json_cstring(&serde_json::json!({ "error": "null command" }).to_string()),
+    };
+    json_cstring(&crate::review_state::command(&json_str))
+}
+
+// ============================================================================
 // Timecoded Notes FFI
 // ============================================================================
 

@@ -2507,6 +2507,15 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         tracing::warn!("Migration: changelist tables failed: {e}");
     }
 
+    // Review-loop state machine (CYAN_REVIEW_LOOP_TRANSITION_CONTRACT): the per
+    // (tenant, asset, branch) review_state row (DRAFT..DELIVERED + round counter)
+    // the editable-proposal review loop advances. Creates `review_state`.
+    // Idempotent (CREATE TABLE IF NOT EXISTS); additive — no existing table or
+    // behavior changes.
+    if let Err(e) = crate::review_state::migrate(conn) {
+        tracing::warn!("Migration: review_state table failed: {e}");
+    }
+
     Ok(())
 }
 

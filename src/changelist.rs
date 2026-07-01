@@ -398,6 +398,13 @@ fn get_entry_row(conn: &Connection, tenant_id: &str, entry_id: &str) -> Result<C
 // Store operations (the `cyan_changelist_*` FFI surface).
 // ============================================================================
 
+/// get_entry(tenant, entry_id) → the single entry, tenant-scoped. Public accessor
+/// over the internal row loader so callers (e.g. the review-loop state machine)
+/// can read one entry without re-implementing the query. Errors if not found.
+pub fn get_entry(conn: &Connection, tenant_id: &str, entry_id: &str) -> Result<ChangeEntry> {
+    get_entry_row(conn, tenant_id, entry_id)
+}
+
 /// append(asset, branch, entry) → ChangeEntry (proposed).
 ///
 /// Content-addresses the entry, assigns the next `seq` within (asset, branch) when
