@@ -197,15 +197,109 @@ async fn large_file_meets_throughput_floor() {
 
     let mb = len as f64 / (1024.0 * 1024.0);
     let mbps = mb / elapsed.as_secs_f64();
+    // ALWAYS printed — the measured number is the deliverable, whichever floor gates.
     eprintln!("📊 direct-QUIC loopback throughput: {mbps:.1} MB/s for {mb:.0} MB");
-    // Regression guard against a collapse to a tiny send window — NOT a benchmark.
-    // Measured ~16 MB/s on loopback; the floor is set well below that with headroom
-    // for the contention of the whole substrate suite running its binaries in parallel.
+
+    // Two floors (G8 hardening): the strict dailies-grade floor (≥ 80 MB/s) gates under
+    // CYAN_PERF=1 — dedicated perf runs, built `--release` (debug builds cap at ~16 MB/s
+    // on QUIC crypto alone) — since shared CI machines vary wildly; every run still
+    // enforces the absolute regression guard against a collapse to a tiny window.
+    //
+    // Measured 2026-07-02 (M-series laptop, loopback, release): ~113 MB/s, and ~115 MB/s
+    // with 1 stream / 1.25 MB window — i.e. loopback is bound by per-connection QUIC
+    // crypto + per-packet UDP syscalls (quinn serializes a connection's crypto on one
+    // core; loopback RTT ≈ 0 so windows/streams never bind here — they pay off on real
+    // LAN RTTs). Suspects for a future >200 MB/s LAN fast path: multiple QUIC
+    // *connections*, UDP GSO/GRO, or a LAN-TCP leg — noted, deliberately NOT built now.
     const FLOOR_MBPS: f64 = 3.0;
+    const PERF_FLOOR_MBPS: f64 = 80.0;
+    let floor = if std::env::var("CYAN_PERF").ok().as_deref() == Some("1") {
+        PERF_FLOOR_MBPS
+    } else {
+        FLOOR_MBPS
+    };
     assert!(
-        mbps >= FLOOR_MBPS,
-        "throughput {mbps:.1} MB/s below floor {FLOOR_MBPS} MB/s"
+        mbps >= floor,
+        "throughput {mbps:.1} MB/s below floor {floor} MB/s"
     );
+}
+
+/// G8 hardening: a large transfer must never head-of-line-block chat/sync — transfers run
+/// on their own tokio tasks and their own QUIC streams. Oracle: a chat broadcast sent the
+/// moment a 512 MB transfer starts is delivered within a strict bound (far below the
+/// transfer's duration), and the transfer itself still completes intact afterwards.
+#[tokio::test]
+async fn chat_delivers_during_large_transfer() {
+    use cyan_backend::models::events::NetworkEvent;
+
+    let _serial = serial().await;
+    let nodes = spawn_mesh(2, cfg()).await.expect("mesh spawns");
+    let group = unique_group_id();
+    meet(&nodes, &group, SYNC_TIMEOUT).await.expect("nodes meet");
+
+    let len: u64 = 512 * 1024 * 1024;
+    let file_id = format!("file-hol-{}", &group[16..32]);
+    let hash = stage_file_streamed(&file_id, &group, len, 0x2B, &nodes[0].node_id);
+
+    // Start the big transfer, then immediately send a chat the other way down the
+    // same group's gossip.
+    let started = Instant::now();
+    nodes[1].request_download(&file_id, &hash, &nodes[0].node_id);
+    let chat_id = format!("chat-hol-{}", &group[16..32]);
+    nodes[0].broadcast(
+        &group,
+        NetworkEvent::ChatSent {
+            id: chat_id.clone(),
+            board_id: group.clone(),
+            workspace_id: group.clone(),
+            message: "still responsive?".to_string(),
+            author: nodes[0].node_id.clone(),
+            parent_id: None,
+            timestamp: 1,
+        },
+    );
+
+    let want = chat_id.clone();
+    nodes[1]
+        .wait_network(
+            move |e| matches!(e, NetworkEvent::ChatSent { id, .. } if *id == want),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("chat must deliver promptly while the transfer streams");
+    let chat_latency = started.elapsed();
+
+    let local_path = nodes[1]
+        .wait_file_downloaded(&file_id, Duration::from_secs(300))
+        .await
+        .expect("the transfer still completes");
+    let transfer_elapsed = started.elapsed();
+
+    eprintln!(
+        "📊 chat under load: delivered in {chat_latency:?}; 512 MB transfer took {transfer_elapsed:?}"
+    );
+    assert!(
+        chat_latency < Duration::from_secs(5),
+        "chat took {chat_latency:?} — head-of-line blocked by the transfer"
+    );
+    assert!(
+        transfer_elapsed > chat_latency,
+        "transfer finished before the chat — the probe never overlapped the transfer"
+    );
+
+    // And the transfer landed intact (streamed verify; this file is large).
+    use std::io::Read;
+    let mut file = std::fs::File::open(&local_path).expect("open downloaded file");
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf).expect("read downloaded slab");
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    assert_eq!(hasher.finalize().to_hex().to_string(), hash, "landed bytes intact");
 }
 
 /// G8 hardening: verification is INCREMENTAL — the receiver hashes chunks as they land

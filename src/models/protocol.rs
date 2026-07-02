@@ -142,4 +142,19 @@ pub enum FileTransferMsg {
     NotFound { file_id: String },
     /// Server responds with error
     Error { file_id: String, message: String },
+    /// Client requests a STRIDED slice for the pipelined parallel-stream transfer
+    /// (G8 hardening): the file is cut into `chunk_size`-byte chunks counted from
+    /// byte 0; stream `index` (of `stride` parallel streams on one connection)
+    /// carries chunks `index, index+stride, index+2·stride, …` in ascending order.
+    /// The server answers with a `Header` (`byte_length` = this stream's byte
+    /// total) followed by the raw chunk bytes. Additive: legacy peers keep using
+    /// `Request`, and a legacy server rejecting this variant makes the new client
+    /// fall back to the single-stream path.
+    RequestStriped {
+        file_id: String,
+        hash: String,
+        chunk_size: u64,
+        stride: u32,
+        index: u32,
+    },
 }

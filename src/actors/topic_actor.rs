@@ -449,6 +449,34 @@ impl TopicActor {
                             }
                         }
                     }
+                    // Pipelined parallel streams (G8 hardening) for fresh large transfers
+                    // whose size is known from the synced file row. Any failure (including
+                    // a legacy peer rejecting `RequestStriped`) falls back to the
+                    // single-stream path below.
+                    let known_size = storage::file_get_for_transfer(&file_id, &hash)
+                        .map(|(_, _, size)| size)
+                        .unwrap_or(0);
+                    if resume_offset == 0 && known_size >= PARALLEL_MIN_BYTES {
+                        match download_file_parallel(
+                            endpoint.clone(),
+                            &file_id,
+                            &hash,
+                            &source_peer,
+                            known_size,
+                            event_tx.clone(),
+                        )
+                        .await
+                        {
+                            Ok(()) => return,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "⚠️ [TOPIC] parallel transfer for {} failed ({}); falling back to single-stream",
+                                    &file_id[..16.min(file_id.len())],
+                                    e
+                                );
+                            }
+                        }
+                    }
                     if let Err(e) = download_file(
                         endpoint,
                         &file_id,
@@ -1476,6 +1504,228 @@ fn preflight_disk_space(
         });
         return Err(anyhow!(msg));
     }
+    Ok(())
+}
+
+/// Stripe/chunk unit for the pipelined parallel transfer. The endpoint's stream
+/// receive window is sized as CYAN_XFER_WINDOW (default 32) of these, so ~32 chunks
+/// ride in flight per stream with no per-chunk lockstep.
+const XFER_CHUNK: u64 = 256 * 1024;
+
+/// Below this size the single-stream path is used — stream fan-out isn't worth it.
+const PARALLEL_MIN_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Parallel QUIC streams per transfer — `CYAN_XFER_STREAMS`, default 4, clamped 1..=16.
+fn xfer_streams() -> u32 {
+    std::env::var("CYAN_XFER_STREAMS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| (1..=16).contains(n))
+        .unwrap_or(4)
+}
+
+/// Pipelined parallel-stream download (G8 hardening): M QUIC streams on ONE connection,
+/// each carrying an interleaved stripe of 256 KB chunks (`RequestStriped`), landing at
+/// their true offsets in a preallocated tmp file. A follower task hashes the contiguous
+/// chunk frontier from the page cache as stripes land, so verification is incremental
+/// (finalize at completion — no whole-file re-read, no dead pause) and RAM stays flat
+/// (M stream buffers + one hash buffer). Fresh downloads only — resume rides the
+/// single-stream path; on any error the striped tmp (which has holes) is deleted so a
+/// legacy resume can never append onto it.
+async fn download_file_parallel(
+    endpoint: Endpoint,
+    file_id: &str,
+    hash: &str,
+    source_peer: &str,
+    total_size: u64,
+    event_tx: UnboundedSender<SwiftEvent>,
+) -> Result<()> {
+    use std::sync::atomic::AtomicU64;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+    let pk = PublicKey::from_str(source_peer)?;
+    let streams = xfer_streams();
+
+    let data_dir = crate::DATA_DIR.get().cloned().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let downloads_dir = data_dir.join("downloads");
+    tokio::fs::create_dir_all(&downloads_dir).await?;
+    preflight_disk_space(&downloads_dir, total_size, file_id, &event_tx)?;
+    let temp_path = downloads_dir.join(format!("{}.tmp", file_id));
+
+    tracing::info!(
+        "📥 [FILE] Parallel download {} ({} bytes, {} streams)",
+        &file_id[..16.min(file_id.len())],
+        total_size,
+        streams
+    );
+    let _ = event_tx.send(SwiftEvent::FileDownloadProgress {
+        file_id: file_id.to_string(),
+        progress: 0.0,
+    });
+
+    let result = async {
+        let conn: Connection = tokio::time::timeout(
+            Duration::from_secs(30),
+            endpoint.connect(pk, FILE_TRANSFER_ALPN),
+        )
+        .await
+        .map_err(|_| anyhow!("File transfer connection timeout"))?
+        .map_err(|e| anyhow!("File transfer connect failed: {}", e))?;
+
+        // Preallocate the tmp file so every stream writes at its true offsets.
+        {
+            let file = tokio::fs::File::create(&temp_path).await?;
+            file.set_len(total_size).await?;
+        }
+
+        // Same transfer-tracking row the single-stream path keeps (UI progress source).
+        let tracked_name = storage::file_get_for_transfer(file_id, hash)
+            .map(|(name, _, _)| name)
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| file_id.to_string());
+        let _ = storage::transfer_upsert(
+            file_id,
+            &tracked_name,
+            total_size,
+            hash,
+            0,
+            temp_path.to_string_lossy().as_ref(),
+            source_peer,
+            "in_progress",
+        );
+
+        let n_chunks = total_size.div_ceil(XFER_CHUNK);
+        // Per-stream count of stripe chunks fully written — the hash follower's frontier.
+        let chunks_done: Arc<Vec<AtomicU64>> =
+            Arc::new((0..streams).map(|_| AtomicU64::new(0)).collect());
+        let (prog_tx, mut prog_rx) = mpsc::unbounded_channel::<()>();
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..streams {
+            let (mut send, mut recv) = conn.open_bi().await?;
+            let req = FileTransferMsg::RequestStriped {
+                file_id: file_id.to_string(),
+                hash: hash.to_string(),
+                chunk_size: XFER_CHUNK,
+                stride: streams,
+                index,
+            };
+            let req_data = serde_json::to_vec(&req)?;
+            let len = (req_data.len() as u32).to_be_bytes();
+            send.write_chunk(Bytes::copy_from_slice(&len)).await?;
+            send.write_chunk(Bytes::from(req_data)).await?;
+
+            let temp_path = temp_path.clone();
+            let file_id = file_id.to_string();
+            let chunks_done = chunks_done.clone();
+            let prog_tx = prog_tx.clone();
+            tasks.spawn(async move {
+                // Per-stream response header (or NotFound/Error).
+                let mut len_buf = [0u8; 4];
+                recv.read_exact(&mut len_buf).await?;
+                let mut header = vec![0u8; u32::from_be_bytes(len_buf) as usize];
+                recv.read_exact(&mut header).await?;
+                match serde_json::from_slice::<FileTransferMsg>(&header)? {
+                    FileTransferMsg::Header { .. } => {}
+                    FileTransferMsg::NotFound { .. } => {
+                        return Err(anyhow!("file {} not found on peer", file_id));
+                    }
+                    other => return Err(anyhow!("unexpected stripe response: {:?}", other)),
+                }
+
+                let mut file = tokio::fs::OpenOptions::new().write(true).open(&temp_path).await?;
+                let mut buf = vec![0u8; XFER_CHUNK as usize];
+                let mut k = index as u64;
+                while k * XFER_CHUNK < total_size {
+                    let pos = k * XFER_CHUNK;
+                    let n = XFER_CHUNK.min(total_size - pos) as usize;
+                    recv.read_exact(&mut buf[..n])
+                        .await
+                        .map_err(|e| anyhow!("stripe {} ended early: {}", index, e))?;
+                    file.seek(std::io::SeekFrom::Start(pos)).await?;
+                    file.write_all(&buf[..n]).await?;
+                    chunks_done[index as usize].fetch_add(1, Ordering::Release);
+                    let _ = prog_tx.send(());
+                    k += streams as u64;
+                }
+                file.flush().await?;
+                Ok::<(), anyhow::Error>(())
+            });
+        }
+        drop(prog_tx);
+
+        // Hash follower: consume chunks IN ORDER as their stripes land — incremental
+        // verification straight off the page cache, finalize at completion.
+        let mut hasher = blake3::Hasher::new();
+        let mut read_file = tokio::fs::File::open(&temp_path).await?;
+        let mut buf = vec![0u8; XFER_CHUNK as usize];
+        let mut last_progress = 0u64;
+        for c in 0..n_chunks {
+            let stream = (c % streams as u64) as usize;
+            let need = c / (streams as u64) + 1;
+            while chunks_done[stream].load(Ordering::Acquire) < need {
+                if prog_rx.recv().await.is_none()
+                    && chunks_done[stream].load(Ordering::Acquire) < need
+                {
+                    // All writers exited without delivering this chunk — surface the
+                    // first task error (or a generic one).
+                    while let Some(res) = tasks.join_next().await {
+                        res.map_err(|e| anyhow!("stripe task panicked: {e}"))??;
+                    }
+                    return Err(anyhow!("stripe writers exited before chunk {}", c));
+                }
+            }
+            let pos = c * XFER_CHUNK;
+            let n = XFER_CHUNK.min(total_size - pos) as usize;
+            read_file.seek(std::io::SeekFrom::Start(pos)).await?;
+            read_file.read_exact(&mut buf[..n]).await?;
+            hasher.update(&buf[..n]);
+            crate::metrics::record_file_verify_streamed(n as u64);
+
+            let done = pos + n as u64;
+            if done - last_progress >= 4 * 1024 * 1024 || done == total_size {
+                last_progress = done;
+                let _ = storage::transfer_update_progress(file_id, done);
+                let _ = event_tx.send(SwiftEvent::FileDownloadProgress {
+                    file_id: file_id.to_string(),
+                    progress: done as f64 / total_size as f64,
+                });
+            }
+        }
+        while let Some(res) = tasks.join_next().await {
+            res.map_err(|e| anyhow!("stripe task panicked: {e}"))??;
+        }
+
+        let actual_hash = hasher.finalize().to_hex().to_string();
+        if actual_hash != hash {
+            let _ = storage::transfer_set_status(file_id, "hash_mismatch");
+            return Err(anyhow!("Hash mismatch: expected {}, got {}", hash, actual_hash));
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    if let Err(e) = result {
+        // A striped tmp has holes — never leave it where a legacy resume could append to it.
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(e);
+    }
+
+    // Land it exactly like the single-stream path: rename, record, notify.
+    let file_name = storage::file_get_for_transfer(file_id, hash)
+        .map(|(name, _, _)| name)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| file_id.to_string());
+    let final_path = downloads_dir.join(&file_name);
+    tokio::fs::rename(&temp_path, &final_path).await?;
+    let _ = storage::file_set_local_path(file_id, final_path.to_string_lossy().as_ref());
+    let _ = storage::transfer_set_status(file_id, "complete");
+
+    tracing::info!("✅ [FILE] Parallel download complete: {}", file_name);
+    let _ = event_tx.send(SwiftEvent::FileDownloaded {
+        file_id: file_id.to_string(),
+        local_path: final_path.to_string_lossy().to_string(),
+    });
     Ok(())
 }
 

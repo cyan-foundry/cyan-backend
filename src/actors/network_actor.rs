@@ -256,8 +256,29 @@ impl NetworkActor {
         // Best-effort: if it can't start (no multicast interface), fall back to the builder form so
         // the endpoint still binds with mDNS exactly as before.
         let public = secret_key.public();
+        // Dailies-grade transfer windows (G8 hardening). quinn's defaults are tuned for
+        // 100 Mbps @ 100 ms RTT; same-WiFi/loopback media moves are choked by them. Keep
+        // N chunks pipelined per stream: stream window = CYAN_XFER_WINDOW (default 32)
+        // × 256 KB chunks = 8 MB; connection budget covers the parallel streams (8×).
+        // iroh's own default (keep_alive 1s) is preserved.
+        let window_chunks: u64 = std::env::var("CYAN_XFER_WINDOW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| (1..=1024).contains(n))
+            .unwrap_or(32);
+        let stream_window = window_chunks * 256 * 1024;
+        let mut transport = iroh::endpoint::TransportConfig::default();
+        transport.keep_alive_interval(Some(Duration::from_secs(1)));
+        if let Ok(w) = iroh::endpoint::VarInt::from_u64(stream_window) {
+            transport.stream_receive_window(w);
+        }
+        if let Ok(w) = iroh::endpoint::VarInt::from_u64(stream_window * 8) {
+            transport.receive_window(w);
+        }
+        transport.send_window(stream_window * 8);
         let mut builder = Endpoint::builder()
             .secret_key(secret_key)
+            .transport_config(transport)
             .alpns(vec![
                 iroh_gossip::ALPN.to_vec(),
                 FILE_TRANSFER_ALPN.to_vec(),
@@ -1578,13 +1599,43 @@ async fn write_dm_frame(send: &mut iroh::endpoint::SendStream, dm: &DirectMessag
 // FILE TRANSFER SERVER (handles incoming file requests)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Accept every bi-directional stream a downloader opens on this connection and serve
+/// each independently. A legacy client opens ONE stream (`Request`) — served exactly as
+/// before; the pipelined parallel client opens M streams (`RequestStriped`) that this
+/// loop serves concurrently. The loop ends when the client closes the connection.
 async fn handle_file_transfer_server(
     conn: Connection,
     _event_tx: UnboundedSender<SwiftEvent>,
 ) -> Result<()> {
-    use crate::models::protocol::FileTransferMsg;
+    let mut served_any = false;
+    loop {
+        match conn.accept_bi().await {
+            Ok((send, recv)) => {
+                served_any = true;
+                tokio::spawn(async move {
+                    if let Err(e) = serve_file_stream(send, recv).await {
+                        tracing::warn!("🔴 [FILE] transfer stream error: {}", e);
+                    }
+                });
+            }
+            // Client closed the connection — the normal end of a transfer.
+            Err(e) => {
+                if !served_any {
+                    return Err(anyhow!("file transfer connection closed early: {e}"));
+                }
+                return Ok(());
+            }
+        }
+    }
+}
 
-    let (mut send, mut recv) = conn.accept_bi().await?;
+/// Serve one file-transfer stream: a legacy whole-remainder `Request` or one strided
+/// slice (`RequestStriped`) of the pipelined parallel transfer.
+async fn serve_file_stream(
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+) -> Result<()> {
+    use crate::models::protocol::FileTransferMsg;
 
     // Read request
     let mut len_buf = [0u8; 4];
@@ -1672,6 +1723,9 @@ async fn handle_file_transfer_server(
                 }
             }
         }
+        FileTransferMsg::RequestStriped { file_id, hash, chunk_size, stride, index } => {
+            serve_striped(&mut send, &file_id, &hash, chunk_size, stride, index).await?;
+        }
         _ => {
             tracing::warn!("⚠️ [FILE] Unexpected message type");
         }
@@ -1681,6 +1735,92 @@ async fn handle_file_transfer_server(
     send.finish()?;
     let _ = send.stopped().await;
 
+    Ok(())
+}
+
+/// Serve one strided slice of a file: chunks `index, index+stride, …` of `chunk_size`
+/// bytes. Seeky 256 KB-granularity reads from the staged file (page-cache friendly);
+/// the QUIC stream window keeps N chunks pipelined in flight — no per-chunk lockstep.
+async fn serve_striped(
+    send: &mut iroh::endpoint::SendStream,
+    file_id: &str,
+    hash: &str,
+    chunk_size: u64,
+    stride: u32,
+    index: u32,
+) -> Result<()> {
+    use crate::models::protocol::FileTransferMsg;
+
+    let send_msg = async |send: &mut iroh::endpoint::SendStream, msg: &FileTransferMsg| -> Result<()> {
+        let data = serde_json::to_vec(msg)?;
+        let len = (data.len() as u32).to_be_bytes();
+        send.write_chunk(Bytes::copy_from_slice(&len)).await?;
+        send.write_chunk(Bytes::copy_from_slice(&data)).await?;
+        Ok(())
+    };
+
+    if chunk_size == 0 || stride == 0 || index >= stride {
+        let msg = FileTransferMsg::Error {
+            file_id: file_id.to_string(),
+            message: format!("bad stripe geometry: chunk_size={chunk_size} stride={stride} index={index}"),
+        };
+        send_msg(send, &msg).await?;
+        return Ok(());
+    }
+
+    let Some((name, local_path, total_size)) = storage::file_get_for_transfer(file_id, hash) else {
+        send_msg(send, &FileTransferMsg::NotFound { file_id: file_id.to_string() }).await?;
+        return Ok(());
+    };
+    if local_path.is_empty() {
+        send_msg(send, &FileTransferMsg::NotFound { file_id: file_id.to_string() }).await?;
+        return Ok(());
+    }
+
+    // This stream's byte total: every `stride`-th chunk starting at `index`.
+    let n_chunks = total_size.div_ceil(chunk_size);
+    let mut stream_len = 0u64;
+    let mut k = index as u64;
+    while k < n_chunks {
+        stream_len += chunk_size.min(total_size - k * chunk_size);
+        k += stride as u64;
+    }
+
+    send_msg(
+        send,
+        &FileTransferMsg::Header {
+            file_id: file_id.to_string(),
+            file_name: name,
+            total_size,
+            hash: hash.to_string(),
+            byte_offset: (index as u64) * chunk_size,
+            byte_length: stream_len,
+        },
+    )
+    .await?;
+
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut file = tokio::fs::File::open(&local_path).await?;
+    let mut buf = vec![0u8; chunk_size as usize];
+    let mut k = index as u64;
+    let mut sent = 0u64;
+    while k * chunk_size < total_size {
+        let pos = k * chunk_size;
+        let n = chunk_size.min(total_size - pos) as usize;
+        file.seek(std::io::SeekFrom::Start(pos)).await?;
+        file.read_exact(&mut buf[..n]).await?;
+        send.write_chunk(Bytes::copy_from_slice(&buf[..n])).await?;
+        sent += n as u64;
+        k += stride as u64;
+    }
+
+    tracing::info!(
+        "📤 [FILE] Sent stripe {}/{} ({} bytes) for {}",
+        index,
+        stride,
+        sent,
+        &file_id[..16.min(file_id.len())]
+    );
     Ok(())
 }
 
