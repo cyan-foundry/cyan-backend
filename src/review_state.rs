@@ -693,7 +693,7 @@ pub fn confirm_op(
     // The confirm gate is HUMAN-only (external editable gate).
     enforce_gate("confirm_op", &Gate::HumanConfirm, actor)?;
 
-    match decision {
+    let resolved = match decision {
         ConfirmDecision::Reject => {
             changelist::set_state(conn, tenant_id, entry_id, "rejected", Some("human"))?;
             // set_active re-reads the row, so the returned entry reflects both the
@@ -741,11 +741,37 @@ pub fn confirm_op(
                         true,
                         Some("human"),
                     )?;
-                    Ok(active)
+                    Ok::<changelist::ChangeEntry, ReviewError>(active)
                 }
             }
         }
+    }?;
+
+    // CONFIRM interlock, per-op leg: resolving the LAST open proposal on this
+    // asset/branch IS the human decision a board's parked manual CONFIRM step
+    // was waiting on — release it without a second approval tap. (The batch
+    // `confirm_notes` transition fires the same interlock; this leg covers the
+    // op-by-op confirm path.) Best-effort: the confirm stands even if the
+    // workflow-side write fails.
+    let open_proposals: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM change_entry \
+             WHERE tenant_id=?1 AND asset_hash=?2 AND branch=?3 \
+               AND kind='op' AND state='proposed'",
+            params![
+                tenant_id,
+                resolved.asset_hash,
+                resolved.branch.as_deref().unwrap_or("main")
+            ],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if open_proposals == 0
+        && let Err(e) = crate::pipeline::approve_review_gate_steps(conn, tenant_id)
+    {
+        tracing::warn!("confirm interlock (per-op, tenant {}): {}", tenant_id, e);
     }
+    Ok(resolved)
 }
 
 /// `escalate_note` — a creative `note` (kind=note) is escalated as a CHOICE: the
@@ -1033,6 +1059,69 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value, ReviewError> {
                 &s("asset_hash")?,
                 in_review_t,
                 notes_in_t,
+            )?;
+            serde_json::to_value(out).map_err(|e| ReviewError::Other(e.to_string()))?
+        }
+        // ── Review-loop controller (additive; see `crate::review_loop`) ─────
+        "loop_register" => {
+            let out = crate::review_loop::register(
+                conn,
+                &s("tenant_id")?,
+                &s("board_id")?,
+                &s("asset_hash")?,
+                &branch(),
+                max_rounds(),
+            )?;
+            serde_json::to_value(out).map_err(|e| ReviewError::Other(e.to_string()))?
+        }
+        "loop_get" => {
+            let out = crate::review_loop::get_loop(
+                conn,
+                &s("tenant_id")?,
+                &s("board_id")?,
+                &s("asset_hash")?,
+            )?;
+            serde_json::to_value(out).map_err(|e| ReviewError::Other(e.to_string()))?
+        }
+        "loop_tick" => {
+            let out = crate::review_loop::tick(
+                conn,
+                &s("tenant_id")?,
+                &s("board_id")?,
+                &s("asset_hash")?,
+            )?;
+            serde_json::to_value(out).map_err(|e| ReviewError::Other(e.to_string()))?
+        }
+        "loop_record_run" => {
+            let out = crate::review_loop::record_round_run(
+                conn,
+                &s("tenant_id")?,
+                &s("board_id")?,
+                &s("asset_hash")?,
+                &s("run_id")?,
+            )?;
+            serde_json::to_value(out).map_err(|e| ReviewError::Other(e.to_string()))?
+        }
+        "loop_runs" => {
+            let out = crate::review_loop::runs_for(
+                conn,
+                &s("tenant_id")?,
+                &s("board_id")?,
+                &s("asset_hash")?,
+            )?;
+            serde_json::to_value(out).map_err(|e| ReviewError::Other(e.to_string()))?
+        }
+        // SENSE → ledger glue: ingest a `frameio.list_comments` step result.
+        "sense_ingest" => {
+            let result = cmd
+                .get("result")
+                .cloned()
+                .ok_or_else(|| ReviewError::Other("missing 'result'".to_string()))?;
+            let out = crate::review_loop::ingest_sense_result(
+                conn,
+                &s("tenant_id")?,
+                &s("proxy_ref")?,
+                &result,
             )?;
             serde_json::to_value(out).map_err(|e| ReviewError::Other(e.to_string()))?
         }

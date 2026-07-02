@@ -534,3 +534,113 @@ fn nudges_none_while_moving_then_stale_at_threshold() {
         "CONFORMING is a working (non-waiting) state — no nudge while it moves"
     );
 }
+
+// ============================================================================
+// WORKFLOW-DRIVEN VARIANT — the same loop, but every advance is DECIDED by the
+// loop controller (`review_loop::tick`) and the sensor beat arrives through the
+// SENSE → ledger glue (`ingest_sense_result` on a canned list_comments result),
+// not by calling `notes_arrived` directly. This is the loop as the workflow
+// machinery runs it: park at publish-done → resume on new notes → exit on
+// external approval, rounds as sequential runs.
+// ============================================================================
+
+#[test]
+fn workflow_driven_loop_park_resume_exit() {
+    use cyan_backend::asset_registry;
+    use cyan_backend::review_loop::{self as rl, LoopDecision};
+
+    let conn = db();
+    asset_registry::migrate(&conn).expect("migrate asset_registry");
+    rl::migrate(&conn).expect("migrate review_loop");
+    const BOARD: &str = "board-wf-e2e";
+
+    // DRAFT: seed one confirmed op; the loop registers on (board, asset).
+    let seed = changelist::append(
+        &conn,
+        A,
+        B,
+        op_entry("level", 120, json!({"target_lufs":-14}), "human"),
+    )
+    .expect("seed op");
+    rl::register(&conn, T, BOARD, A, B, rv::DEFAULT_MAX_ROUNDS).expect("register loop");
+    rv::confirm_op(&conn, T, &seed.id, None, ConfirmDecision::Approve, Actor::Human)
+        .expect("confirm seed");
+    assert_eq!(
+        rl::tick(&conn, T, BOARD, A).expect("tick draft"),
+        LoopDecision::Working { state: "DRAFT".to_string() },
+        "authoring is the machinery's business — the controller waits"
+    );
+
+    // PUBLISH v1 (human) → the controller PARKS the run.
+    rv::publish_draft(&conn, T, A, B, Actor::Human).expect("publish v1");
+    rl::record_round_run(&conn, T, BOARD, A, "run-1").expect("record run-1");
+    assert_eq!(
+        rl::tick(&conn, T, BOARD, A).expect("tick parked"),
+        LoopDecision::Park { round: 0 }
+    );
+
+    // The published proxy is registered with its Frame.io ref (the actuator's
+    // breadcrumb), and the producer comments — the SENSE result ingests.
+    let v1 = head_version(&conn);
+    asset_registry::upsert(
+        &conn,
+        &asset_registry::Asset {
+            hash: "proxy-e2e-1".to_string(),
+            tenant_id: T.to_string(),
+            kind: Some("proxy".to_string()),
+            fps: Some(24.0),
+            duration_ms: None,
+            derived_from_asset: None,
+            derived_from_version: None,
+            remote_refs: json!({}),
+            profile_json: json!({}),
+            render_profile: None,
+            created_at: 0,
+        },
+    )
+    .expect("register proxy");
+    asset_registry::set_derivation(&conn, T, "proxy-e2e-1", A, &v1.version_id).expect("derivation");
+    asset_registry::set_remote_ref(&conn, T, "proxy-e2e-1", "frameio", "file_e2e_1")
+        .expect("remote ref");
+
+    let sense = json!({ "data": [
+        { "id": "c-e2e-1", "text": "music too loud at 0:42", "frame": 1008 }
+    ]});
+    let ingest = rl::ingest_sense_result(&conn, T, "file_e2e_1", &sense).expect("SENSE ingest");
+    assert_eq!(ingest.appended.len(), 1, "the producer note landed on the ledger");
+
+    // New notes → the controller RESUMES; the round runs to the next publish.
+    assert_eq!(
+        rl::tick(&conn, T, BOARD, A).expect("tick resumed"),
+        LoopDecision::Resume { round: 0 }
+    );
+    let prop = rv::propose_op(&conn, A, B, op_entry("mute", 1008, json!({}), "agent"), Actor::Agent)
+        .expect("agent proposes");
+    rv::confirm_op(&conn, T, &prop.id, None, ConfirmDecision::Approve, Actor::Human)
+        .expect("confirm");
+    rv::confirm_notes(&conn, T, A, B, Actor::Human).expect("confirm_notes");
+    rv::conform_run(&conn, T, A, B, Actor::Auto).expect("conform");
+    rv::publish_proxy(&conn, T, A, B, Actor::Human, rv::DEFAULT_MAX_ROUNDS).expect("publish r1");
+    rl::record_round_run(&conn, T, BOARD, A, "run-2").expect("record run-2");
+    assert_eq!(
+        rl::tick(&conn, T, BOARD, A).expect("tick parked r1"),
+        LoopDecision::Park { round: 1 },
+        "round 1 published → parked again"
+    );
+
+    // External approval → the controller EXITS and ships the cut.
+    rv::version_approved(&conn, T, A, B, Actor::Auto).expect("approved");
+    assert_eq!(
+        rl::tick(&conn, T, BOARD, A).expect("tick exit"),
+        LoopDecision::Exit { outcome: "shipped".to_string() }
+    );
+    assert_eq!(head_version(&conn).outcome, "shipped", "the delivered cut carries the label");
+
+    // Rounds were SEQUENTIAL RUNS with the round stamp.
+    let runs = rl::runs_for(&conn, T, BOARD, A).expect("runs");
+    assert_eq!(
+        runs.iter().map(|r| (r.run_id.as_str(), r.round)).collect::<Vec<_>>(),
+        vec![("run-1", 0), ("run-2", 1)],
+        "each round is its own run, stamped with review_state.round"
+    );
+}

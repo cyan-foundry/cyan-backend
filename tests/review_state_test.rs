@@ -550,20 +550,27 @@ fn confirm_all_proposals_advances_workflow_confirm_step() {
     )
     .expect("propose fade");
 
-    // Confirming individual proposals does NOT fire the interlock — the step stays
-    // parked until the whole batch is resolved and the machine advances.
+    // Confirming a proposal while OTHERS remain open does NOT fire the interlock —
+    // the step stays parked until the whole batch is resolved.
     rv::confirm_op(&conn, T, &p1.id, None, ConfirmDecision::Approve, Actor::Human)
         .expect("confirm p1");
     assert_eq!(cell_status(&conn, "cell-gate"), "ai_complete", "still parked mid-batch");
+
+    // Resolving the LAST open proposal IS the human decision the CONFIRM step was
+    // waiting on — the per-op interlock leg releases it right here.
     rv::confirm_op(&conn, T, &p2.id, None, ConfirmDecision::Approve, Actor::Human)
         .expect("confirm p2");
-    assert_eq!(cell_status(&conn, "cell-gate"), "ai_complete", "still parked before confirm_notes");
+    assert_eq!(
+        cell_status(&conn, "cell-gate"),
+        "human_approved",
+        "the review gate un-parks at the last confirmed proposal"
+    );
 
-    // The last proposal is resolved → the human fires NOTES_IN → CONFORMING. The
-    // interlock marks the parked CONFIRM step human_approved.
+    // The batch transition still advances the machine (and its interlock leg is
+    // idempotent over the already-approved gate).
     let s = rv::confirm_notes(&conn, T, A, B, Actor::Human).expect("confirm_notes");
     assert_eq!(s.state, "CONFORMING");
-    assert_eq!(cell_status(&conn, "cell-gate"), "human_approved", "the review gate un-parked");
+    assert_eq!(cell_status(&conn, "cell-gate"), "human_approved", "gate stays approved");
 
     // run_id survives the state write, and the unmarked manual step did not move.
     let meta: String = conn

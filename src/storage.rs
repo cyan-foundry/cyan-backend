@@ -2632,6 +2632,15 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         tracing::warn!("Migration: asset registry table failed: {e}");
     }
 
+    // Review-loop controller (CYAN_CHANGELIST_STORE_AND_REVIEW_LOOP §Part 2,
+    // engine delta #3): the per (board, asset) loop registration + the rounds-as-
+    // sequential-runs stamp table. Creates `review_loop` / `review_loop_run`.
+    // Idempotent (CREATE TABLE IF NOT EXISTS); additive — no existing table or
+    // behavior changes.
+    if let Err(e) = crate::review_loop::migrate(conn) {
+        tracing::warn!("Migration: review_loop tables failed: {e}");
+    }
+
     Ok(())
 }
 

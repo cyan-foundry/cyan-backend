@@ -205,6 +205,26 @@ pub fn set_remote_ref(
     Ok(asset)
 }
 
+/// find_by_remote_ref(key, value) → the asset carrying that external id, e.g.
+/// key "frameio" + a file id → the proxy the PUBLISH actuator registered. This
+/// is the sensor leg's backward walk (file id → proxy → version → master).
+/// Tenant-scoped; `None` if no asset carries the ref. Filtered in Rust (the
+/// asset table is small; no JSON1 dependency).
+pub fn find_by_remote_ref(
+    conn: &Connection,
+    tenant_id: &str,
+    key: &str,
+    value: &str,
+) -> Result<Option<Asset>> {
+    let mut stmt = conn.prepare("SELECT * FROM asset WHERE tenant_id=?1")?;
+    let rows = stmt
+        .query_map(params![tenant_id], row_to_asset)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .find(|a| a.remote_refs.get(key).and_then(|v| v.as_str()) == Some(value)))
+}
+
 /// set_derivation(hash, derived_from_asset, derived_from_version) → record the
 /// derivation edge: this asset was rendered FROM `derived_from_asset` at ledger
 /// version `derived_from_version` (proxy → {master, version}; deliverable →
