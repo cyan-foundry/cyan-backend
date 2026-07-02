@@ -419,6 +419,80 @@ async fn twenty_gb_transfer_stays_ram_flat() {
     );
 }
 
+/// G10 hardening: an INTERRUPTED direct transfer resumes from the bytes already on disk
+/// instead of re-pulling from zero. Fixture = the exact state a mid-transfer death leaves
+/// behind: a tmp file holding the stream prefix + an `in_progress` transfers row naming
+/// it. Oracles: the engine's own byte counters — the prefix was RE-HASHED from disk
+/// (`prefix delta == prefix len`) while only the REMAINDER was streamed off the wire
+/// (`streamed delta == len - prefix`) — and the landed bytes blake3-verify intact.
+#[tokio::test]
+async fn partial_direct_transfer_resumes_from_tmp_prefix() {
+    use cyan_backend::metrics;
+    use cyan_backend::storage;
+
+    let _serial = serial().await;
+    let nodes = spawn_mesh(2, cfg()).await.expect("mesh spawns");
+    let group = unique_group_id();
+    meet(&nodes, &group, SYNC_TIMEOUT).await.expect("nodes meet");
+
+    let len = 6 * 1024 * 1024 + 11; // 6 MB (< the parallel cutoff → single-stream resume path)
+    let prefix_len = 2 * 1024 * 1024 + 5;
+    let content = make_content(len, 0x9C);
+    let file_id = format!("file-resume-{}", &group[16..32]);
+    let hash = stage_file(&file_id, &group, None, None, &content, &nodes[0].node_id);
+
+    // The wreckage of an interrupted transfer on the downloader: the landed prefix in
+    // the tmp file + the in_progress transfers row pointing at it.
+    let downloads = cyan_backend::DATA_DIR
+        .get()
+        .cloned()
+        .expect("harness sets DATA_DIR")
+        .join("downloads");
+    std::fs::create_dir_all(&downloads).expect("create downloads dir");
+    let tmp = downloads.join(format!("{file_id}.tmp"));
+    std::fs::write(&tmp, &content[..prefix_len]).expect("write interrupted prefix");
+    storage::transfer_upsert(
+        &file_id,
+        &format!("{file_id}.bin"),
+        len as u64,
+        &hash,
+        prefix_len as u64,
+        tmp.to_string_lossy().as_ref(),
+        &nodes[0].node_id,
+        "in_progress",
+    )
+    .expect("seed interrupted transfer row");
+
+    let streamed_before = metrics::file_verify_streamed_bytes();
+    let prefix_before = metrics::file_verify_prefix_read_bytes();
+
+    nodes[1].request_download(&file_id, &hash, &nodes[0].node_id);
+    let local_path = nodes[1]
+        .wait_file_downloaded(&file_id, SYNC_TIMEOUT)
+        .await
+        .expect("peer reports FileDownloaded for the resumed transfer");
+
+    let streamed = metrics::file_verify_streamed_bytes() - streamed_before;
+    let prefix = metrics::file_verify_prefix_read_bytes() - prefix_before;
+    assert_eq!(
+        prefix, prefix_len as u64,
+        "the landed prefix must be re-hashed from disk, not re-transferred"
+    );
+    assert_eq!(
+        streamed,
+        (len - prefix_len) as u64,
+        "only the remainder must come over the wire"
+    );
+
+    let got = std::fs::read(&local_path).expect("read resumed file");
+    assert_eq!(got.len(), len, "byte length matches");
+    assert_eq!(
+        blake3::hash(&got).to_hex().to_string(),
+        hash,
+        "resumed bytes blake3-match the source"
+    );
+}
+
 /// G8: 1 GB blob — `#[ignore]` for CI cost; runnable on demand to confirm the headline.
 #[ignore = "1GB transfer is expensive; run on demand"]
 #[tokio::test]

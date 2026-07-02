@@ -1626,6 +1626,21 @@ pub fn transfer_set_status(file_id: &str, status: &str) -> Result<()> {
     Ok(())
 }
 
+/// The interrupted-transfer row for `(file_id, hash)`, if one is still resumable:
+/// returns `(bytes_received, temp_path)`. Complete transfers and hash mismatches
+/// don't resume; a different hash means the file changed — start fresh.
+pub fn transfer_get_partial(file_id: &str, hash: &str) -> Option<(u64, String)> {
+    let conn = db().lock_safe();
+    conn.query_row(
+        "SELECT bytes_received, temp_path FROM file_transfers \
+         WHERE file_id=?1 AND hash=?2 AND status IN ('pending','in_progress','failed')",
+        params![file_id, hash],
+        |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)),
+    )
+    .optional()
+    .ok()?
+}
+
 pub fn transfer_list_pending() -> Result<Vec<(String, String, String, u64)>> {
     let conn = db().lock_safe();
     let mut stmt = conn.prepare("SELECT file_id, hash, source_peer, bytes_received FROM file_transfers WHERE status IN ('pending', 'in_progress')")?;

@@ -449,13 +449,38 @@ impl TopicActor {
                             }
                         }
                     }
+                    let known_size = storage::file_get_for_transfer(&file_id, &hash)
+                        .map(|(_, _, size)| size)
+                        .unwrap_or(0);
+
+                    // Resume-from-offset (G10): when the caller didn't pin an offset,
+                    // derive it from OUR interrupted-transfer state — the transfers row
+                    // names the tmp file, and the bytes actually on disk are exactly the
+                    // stream prefix that landed before the interruption (the incremental
+                    // verify re-hashes that prefix, so a lying tmp is still caught at
+                    // the final hash gate). A stale tmp at/over the full size restarts
+                    // fresh instead of appending garbage.
+                    let mut resume_offset = resume_offset;
+                    if resume_offset == 0
+                        && let Some((_, tmp)) = storage::transfer_get_partial(&file_id, &hash)
+                        && let Ok(meta) = std::fs::metadata(&tmp)
+                    {
+                        if known_size > 0 && meta.len() >= known_size {
+                            let _ = std::fs::remove_file(&tmp);
+                        } else {
+                            resume_offset = meta.len();
+                            tracing::info!(
+                                "🔁 [TOPIC] resuming {} from verified prefix at {} bytes",
+                                &file_id[..16.min(file_id.len())],
+                                resume_offset
+                            );
+                        }
+                    }
+
                     // Pipelined parallel streams (G8 hardening) for fresh large transfers
                     // whose size is known from the synced file row. Any failure (including
                     // a legacy peer rejecting `RequestStriped`) falls back to the
                     // single-stream path below.
-                    let known_size = storage::file_get_for_transfer(&file_id, &hash)
-                        .map(|(_, _, size)| size)
-                        .unwrap_or(0);
                     if resume_offset == 0 && known_size >= PARALLEL_MIN_BYTES {
                         match download_file_parallel(
                             endpoint.clone(),
