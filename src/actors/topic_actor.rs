@@ -493,6 +493,12 @@ impl TopicActor {
                         .await
                         {
                             Ok(()) => return,
+                            // A policy refusal is final — the single-stream path would
+                            // ride the same relay; don't fall back around the policy.
+                            Err(e) if e.downcast_ref::<crate::xfer_policy::RelayRefused>().is_some() => {
+                                tracing::warn!("⛔ [TOPIC] transfer refused by relay policy: {}", e);
+                                return;
+                            }
                             Err(e) => {
                                 tracing::warn!(
                                     "⚠️ [TOPIC] parallel transfer for {} failed ({}); falling back to single-stream",
@@ -1540,6 +1546,38 @@ const XFER_CHUNK: u64 = 256 * 1024;
 /// Below this size the single-stream path is used — stream fan-out isn't worth it.
 const PARALLEL_MIN_BYTES: u64 = 8 * 1024 * 1024;
 
+/// True when the ONLY live path to `pk` is the relay — the media-plane refusal key
+/// (G8 fix 5). Direct and mixed paths (incl. mDNS-LAN) are never relay-only; an
+/// unknown peer (no address info) is not judged here — the dial itself decides.
+fn relay_only_path(endpoint: &Endpoint, pk: &PublicKey) -> bool {
+    use iroh::Watcher;
+    match endpoint.conn_type(*pk) {
+        Some(mut watcher) => matches!(watcher.get(), iroh::endpoint::ConnectionType::Relay(_)),
+        None => false,
+    }
+}
+
+/// Apply the relay policy to a transfer of `total_size` bytes toward `pk`: above the
+/// threshold, a relay-only path is refused with the typed error surfaced as a clean
+/// `FileDownloadFailed` (never a mid-transfer stall on a saturated relay).
+fn enforce_relay_policy(
+    endpoint: &Endpoint,
+    pk: &PublicKey,
+    total_size: u64,
+    file_id: &str,
+    event_tx: &UnboundedSender<SwiftEvent>,
+) -> Result<()> {
+    if let Err(e) = crate::xfer_policy::enforce(total_size, relay_only_path(endpoint, pk)) {
+        let _ = storage::transfer_set_status(file_id, "relay_refused");
+        let _ = event_tx.send(SwiftEvent::FileDownloadFailed {
+            file_id: file_id.to_string(),
+            error: e.to_string(),
+        });
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 /// Parallel QUIC streams per transfer — `CYAN_XFER_STREAMS`, default 4, clamped 1..=16.
 fn xfer_streams() -> u32 {
     std::env::var("CYAN_XFER_STREAMS")
@@ -1596,6 +1634,9 @@ async fn download_file_parallel(
         .await
         .map_err(|_| anyhow!("File transfer connection timeout"))?
         .map_err(|e| anyhow!("File transfer connect failed: {}", e))?;
+
+        // Relay policy (fix 5): the small relay is signaling, not a media plane.
+        enforce_relay_policy(&endpoint, &pk, total_size, file_id, &event_tx)?;
 
         // Preallocate the tmp file so every stream writes at its true offsets.
         {
@@ -1818,6 +1859,10 @@ async fn download_file(
                 byte_length,
                 byte_offset
             );
+
+            // Relay policy (fix 5): the header names the media's true size — refuse a
+            // relay-only path for large media before a byte of payload moves.
+            enforce_relay_policy(&endpoint, &pk, total_size, &file_id, &event_tx)?;
 
             // Create temp file for download
             let data_dir = crate::DATA_DIR.get().cloned().unwrap_or_else(|| std::path::PathBuf::from("."));
