@@ -144,6 +144,13 @@ pub struct ChangeVersion {
     pub branch: String,
     pub version_no: i64,
     pub list_hash: String,
+    /// `cut_hash = Blake3(asset_hash + ordered active OP entry hashes)` — the PICTURE
+    /// identity (list_hash/cut_hash split, CYAN_FORMAT_QA). Renders derive from it;
+    /// an unchanged cut_hash means nothing to re-render. Notes/markers change
+    /// `list_hash` but never `cut_hash`. `#[serde(default)]` so versions serialized
+    /// before this field existed still parse.
+    #[serde(default)]
+    pub cut_hash: String,
     /// Ordered active entry hashes captured at snapshot time.
     pub entry_hashes: Vec<String>,
     pub created_at: i64,
@@ -217,6 +224,22 @@ pub fn compute_list_hash(asset_hash: &str, ordered_entry_hashes: &[String]) -> S
     hasher.finalize().to_hex().to_string()
 }
 
+/// `cut_hash = Blake3(asset_hash + ordered active OP entry hashes)` — same
+/// construction as `compute_list_hash`, but the caller passes ONLY the hashes of
+/// `kind == "op"` entries (see `snapshot`). This is the picture identity: notes and
+/// markers annotate the cut without changing it, so two versions that differ only
+/// by comments share a cut_hash (same picture ⇒ the previous render is reusable).
+/// By construction, a version whose active set is pure ops has cut_hash == list_hash.
+pub fn compute_cut_hash(asset_hash: &str, ordered_op_entry_hashes: &[String]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(asset_hash.as_bytes());
+    for h in ordered_op_entry_hashes {
+        hasher.update(b"\n");
+        hasher.update(h.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 // ============================================================================
 // Schema migration.
 // ============================================================================
@@ -254,7 +277,8 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             seq           INTEGER NOT NULL DEFAULT 0,
             depends_on    TEXT,
             version_ref   TEXT,
-            outcome       TEXT
+            outcome       TEXT,
+            updated_at    INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_ce_asset
             ON change_entry(tenant_id, asset_hash, branch);
@@ -268,6 +292,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             branch        TEXT NOT NULL,
             version_no    INTEGER NOT NULL,
             list_hash     TEXT NOT NULL,
+            cut_hash      TEXT,
             entry_hashes  TEXT NOT NULL DEFAULT '[]',
             created_at    INTEGER NOT NULL,
             outcome       TEXT NOT NULL DEFAULT 'pending'
@@ -281,23 +306,110 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             branch        TEXT NOT NULL,
             head_version  TEXT,
             created_at    INTEGER NOT NULL,
+            updated_at    INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (tenant_id, asset_hash, branch)
         );
 
         CREATE TABLE IF NOT EXISTS change_audit (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            id            TEXT PRIMARY KEY,
             entry_id      TEXT NOT NULL,
             tenant_id     TEXT NOT NULL,
             transition    TEXT NOT NULL,
             actor         TEXT,
             ts            INTEGER NOT NULL,
-            detail        TEXT
+            detail        TEXT,
+            audit_hash    TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_ca_entry
-            ON change_audit(tenant_id, entry_id, ts);
         "#,
     )?;
+
+    // ── Defensive upgrades for DBs created by earlier feat/frameio builds. ──────
+    // The CREATE TABLE statements above carry the current shape; a device holding
+    // the previous build's tables is brought to the same shape via PRAGMA-guarded
+    // ALTERs (SQLite has no `ADD COLUMN IF NOT EXISTS`). CYAN_FORMAT_SPEC §6.1.
+    if !has_column(conn, "change_version", "cut_hash")? {
+        conn.execute("ALTER TABLE change_version ADD COLUMN cut_hash TEXT", [])?;
+    }
+    if !has_column(conn, "change_entry", "updated_at")? {
+        conn.execute(
+            "ALTER TABLE change_entry ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !has_column(conn, "change_branch", "updated_at")? {
+        conn.execute(
+            "ALTER TABLE change_branch ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    // change_audit: the earlier build used `id INTEGER PRIMARY KEY AUTOINCREMENT` —
+    // local-only ids that cannot union across peers (CYAN_FORMAT_SPEC §6.1 delta 2).
+    // Rebuild to the content-addressed shape (TEXT uuid id + audit_hash). Legacy rows
+    // keep their stringified ids with a NULL audit_hash (they predate content
+    // addressing; NULLs are distinct under the unique index, so nothing is lost or
+    // falsely deduped).
+    if audit_id_is_integer(conn)? {
+        conn.execute_batch(
+            r#"
+            ALTER TABLE change_audit RENAME TO change_audit_legacy;
+            CREATE TABLE change_audit (
+                id            TEXT PRIMARY KEY,
+                entry_id      TEXT NOT NULL,
+                tenant_id     TEXT NOT NULL,
+                transition    TEXT NOT NULL,
+                actor         TEXT,
+                ts            INTEGER NOT NULL,
+                detail        TEXT,
+                audit_hash    TEXT
+            );
+            INSERT INTO change_audit (id, entry_id, tenant_id, transition, actor, ts, detail, audit_hash)
+                SELECT CAST(id AS TEXT), entry_id, tenant_id, transition, actor, ts, detail, NULL
+                FROM change_audit_legacy;
+            DROP TABLE change_audit_legacy;
+            "#,
+        )?;
+    }
+    if !has_column(conn, "change_audit", "audit_hash")? {
+        conn.execute("ALTER TABLE change_audit ADD COLUMN audit_hash TEXT", [])?;
+    }
+
+    // (Re)create the audit indexes once the shape is settled — the unique hash index
+    // is what makes provenance union-merge (INSERT OR IGNORE) a no-op on replay.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_ca_entry
+             ON change_audit(tenant_id, entry_id, ts);
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_ca_hash
+             ON change_audit(tenant_id, audit_hash);",
+    )?;
     Ok(())
+}
+
+/// PRAGMA-guarded column existence check (SQLite has no `ADD COLUMN IF NOT EXISTS`).
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// True when `change_audit.id` still has the legacy INTEGER AUTOINCREMENT shape.
+fn audit_id_is_integer(conn: &Connection) -> Result<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(change_audit)")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "id" {
+            let declared_type: String = row.get(2)?;
+            return Ok(declared_type.to_ascii_uppercase().contains("INT"));
+        }
+    }
+    Ok(false)
 }
 
 // ============================================================================
@@ -369,6 +481,31 @@ fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<ChangeEntry> {
     })
 }
 
+/// Canonical Blake3 hash of an audit row's content:
+/// `Blake3(entry_id ‖ transition ‖ actor ‖ ts ‖ detail)` (CYAN_FORMAT_SPEC §6.1).
+/// The local `id` (a uuid) is deliberately excluded — two peers observing the same
+/// transition produce the same audit_hash, so provenance merges by union under the
+/// unique `(tenant_id, audit_hash)` index.
+pub fn compute_audit_hash(
+    entry_id: &str,
+    transition: &str,
+    actor: Option<&str>,
+    ts: i64,
+    detail: Option<&str>,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(entry_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(transition.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(actor.unwrap_or("").as_bytes());
+    hasher.update(b"\n");
+    hasher.update(ts.to_string().as_bytes());
+    hasher.update(b"\n");
+    hasher.update(detail.unwrap_or("").as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
 fn audit(
     conn: &Connection,
     entry_id: &str,
@@ -377,10 +514,17 @@ fn audit(
     actor: Option<&str>,
     detail: Option<&str>,
 ) -> Result<()> {
+    let ts = now();
+    let id = uuid::Uuid::new_v4().to_string();
+    let audit_hash = compute_audit_hash(entry_id, transition, actor, ts, detail);
+    // INSERT OR IGNORE + unique (tenant_id, audit_hash): an identical transition
+    // observed twice (local replay or a peer's copy arriving over sync) unions to
+    // one row instead of duplicating.
     conn.execute(
-        "INSERT INTO change_audit (entry_id, tenant_id, transition, actor, ts, detail) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![entry_id, tenant_id, transition, actor, now(), detail],
+        "INSERT OR IGNORE INTO change_audit \
+            (id, entry_id, tenant_id, transition, actor, ts, detail, audit_hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![id, entry_id, tenant_id, transition, actor, ts, detail, audit_hash],
     )?;
     Ok(())
 }
@@ -528,9 +672,9 @@ pub fn set_state(
         None
     };
     conn.execute(
-        "UPDATE change_entry SET state=?1, approved_by=?2, approved_at=?3 \
-         WHERE tenant_id=?4 AND id=?5",
-        params![new_state, by, approved_at, tenant_id, entry_id],
+        "UPDATE change_entry SET state=?1, approved_by=?2, approved_at=?3, updated_at=?4 \
+         WHERE tenant_id=?5 AND id=?6",
+        params![new_state, by, approved_at, now(), tenant_id, entry_id],
     )?;
     audit(
         conn,
@@ -556,8 +700,8 @@ pub fn set_active(
 ) -> Result<ChangeEntry> {
     let mut e = get_entry_row(conn, tenant_id, entry_id)?;
     conn.execute(
-        "UPDATE change_entry SET active=?1 WHERE tenant_id=?2 AND id=?3",
-        params![active as i64, tenant_id, entry_id],
+        "UPDATE change_entry SET active=?1, updated_at=?2 WHERE tenant_id=?3 AND id=?4",
+        params![active as i64, now(), tenant_id, entry_id],
     )?;
     audit(
         conn,
@@ -594,9 +738,9 @@ pub fn supersede(
     let appended = append(conn, &old.asset_hash, &branch, new)?;
 
     conn.execute(
-        "UPDATE change_entry SET state='superseded', active=0, superseded_by=?1 \
-         WHERE tenant_id=?2 AND id=?3",
-        params![appended.id, tenant_id, old_entry_id],
+        "UPDATE change_entry SET state='superseded', active=0, superseded_by=?1, updated_at=?2 \
+         WHERE tenant_id=?3 AND id=?4",
+        params![appended.id, now(), tenant_id, old_entry_id],
     )?;
     audit(
         conn,
@@ -637,7 +781,8 @@ fn active_entries(
     Ok(rows)
 }
 
-/// snapshot(asset, branch) → freeze active set → change_version (+ list_hash).
+/// snapshot(asset, branch) → freeze active set → change_version (+ list_hash and
+/// cut_hash — the full frozen-list identity and the ops-only picture identity).
 ///
 /// Immutable: each call mints a NEW version_no (monotonic per asset+branch). Stamps
 /// `version_ref` on entries that first appear in this version and advances the
@@ -651,6 +796,13 @@ pub fn snapshot(
     let entries = active_entries(conn, tenant_id, asset_hash, branch)?;
     let entry_hashes: Vec<String> = entries.iter().map(|e| e.entry_hash.clone()).collect();
     let list_hash = compute_list_hash(asset_hash, &entry_hashes);
+    // The picture identity: only the actionable ops (kind=="op"), in the same order.
+    let op_hashes: Vec<String> = entries
+        .iter()
+        .filter(|e| e.kind == "op")
+        .map(|e| e.entry_hash.clone())
+        .collect();
+    let cut_hash = compute_cut_hash(asset_hash, &op_hashes);
 
     let version_no: i64 = conn
         .query_row(
@@ -668,6 +820,7 @@ pub fn snapshot(
         branch: branch.to_string(),
         version_no,
         list_hash: list_hash.clone(),
+        cut_hash: cut_hash.clone(),
         entry_hashes: entry_hashes.clone(),
         created_at: now(),
         outcome: "pending".to_string(),
@@ -676,8 +829,8 @@ pub fn snapshot(
     conn.execute(
         "INSERT INTO change_version (\
             version_id, asset_hash, tenant_id, branch, version_no, list_hash, \
-            entry_hashes, created_at, outcome) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            cut_hash, entry_hashes, created_at, outcome) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         params![
             version.version_id,
             version.asset_hash,
@@ -685,6 +838,7 @@ pub fn snapshot(
             version.branch,
             version.version_no,
             version.list_hash,
+            version.cut_hash,
             serde_json::to_string(&version.entry_hashes)?,
             version.created_at,
             version.outcome,
@@ -702,12 +856,13 @@ pub fn snapshot(
         }
     }
 
-    // Advance the branch head.
+    // Advance the branch head (bumping the branch's lifecycle clock — the head
+    // moving IS the branch-level LWW event, CYAN_FORMAT_SPEC §6.1).
     conn.execute(
-        "INSERT INTO change_branch (tenant_id, asset_hash, branch, head_version, created_at) \
-         VALUES (?1,?2,?3,?4,?5) \
+        "INSERT INTO change_branch (tenant_id, asset_hash, branch, head_version, created_at, updated_at) \
+         VALUES (?1,?2,?3,?4,?5,?5) \
          ON CONFLICT(tenant_id, asset_hash, branch) \
-         DO UPDATE SET head_version=excluded.head_version",
+         DO UPDATE SET head_version=excluded.head_version, updated_at=excluded.updated_at",
         params![tenant_id, asset_hash, branch, version.version_id, now()],
     )?;
 
@@ -716,10 +871,12 @@ pub fn snapshot(
 
 /// branch(asset, from_branch, new_branch) → fork the active set (today/tomorrow/day-after).
 ///
-/// Copies the active entries of `from_branch` onto `new_branch` as fresh proposed
-/// entries (new ids; content re-hashed under the new branch is identical since
-/// branch is not part of the content hash — so the active SET forks but entries
-/// stay content-addressed and dedup across branches). Registers the new branch.
+/// Copies the active entries of `from_branch` onto `new_branch` as fresh entries
+/// (new ids, keeping state/active so the fork starts with the same conform set).
+/// `branch` IS part of the content hash (see `compute_entry_hash`), so each copy
+/// re-hashes under the new branch: the same edit on two branches is two distinct
+/// entries — a lineage fork. Only identical content on the SAME branch dedups
+/// (the P2P union-merge key). Registers the new branch.
 pub fn branch(
     conn: &Connection,
     tenant_id: &str,
@@ -744,8 +901,70 @@ pub fn branch(
         forked.push(append(conn, asset_hash, new_branch, clone)?);
     }
     conn.execute(
-        "INSERT OR IGNORE INTO change_branch (tenant_id, asset_hash, branch, head_version, created_at) \
-         VALUES (?1,?2,?3,NULL,?4)",
+        "INSERT OR IGNORE INTO change_branch (tenant_id, asset_hash, branch, head_version, created_at, updated_at) \
+         VALUES (?1,?2,?3,NULL,?4,?4)",
+        params![tenant_id, asset_hash, new_branch, now()],
+    )?;
+    Ok(forked)
+}
+
+/// branch_from_version(asset, from_version_id, new_branch) → fork the FROZEN entry
+/// set of a specific version — not the current head — as the new branch's starting
+/// active set (CYAN_FORMAT_QA: "branch(from_version) additive param: build").
+///
+/// Resolves the version's immutable `entry_hashes` back to rows in frozen order,
+/// then runs the same clone/append flow as `branch()`: new ids, content re-hashed
+/// under the new branch (branch IS identity). Because lifecycle may have moved on
+/// since the snapshot (an entry superseded in a later version), each clone is
+/// restored as `active`; a clone whose current state is `superseded`/`rejected`
+/// restarts as `proposed` on the fork (approval is re-earned per branch — the
+/// frozen set never recorded which approval it carried at freeze time).
+pub fn branch_from_version(
+    conn: &Connection,
+    tenant_id: &str,
+    asset_hash: &str,
+    from_version_id: &str,
+    new_branch: &str,
+) -> Result<Vec<ChangeEntry>> {
+    if new_branch.trim().is_empty() {
+        return Err(anyhow!("new_branch required"));
+    }
+    let version = get_version(conn, tenant_id, from_version_id)?;
+    if version.asset_hash != asset_hash {
+        return Err(anyhow!(
+            "version {} belongs to asset {}, not {}",
+            from_version_id,
+            version.asset_hash,
+            asset_hash
+        ));
+    }
+    let mut forked = Vec::with_capacity(version.entry_hashes.len());
+    for h in &version.entry_hashes {
+        let e = conn
+            .query_row(
+                "SELECT * FROM change_entry WHERE tenant_id=?1 AND entry_hash=?2",
+                params![tenant_id, h],
+                row_to_entry,
+            )
+            .map_err(|err| anyhow!("entry for frozen hash {} not found: {}", h, err))?;
+        let mut clone = e;
+        clone.id = uuid::Uuid::new_v4().to_string();
+        clone.entry_hash = String::new(); // recompute under append (branch IS identity)
+        clone.branch = Some(new_branch.to_string());
+        clone.version_ref = None;
+        clone.superseded_by = None;
+        clone.outcome = None;
+        clone.active = true; // the frozen set IS the fork's starting active set
+        if clone.state == "superseded" || clone.state == "rejected" {
+            clone.state = "proposed".to_string();
+            clone.approved_by = None;
+            clone.approved_at = None;
+        }
+        forked.push(append(conn, asset_hash, new_branch, clone)?);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO change_branch (tenant_id, asset_hash, branch, head_version, created_at, updated_at) \
+         VALUES (?1,?2,?3,NULL,?4,?4)",
         params![tenant_id, asset_hash, new_branch, now()],
     )?;
     Ok(forked)
@@ -891,7 +1110,7 @@ pub fn get(conn: &Connection, tenant_id: &str, asset_hash: &str, branch: &str) -
 pub fn get_version(conn: &Connection, tenant_id: &str, version_id: &str) -> Result<ChangeVersion> {
     conn.query_row(
         "SELECT version_id, asset_hash, tenant_id, branch, version_no, list_hash, \
-                entry_hashes, created_at, outcome \
+                cut_hash, entry_hashes, created_at, outcome \
          FROM change_version WHERE tenant_id=?1 AND version_id=?2",
         params![tenant_id, version_id],
         |row| {
@@ -903,6 +1122,10 @@ pub fn get_version(conn: &Connection, tenant_id: &str, version_id: &str) -> Resu
                 branch: row.get("branch")?,
                 version_no: row.get("version_no")?,
                 list_hash: row.get("list_hash")?,
+                // NULL for versions snapshotted before the cut_hash column existed.
+                cut_hash: row
+                    .get::<_, Option<String>>("cut_hash")?
+                    .unwrap_or_default(),
                 entry_hashes: serde_json::from_str(&hashes_str).unwrap_or_default(),
                 created_at: row.get("created_at")?,
                 outcome: row.get("outcome")?,
@@ -929,9 +1152,9 @@ pub fn set_outcome(conn: &Connection, tenant_id: &str, version_id: &str, outcome
         return Err(anyhow!("version {} not found", version_id));
     }
     conn.execute(
-        "UPDATE change_entry SET outcome=?1 \
+        "UPDATE change_entry SET outcome=?1, updated_at=?4 \
          WHERE tenant_id=?2 AND version_ref=?3 AND (outcome IS NULL OR outcome='pending')",
-        params![outcome, tenant_id, version_id],
+        params![outcome, tenant_id, version_id, now()],
     )?;
     Ok(())
 }
@@ -962,7 +1185,8 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("missing 'op'"))?;
 
-    let lock = crate::storage::db()
+    let lock = crate::storage::try_db()
+        .ok_or_else(|| anyhow!("DB not initialized"))?
         .lock()
         .map_err(|e| anyhow!("DB lock: {}", e))?;
     let conn: &Connection = &lock;
@@ -1043,6 +1267,16 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
             )?;
             Ok(serde_json::to_value(out)?)
         }
+        "branch_from_version" => {
+            let out = branch_from_version(
+                conn,
+                &tenant(&cmd)?,
+                &s(&cmd, "asset_hash")?,
+                &s(&cmd, "from_version_id")?,
+                &s(&cmd, "new_branch")?,
+            )?;
+            Ok(serde_json::to_value(out)?)
+        }
         "diff" => {
             let out = diff(
                 conn,
@@ -1077,6 +1311,33 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
                 &s(&cmd, "outcome")?,
             )?;
             Ok(serde_json::json!({ "ok": true }))
+        }
+        // ── asset registry (src/asset_registry.rs) — additive ops on the same JSON
+        // seam; where an asset_hash resolves to what the asset IS (kind/fps/duration,
+        // derivation edges, remote refs like the Frame.io file id).
+        "asset_upsert" => {
+            let asset: crate::asset_registry::Asset = serde_json::from_value(
+                cmd.get("asset")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("missing 'asset'"))?,
+            )
+            .map_err(|e| anyhow!("bad asset: {}", e))?;
+            let out = crate::asset_registry::upsert(conn, &asset)?;
+            Ok(serde_json::to_value(out)?)
+        }
+        "asset_get" => {
+            let out = crate::asset_registry::get(conn, &tenant(&cmd)?, &s(&cmd, "hash")?)?;
+            Ok(serde_json::to_value(out)?)
+        }
+        "asset_set_remote_ref" => {
+            let out = crate::asset_registry::set_remote_ref(
+                conn,
+                &tenant(&cmd)?,
+                &s(&cmd, "hash")?,
+                &s(&cmd, "key")?,
+                &s(&cmd, "value")?,
+            )?;
+            Ok(serde_json::to_value(out)?)
         }
         other => Err(anyhow!("unknown op '{}'", other)),
     }

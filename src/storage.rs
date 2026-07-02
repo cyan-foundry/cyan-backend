@@ -73,6 +73,13 @@ pub fn db() -> &'static Mutex<Connection> {
     DB.get().expect("DB not initialized - call init_db first")
 }
 
+/// Non-panicking accessor for the JSON dispatch paths (`changelist::command`,
+/// `review_state::command`): a command arriving before `init_db` must surface as a
+/// clean `{"error": ...}` JSON string, never a panic across the FFI boundary.
+pub fn try_db() -> Option<&'static Mutex<Connection>> {
+    DB.get()
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // GROUPS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2514,6 +2521,16 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     // behavior changes.
     if let Err(e) = crate::review_state::migrate(conn) {
         tracing::warn!("Migration: review_state table failed: {e}");
+    }
+
+    // Asset registry (CYAN_FORMAT_SPEC / CYAN_FORMAT_QA): one row per
+    // content-addressed media asset — kind/fps/duration (frame math), derivation
+    // edges (proxy/deliverable → {parent master, version}), and remote refs
+    // (e.g. the Frame.io file id a proxy was published as). Creates `asset`.
+    // Idempotent (CREATE TABLE IF NOT EXISTS); additive — no existing table or
+    // behavior changes.
+    if let Err(e) = crate::asset_registry::migrate(conn) {
+        tracing::warn!("Migration: asset registry table failed: {e}");
     }
 
     Ok(())

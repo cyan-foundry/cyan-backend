@@ -832,7 +832,8 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value, ReviewError> {
         .ok_or_else(|| ReviewError::Other("missing 'op'".to_string()))?
         .to_string();
 
-    let lock = crate::storage::db()
+    let lock = crate::storage::try_db()
+        .ok_or_else(|| ReviewError::Other("DB not initialized".to_string()))?
         .lock()
         .map_err(|e| ReviewError::Other(format!("DB lock: {}", e)))?;
     let conn: &Connection = &lock;

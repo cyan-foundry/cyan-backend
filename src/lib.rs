@@ -1889,6 +1889,7 @@ pub mod templates;
 pub mod timecode_notes;
 pub mod changelist;
 pub mod review_state;
+pub mod asset_registry;
 pub mod skills;
 pub mod pipeline_executor;
 pub mod dashboard;

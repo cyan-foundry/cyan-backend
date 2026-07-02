@@ -320,3 +320,291 @@ fn notes_excluded_from_conform_plan() {
     assert_eq!(plan.len(), 1, "creative notes are not actionable ops");
     assert_eq!(plan[0].entry_id, op.id);
 }
+
+// ── cut_hash: picture identity covers ONLY the active ops (list/cut split) ─────
+
+#[test]
+fn snapshot_computes_cut_hash_over_ops_only() {
+    let conn = db();
+    let op = changelist::append(&conn, "a", "main", op_entry("t", "a", "trim", 0, json!({"edge":"head","frames":6}))).expect("op");
+    let mut note = op_entry("t", "a", "trim", 24, json!({}));
+    note.kind = "note".to_string();
+    note.op = None;
+    note.intent = "first note".to_string();
+    changelist::append(&conn, "a", "main", note).expect("note");
+
+    let v1 = changelist::snapshot(&conn, "t", "a", "main").expect("v1");
+    assert_eq!(
+        v1.cut_hash,
+        changelist::compute_cut_hash("a", std::slice::from_ref(&op.entry_hash)),
+        "cut_hash covers only the ordered active OP hashes"
+    );
+    assert_ne!(v1.cut_hash, v1.list_hash, "with a note in the set, picture identity != full frozen-list identity");
+
+    // A second note changes the list (new comments) but never the picture.
+    let mut note2 = op_entry("t", "a", "trim", 48, json!({}));
+    note2.kind = "note".to_string();
+    note2.op = None;
+    note2.intent = "second note".to_string();
+    changelist::append(&conn, "a", "main", note2).expect("note2");
+
+    let v2 = changelist::snapshot(&conn, "t", "a", "main").expect("v2");
+    assert_eq!(v2.cut_hash, v1.cut_hash, "a new note leaves the cut untouched — the previous render is reusable");
+    assert_ne!(v2.list_hash, v1.list_hash, "but the frozen list did change");
+
+    // Round-trips through the store.
+    let reloaded = changelist::get_version(&conn, "t", &v2.version_id).expect("get_version");
+    assert_eq!(reloaded.cut_hash, v2.cut_hash);
+}
+
+// ── lifecycle transitions bump the LWW clocks (spec §6.1 delta 1) ──────────────
+
+#[test]
+fn lifecycle_transitions_bump_updated_at() {
+    let conn = db();
+    let updated_at = |id: &str| -> i64 {
+        conn.query_row("SELECT updated_at FROM change_entry WHERE id=?1", [id], |r| r.get(0))
+            .expect("updated_at")
+    };
+    let reset = |id: &str| {
+        conn.execute("UPDATE change_entry SET updated_at=0 WHERE id=?1", [id])
+            .expect("reset clock");
+    };
+
+    let e = changelist::append(&conn, "a", "main", op_entry("t", "a", "trim", 0, json!({"edge":"head","frames":6}))).expect("e");
+    assert_eq!(updated_at(&e.id), 0, "append is content, not lifecycle — the clock starts at 0");
+
+    changelist::set_state(&conn, "t", &e.id, "approved", Some("u-prod")).expect("set_state");
+    assert!(updated_at(&e.id) > 0, "set_state bumps the lifecycle clock");
+
+    reset(&e.id);
+    changelist::set_active(&conn, "t", &e.id, false, None).expect("set_active");
+    assert!(updated_at(&e.id) > 0, "set_active bumps the lifecycle clock");
+
+    reset(&e.id);
+    let e2 = changelist::supersede(&conn, &e.id, op_entry("t", "a", "trim", 0, json!({"edge":"head","frames":9}))).expect("supersede");
+    assert!(updated_at(&e.id) > 0, "supersede bumps the OLD entry's clock");
+
+    // Outcome propagation bumps the entries first appearing in the version.
+    let v = changelist::snapshot(&conn, "t", "a", "main").expect("snapshot");
+    reset(&e2.id);
+    changelist::set_outcome(&conn, "t", &v.version_id, "shipped").expect("set_outcome");
+    assert!(updated_at(&e2.id) > 0, "outcome propagation bumps the labeled entries");
+
+    // The head advancing (snapshot) bumps the branch clock.
+    let branch_clock: i64 = conn
+        .query_row(
+            "SELECT updated_at FROM change_branch WHERE tenant_id='t' AND asset_hash='a' AND branch='main'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("branch clock");
+    assert!(branch_clock > 0, "advancing the branch head bumps change_branch.updated_at");
+}
+
+// ── audit rows are content-addressed and union-merge (spec §6.1 delta 2) ───────
+
+#[test]
+fn audit_rows_are_content_addressed_and_dedup() {
+    let conn = db();
+    let e = changelist::append(&conn, "a", "main", op_entry("t", "a", "trim", 0, json!({"edge":"tail","frames":3}))).expect("e");
+
+    // The append audit row carries a TEXT uuid id + an audit_hash that recomputes
+    // exactly from its own fields — provenance is global, not a local counter.
+    let (id, actor, ts, audit_hash): (String, Option<String>, i64, Option<String>) = conn
+        .query_row(
+            "SELECT id, actor, ts, audit_hash FROM change_audit \
+             WHERE tenant_id='t' AND entry_id=?1 AND transition='append'",
+            [&e.id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .expect("append audit row");
+    assert_eq!(id.len(), 36, "audit id is a uuid, not an AUTOINCREMENT int");
+    let expected = changelist::compute_audit_hash(&e.id, "append", actor.as_deref(), ts, None);
+    assert_eq!(audit_hash.as_deref(), Some(expected.as_str()), "audit rows are content-addressed");
+
+    // Union-merge: the same audit row arriving again (a peer's copy — same content
+    // hash, different local uuid) is a no-op under the unique (tenant_id, audit_hash)
+    // index + INSERT OR IGNORE.
+    let before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM change_audit WHERE tenant_id='t'", [], |r| r.get(0))
+        .expect("count before");
+    conn.execute(
+        "INSERT OR IGNORE INTO change_audit \
+            (id, entry_id, tenant_id, transition, actor, ts, detail, audit_hash) \
+         VALUES ('peer-replayed-uuid', ?1, 't', 'append', ?2, ?3, NULL, ?4)",
+        rusqlite::params![e.id, actor, ts, expected],
+    )
+    .expect("replay insert");
+    let after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM change_audit WHERE tenant_id='t'", [], |r| r.get(0))
+        .expect("count after");
+    assert_eq!(before, after, "identical provenance unions to one row");
+
+    // A different transition is new content — a new row, no false dedup.
+    changelist::set_state(&conn, "t", &e.id, "approved", Some("u-prod")).expect("approve");
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM change_audit WHERE tenant_id='t' AND entry_id=?1",
+            [&e.id],
+            |r| r.get(0),
+        )
+        .expect("n");
+    assert_eq!(n, 2, "distinct transitions produce distinct audit rows");
+}
+
+// ── branch_from_version forks the FROZEN set, not the moved-on head ────────────
+
+#[test]
+fn branch_from_version_forks_frozen_set() {
+    let conn = db();
+    let e1 = changelist::append(&conn, "a", "main", op_entry("t", "a", "trim", 0, json!({"edge":"head","frames":5}))).expect("e1");
+    let e2 = changelist::append(&conn, "a", "main", op_entry("t", "a", "lift", 100, json!({}))).expect("e2");
+    let v1 = changelist::snapshot(&conn, "t", "a", "main").expect("v1");
+
+    // The head moves on: e2 is superseded and a new version is cut.
+    let e2b = changelist::supersede(&conn, &e2.id, op_entry("t", "a", "delete", 100, json!({}))).expect("e2'");
+    let v2 = changelist::snapshot(&conn, "t", "a", "main").expect("v2");
+    assert!(v2.entry_hashes.contains(&e2b.entry_hash), "sanity: v2 carries the replacement");
+    assert!(!v2.entry_hashes.contains(&e2.entry_hash), "sanity: v2 dropped the superseded op");
+
+    // Fork from v1 — the fork's starting active set is v1's frozen set.
+    let forked = changelist::branch_from_version(&conn, "t", "a", &v1.version_id, "alt").expect("fork");
+    assert_eq!(forked.len(), 2, "both frozen entries restored on the fork");
+
+    let v_alt = changelist::snapshot(&conn, "t", "a", "alt").expect("v_alt");
+    assert_eq!(v_alt.entry_hashes.len(), 2);
+
+    let view = changelist::get(&conn, "t", "a", "alt").expect("get alt");
+    let active_ops: Vec<(String, i64)> = view
+        .entries
+        .iter()
+        .filter(|x| x.active)
+        .map(|x| (x.op.clone().unwrap_or_default(), x.tc_in))
+        .collect();
+    assert!(active_ops.contains(&("trim".to_string(), 0)), "v1's e1 is on the fork");
+    assert!(
+        active_ops.contains(&("lift".to_string(), 100)),
+        "the fork restores v1's e2 — the entry the head later superseded"
+    );
+    assert!(
+        !active_ops.contains(&("delete".to_string(), 100)),
+        "v2's superseding entry is NOT part of the v1 fork"
+    );
+    // Sanity vs e1 content: the same edit re-hashes under the new branch (branch IS
+    // identity), so the fork's frozen hashes are all distinct from v1's.
+    assert_eq!(e1.op.as_deref(), Some("trim"));
+    for h in &v_alt.entry_hashes {
+        assert!(!v1.entry_hashes.contains(h), "forked entries re-hash under the new branch");
+    }
+}
+
+// ── migration robustness: idempotence + legacy audit-table rebuild ─────────────
+
+#[test]
+fn migrate_is_idempotent_and_preserves_data() {
+    let conn = db(); // first migrate ran in db()
+    let e = changelist::append(&conn, "a", "main", op_entry("t", "a", "trim", 0, json!({"edge":"head","frames":2})))
+        .expect("append");
+    let v = changelist::snapshot(&conn, "t", "a", "main").expect("snapshot");
+
+    // A device re-opening its DB runs the migration again — must be a clean no-op.
+    changelist::migrate(&conn).expect("second migrate");
+    changelist::migrate(&conn).expect("third migrate");
+
+    let reread = changelist::get_entry(&conn, "t", &e.id).expect("entry survives re-migration");
+    assert_eq!(reread.entry_hash, e.entry_hash);
+    let ver = changelist::get_version(&conn, "t", &v.version_id).expect("version survives");
+    assert_eq!(ver.entry_hashes, v.entry_hashes);
+    let audits: i64 = conn
+        .query_row("SELECT COUNT(*) FROM change_audit WHERE tenant_id='t'", [], |r| r.get(0))
+        .expect("audit count");
+    assert!(audits >= 1, "audit rows survive re-migration");
+}
+
+#[test]
+fn migrate_rebuilds_legacy_integer_audit_table() {
+    // Pre-seed the PREVIOUS build's audit shape: INTEGER AUTOINCREMENT ids, no
+    // audit_hash (CYAN_FORMAT_SPEC §6.1 delta 2 — local-only ids that cannot union).
+    let conn = Connection::open_in_memory().expect("in-memory db");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE change_audit (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_id    TEXT NOT NULL,
+            tenant_id   TEXT NOT NULL,
+            transition  TEXT NOT NULL,
+            actor       TEXT,
+            ts          INTEGER NOT NULL,
+            detail      TEXT
+        );
+        INSERT INTO change_audit (entry_id, tenant_id, transition, actor, ts, detail)
+            VALUES ('e-old-1', 't', 'append', 'u1', 100, NULL),
+                   ('e-old-1', 't', 'set_state:approved', 'u2', 200, 'by u2');
+        "#,
+    )
+    .expect("seed legacy table");
+
+    changelist::migrate(&conn).expect("migrate rebuilds the legacy table");
+
+    // Legacy rows survive with stringified ids + NULL audit_hash (they predate
+    // content addressing; NULLs are distinct under the unique index).
+    let rows: Vec<(String, String, Option<String>)> = conn
+        .prepare("SELECT id, transition, audit_hash FROM change_audit WHERE tenant_id='t' ORDER BY ts")
+        .expect("prepare")
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(rows.len(), 2, "both legacy audit rows survive the rebuild");
+    assert_eq!(rows[0], ("1".to_string(), "append".to_string(), None));
+    assert_eq!(rows[1].1, "set_state:approved");
+    assert!(rows[1].2.is_none(), "legacy rows carry NULL audit_hash");
+
+    // The rebuilt table accepts new content-addressed writes end-to-end.
+    let e = changelist::append(&conn, "a", "main", op_entry("t", "a", "mute", 0, json!({})))
+        .expect("append on rebuilt table");
+    let new_hash: Option<String> = conn
+        .query_row(
+            "SELECT audit_hash FROM change_audit WHERE tenant_id='t' AND entry_id=?1 AND transition='append'",
+            [&e.id],
+            |r| r.get(0),
+        )
+        .expect("new audit row");
+    assert!(new_hash.is_some(), "new audit rows are content-addressed after the rebuild");
+
+    // Re-running the migration on the ALREADY-rebuilt table is a no-op (idempotent —
+    // the INTEGER-id guard no longer fires; nothing is dropped or duplicated).
+    let before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM change_audit", [], |r| r.get(0))
+        .expect("count before");
+    changelist::migrate(&conn).expect("re-migrate rebuilt table");
+    let after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM change_audit", [], |r| r.get(0))
+        .expect("count after");
+    assert_eq!(before, after, "re-migration neither drops nor duplicates audit rows");
+}
+
+// ── FFI dispatch never panics — bad input surfaces as {"error": ...} JSON ──────
+
+#[test]
+fn command_dispatch_returns_clean_json_errors() {
+    // These paths must NEVER panic (they sit behind cyan_changelist_command). The
+    // process-global DB is deliberately untouched here: garbage JSON, a missing op,
+    // an unknown op, and an op reaching for the uninitialized DB all come back as
+    // parseable {"error": ...} strings.
+    for bad in [
+        "not json at all",
+        r#"{"no_op_field": 1}"#,
+        r#"{"op": "definitely_not_an_op"}"#,
+        r#"{"op": "get", "tenant_id": "t", "asset_hash": "a"}"#,
+    ] {
+        let out = changelist::command(bad);
+        let v: serde_json::Value =
+            serde_json::from_str(&out).expect("dispatch output is always valid JSON");
+        assert!(
+            v.get("error").and_then(|e| e.as_str()).is_some(),
+            "bad command {bad:?} surfaces a clean error, got: {out}"
+        );
+    }
+}
