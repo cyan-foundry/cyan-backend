@@ -333,6 +333,14 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             detail        TEXT,
             audit_hash    TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS own_refs (
+            tenant_id     TEXT NOT NULL,
+            source        TEXT NOT NULL,
+            source_ref    TEXT NOT NULL,
+            created_at    INTEGER NOT NULL,
+            PRIMARY KEY (tenant_id, source, source_ref)
+        );
         "#,
     )?;
 
@@ -1180,6 +1188,50 @@ pub fn set_outcome(conn: &Connection, tenant_id: &str, version_id: &str, outcome
 }
 
 // ============================================================================
+// Echo suppression (CYAN_FORMAT_QA gap 3) — the own_refs breadcrumb table.
+// ============================================================================
+//
+// When an ACTUATOR writes back to an external system (posts a Frame.io comment,
+// stamps a status), it records the remote id it just created here. The SENSOR leg
+// checks `is_own_source_ref` before ingesting a remote item — our own write-backs
+// never re-enter the ledger as new entries (the echo loop at the boundary).
+
+/// Record one actuator write-back breadcrumb: we created `(source, source_ref)`
+/// remotely. Idempotent — recording the same write-back twice is a no-op.
+pub fn record_own_ref(
+    conn: &Connection,
+    tenant_id: &str,
+    source: &str,
+    source_ref: &str,
+) -> Result<()> {
+    if tenant_id.trim().is_empty() || source.trim().is_empty() || source_ref.trim().is_empty() {
+        return Err(anyhow!("record_own_ref: tenant_id, source and source_ref required"));
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO own_refs (tenant_id, source, source_ref, created_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![tenant_id, source, source_ref, now()],
+    )?;
+    Ok(())
+}
+
+/// True iff `(source, source_ref)` was written back by one of OUR actuators —
+/// the sensor leg's echo check. Tenant-scoped.
+pub fn is_own_source_ref(
+    conn: &Connection,
+    tenant_id: &str,
+    source: &str,
+    source_ref: &str,
+) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM own_refs WHERE tenant_id=?1 AND source=?2 AND source_ref=?3",
+        params![tenant_id, source, source_ref],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+// ============================================================================
 // P2P sync (CYAN_FORMAT_SPEC §6) — wire rows, apply paths, list reads.
 // ============================================================================
 //
@@ -1830,6 +1882,21 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
         "conform_plan" => {
             let out = conform_plan(conn, &tenant(&cmd)?, &s(&cmd, "version_id")?)?;
             Ok(serde_json::to_value(out)?)
+        }
+        // The proxy ⇄ master frame map for a version (src/conform_map.rs) — the
+        // sensor leg's remap entry point (CYAN_FORMAT_QA gap 1).
+        "conform_map" => {
+            let out = crate::conform_map::for_version(conn, &tenant(&cmd)?, &s(&cmd, "version_id")?)?;
+            Ok(serde_json::to_value(out)?)
+        }
+        // Echo suppression (CYAN_FORMAT_QA gap 3): actuator write-back breadcrumbs.
+        "record_own_ref" => {
+            record_own_ref(conn, &tenant(&cmd)?, &s(&cmd, "source")?, &s(&cmd, "source_ref")?)?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "is_own_source_ref" => {
+            let own = is_own_source_ref(conn, &tenant(&cmd)?, &s(&cmd, "source")?, &s(&cmd, "source_ref")?)?;
+            Ok(serde_json::json!({ "own": own }))
         }
         "get" => {
             let branch = cmd

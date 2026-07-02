@@ -448,3 +448,135 @@ fn reopen_branches_off_delivered() {
     let forked = changelist::get(&conn, T, A, "reopen-1").expect("get forked");
     assert!(!forked.entries.is_empty(), "reopen forked the active ops");
 }
+
+// ── CONFIRM-step interlock: confirming every proposal un-parks the workflow ────
+
+/// The workflow tables (`objects`/`workspaces`/`notebook_cells`) the interlock
+/// walks, on the SAME isolated connection the review machine runs on.
+fn migrate_workflow_tables(conn: &Connection) {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS workspaces (
+            id TEXT PRIMARY KEY, group_id TEXT NOT NULL, name TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS objects (
+            id TEXT PRIMARY KEY, workspace_id TEXT, group_id TEXT, board_id TEXT,
+            type TEXT NOT NULL, name TEXT NOT NULL, hash TEXT, data TEXT, size INTEGER,
+            source_peer TEXT, local_path TEXT, created_at INTEGER NOT NULL,
+            board_mode TEXT DEFAULT 'canvas'
+        );
+        CREATE TABLE IF NOT EXISTS notebook_cells (
+            id TEXT PRIMARY KEY, board_id TEXT NOT NULL, cell_type TEXT NOT NULL,
+            cell_order INTEGER NOT NULL, content TEXT, output TEXT,
+            collapsed INTEGER DEFAULT 0, height REAL, metadata_json TEXT,
+            created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+        );
+        "#,
+    )
+    .expect("workflow tables");
+}
+
+fn cell_status(conn: &Connection, cell_id: &str) -> String {
+    let meta: String = conn
+        .query_row(
+            "SELECT metadata_json FROM notebook_cells WHERE id=?1",
+            [cell_id],
+            |r| r.get(0),
+        )
+        .expect("cell metadata");
+    let v: serde_json::Value = serde_json::from_str(&meta).expect("metadata json");
+    v["pipeline"]["state"]["status"].as_str().unwrap_or("").to_string()
+}
+
+#[test]
+fn confirm_all_proposals_advances_workflow_confirm_step() {
+    let conn = db();
+    migrate_workflow_tables(&conn);
+
+    // A board in the tenant's group with a MANUAL step parked at its approval gate,
+    // marked as the review gate (metadata.review_gate = true). A second manual step
+    // WITHOUT the marker must not move — the interlock is marker-scoped, not
+    // approve-everything.
+    conn.execute(
+        "INSERT INTO workspaces (id, group_id, name, created_at) VALUES ('ws1', ?1, 'Main', 1)",
+        [T],
+    )
+    .expect("workspace");
+    conn.execute(
+        "INSERT INTO objects (id, workspace_id, type, name, created_at) \
+         VALUES ('board1', 'ws1', 'whiteboard', 'Review Board', 1)",
+        [],
+    )
+    .expect("board");
+    let gate_meta = serde_json::json!({
+        "review_gate": true,
+        "pipeline": {
+            "step_id": "confirm-1",
+            "executor": "manual",
+            "state": { "status": "ai_complete", "run_id": "run-7" }
+        }
+    });
+    let plain_meta = serde_json::json!({
+        "pipeline": {
+            "step_id": "other-manual",
+            "executor": "manual",
+            "state": { "status": "ai_complete", "run_id": "run-7" }
+        }
+    });
+    conn.execute(
+        "INSERT INTO notebook_cells (id, board_id, cell_type, cell_order, content, metadata_json, created_at, updated_at) \
+         VALUES ('cell-gate', 'board1', 'step', 0, 'CONFIRM the proposed ops', ?1, 1, 1)",
+        [gate_meta.to_string()],
+    )
+    .expect("gate cell");
+    conn.execute(
+        "INSERT INTO notebook_cells (id, board_id, cell_type, cell_order, content, metadata_json, created_at, updated_at) \
+         VALUES ('cell-plain', 'board1', 'step', 1, 'Some other manual step', ?1, 1, 1)",
+        [plain_meta.to_string()],
+    )
+    .expect("plain cell");
+
+    // Review loop reaches NOTES_IN with two agent proposals.
+    rv::start_draft(&conn, T, A, B).unwrap();
+    rv::publish_draft(&conn, T, A, B, Actor::Human).unwrap();
+    rv::notes_arrived(&conn, T, A, B, Actor::Auto).unwrap();
+    let p1 = rv::propose_op(&conn, A, B, op_entry("mute", 200, json!({}), "agent"), Actor::Agent)
+        .expect("propose mute");
+    let p2 = rv::propose_op(
+        &conn, A, B,
+        op_entry("fade", 260, json!({"dir":"out","frames":8}), "agent"),
+        Actor::Agent,
+    )
+    .expect("propose fade");
+
+    // Confirming individual proposals does NOT fire the interlock — the step stays
+    // parked until the whole batch is resolved and the machine advances.
+    rv::confirm_op(&conn, T, &p1.id, None, ConfirmDecision::Approve, Actor::Human)
+        .expect("confirm p1");
+    assert_eq!(cell_status(&conn, "cell-gate"), "ai_complete", "still parked mid-batch");
+    rv::confirm_op(&conn, T, &p2.id, None, ConfirmDecision::Approve, Actor::Human)
+        .expect("confirm p2");
+    assert_eq!(cell_status(&conn, "cell-gate"), "ai_complete", "still parked before confirm_notes");
+
+    // The last proposal is resolved → the human fires NOTES_IN → CONFORMING. The
+    // interlock marks the parked CONFIRM step human_approved.
+    let s = rv::confirm_notes(&conn, T, A, B, Actor::Human).expect("confirm_notes");
+    assert_eq!(s.state, "CONFORMING");
+    assert_eq!(cell_status(&conn, "cell-gate"), "human_approved", "the review gate un-parked");
+
+    // run_id survives the state write, and the unmarked manual step did not move.
+    let meta: String = conn
+        .query_row("SELECT metadata_json FROM notebook_cells WHERE id='cell-gate'", [], |r| r.get(0))
+        .expect("gate metadata");
+    let v: serde_json::Value = serde_json::from_str(&meta).expect("json");
+    assert_eq!(v["pipeline"]["state"]["run_id"], json!("run-7"), "run_id preserved");
+    assert_eq!(cell_status(&conn, "cell-plain"), "ai_complete", "unmarked manual step untouched");
+
+    // Idempotent: a later confirm on another asset's batch leaves it approved.
+    rv::start_draft(&conn, T, "assetB", B).unwrap();
+    rv::publish_draft(&conn, T, "assetB", B, Actor::Human).unwrap();
+    rv::notes_arrived(&conn, T, "assetB", B, Actor::Auto).unwrap();
+    rv::confirm_notes(&conn, T, "assetB", B, Actor::Human).expect("second confirm");
+    assert_eq!(cell_status(&conn, "cell-gate"), "human_approved", "stays approved");
+}

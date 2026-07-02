@@ -1974,9 +1974,31 @@ fn update_step_state_full(
     duration: Option<f64>,
     command_tx: &UnboundedSender<CommandMsg>,
 ) -> Result<()> {
-    // CRITICAL: Re-read cell from DB to get latest metadata (avoids race condition)
-    let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
+    let cmd = {
+        // CRITICAL: Re-read cell from DB to get latest metadata (avoids race condition)
+        let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
+        update_step_state_full_on(&conn, board_id, cell_id, status, ai_result, error, run_id, duration)?
+    }; // Release lock before sending command
+    let _ = command_tx.send(cmd);
+    Ok(())
+}
 
+/// Conn-explicit core of `update_step_state_full` — the review-loop CONFIRM
+/// interlock calls this on a connection it already holds (`approve_review_gate_steps`).
+/// Reads the cell's latest metadata, folds the new step state in, persists it
+/// SYNCHRONOUSLY on `conn`, and returns the `UpdateNotebookCell` command for the
+/// caller to gossip AFTER its lock is released (sync-before-gossip).
+#[allow(clippy::too_many_arguments)]
+fn update_step_state_full_on(
+    conn: &rusqlite::Connection,
+    board_id: &str,
+    cell_id: &str,
+    status: &str,
+    ai_result: Option<&str>,
+    error: Option<&str>,
+    run_id: &str,
+    duration: Option<f64>,
+) -> Result<CommandMsg> {
     let (content, cell_order, current_metadata_json): (String, i32, Option<String>) = conn.query_row(
         "SELECT content, cell_order, metadata_json FROM notebook_cells WHERE id = ?1",
         rusqlite::params![cell_id],
@@ -1986,8 +2008,6 @@ fn update_step_state_full(
             row.get(2)?,
         )),
     ).map_err(|e| anyhow!("Cell not found: {}", e))?;
-
-    drop(conn); // Release lock before sending command
 
     let mut metadata: serde_json::Value = current_metadata_json.as_ref()
         .and_then(|s| serde_json::from_str(s).ok())
@@ -2013,23 +2033,28 @@ fn update_step_state_full(
     }
 
     // SYNCHRONOUS persist (N/L/M): write the new state to storage NOW so the resume-run
-    // and the Dashboard reconstruct read the latest status immediately (the command_tx
-    // path below still gossips it to peers). Without this, a resume raced the async
+    // and the Dashboard reconstruct read the latest status immediately (the returned
+    // command still gossips it to peers). Without this, a resume raced the async
     // command and re-paused at the just-finished step, and reconstruct showed stale cost.
-    let _ = storage::cell_update(&crate::models::dto::NotebookCellDTO {
-        id: cell_id.to_string(),
-        board_id: board_id.to_string(),
-        cell_type: "markdown".to_string(),
-        cell_order,
-        content: Some(content.clone()),
-        output: ai_result.map(|s| s.to_string()),
-        collapsed: false,
-        height: None,
-        metadata_json: Some(metadata.to_string()),
-        created_at: now,
-        updated_at: now,
-    });
-    let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
+    let _ = conn.execute(
+        "UPDATE notebook_cells SET cell_type=?2, cell_order=?3, content=?4, output=?5, \
+            collapsed=?6, height=?7, metadata_json=?8, updated_at=?9 WHERE id=?1",
+        rusqlite::params![
+            cell_id,
+            "markdown",
+            cell_order,
+            Some(content.clone()),
+            ai_result,
+            0i32,
+            Option::<f64>::None,
+            metadata.to_string(),
+            now,
+        ],
+    );
+
+    tracing::info!("📝 Pipeline step {} → {} (metadata: {}B)", cell_id.get(..8).unwrap_or(cell_id), status, metadata.to_string().len());
+
+    Ok(CommandMsg::UpdateNotebookCell {
         id: cell_id.to_string(),
         board_id: board_id.to_string(),
         cell_type: "markdown".to_string(),
@@ -2039,11 +2064,73 @@ fn update_step_state_full(
         collapsed: false,
         height: None,
         metadata_json: Some(metadata.to_string()),
-    });
+    })
+}
 
-    tracing::info!("📝 Pipeline step {} → {} (metadata: {}B)", cell_id.get(..8).unwrap_or(cell_id), status, metadata.to_string().len());
+/// CONFIRM-step ↔ review-loop interlock (CYAN_FORMAT_QA gap 6). When the review
+/// machine advances NOTES_IN → CONFORMING (every proposal resolved through the
+/// human confirm gate), the tenant's parked manual CONFIRM steps — cells marked
+/// with a top-level `"review_gate": true` in `metadata_json` — flip to
+/// `human_approved`: the workflow was parked on the SAME human decision the review
+/// gate just recorded, so it un-parks without a second approval tap.
+///
+/// Writes through the `update_step_state_full` core on the CALLER's connection
+/// (synchronous persist first), then gossips via `queue_command`
+/// (sync-before-gossip; a no-op without a running system). Only parked steps move:
+/// already-approved, skipped, or failed (explicitly rejected) gates are left
+/// alone. A DB without the workflow tables (bare ledger-only stores) has zero
+/// boards — never an error.
+pub fn approve_review_gate_steps(conn: &rusqlite::Connection, tenant_id: &str) -> Result<usize> {
+    let Ok(mut board_stmt) = conn.prepare(
+        "SELECT id FROM objects WHERE type='whiteboard' AND (group_id=?1 \
+            OR workspace_id IN (SELECT id FROM workspaces WHERE group_id=?1))",
+    ) else {
+        return Ok(0); // no workflow tables on this DB
+    };
+    let board_ids: Vec<String> = board_stmt
+        .query_map(rusqlite::params![tenant_id], |r| r.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(board_stmt);
 
-    Ok(())
+    let mut approved = 0usize;
+    for board_id in &board_ids {
+        let mut cell_stmt = conn.prepare(
+            "SELECT id, metadata_json FROM notebook_cells \
+             WHERE board_id=?1 AND cell_type != 'archived'",
+        )?;
+        let cells: Vec<(String, Option<String>)> = cell_stmt
+            .query_map(rusqlite::params![board_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(cell_stmt);
+
+        for (cell_id, meta_json) in cells {
+            let Some(meta) = meta_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            else {
+                continue;
+            };
+            if meta.get("review_gate").and_then(|v| v.as_bool()) != Some(true) {
+                continue;
+            }
+            // Only a manual (human-approval) pipeline step can be a review gate.
+            let executor = meta["pipeline"]["executor"].as_str().unwrap_or("");
+            if executor != "manual" {
+                continue;
+            }
+            let status = meta["pipeline"]["state"]["status"].as_str().unwrap_or("pending");
+            if matches!(status, "human_approved" | "skipped" | "failed") {
+                continue; // resolved gates never move (idempotent; a rejection stands)
+            }
+            let run_id = meta["pipeline"]["state"]["run_id"].as_str().unwrap_or("").to_string();
+            let cmd = update_step_state_full_on(
+                conn, board_id, &cell_id, "human_approved", None, None, &run_id, None,
+            )?;
+            crate::queue_command(cmd);
+            approved += 1;
+        }
+    }
+    Ok(approved)
 }
 
 /// Fire notifications for a step event

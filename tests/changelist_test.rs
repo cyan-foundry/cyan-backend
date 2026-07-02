@@ -610,3 +610,38 @@ fn command_dispatch_returns_clean_json_errors() {
         );
     }
 }
+
+// ── echo suppression: own write-back refs are flagged (own_refs table) ─────────
+
+#[test]
+fn own_writeback_ref_is_flagged() {
+    let conn = db();
+
+    // An actuator posted comment-123 to Frame.io and recorded the breadcrumb.
+    changelist::record_own_ref(&conn, "t1", "frameio", "comment-123").expect("record own ref");
+
+    // The sensor leg's echo check: OUR write-back is flagged…
+    assert!(
+        changelist::is_own_source_ref(&conn, "t1", "frameio", "comment-123").expect("check own"),
+        "our own write-back must be flagged"
+    );
+    // …and everything else is not: another ref, another source, another tenant.
+    assert!(!changelist::is_own_source_ref(&conn, "t1", "frameio", "comment-999").expect("other ref"));
+    assert!(!changelist::is_own_source_ref(&conn, "t1", "resolve", "comment-123").expect("other source"));
+    assert!(!changelist::is_own_source_ref(&conn, "t2", "frameio", "comment-123").expect("other tenant"));
+
+    // Recording the same write-back twice is a no-op (idempotent breadcrumb).
+    changelist::record_own_ref(&conn, "t1", "frameio", "comment-123").expect("idempotent record");
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM own_refs WHERE tenant_id='t1' AND source='frameio' AND source_ref='comment-123'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(n, 1, "one breadcrumb row, not two");
+
+    // Blank pieces are rejected with a clean error, never a panic.
+    assert!(changelist::record_own_ref(&conn, "t1", "", "x").is_err());
+    assert!(changelist::record_own_ref(&conn, "t1", "frameio", " ").is_err());
+}

@@ -464,7 +464,9 @@ pub fn version_approved(
 
 /// NOTES_IN → CONFORMING: the human has confirmed the proposed ops (the editable
 /// gate). HUMAN-gated. Per-op confirm is done through `confirm_op`; this fires once
-/// the batch is confirmed to advance the machine into the conform run.
+/// the batch is confirmed to advance the machine into the conform run. Advancing
+/// also fires the CONFIRM-step interlock: the tenant's parked manual review-gate
+/// workflow steps flip to human_approved (`pipeline::approve_review_gate_steps`).
 pub fn confirm_notes(
     conn: &Connection,
     tenant_id: &str,
@@ -481,7 +483,16 @@ pub fn confirm_notes(
             event: event.to_string(),
         });
     }
-    put_state(conn, tenant_id, asset_hash, branch, "CONFORMING", cur.round)
+    let out = put_state(conn, tenant_id, asset_hash, branch, "CONFORMING", cur.round)?;
+    // CONFIRM interlock (CYAN_FORMAT_QA gap 6): this NOTES_IN → CONFORMING advance
+    // is the human decision a board's parked manual CONFIRM step was waiting on —
+    // mark it human_approved so the workflow un-parks without a second approval
+    // tap. Best-effort: the machine's advance stands even if the workflow-side
+    // write fails (and a bare ledger-only DB simply has no boards).
+    if let Err(e) = crate::pipeline::approve_review_gate_steps(conn, tenant_id) {
+        tracing::warn!("confirm interlock (tenant {}): {}", tenant_id, e);
+    }
+    Ok(out)
 }
 
 /// CONFORMING → CONFORMING: a conform run (conform_plan → render proxy → snapshot
