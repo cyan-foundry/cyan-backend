@@ -356,12 +356,16 @@ async fn compile_preserves_manual_executor() {
 
     let lens_meta = r#"{"pipeline":{"step_id":"ingest","depends_on":[],"executor":"lens","model":"cyan-lens","timeout_seconds":300,"retry_count":1,"auto_advance":false,"notifications":[],"state":{"status":"pending","attempt":0}}}"#;
     let manual_meta = r#"{"pipeline":{"step_id":"package","depends_on":["ingest"],"executor":"manual","model":"cyan-lens","timeout_seconds":300,"retry_count":1,"auto_advance":false,"notifications":[],"state":{"status":"pending","attempt":0}}}"#;
+    // Authored as "step" (the ONLY authorable kind per W1). Using a legacy kind
+    // here would also race the legacy-migration test above: both share the
+    // process-global DB, and the global legacy sweep would migrate these rows,
+    // breaking that test's second-run-is-a-no-op assertion.
     storage::cell_insert_simple(
-        &format!("{board}-ingest"), board, "markdown", 0,
+        &format!("{board}-ingest"), board, "step", 0,
         Some("Ingest the master big-buck-bunny.mp4"), None, false, None, Some(lens_meta), now, now,
     ).expect("ingest cell");
     storage::cell_insert_simple(
-        &format!("{board}-package"), board, "markdown", 1,
+        &format!("{board}-package"), board, "step", 1,
         Some("Package: deliver big-buck-bunny.mp4 at -14 LUFS and write the sidecar"),
         None, false, None, Some(manual_meta), now, now,
     ).expect("package cell");
