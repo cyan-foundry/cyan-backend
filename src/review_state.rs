@@ -271,6 +271,36 @@ pub fn get(
     .map_err(Into::into)
 }
 
+/// Every review-state row a tenant holds — the snapshot-frame / digest-lane read
+/// (CYAN_FORMAT_SPEC §6.4, the `rs` lane).
+pub fn list_by_tenant(conn: &Connection, tenant_id: &str) -> Result<Vec<ReviewState>, ReviewError> {
+    let mut stmt = conn.prepare(
+        "SELECT tenant_id, asset_hash, branch, state, round, updated_at \
+         FROM review_state WHERE tenant_id=?1 ORDER BY asset_hash ASC, branch ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![tenant_id], row_to_state)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Apply a peer's review-state row (a snapshot frame / anti-entropy repair): LWW
+/// upsert on `updated_at` — a replayed or stale row never clobbers a newer local
+/// state, the same guard as `workflow_state_upsert`. Returns whether it landed.
+/// This deliberately bypasses the transition gates: the AUTHORITY was enforced on
+/// the peer that fired the transition; replication only converges the outcome.
+pub fn apply_remote(conn: &Connection, rs: &ReviewState) -> Result<bool, ReviewError> {
+    let n = conn.execute(
+        "INSERT INTO review_state (tenant_id, asset_hash, branch, state, round, updated_at) \
+         VALUES (?1,?2,?3,?4,?5,?6) \
+         ON CONFLICT(tenant_id, asset_hash, branch) DO UPDATE SET \
+            state=excluded.state, round=excluded.round, updated_at=excluded.updated_at \
+         WHERE excluded.updated_at > review_state.updated_at",
+        params![rs.tenant_id, rs.asset_hash, rs.branch, rs.state, rs.round, rs.updated_at],
+    )?;
+    Ok(n > 0)
+}
+
 fn require(
     conn: &Connection,
     tenant_id: &str,

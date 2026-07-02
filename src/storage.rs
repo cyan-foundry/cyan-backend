@@ -1050,6 +1050,90 @@ pub fn workflow_state_upsert(s: &WorkflowStateDTO) -> Result<bool> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// LEDGER SYNC (CYAN_FORMAT_SPEC §6) — process-global wrappers over the explicit-
+// connection `changelist::` / `review_state::` fns, so the gossip apply path
+// (`topic_actor::persist_event`), the snapshot build/apply, and the anti-entropy
+// digest all read/write the ledger the same way they do notes/pins. Tenant == the
+// group id.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Apply an inbound `ChangeEntryAppended` (or one snapshot entry row) — union by
+/// `entry_hash` + lifecycle LWW, via `changelist::apply_entry`.
+pub fn change_entry_apply(e: &crate::changelist::ChangeEntry) -> Result<()> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::changelist::apply_entry(&conn, e).map(|_| ())
+}
+
+/// Apply an inbound `ChangeEntryLifecycle` — audit unions, lifecycle LWW.
+pub fn change_lifecycle_apply(tenant_id: &str, d: &crate::changelist::LifecycleDelta) -> Result<bool> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::changelist::apply_lifecycle(&conn, tenant_id, d)
+}
+
+/// Apply an inbound `ChangeVersionCreated` (or one snapshot version row) —
+/// immutable union by `version_id`.
+pub fn change_version_apply(v: &crate::changelist::ChangeVersion) -> Result<bool> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::changelist::apply_version(&conn, v)
+}
+
+/// Apply an inbound `ChangeBranchHead` (or one snapshot branch row) — LWW upsert.
+pub fn change_branch_head_apply(
+    tenant_id: &str,
+    asset_hash: &str,
+    branch: &str,
+    head_version: Option<&str>,
+    updated_at: i64,
+) -> Result<bool> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::changelist::apply_branch_head(&conn, tenant_id, asset_hash, branch, head_version, updated_at)
+}
+
+/// Apply one snapshot audit row — union by `audit_hash`.
+pub fn change_audit_apply(a: &crate::changelist::ChangeAudit) -> Result<bool> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::changelist::apply_audit(&conn, a)
+}
+
+/// Every ledger entry the tenant (group) holds — the snapshot/digest read.
+pub fn change_entry_list_by_tenant(tenant_id: &str) -> Result<Vec<crate::changelist::ChangeEntry>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::changelist::list_entries_by_tenant(&conn, tenant_id)
+}
+
+/// Every version the tenant holds.
+pub fn change_version_list_by_tenant(tenant_id: &str) -> Result<Vec<crate::changelist::ChangeVersion>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::changelist::list_versions_by_tenant(&conn, tenant_id)
+}
+
+/// Every branch head-pointer the tenant holds.
+pub fn change_branch_list_by_tenant(tenant_id: &str) -> Result<Vec<crate::changelist::ChangeBranch>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::changelist::list_branches_by_tenant(&conn, tenant_id)
+}
+
+/// Every audit row the tenant holds.
+pub fn change_audit_list_by_tenant(tenant_id: &str) -> Result<Vec<crate::changelist::ChangeAudit>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::changelist::list_audits_by_tenant(&conn, tenant_id)
+}
+
+/// Every review-loop state row the tenant holds (the `rs` lane).
+pub fn review_state_list_by_tenant(tenant_id: &str) -> Result<Vec<crate::review_state::ReviewState>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::review_state::list_by_tenant(&conn, tenant_id)
+        .map_err(|e| anyhow::anyhow!("review_state list: {}", e))
+}
+
+/// Apply one snapshot review-state row — LWW on `updated_at`.
+pub fn review_state_apply(rs: &crate::review_state::ReviewState) -> Result<bool> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::review_state::apply_remote(&conn, rs)
+        .map_err(|e| anyhow::anyhow!("review_state apply: {}", e))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // FILES
 // ═══════════════════════════════════════════════════════════════════════════
 

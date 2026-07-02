@@ -1213,6 +1213,29 @@ impl TopicActor {
                 };
                 let _ = storage::pin_upsert(&pin);
             }
+            // Ledger sync deltas (CYAN_FORMAT_SPEC §6.2) — apply through the SAME
+            // idempotent store fns the local FFI path uses: content unions by
+            // entry_hash, versions by version_id, audits by audit_hash; lifecycle
+            // and branch heads are ONE LWW lane on updated_at (ties: higher actor
+            // id). Replays/echoes are no-ops, so gossip at-least-once is safe.
+            NetworkEvent::ChangeEntryAppended { entry, .. } => {
+                let _ = storage::change_entry_apply(entry);
+            }
+            NetworkEvent::ChangeEntryLifecycle { tenant_id, delta } => {
+                let _ = storage::change_lifecycle_apply(tenant_id, delta);
+            }
+            NetworkEvent::ChangeVersionCreated { version, .. } => {
+                let _ = storage::change_version_apply(version);
+            }
+            NetworkEvent::ChangeBranchHead { tenant_id, asset_hash, branch, head_version, updated_at } => {
+                let _ = storage::change_branch_head_apply(
+                    tenant_id,
+                    asset_hash,
+                    branch,
+                    head_version.as_deref(),
+                    *updated_at,
+                );
+            }
             NetworkEvent::WhiteboardElementAdded {
                 id, board_id, element_type, x, y, width, height, z_index,
                 style_json, content_json, created_at, updated_at,
@@ -1748,7 +1771,7 @@ async fn download_snapshot_since(
                 }
             }
 
-            SnapshotFrame::Metadata { chats, files, integrations, board_metadata, notes, pins, workflow_states } => {
+            SnapshotFrame::Metadata { chats, files, integrations, board_metadata, notes, pins, workflow_states, .. } => {
                 eprintln!(
                     "📥 [SNAP-DL-9] METADATA: chats={} files={} integ={} meta={} notes={} pins={} wf={}",
                     chats.len(), files.len(), integrations.len(),

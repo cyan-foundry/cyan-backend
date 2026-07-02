@@ -119,6 +119,35 @@ pub enum NetworkEvent {
         pinned: bool,
         updated_at: i64,
     },
+    // ---- Ledger sync deltas (CYAN_FORMAT_SPEC §6.2 — additive) ----
+    // Live gossip for the review ledger, on the same group topic notes/pins ride.
+    // Receivers apply through the idempotent `changelist::` fns (content unions by
+    // `entry_hash`, versions by `version_id`, audits by `audit_hash`; lifecycle and
+    // branch heads are ONE LWW lane keyed `updated_at`, ties by higher actor id) —
+    // so replays, echoes, and delta-vs-snapshot races all converge identically.
+    /// A ChangeEntry was appended (content lane).
+    ChangeEntryAppended {
+        tenant_id: String,
+        entry: Box<crate::changelist::ChangeEntry>,
+    },
+    /// An entry's lifecycle moved (LWW; the carried audit row always unions).
+    ChangeEntryLifecycle {
+        tenant_id: String,
+        delta: Box<crate::changelist::LifecycleDelta>,
+    },
+    /// A version was snapshotted (immutable union — concurrent snapshots both survive).
+    ChangeVersionCreated {
+        tenant_id: String,
+        version: Box<crate::changelist::ChangeVersion>,
+    },
+    /// A branch head moved (LWW on `updated_at`).
+    ChangeBranchHead {
+        tenant_id: String,
+        asset_hash: String,
+        branch: String,
+        head_version: Option<String>,
+        updated_at: i64,
+    },
     // ---- Whiteboard element events ----
     WhiteboardElementAdded {
         id: String,

@@ -179,6 +179,29 @@ pub fn group_digest(group_id: &str) -> (u64, String) {
     for f in storage::file_list_by_group(group_id).unwrap_or_default() {
         entries.push(format!("f{SEP}{}{SEP}{}", f.id, f.hash));
     }
+    // CYAN_FORMAT_SPEC §6.4 — the five review-ledger lanes (tenant == group id).
+    // Versioning column per lane: `ce` entry content is immutable but its lifecycle
+    // moves, so it versions on (entry_hash, updated_at); `cv` versions are immutable
+    // (version_id suffices); `cb` branch heads and `rs` review states are LWW rows on
+    // `updated_at`; `ca` audit rows are content-addressed (audit_hash; legacy rows
+    // with no hash version on their id). Any missed delta in any lane flips the
+    // group hash ⇒ the next sweep pulls the snapshot repair — which carries all five
+    // tables — so the detector never sees further than the repair can heal.
+    for e in storage::change_entry_list_by_tenant(group_id).unwrap_or_default() {
+        entries.push(format!("ce{SEP}{}{SEP}{}", e.entry_hash, e.updated_at));
+    }
+    for v in storage::change_version_list_by_tenant(group_id).unwrap_or_default() {
+        entries.push(format!("cv{SEP}{}", v.version_id));
+    }
+    for b in storage::change_branch_list_by_tenant(group_id).unwrap_or_default() {
+        entries.push(format!("cb{SEP}{}{SEP}{}{SEP}{}", b.asset_hash, b.branch, b.updated_at));
+    }
+    for a in storage::change_audit_list_by_tenant(group_id).unwrap_or_default() {
+        entries.push(format!("ca{SEP}{}", a.audit_hash.as_deref().unwrap_or(&a.id)));
+    }
+    for rs in storage::review_state_list_by_tenant(group_id).unwrap_or_default() {
+        entries.push(format!("rs{SEP}{}{SEP}{}{SEP}{}", rs.asset_hash, rs.branch, rs.updated_at));
+    }
 
     entries.sort_unstable();
     let count = entries.len() as u64;

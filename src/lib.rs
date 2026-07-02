@@ -130,6 +130,17 @@ pub fn bootstrap_node_id() -> &'static str {
         .unwrap_or(rendezvous::BUNDLED_BOOTSTRAP_NODE_ID)
 }
 
+/// Queue an engine-internal `CommandMsg` onto the running system's command loop —
+/// the ledger-sync broadcast bridge (`changelist::dispatch` → group-topic gossip,
+/// CYAN_FORMAT_SPEC §6.2). A no-op when the full system isn't up (unit tests, bare
+/// storage use, the substrate harness driving `NetworkActor` directly) — the sync
+/// stays engine-internal and never blocks or fails a local store operation.
+pub(crate) fn queue_command(cmd: CommandMsg) {
+    if let Some(sys) = SYSTEM.get() {
+        let _ = sys.command_tx.send(cmd);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // CYAN SYSTEM
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1424,6 +1435,39 @@ impl CommandActor {
                     tracing::debug!("SeedDemoIfEmpty is a no-op (demo seeding removed)");
                 }
 
+                // ── Ledger sync deltas (CYAN_FORMAT_SPEC §6.2) ─────────────────
+                // Engine-internal: queued by `changelist::dispatch` after a LOCAL
+                // ledger mutation (via `queue_command`); this loop's only job is to
+                // put the matching NetworkEvent on the group topic (tenant == group).
+                // The receiver applies through the same idempotent `changelist::`
+                // fns, so a re-broadcast or an echo is a no-op.
+                CommandMsg::ChangeEntryAppended { tenant_id, entry } => {
+                    let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                        group_id: tenant_id.clone(),
+                        event: NetworkEvent::ChangeEntryAppended { tenant_id, entry },
+                    });
+                }
+                CommandMsg::ChangeEntryLifecycle { tenant_id, delta } => {
+                    let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                        group_id: tenant_id.clone(),
+                        event: NetworkEvent::ChangeEntryLifecycle { tenant_id, delta },
+                    });
+                }
+                CommandMsg::ChangeVersionCreated { tenant_id, version } => {
+                    let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                        group_id: tenant_id.clone(),
+                        event: NetworkEvent::ChangeVersionCreated { tenant_id, version },
+                    });
+                }
+                CommandMsg::ChangeBranchHead { tenant_id, asset_hash, branch, head_version, updated_at } => {
+                    let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                        group_id: tenant_id.clone(),
+                        event: NetworkEvent::ChangeBranchHead {
+                            tenant_id, asset_hash, branch, head_version, updated_at,
+                        },
+                    });
+                }
+
                 CommandMsg::SeedDemo => {
                     // Fix A: seed the coherent demo set IN-PROCESS under THIS engine's
                     // identity, so the seeded groups are stamped with our node_id (owned +
@@ -1806,6 +1850,15 @@ fn route_event_to_buffers(
                 // by the app: there is no UI panel for a Lens-orchestrated tool call
                 // running locally. Pass-through here.
                 NetworkEvent::RemoteToolCall { .. } | NetworkEvent::RemoteToolResult { .. } => {}
+
+                // Ledger sync deltas (CYAN_FORMAT_SPEC §6.2) are engine-internal
+                // replication: the receiver's storage is the surface, and the app
+                // reads the ledger via cyan_changelist_command / cyan_review_command.
+                // No UI buffer consumes them — pass-through, like PluginRelay.
+                NetworkEvent::ChangeEntryAppended { .. }
+                | NetworkEvent::ChangeEntryLifecycle { .. }
+                | NetworkEvent::ChangeVersionCreated { .. }
+                | NetworkEvent::ChangeBranchHead { .. } => {}
             }
         }
 

@@ -82,6 +82,20 @@ pub enum SnapshotFrame {
         /// peers — so adding it never breaks a mixed-version snapshot transfer.
         #[serde(default)]
         workflow_states: Vec<WorkflowStateDTO>,
+        /// CYAN_FORMAT_SPEC §6.4 — the five review-ledger tables, so a cold joiner
+        /// gets the FULL ledger with the snapshot. Same wire-compat contract as
+        /// `notes`/`pins`; applied via the idempotent union/LWW `changelist::apply_*`
+        /// paths, so a replayed frame or a frame racing live deltas never duplicates.
+        #[serde(default)]
+        change_entries: Vec<crate::changelist::ChangeEntry>,
+        #[serde(default)]
+        change_versions: Vec<crate::changelist::ChangeVersion>,
+        #[serde(default)]
+        change_branches: Vec<crate::changelist::ChangeBranch>,
+        #[serde(default)]
+        change_audits: Vec<crate::changelist::ChangeAudit>,
+        #[serde(default)]
+        review_states: Vec<crate::review_state::ReviewState>,
     },
     /// Signals transfer complete
     Complete,

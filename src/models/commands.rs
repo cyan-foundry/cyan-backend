@@ -366,6 +366,38 @@ pub enum CommandMsg {
     },
 
     // ═══════════════════════════════════════════════════════════════════════
+    // LEDGER SYNC COMMANDS (CYAN_FORMAT_SPEC §6.2 — additive, engine-internal)
+    // ═══════════════════════════════════════════════════════════════════════
+    // Queued by `changelist::dispatch` after a LOCAL ledger mutation; the command
+    // loop broadcasts the matching `NetworkEvent` on the tenant's group topic
+    // (tenant == group id — where notes/pins already gossip). NOT sent by the app;
+    // additive so the FFI command shape stays drop-in.
+    /// A ChangeEntry was appended locally (content lane — unions by `entry_hash`).
+    ChangeEntryAppended {
+        tenant_id: String,
+        entry: Box<crate::changelist::ChangeEntry>,
+    },
+    /// An entry's lifecycle moved locally (ONE LWW lane keyed `updated_at`,
+    /// ties by higher actor id; the carried audit row unions on every peer).
+    ChangeEntryLifecycle {
+        tenant_id: String,
+        delta: Box<crate::changelist::LifecycleDelta>,
+    },
+    /// A version was snapshotted locally (immutable union by `version_id`).
+    ChangeVersionCreated {
+        tenant_id: String,
+        version: Box<crate::changelist::ChangeVersion>,
+    },
+    /// A branch head moved locally (LWW on `updated_at`).
+    ChangeBranchHead {
+        tenant_id: String,
+        asset_hash: String,
+        branch: String,
+        head_version: Option<String>,
+        updated_at: i64,
+    },
+
+    // ═══════════════════════════════════════════════════════════════════════
     // SYSTEM COMMANDS
     // ═══════════════════════════════════════════════════════════════════════
     Snapshot {},

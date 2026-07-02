@@ -133,6 +133,18 @@ pub struct ChangeEntry {
     pub branch: Option<String>, // the branch this entry lives on
     #[serde(default)]
     pub outcome: Option<String>, // pending | shipped | rejected
+
+    // ── lifecycle LWW clock (CYAN_FORMAT_SPEC §6.1) ────────────────────
+    /// Versions ONLY the mutable lifecycle columns (content is immutable). Bumped by
+    /// `set_state`/`set_active`/`supersede`/`set_outcome` and the `snapshot()`
+    /// version_ref stamp; the P2P merge key for the ONE lifecycle LWW lane per entry.
+    /// `#[serde(default)]` keeps pre-sync serializations parsing (clock 0 = never moved).
+    #[serde(default)]
+    pub updated_at: i64,
+    /// The actor id of the last lifecycle write — the deterministic LWW tie-break
+    /// (§6.3: equal clocks ⇒ higher actor id wins).
+    #[serde(default)]
+    pub updated_by: Option<String>,
 }
 
 /// An immutable version snapshot: `master@asset_hash + list_hash`.
@@ -278,7 +290,8 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             depends_on    TEXT,
             version_ref   TEXT,
             outcome       TEXT,
-            updated_at    INTEGER NOT NULL DEFAULT 0
+            updated_at    INTEGER NOT NULL DEFAULT 0,
+            updated_by    TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_ce_asset
             ON change_entry(tenant_id, asset_hash, branch);
@@ -341,6 +354,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             "ALTER TABLE change_branch ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
+    }
+    if !has_column(conn, "change_entry", "updated_by")? {
+        conn.execute("ALTER TABLE change_entry ADD COLUMN updated_by TEXT", [])?;
     }
 
     // change_audit: the earlier build used `id INTEGER PRIMARY KEY AUTOINCREMENT` —
@@ -478,6 +494,8 @@ fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<ChangeEntry> {
         depends_on: row.get("depends_on")?,
         version_ref: row.get("version_ref")?,
         outcome: row.get("outcome")?,
+        updated_at: row.get("updated_at")?,
+        updated_by: row.get("updated_by")?,
     })
 }
 
@@ -672,9 +690,9 @@ pub fn set_state(
         None
     };
     conn.execute(
-        "UPDATE change_entry SET state=?1, approved_by=?2, approved_at=?3, updated_at=?4 \
-         WHERE tenant_id=?5 AND id=?6",
-        params![new_state, by, approved_at, now(), tenant_id, entry_id],
+        "UPDATE change_entry SET state=?1, approved_by=?2, approved_at=?3, updated_at=?4, updated_by=?5 \
+         WHERE tenant_id=?6 AND id=?7",
+        params![new_state, by, approved_at, now(), by, tenant_id, entry_id],
     )?;
     audit(
         conn,
@@ -700,8 +718,8 @@ pub fn set_active(
 ) -> Result<ChangeEntry> {
     let mut e = get_entry_row(conn, tenant_id, entry_id)?;
     conn.execute(
-        "UPDATE change_entry SET active=?1, updated_at=?2 WHERE tenant_id=?3 AND id=?4",
-        params![active as i64, now(), tenant_id, entry_id],
+        "UPDATE change_entry SET active=?1, updated_at=?2, updated_by=?3 WHERE tenant_id=?4 AND id=?5",
+        params![active as i64, now(), by, tenant_id, entry_id],
     )?;
     audit(
         conn,
@@ -738,9 +756,9 @@ pub fn supersede(
     let appended = append(conn, &old.asset_hash, &branch, new)?;
 
     conn.execute(
-        "UPDATE change_entry SET state='superseded', active=0, superseded_by=?1, updated_at=?2 \
-         WHERE tenant_id=?3 AND id=?4",
-        params![appended.id, now(), tenant_id, old_entry_id],
+        "UPDATE change_entry SET state='superseded', active=0, superseded_by=?1, updated_at=?2, updated_by=?3 \
+         WHERE tenant_id=?4 AND id=?5",
+        params![appended.id, now(), appended.proposed_by, tenant_id, old_entry_id],
     )?;
     audit(
         conn,
@@ -845,13 +863,15 @@ pub fn snapshot(
         ],
     )?;
 
-    // Stamp version_ref on entries that didn't have one (first appearance).
+    // Stamp version_ref on entries that didn't have one (first appearance). Bumps the
+    // lifecycle clock so the stamp is visible to the anti-entropy `ce` lane and rides
+    // the next sweep to peers (version_ref is lifecycle ABOUT the entry, never content).
     for e in &entries {
         if e.version_ref.is_none() {
             conn.execute(
-                "UPDATE change_entry SET version_ref=?1 \
-                 WHERE tenant_id=?2 AND id=?3 AND version_ref IS NULL",
-                params![version.version_id, tenant_id, e.id],
+                "UPDATE change_entry SET version_ref=?1, updated_at=?2 \
+                 WHERE tenant_id=?3 AND id=?4 AND version_ref IS NULL",
+                params![version.version_id, now(), tenant_id, e.id],
             )?;
         }
     }
@@ -1160,6 +1180,464 @@ pub fn set_outcome(conn: &Connection, tenant_id: &str, version_id: &str, outcome
 }
 
 // ============================================================================
+// P2P sync (CYAN_FORMAT_SPEC §6) — wire rows, apply paths, list reads.
+// ============================================================================
+//
+// The ledger replicates over the SAME three legs the rest of group state uses:
+// live gossip deltas (`NetworkEvent::Change*`), the join-time snapshot (the five
+// review tables ride the `Metadata` frame), and the anti-entropy digest sweep
+// (`ce`/`cv`/`cb`/`ca`/`rs` lanes in `anti_entropy::group_digest`). Everything
+// below is idempotent by construction — content unions by `entry_hash`, versions
+// union by `version_id`, audits union by `audit_hash`, lifecycle/branch/review
+// rows are one LWW lane keyed `updated_at` (ties: higher actor id, §6.3) — so a
+// delta applied twice, or a delta racing a snapshot merge, converges identically.
+
+/// One branch head-pointer row (`change_branch`) — replicated LWW on `updated_at`
+/// (the head moving IS the branch-level event).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChangeBranch {
+    pub tenant_id: String,
+    pub asset_hash: String,
+    pub branch: String,
+    #[serde(default)]
+    pub head_version: Option<String>,
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+/// One content-addressed audit row (`change_audit`). Provenance is global, not
+/// local observability (§6.1): rows union across peers by `audit_hash`, so the
+/// trail preserves BOTH histories even when lifecycle LWW discards a transition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChangeAudit {
+    pub id: String,
+    pub entry_id: String,
+    pub tenant_id: String,
+    pub transition: String,
+    #[serde(default)]
+    pub actor: Option<String>,
+    pub ts: i64,
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// `None` only for legacy rows that predate content addressing.
+    #[serde(default)]
+    pub audit_hash: Option<String>,
+}
+
+/// The full lifecycle projection of one entry — the `ChangeEntryLifecycle` wire
+/// payload (§6.2). Carries `entry_hash` alongside `entry_id` so a receiver whose
+/// union-dedup kept a different row id for the same content still resolves it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LifecycleDelta {
+    pub entry_id: String,
+    #[serde(default)]
+    pub entry_hash: String,
+    pub state: String,
+    pub active: bool,
+    #[serde(default)]
+    pub approved_by: Option<String>,
+    #[serde(default)]
+    pub approved_at: Option<i64>,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    #[serde(default)]
+    pub version_ref: Option<String>,
+    #[serde(default)]
+    pub outcome: Option<String>,
+    pub updated_at: i64,
+    #[serde(default)]
+    pub updated_by: Option<String>,
+    /// The audit row the sender minted for this transition — unioned on apply even
+    /// when the LWW discards the lifecycle change itself (nothing is lost, §6.3).
+    #[serde(default)]
+    pub audit: Option<ChangeAudit>,
+}
+
+/// The ONE lifecycle LWW comparison (§6.3): a write wins iff its clock is strictly
+/// newer, or — equal clocks from concurrent writers — its actor id sorts higher
+/// (deterministic on every peer). A zero clock (never moved) never wins a tie.
+fn lww_wins(in_at: i64, in_by: Option<&str>, cur_at: i64, cur_by: Option<&str>) -> bool {
+    in_at > cur_at || (in_at == cur_at && in_at > 0 && in_by.unwrap_or("") > cur_by.unwrap_or(""))
+}
+
+fn row_to_branch(row: &rusqlite::Row) -> rusqlite::Result<ChangeBranch> {
+    Ok(ChangeBranch {
+        tenant_id: row.get("tenant_id")?,
+        asset_hash: row.get("asset_hash")?,
+        branch: row.get("branch")?,
+        head_version: row.get("head_version")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
+fn row_to_audit(row: &rusqlite::Row) -> rusqlite::Result<ChangeAudit> {
+    Ok(ChangeAudit {
+        id: row.get("id")?,
+        entry_id: row.get("entry_id")?,
+        tenant_id: row.get("tenant_id")?,
+        transition: row.get("transition")?,
+        actor: row.get("actor")?,
+        ts: row.get("ts")?,
+        detail: row.get("detail")?,
+        audit_hash: row.get("audit_hash")?,
+    })
+}
+
+/// Load one branch head-pointer row.
+pub fn get_branch(
+    conn: &Connection,
+    tenant_id: &str,
+    asset_hash: &str,
+    branch: &str,
+) -> Result<Option<ChangeBranch>> {
+    conn.query_row(
+        "SELECT * FROM change_branch WHERE tenant_id=?1 AND asset_hash=?2 AND branch=?3",
+        params![tenant_id, asset_hash, branch],
+        row_to_branch,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// The full lifecycle projection of `entry_id` plus its newest audit row — what a
+/// sender puts on the wire after a local transition.
+pub fn lifecycle_delta_for(
+    conn: &Connection,
+    tenant_id: &str,
+    entry_id: &str,
+) -> Result<LifecycleDelta> {
+    let e = get_entry_row(conn, tenant_id, entry_id)?;
+    let audit = conn
+        .query_row(
+            "SELECT * FROM change_audit WHERE tenant_id=?1 AND entry_id=?2 \
+             ORDER BY ts DESC, id DESC LIMIT 1",
+            params![tenant_id, entry_id],
+            row_to_audit,
+        )
+        .optional()?;
+    Ok(LifecycleDelta {
+        entry_id: e.id,
+        entry_hash: e.entry_hash,
+        state: e.state,
+        active: e.active,
+        approved_by: e.approved_by,
+        approved_at: e.approved_at,
+        superseded_by: e.superseded_by,
+        version_ref: e.version_ref,
+        outcome: e.outcome,
+        updated_at: e.updated_at,
+        updated_by: e.updated_by,
+        audit,
+    })
+}
+
+/// Apply a peer's `ChangeEntryAppended` (or one snapshot-frame entry row): the
+/// content lane unions under the unique `(tenant, entry_hash)` index — the same
+/// dedup key `append` enforces — then the incoming lifecycle lane lands iff its
+/// clock wins the LWW. Returns the local row.
+///
+/// Deliberately does NOT route through `append`: `append` mints a local "append"
+/// audit row, and a REMOTE apply must not re-author provenance (N peers would each
+/// mint one per entry). The sender's own append audit replicates on the `ca` lane
+/// (lifecycle deltas + snapshot/sweep) instead. The closed op vocab is still
+/// enforced on the inbound row, and the hash is recomputed — never trusted from
+/// the wire.
+pub fn apply_entry(conn: &Connection, entry: &ChangeEntry) -> Result<ChangeEntry> {
+    let mut e = entry.clone();
+    if e.branch.as_deref().unwrap_or("").is_empty() {
+        e.branch = Some("main".to_string());
+    }
+    if e.id.trim().is_empty() {
+        e.id = uuid::Uuid::new_v4().to_string();
+    }
+    if e.created_at == 0 {
+        e.created_at = now();
+    }
+    if e.kind.trim().is_empty() {
+        e.kind = "note".to_string();
+    }
+    if e.state.trim().is_empty() {
+        e.state = "proposed".to_string();
+    }
+    validate_entry(&e)?;
+    e.entry_hash = compute_entry_hash(&e);
+
+    // Content union: OR IGNORE on both the id PK and the (tenant, entry_hash)
+    // unique index — a replayed delta or a concurrent identical append is a no-op.
+    conn.execute(
+        "INSERT OR IGNORE INTO change_entry (\
+            id, entry_hash, asset_hash, tenant_id, branch, track, tc_in, tc_out, \
+            kind, op, params, intent, source, source_ref, author, role, proposed_by, \
+            created_at, state, active, approved_by, approved_at, supersedes, \
+            superseded_by, seq, depends_on, version_ref, outcome, updated_at, updated_by) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,\
+                 ?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30)",
+        params![
+            e.id,
+            e.entry_hash,
+            e.asset_hash,
+            e.tenant_id,
+            e.branch,
+            e.track,
+            e.tc_in,
+            e.tc_out,
+            e.kind,
+            e.op,
+            e.params.to_string(),
+            e.intent,
+            e.source,
+            e.source_ref,
+            e.author,
+            e.role,
+            e.proposed_by,
+            e.created_at,
+            e.state,
+            e.active as i64,
+            e.approved_by,
+            e.approved_at,
+            e.supersedes,
+            e.superseded_by,
+            e.seq,
+            e.depends_on,
+            e.version_ref,
+            e.outcome,
+            e.updated_at,
+            e.updated_by,
+        ],
+    )?;
+
+    // The row that actually holds this content locally (ours on a union hit).
+    let cur = conn
+        .query_row(
+            "SELECT * FROM change_entry WHERE tenant_id=?1 AND entry_hash=?2",
+            params![e.tenant_id, e.entry_hash],
+            row_to_entry,
+        )
+        .map_err(|err| anyhow!("apply_entry: row for hash {} not found: {}", e.entry_hash, err))?;
+
+    // Lifecycle LWW (one lane per entry, §6.3).
+    if lww_wins(
+        e.updated_at,
+        e.updated_by.as_deref(),
+        cur.updated_at,
+        cur.updated_by.as_deref(),
+    ) {
+        conn.execute(
+            "UPDATE change_entry SET state=?1, active=?2, approved_by=?3, approved_at=?4, \
+                superseded_by=?5, version_ref=COALESCE(?6, version_ref), outcome=?7, \
+                updated_at=?8, updated_by=?9 \
+             WHERE tenant_id=?10 AND id=?11",
+            params![
+                e.state,
+                e.active as i64,
+                e.approved_by,
+                e.approved_at,
+                e.superseded_by,
+                e.version_ref,
+                e.outcome,
+                e.updated_at,
+                e.updated_by,
+                e.tenant_id,
+                cur.id,
+            ],
+        )?;
+    }
+    get_entry_row(conn, &e.tenant_id, &cur.id)
+}
+
+/// Apply a peer's `ChangeEntryLifecycle`: union the audit row FIRST (provenance is
+/// never lost), then apply the lifecycle projection iff `updated_at` wins the LWW
+/// (§6.3). Returns whether the lifecycle landed. An entry we don't hold yet is a
+/// no-op (`false`) — the content row arrives via its own lane / the next sweep.
+pub fn apply_lifecycle(conn: &Connection, tenant_id: &str, d: &LifecycleDelta) -> Result<bool> {
+    if let Some(a) = &d.audit {
+        apply_audit(conn, a)?;
+    }
+    // Resolve by id first; fall back to entry_hash (concurrent identical-content
+    // appends dedup to one row whose id may differ from the sender's).
+    let cur = conn
+        .query_row(
+            "SELECT * FROM change_entry WHERE tenant_id=?1 AND id=?2",
+            params![tenant_id, d.entry_id],
+            row_to_entry,
+        )
+        .optional()?;
+    let cur = match cur {
+        Some(c) => Some(c),
+        None if !d.entry_hash.is_empty() => conn
+            .query_row(
+                "SELECT * FROM change_entry WHERE tenant_id=?1 AND entry_hash=?2",
+                params![tenant_id, d.entry_hash],
+                row_to_entry,
+            )
+            .optional()?,
+        None => None,
+    };
+    let Some(cur) = cur else {
+        return Ok(false);
+    };
+    if !lww_wins(
+        d.updated_at,
+        d.updated_by.as_deref(),
+        cur.updated_at,
+        cur.updated_by.as_deref(),
+    ) {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE change_entry SET state=?1, active=?2, approved_by=?3, approved_at=?4, \
+            superseded_by=?5, version_ref=COALESCE(?6, version_ref), outcome=?7, \
+            updated_at=?8, updated_by=?9 \
+         WHERE tenant_id=?10 AND id=?11",
+        params![
+            d.state,
+            d.active as i64,
+            d.approved_by,
+            d.approved_at,
+            d.superseded_by,
+            d.version_ref,
+            d.outcome,
+            d.updated_at,
+            d.updated_by,
+            tenant_id,
+            cur.id,
+        ],
+    )?;
+    Ok(true)
+}
+
+/// Apply a peer's `ChangeVersionCreated` (or one snapshot-frame version row):
+/// immutable union by `version_id` (§6.3 — two peers snapshotting concurrently keep
+/// BOTH versions). The set-once `outcome` label still unions onto an existing row
+/// (`pending` → shipped/rejected is monotone; never overwritten once set).
+pub fn apply_version(conn: &Connection, v: &ChangeVersion) -> Result<bool> {
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO change_version (\
+            version_id, asset_hash, tenant_id, branch, version_no, list_hash, \
+            cut_hash, entry_hashes, created_at, outcome) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![
+            v.version_id,
+            v.asset_hash,
+            v.tenant_id,
+            v.branch,
+            v.version_no,
+            v.list_hash,
+            v.cut_hash,
+            serde_json::to_string(&v.entry_hashes)?,
+            v.created_at,
+            v.outcome,
+        ],
+    )?;
+    if n == 0 && v.outcome != "pending" {
+        conn.execute(
+            "UPDATE change_version SET outcome=?1 \
+             WHERE tenant_id=?2 AND version_id=?3 AND outcome='pending'",
+            params![v.outcome, v.tenant_id, v.version_id],
+        )?;
+    }
+    Ok(n > 0)
+}
+
+/// Apply a peer's `ChangeBranchHead` (or one snapshot-frame branch row): LWW upsert
+/// on `updated_at` — a stale head move never clobbers a newer one.
+pub fn apply_branch_head(
+    conn: &Connection,
+    tenant_id: &str,
+    asset_hash: &str,
+    branch: &str,
+    head_version: Option<&str>,
+    updated_at: i64,
+) -> Result<bool> {
+    let n = conn.execute(
+        "INSERT INTO change_branch (tenant_id, asset_hash, branch, head_version, created_at, updated_at) \
+         VALUES (?1,?2,?3,?4,?5,?5) \
+         ON CONFLICT(tenant_id, asset_hash, branch) DO UPDATE SET \
+            head_version=excluded.head_version, updated_at=excluded.updated_at \
+         WHERE excluded.updated_at > change_branch.updated_at",
+        params![tenant_id, asset_hash, branch, head_version, updated_at],
+    )?;
+    Ok(n > 0)
+}
+
+/// Apply a peer's audit row: union by the unique `(tenant_id, audit_hash)` index
+/// (identical transitions observed on two peers collapse to one row); the `id` PK
+/// catches legacy rows with no hash. Preserves the sender's id/ts — provenance is
+/// content, never re-stamped.
+pub fn apply_audit(conn: &Connection, a: &ChangeAudit) -> Result<bool> {
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO change_audit \
+            (id, entry_id, tenant_id, transition, actor, ts, detail, audit_hash) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![a.id, a.entry_id, a.tenant_id, a.transition, a.actor, a.ts, a.detail, a.audit_hash],
+    )?;
+    Ok(n > 0)
+}
+
+/// Every entry a tenant holds, in canonical order — the snapshot-frame read.
+pub fn list_entries_by_tenant(conn: &Connection, tenant_id: &str) -> Result<Vec<ChangeEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM change_entry WHERE tenant_id=?1 ORDER BY seq ASC, created_at ASC, id ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![tenant_id], row_to_entry)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Every version a tenant holds.
+pub fn list_versions_by_tenant(conn: &Connection, tenant_id: &str) -> Result<Vec<ChangeVersion>> {
+    let mut stmt = conn.prepare(
+        "SELECT version_id, asset_hash, tenant_id, branch, version_no, list_hash, \
+                cut_hash, entry_hashes, created_at, outcome \
+         FROM change_version WHERE tenant_id=?1 ORDER BY created_at ASC, version_id ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![tenant_id], |row| {
+            let hashes_str: String = row.get("entry_hashes")?;
+            Ok(ChangeVersion {
+                version_id: row.get("version_id")?,
+                asset_hash: row.get("asset_hash")?,
+                tenant_id: row.get("tenant_id")?,
+                branch: row.get("branch")?,
+                version_no: row.get("version_no")?,
+                list_hash: row.get("list_hash")?,
+                cut_hash: row
+                    .get::<_, Option<String>>("cut_hash")?
+                    .unwrap_or_default(),
+                entry_hashes: serde_json::from_str(&hashes_str).unwrap_or_default(),
+                created_at: row.get("created_at")?,
+                outcome: row.get("outcome")?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Every branch head-pointer a tenant holds.
+pub fn list_branches_by_tenant(conn: &Connection, tenant_id: &str) -> Result<Vec<ChangeBranch>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM change_branch WHERE tenant_id=?1 ORDER BY asset_hash ASC, branch ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![tenant_id], row_to_branch)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Every audit row a tenant holds.
+pub fn list_audits_by_tenant(conn: &Connection, tenant_id: &str) -> Result<Vec<ChangeAudit>> {
+    let mut stmt =
+        conn.prepare("SELECT * FROM change_audit WHERE tenant_id=?1 ORDER BY ts ASC, id ASC")?;
+    let rows = stmt
+        .query_map(params![tenant_id], row_to_audit)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+// ============================================================================
 // FFI command/event JSON dispatch.
 // ============================================================================
 //
@@ -1204,6 +1682,44 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
             .ok_or_else(|| anyhow!("missing '{}'", k))
     };
 
+    // Ledger-sync broadcast bridge (CYAN_FORMAT_SPEC §6.2): after a successful LOCAL
+    // mutation, queue the matching delta for the group topic (tenant == group id) via
+    // the engine command loop. `queue_command` is a no-op without a running system,
+    // and the topic simply isn't joined for non-group tenants — a local store op
+    // never fails or blocks on sync. Receivers apply through the same idempotent
+    // fns, so echoes/replays are no-ops (no rebroadcast loop: applies don't queue).
+    let queue_entry = |entry: &ChangeEntry| {
+        crate::queue_command(crate::models::commands::CommandMsg::ChangeEntryAppended {
+            tenant_id: entry.tenant_id.clone(),
+            entry: Box::new(entry.clone()),
+        });
+    };
+    let queue_lifecycle = |conn: &Connection, tenant_id: &str, entry_id: &str| {
+        if let Ok(delta) = lifecycle_delta_for(conn, tenant_id, entry_id) {
+            crate::queue_command(crate::models::commands::CommandMsg::ChangeEntryLifecycle {
+                tenant_id: tenant_id.to_string(),
+                delta: Box::new(delta),
+            });
+        }
+    };
+    let queue_version = |version: &ChangeVersion| {
+        crate::queue_command(crate::models::commands::CommandMsg::ChangeVersionCreated {
+            tenant_id: version.tenant_id.clone(),
+            version: Box::new(version.clone()),
+        });
+    };
+    let queue_branch_head = |conn: &Connection, tenant_id: &str, asset: &str, br: &str| {
+        if let Ok(Some(b)) = get_branch(conn, tenant_id, asset, br) {
+            crate::queue_command(crate::models::commands::CommandMsg::ChangeBranchHead {
+                tenant_id: b.tenant_id,
+                asset_hash: b.asset_hash,
+                branch: b.branch,
+                head_version: b.head_version,
+                updated_at: b.updated_at,
+            });
+        }
+    };
+
     match op {
         "append" => {
             let asset = s(&cmd, "asset_hash")?;
@@ -1217,27 +1733,34 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
             )
             .map_err(|e| anyhow!("bad entry: {}", e))?;
             let out = append(conn, &asset, &branch, entry)?;
+            queue_entry(&out);
             Ok(serde_json::to_value(out)?)
         }
         "set_state" => {
+            let tenant_id = tenant(&cmd)?;
+            let entry_id = s(&cmd, "entry_id")?;
             let out = set_state(
                 conn,
-                &tenant(&cmd)?,
-                &s(&cmd, "entry_id")?,
+                &tenant_id,
+                &entry_id,
                 &s(&cmd, "state")?,
                 cmd.get("by").and_then(|v| v.as_str()),
             )?;
+            queue_lifecycle(conn, &tenant_id, &entry_id);
             Ok(serde_json::to_value(out)?)
         }
         "set_active" => {
+            let tenant_id = tenant(&cmd)?;
+            let entry_id = s(&cmd, "entry_id")?;
             let active = cmd.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
             let out = set_active(
                 conn,
-                &tenant(&cmd)?,
-                &s(&cmd, "entry_id")?,
+                &tenant_id,
+                &entry_id,
                 active,
                 cmd.get("by").and_then(|v| v.as_str()),
             )?;
+            queue_lifecycle(conn, &tenant_id, &entry_id);
             Ok(serde_json::to_value(out)?)
         }
         "supersede" => {
@@ -1245,7 +1768,11 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
                 cmd.get("entry").cloned().ok_or_else(|| anyhow!("missing 'entry'"))?,
             )
             .map_err(|e| anyhow!("bad entry: {}", e))?;
-            let out = supersede(conn, &s(&cmd, "old_entry_id")?, new_entry)?;
+            let old_entry_id = s(&cmd, "old_entry_id")?;
+            let out = supersede(conn, &old_entry_id, new_entry)?;
+            // Two deltas: the new content row + the old entry's superseded lifecycle.
+            queue_entry(&out);
+            queue_lifecycle(conn, &out.tenant_id, &old_entry_id);
             Ok(serde_json::to_value(out)?)
         }
         "snapshot" => {
@@ -1254,27 +1781,41 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("main")
                 .to_string();
-            let out = snapshot(conn, &tenant(&cmd)?, &s(&cmd, "asset_hash")?, &branch)?;
+            let tenant_id = tenant(&cmd)?;
+            let asset = s(&cmd, "asset_hash")?;
+            let out = snapshot(conn, &tenant_id, &asset, &branch)?;
+            // Two deltas: the immutable version + the branch head move (LWW). The
+            // version_ref stamps on member entries ride the `ce` digest lane.
+            queue_version(&out);
+            queue_branch_head(conn, &tenant_id, &asset, &branch);
             Ok(serde_json::to_value(out)?)
         }
         "branch" => {
-            let out = branch(
-                conn,
-                &tenant(&cmd)?,
-                &s(&cmd, "asset_hash")?,
-                &s(&cmd, "from_branch")?,
-                &s(&cmd, "new_branch")?,
-            )?;
+            let tenant_id = tenant(&cmd)?;
+            let asset = s(&cmd, "asset_hash")?;
+            let new_branch = s(&cmd, "new_branch")?;
+            let out = branch(conn, &tenant_id, &asset, &s(&cmd, "from_branch")?, &new_branch)?;
+            for e in &out {
+                queue_entry(e);
+            }
+            queue_branch_head(conn, &tenant_id, &asset, &new_branch);
             Ok(serde_json::to_value(out)?)
         }
         "branch_from_version" => {
+            let tenant_id = tenant(&cmd)?;
+            let asset = s(&cmd, "asset_hash")?;
+            let new_branch = s(&cmd, "new_branch")?;
             let out = branch_from_version(
                 conn,
-                &tenant(&cmd)?,
-                &s(&cmd, "asset_hash")?,
+                &tenant_id,
+                &asset,
                 &s(&cmd, "from_version_id")?,
-                &s(&cmd, "new_branch")?,
+                &new_branch,
             )?;
+            for e in &out {
+                queue_entry(e);
+            }
+            queue_branch_head(conn, &tenant_id, &asset, &new_branch);
             Ok(serde_json::to_value(out)?)
         }
         "diff" => {
@@ -1304,12 +1845,15 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
             Ok(serde_json::to_value(out)?)
         }
         "set_outcome" => {
-            set_outcome(
-                conn,
-                &tenant(&cmd)?,
-                &s(&cmd, "version_id")?,
-                &s(&cmd, "outcome")?,
-            )?;
+            let tenant_id = tenant(&cmd)?;
+            let version_id = s(&cmd, "version_id")?;
+            set_outcome(conn, &tenant_id, &version_id, &s(&cmd, "outcome")?)?;
+            // Re-broadcast the version row: `apply_version` unions the set-once
+            // outcome onto a peer's existing row (pending → shipped/rejected).
+            // Member-entry outcome stamps bumped their clocks ⇒ the `ce` lane heals them.
+            if let Ok(v) = get_version(conn, &tenant_id, &version_id) {
+                queue_version(&v);
+            }
             Ok(serde_json::json!({ "ok": true }))
         }
         // ── asset registry (src/asset_registry.rs) — additive ops on the same JSON

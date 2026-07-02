@@ -69,6 +69,8 @@ fn op_entry(op: &str, tc_in: i64, params: serde_json::Value, proposed_by: &str) 
         depends_on: None,
         version_ref: None,
         outcome: None,
+        updated_at: 0,
+        updated_by: None,
     }
 }
 

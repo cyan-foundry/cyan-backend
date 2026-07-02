@@ -49,6 +49,8 @@ fn op_entry(tenant: &str, asset: &str, op: &str, tc_in: i64, params: serde_json:
         depends_on: None,
         version_ref: None,
         outcome: None,
+        updated_at: 0,
+        updated_by: None,
     }
 }
 
