@@ -748,6 +748,7 @@ dependencies = [
  "iroh-blobs",
  "iroh-gossip",
  "iroh-relay",
+ "libc",
  "once_cell",
  "pdf-extract",
  "petgraph",

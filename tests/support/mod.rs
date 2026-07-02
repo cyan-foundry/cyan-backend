@@ -482,6 +482,64 @@ pub fn stage_file(
     hash
 }
 
+/// Stage a LARGE file for transfer WITHOUT ever holding it in memory (the RAM-flat
+/// oracle must not be polluted by the fixture): deterministic content is generated and
+/// written to disk in 4 MiB slabs while Blake3 hashes the same slabs incrementally.
+/// Same DB registration as [`stage_file`]; returns the blake3 hex hash.
+#[allow(dead_code)] // each test binary compiles its own `support`; not all use this
+pub fn stage_file_streamed(
+    file_id: &str,
+    group_id: &str,
+    len: u64,
+    seed: u8,
+    source_peer: &str,
+) -> String {
+    use std::io::Write;
+
+    let data_dir = cyan_backend::DATA_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("."));
+    let staged = data_dir.join("staged");
+    std::fs::create_dir_all(&staged).expect("create staged dir");
+    let path = staged.join(file_id);
+
+    const SLAB: usize = 4 * 1024 * 1024;
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&path).expect("create staged file"));
+    let mut hasher = blake3::Hasher::new();
+    let mut slab = vec![0u8; SLAB];
+    let mut x = seed;
+    let mut written = 0u64;
+    while written < len {
+        let n = SLAB.min((len - written) as usize);
+        for (i, b) in slab[..n].iter_mut().enumerate() {
+            x = x.wrapping_mul(31).wrapping_add((i as u8) ^ seed).wrapping_add(7);
+            *b = x;
+        }
+        file.write_all(&slab[..n]).expect("write staged slab");
+        hasher.update(&slab[..n]);
+        written += n as u64;
+    }
+    file.flush().expect("flush staged file");
+    drop(file);
+    let hash = hasher.finalize().to_hex().to_string();
+
+    let name = format!("{file_id}.bin");
+    let _ = storage::file_insert_simple(
+        file_id,
+        Some(group_id),
+        None,
+        None,
+        &name,
+        &hash,
+        len,
+        Some(source_peer),
+        1,
+    );
+    let _ = storage::file_set_local_path(file_id, path.to_str().expect("utf8 staged path"));
+    hash
+}
+
 /// Create the base tables the migrations assume exist (mirrors the multi-process bins'
 /// `init_test_schema`). Runs once against the shared DB before `storage::init_db`.
 fn init_base_schema(db_path: &Path) -> Result<()> {

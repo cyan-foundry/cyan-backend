@@ -290,7 +290,15 @@ impl NetworkActor {
         // Content-addressed blob swarm (G10): a per-node store served on the blobs ALPN over THIS
         // same endpoint/router. Additive and behavior-preserving — holders are addressed by the
         // node's normal node id, and the gossip/file/dm/snapshot paths are untouched. See `swarm.rs`.
-        let swarm = Arc::new(BlobSwarm::new(endpoint.clone(), node_id.clone()));
+        // The store is FS-BACKED (RAM-flat, resumable across restarts) under a per-node root so
+        // in-process multi-node tests keep honest per-node stores.
+        let blobs_root = crate::DATA_DIR
+            .get()
+            .cloned()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("blobs")
+            .join(&node_id[..16.min(node_id.len())]);
+        let swarm = Arc::new(BlobSwarm::new(endpoint.clone(), node_id.clone(), &blobs_root).await?);
 
         // Per-node mesh-write authority (identity/RBAC mesh half). Created here so the snapshot
         // server handler can share it: the join-time snapshot read is gated by the same authorizer

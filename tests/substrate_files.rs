@@ -13,8 +13,8 @@ mod support;
 use std::time::{Duration, Instant};
 
 use support::{
-    meet, serial, spawn_mesh, stage_file, unique_discovery_key, unique_group_id, NodeCfg,
-    SYNC_TIMEOUT,
+    meet, serial, spawn_mesh, stage_file, stage_file_streamed, unique_discovery_key,
+    unique_group_id, NodeCfg, SYNC_TIMEOUT,
 };
 
 fn cfg() -> NodeCfg {
@@ -205,6 +205,72 @@ async fn large_file_meets_throughput_floor() {
     assert!(
         mbps >= FLOOR_MBPS,
         "throughput {mbps:.1} MB/s below floor {FLOOR_MBPS} MB/s"
+    );
+}
+
+/// G8 hardening: a multi-GB transfer is RAM-FLAT — no path (send, receive, verify) ever
+/// holds the whole file in memory. 2 GB generated file in CI; the full 20 GB behind
+/// `CYAN_BIGFILE=1`. Oracle: this process's PEAK RSS delta across the transfer stays under
+/// 256 MB (rusage), plus the landed bytes Blake3-verify via a STREAMED read.
+#[tokio::test]
+async fn twenty_gb_transfer_stays_ram_flat() {
+    let _serial = serial().await;
+    let nodes = spawn_mesh(2, cfg()).await.expect("mesh spawns");
+    let group = unique_group_id();
+    meet(&nodes, &group, SYNC_TIMEOUT).await.expect("nodes meet");
+
+    let big = std::env::var("CYAN_BIGFILE").ok().as_deref() == Some("1");
+    let len: u64 = if big { 20 * 1024 * 1024 * 1024 } else { 2 * 1024 * 1024 * 1024 };
+    let deadline = Duration::from_secs(if big { 3600 } else { 900 });
+
+    // Fixture is itself RAM-flat: generated + hashed in 4 MiB slabs straight to disk.
+    let file_id = format!("file-ramflat-{}", &group[16..32]);
+    let hash = stage_file_streamed(&file_id, &group, len, 0x5A, &nodes[0].node_id);
+
+    let rss_before = cyan_backend::util::peak_rss_bytes();
+    nodes[1].request_download(&file_id, &hash, &nodes[0].node_id);
+    let local_path = nodes[1]
+        .wait_file_downloaded(&file_id, deadline)
+        .await
+        .expect("peer reports FileDownloaded for the RAM-flat probe");
+    let rss_after = cyan_backend::util::peak_rss_bytes();
+
+    let delta = rss_after.saturating_sub(rss_before);
+    eprintln!(
+        "📊 RAM-flat probe: {} GB transferred, peak-RSS delta {} MB (before {} MB, after {} MB)",
+        len / (1024 * 1024 * 1024),
+        delta / (1024 * 1024),
+        rss_before / (1024 * 1024),
+        rss_after / (1024 * 1024),
+    );
+    const RSS_CEILING: u64 = 256 * 1024 * 1024;
+    assert!(
+        delta < RSS_CEILING,
+        "peak RSS grew {} MB during a {} GB transfer — some path materialized the file",
+        delta / (1024 * 1024),
+        len / (1024 * 1024 * 1024),
+    );
+
+    // Verify the landed bytes with a STREAMED read (a whole-file read here would defeat
+    // the point of the probe).
+    use std::io::Read;
+    let mut file = std::fs::File::open(&local_path).expect("open downloaded file");
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+    let mut got_len = 0u64;
+    loop {
+        let n = file.read(&mut buf).expect("read downloaded slab");
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        got_len += n as u64;
+    }
+    assert_eq!(got_len, len, "downloaded byte length matches");
+    assert_eq!(
+        hasher.finalize().to_hex().to_string(),
+        hash,
+        "downloaded bytes blake3-match the source"
     );
 }
 

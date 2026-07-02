@@ -1401,13 +1401,12 @@ async fn swarm_download_file(
 ) -> Result<()> {
     let parsed = Hash::from_str(hash).map_err(|e| anyhow!("bad blob hash {}: {}", hash, e))?;
 
-    let bytes = swarm.fetch(&parsed, holders).await?; // Blake3-verified on completion
-
-    // File name from the existing file row (registered via FileAvailable); fall back to the id.
-    let file_name = storage::file_get_for_transfer(file_id, hash)
-        .map(|(name, _, _)| name)
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| file_id.to_string());
+    // File name + advertised size from the existing file row (registered via FileAvailable);
+    // fall back to the id.
+    let (file_name, advertised_size) = storage::file_get_for_transfer(file_id, hash)
+        .map(|(name, _, size)| (name, size))
+        .filter(|(n, _)| !n.is_empty())
+        .unwrap_or_else(|| (file_id.to_string(), 0));
 
     let data_dir = crate::DATA_DIR
         .get()
@@ -1415,8 +1414,15 @@ async fn swarm_download_file(
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let downloads_dir = data_dir.join("downloads");
     tokio::fs::create_dir_all(&downloads_dir).await?;
+
+    // Disk preflight: refuse a transfer that cannot land (advertised size + margin vs free
+    // space) with a clean error instead of failing at 99% on a full disk.
+    preflight_disk_space(&downloads_dir, advertised_size, file_id, &event_tx)?;
+
+    // RAM-flat: fetch into the fs-backed store (chunks land on disk as they arrive), export
+    // file-to-file, stream-verify. Never the whole blob in memory.
     let final_path = downloads_dir.join(&file_name);
-    tokio::fs::write(&final_path, &bytes).await?;
+    let size = swarm.fetch_to_path(&parsed, holders, &final_path).await?;
 
     let _ = storage::file_set_local_path(file_id, &final_path.to_string_lossy());
     let _ = storage::transfer_set_status(file_id, "complete");
@@ -1424,13 +1430,52 @@ async fn swarm_download_file(
     tracing::info!(
         "✅ [FILE] Swarm download complete: {} ({} bytes from {} holders)",
         file_name,
-        bytes.len(),
+        size,
         holders.len()
     );
     let _ = event_tx.send(SwiftEvent::FileDownloaded {
         file_id: file_id.to_string(),
         local_path: final_path.to_string_lossy().to_string(),
     });
+    Ok(())
+}
+
+/// Disk-space margin kept free beyond the transfer itself, so a download can never run the
+/// device out of disk (dailies-grade preflight).
+const DISK_FREE_MARGIN: u64 = 512 * 1024 * 1024;
+
+/// Refuse a transfer whose `needed` bytes don't fit in the destination filesystem's free
+/// space plus [`DISK_FREE_MARGIN`]. `needed == 0` (size unknown) skips the check. Emits the
+/// typed `FileDownloadFailed` so the app surfaces the reason instead of a mid-transfer stall.
+fn preflight_disk_space(
+    dir: &std::path::Path,
+    needed: u64,
+    file_id: &str,
+    event_tx: &UnboundedSender<SwiftEvent>,
+) -> Result<()> {
+    if needed == 0 {
+        return Ok(());
+    }
+    let free = match crate::util::free_disk_space(dir) {
+        Ok(f) => f,
+        Err(e) => {
+            // Preflight is a guard, not a gate: an unreadable statvfs must not break transfers.
+            tracing::warn!("⚠️ [FILE] disk preflight unavailable for {}: {}", dir.display(), e);
+            return Ok(());
+        }
+    };
+    if needed.saturating_add(DISK_FREE_MARGIN) > free {
+        let msg = format!(
+            "insufficient disk space: transfer needs {} bytes (+{} margin), only {} free",
+            needed, DISK_FREE_MARGIN, free
+        );
+        let _ = storage::transfer_set_status(file_id, "no_disk_space");
+        let _ = event_tx.send(SwiftEvent::FileDownloadFailed {
+            file_id: file_id.to_string(),
+            error: msg.clone(),
+        });
+        return Err(anyhow!(msg));
+    }
     Ok(())
 }
 
@@ -1504,6 +1549,9 @@ async fn download_file(
             let downloads_dir = data_dir.join("downloads");
             std::fs::create_dir_all(&downloads_dir)?;
 
+            // Disk preflight: refuse up front what cannot land (clean error, not a 99% stall).
+            preflight_disk_space(&downloads_dir, byte_length, &file_id, &event_tx)?;
+
             let temp_path = downloads_dir.join(format!("{}.tmp", file_id));
             let final_path = downloads_dir.join(&file_name);
 
@@ -1563,9 +1611,9 @@ async fn download_file(
             file.flush().await?;
             drop(file);
 
-            // Verify hash
-            let file_data = tokio::fs::read(&temp_path).await?;
-            let actual_hash = blake3::hash(&file_data).to_hex().to_string();
+            // Verify hash — STREAMED in bounded buffers (RAM-flat: a 20 GB file must never be
+            // materialized in memory to check its identity).
+            let actual_hash = crate::swarm::hash_file_streaming(&temp_path).await?.to_string();
 
             if actual_hash != hash {
                 let _ = storage::transfer_set_status(&file_id, "hash_mismatch");
