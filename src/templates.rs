@@ -31,6 +31,7 @@ const STEP_KIND: &str = "step";
 pub const SEED_TRANSCODE_DELIVER_NAME: &str = "Transcode master → deliver to Contido";
 pub const SEED_TRANSCRIBE_QC_NAME: &str = "Transcribe + compliance QC";
 pub const SEED_CONFORM_APPROVE_MASTER_NAME: &str = "Conform + approve + master";
+pub const SEED_FRAMEIO_REVIEW_LOOP_NAME: &str = "Frame.io review loop";
 
 /// The built-in media seed templates — always present, for every tenant. `tenant_id`
 /// is empty (they are global defaults, not tenant-owned); `created_at` is a fixed epoch
@@ -78,6 +79,36 @@ pub fn seed_templates() -> Vec<Template> {
                 s("Conform the edit from the AAF", None),
                 s("Gate the cut for sign-off /needs-approval", None),
                 s("Master the approved cut", None),
+            ],
+            created_at: 0,
+        },
+        // The review LOOP as an authorable workflow (CYAN_CHANGELIST_STORE_AND_
+        // REVIEW_LOOP §Part 2; step text per E2E_LIVE_SCRIPT §4). A tenant
+        // instantiates this per asset from the template picker; the `@frameio.*`
+        // references bind at compile. Both external sends are human-gated
+        // (`/needs-approval` — external_send is ALWAYS human-fired, per the
+        // transition contract).
+        Template {
+            id: "builtin:frameio-review-loop".to_string(),
+            tenant_id: String::new(),
+            name: SEED_FRAMEIO_REVIEW_LOOP_NAME.to_string(),
+            description: "Publish a proxy to Frame.io, pull review comments each round, \
+                          confirm mechanical edits, and loop until the producer approves."
+                .to_string(),
+            source: SOURCE_BUILTIN.to_string(),
+            steps: vec![
+                s("ingest and probe the dailies", None),
+                s("proxy for review", None),
+                s(
+                    "upload to @frameio.upload for producer review /needs-approval",
+                    Some("frameio"),
+                ),
+                s("get review comments from @frameio.list_comments", Some("frameio")),
+                s("apply confirmed mechanical edits and conform proxy", None),
+                s(
+                    "publish revised cut to @frameio.upload /needs-approval",
+                    Some("frameio"),
+                ),
             ],
             created_at: 0,
         },
