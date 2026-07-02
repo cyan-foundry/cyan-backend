@@ -111,6 +111,55 @@ static FULL_SERVED: AtomicU64 = AtomicU64::new(0);
 /// reflects the delta count, not the whole group.
 static ROWS_SERVED_LAST: AtomicU64 = AtomicU64::new(0);
 
+/// G8 hardening (incremental verify): bytes the direct-QUIC receiver hashed AS THEY
+/// LANDED (blake3::Hasher::update per chunk, in-loop). Paired with
+/// [`file_verify_tail_read_bytes`] so a test proves verification was incremental:
+/// streamed delta == file length, tail delta == 0.
+static FILE_VERIFY_STREAMED: AtomicU64 = AtomicU64::new(0);
+
+/// G8 hardening: bytes re-read from the partial tmp file at RESUME start to rebuild the
+/// incremental hasher's state (a bounded HEAD read before streaming — allowed).
+static FILE_VERIFY_PREFIX_READ: AtomicU64 = AtomicU64::new(0);
+
+/// G8 hardening TRIPWIRE: bytes read back from the landed file AFTER the last chunk for
+/// verification. The incremental verify leaves NO such site; any future reintroduction of
+/// a post-completion verify read must route through [`record_file_verify_tail_read`], and
+/// `verify_is_incremental_no_tail_read` fails.
+static FILE_VERIFY_TAIL_READ: AtomicU64 = AtomicU64::new(0);
+
+/// `bytes` hashed in-loop as a chunk landed on disk.
+#[inline]
+pub fn record_file_verify_streamed(bytes: u64) {
+    FILE_VERIFY_STREAMED.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// `bytes` re-read at resume start to rebuild incremental-hash state.
+#[inline]
+pub fn record_file_verify_prefix_read(bytes: u64) {
+    FILE_VERIFY_PREFIX_READ.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// `bytes` read back post-completion for verification (must stay zero — the tripwire).
+#[inline]
+pub fn record_file_verify_tail_read(bytes: u64) {
+    FILE_VERIFY_TAIL_READ.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Bytes verified incrementally as they landed.
+pub fn file_verify_streamed_bytes() -> u64 {
+    FILE_VERIFY_STREAMED.load(Ordering::Relaxed)
+}
+
+/// Bytes re-read at resume start.
+pub fn file_verify_prefix_read_bytes() -> u64 {
+    FILE_VERIFY_PREFIX_READ.load(Ordering::Relaxed)
+}
+
+/// Bytes read back after the last chunk for verification (the tripwire; see above).
+pub fn file_verify_tail_read_bytes() -> u64 {
+    FILE_VERIFY_TAIL_READ.load(Ordering::Relaxed)
+}
+
 /// One incremental (`since`-bounded) snapshot served, carrying `rows` data rows.
 #[inline]
 pub fn record_incremental_served(rows: u64) {

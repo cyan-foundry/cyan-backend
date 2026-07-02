@@ -208,6 +208,57 @@ async fn large_file_meets_throughput_floor() {
     );
 }
 
+/// G8 hardening: verification is INCREMENTAL — the receiver hashes chunks as they land
+/// (blake3 streaming) and the completion check is a hasher finalize, never a re-read of
+/// the landed file. Oracles: the engine's own byte counters — every payload byte was
+/// hashed in-loop (`file_verify_streamed_bytes` delta == file length) and ZERO bytes were
+/// read back after the last chunk (`file_verify_tail_read_bytes` delta == 0) — plus the
+/// usual blake3-intact check of the landed bytes.
+#[tokio::test]
+async fn verify_is_incremental_no_tail_read() {
+    use cyan_backend::metrics;
+
+    let _serial = serial().await;
+    let nodes = spawn_mesh(2, cfg()).await.expect("mesh spawns");
+    let group = unique_group_id();
+    meet(&nodes, &group, SYNC_TIMEOUT).await.expect("nodes meet");
+
+    let len = 8 * 1024 * 1024 + 37; // 8 MB, not chunk-aligned
+    let content = make_content(len, 0xD1);
+    let file_id = format!("file-incr-{}", &group[16..32]);
+    let hash = stage_file(&file_id, &group, None, None, &content, &nodes[0].node_id);
+
+    let streamed_before = metrics::file_verify_streamed_bytes();
+    let prefix_before = metrics::file_verify_prefix_read_bytes();
+    let tail_before = metrics::file_verify_tail_read_bytes();
+
+    nodes[1].request_download(&file_id, &hash, &nodes[0].node_id);
+    let local_path = nodes[1]
+        .wait_file_downloaded(&file_id, SYNC_TIMEOUT)
+        .await
+        .expect("peer reports FileDownloaded for the incremental-verify probe");
+
+    // The transfer completed AND verified (the engine only emits FileDownloaded after the
+    // hash gate) — now prove HOW it verified.
+    let streamed = metrics::file_verify_streamed_bytes() - streamed_before;
+    let prefix = metrics::file_verify_prefix_read_bytes() - prefix_before;
+    let tail = metrics::file_verify_tail_read_bytes() - tail_before;
+    assert_eq!(
+        streamed, len as u64,
+        "every payload byte must be hashed in-loop as it lands"
+    );
+    assert_eq!(prefix, 0, "a fresh (non-resume) download re-reads no prefix");
+    assert_eq!(tail, 0, "zero verification reads after the last chunk");
+
+    let got = std::fs::read(&local_path).expect("read downloaded file");
+    assert_eq!(got.len(), len, "byte length matches");
+    assert_eq!(
+        blake3::hash(&got).to_hex().to_string(),
+        hash,
+        "landed bytes blake3-match the source"
+    );
+}
+
 /// G8 hardening: a multi-GB transfer is RAM-FLAT — no path (send, receive, verify) ever
 /// holds the whole file in memory. 2 GB generated file in CI; the full 20 GB behind
 /// `CYAN_BIGFILE=1`. Oracle: this process's PEAK RSS delta across the transfer stays under

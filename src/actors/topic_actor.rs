@@ -1555,6 +1555,34 @@ async fn download_file(
             let temp_path = downloads_dir.join(format!("{}.tmp", file_id));
             let final_path = downloads_dir.join(&file_name);
 
+            // Incremental Blake3 (dailies-grade): hash chunks AS THEY LAND, so completion
+            // needs no whole-file re-read (no RAM spike, no dead pause at 100%). On resume,
+            // the hasher's state is rebuilt by streaming the already-verified prefix from
+            // the tmp file — a bounded HEAD read before the transfer, never a tail read.
+            let mut hasher = blake3::Hasher::new();
+            if byte_offset > 0 {
+                use tokio::io::AsyncReadExt;
+                let mut prefix = tokio::fs::File::open(&temp_path).await.map_err(|e| {
+                    anyhow!("resume at {} but tmp file is unreadable: {}", byte_offset, e)
+                })?;
+                let mut remaining = byte_offset;
+                let mut buf = vec![0u8; 1024 * 1024];
+                while remaining > 0 {
+                    let want = remaining.min(buf.len() as u64) as usize;
+                    let n = prefix.read(&mut buf[..want]).await?;
+                    if n == 0 {
+                        return Err(anyhow!(
+                            "resume at {} but tmp file holds only {} bytes",
+                            byte_offset,
+                            byte_offset - remaining
+                        ));
+                    }
+                    hasher.update(&buf[..n]);
+                    crate::metrics::record_file_verify_prefix_read(n as u64);
+                    remaining -= n as u64;
+                }
+            }
+
             // Open file for writing (append if resuming)
             let mut file = if resume_offset > 0 && temp_path.exists() {
                 tokio::fs::OpenOptions::new()
@@ -1590,6 +1618,8 @@ async fn download_file(
                 match recv.read_chunk(chunk_size, true).await? {
                     Some(chunk) => {
                         file.write_all(&chunk.bytes).await?;
+                        hasher.update(&chunk.bytes);
+                        crate::metrics::record_file_verify_streamed(chunk.bytes.len() as u64);
                         received += chunk.bytes.len() as u64;
 
                         // Update progress every 256KB
@@ -1611,9 +1641,10 @@ async fn download_file(
             file.flush().await?;
             drop(file);
 
-            // Verify hash — STREAMED in bounded buffers (RAM-flat: a 20 GB file must never be
-            // materialized in memory to check its identity).
-            let actual_hash = crate::swarm::hash_file_streaming(&temp_path).await?.to_string();
+            // Verify: the incremental hasher already consumed every byte (prefix + chunks) —
+            // finalize and compare. NO read of the landed file happens after the last chunk
+            // (the `file_verify_tail_read` tripwire stays zero).
+            let actual_hash = hasher.finalize().to_hex().to_string();
 
             if actual_hash != hash {
                 let _ = storage::transfer_set_status(&file_id, "hash_mismatch");
