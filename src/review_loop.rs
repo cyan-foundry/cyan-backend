@@ -193,16 +193,57 @@ pub struct SenseComment {
     pub author: Option<String>,
 }
 
+/// Frame.io V4 `Comment.timestamp` is a **oneOf** (verified against the live
+/// V4 openapi.json, 2026-07-03): an integer FRAME NUMBER *or* a non-drop
+/// timecode string `"HH:MM:SS:FF"`. An integer passes through as frames. A
+/// timecode string needs the proxy's fps to become a frame index
+/// (`(h*3600+m*60+s)*round(fps) + ff` — nominal SMPTE NDF math; 23.976
+/// rounds to base 24). Returns `None` for a timecode string when fps is
+/// unknown, for drop-frame (`;`-separated) forms, and for anything
+/// unparseable — the caller counts those malformed rather than silently
+/// pinning the note to frame 0 (the pre-2026-07-03 bug).
+fn timestamp_frames(v: &serde_json::Value, fps: Option<f64>) -> Option<i64> {
+    if let Some(n) = v.as_i64() {
+        return Some(n);
+    }
+    let s = v.as_str()?;
+    if s.contains(';') {
+        return None; // drop-frame timecode: not supported — surface, don't guess
+    }
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let nums: Vec<i64> = parts
+        .iter()
+        .map(|p| p.parse::<i64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    let (h, m, sec, ff) = (nums[0], nums[1], nums[2], nums[3]);
+    let base = fps?.round() as i64;
+    if base <= 0 || h < 0 || !(0..60).contains(&m) || !(0..60).contains(&sec) || !(0..base).contains(&ff) {
+        return None;
+    }
+    Some((h * 3600 + m * 60 + sec) * base + ff)
+}
+
 /// Parse the comments out of a SENSE step's plugin tool result. The step-result
 /// contract (what `execute_local_mcp_tool_step` / the lens path persist as the
 /// step's output): the tool's JSON — either the Frame.io V4 envelope
 /// `{"data": [ ...comments ]}` or a bare comment array. Per comment:
 /// `id` (string, required), `text` (string, required), the proxy-frame anchor
-/// from `frame` else `timestamp` (integer frames, default 0), optional
-/// `frame_out`, author from `owner.name` else `author`. Comments missing
-/// `id`/`text` are malformed and skipped (counted by the caller's report —
-/// no silent truncation).
-pub fn parse_sense_comments(result: &serde_json::Value) -> (Vec<SenseComment>, usize) {
+/// from `frame` else `timestamp` (int frames OR `"HH:MM:SS:FF"` timecode —
+/// the V4 oneOf; timecode needs `fps`, see [`timestamp_frames`]). A comment
+/// with NO anchor field at all is a general file comment → frame 0. A comment
+/// whose anchor is PRESENT but unresolvable (timecode without fps, drop-frame,
+/// garbage) is malformed and skipped — counted, never guessed onto frame 0.
+/// Range end from `frame_out`, else Frame.io's `duration` (int FRAMES per the
+/// V4 spec) added to the anchor. Author from `owner.name` else `author`.
+/// Comments missing `id`/`text` are malformed and skipped (counted by the
+/// caller's report — no silent truncation).
+pub fn parse_sense_comments(
+    result: &serde_json::Value,
+    fps: Option<f64>,
+) -> (Vec<SenseComment>, usize) {
     let items = result
         .get("data")
         .and_then(|d| d.as_array())
@@ -219,12 +260,30 @@ pub fn parse_sense_comments(result: &serde_json::Value) -> (Vec<SenseComment>, u
             malformed += 1;
             continue;
         }
-        let frame = item
-            .get("frame")
+        let anchor_value = item.get("frame").or_else(|| item.get("timestamp"));
+        let frame = match anchor_value {
+            None => 0, // no anchor = general file comment → start of media
+            Some(v) if v.is_null() => 0,
+            Some(v) => match timestamp_frames(v, fps) {
+                Some(f) => f,
+                None => {
+                    // Anchor present but unresolvable — surfacing beats guessing.
+                    tracing::warn!(
+                        "sense parse: comment {} anchor {:?} unresolvable (fps={:?}) — counted malformed",
+                        id, v, fps
+                    );
+                    malformed += 1;
+                    continue;
+                }
+            },
+        };
+        let frame_out = item
+            .get("frame_out")
             .and_then(|v| v.as_i64())
-            .or_else(|| item.get("timestamp").and_then(|v| v.as_i64()))
-            .unwrap_or(0);
-        let frame_out = item.get("frame_out").and_then(|v| v.as_i64());
+            .or_else(|| {
+                // Frame.io V4: `duration` is an int32 in FRAMES (requires timestamp).
+                item.get("duration").and_then(|v| v.as_i64()).map(|d| frame + d)
+            });
         let author = item
             .get("owner")
             .and_then(|o| o.get("name"))
@@ -293,7 +352,7 @@ pub fn ingest_sense_result(
     let version = changelist::get_version(conn, tenant_id, &version_id)?;
     let map = conform_map::for_version(conn, tenant_id, &version_id)?;
 
-    let (comments, malformed) = parse_sense_comments(result);
+    let (comments, malformed) = parse_sense_comments(result, proxy.fps);
     let mut ingest = SenseIngest {
         appended: Vec::new(),
         deduped: 0,

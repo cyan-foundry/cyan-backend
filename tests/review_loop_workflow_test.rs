@@ -578,3 +578,91 @@ mod template {
         }
     }
 }
+
+// ============================================================================
+// 8. Frame.io V4 `Comment.timestamp` is a oneOf — int FRAMES or "HH:MM:SS:FF"
+//    timecode (verified against the live V4 openapi.json, 2026-07-03). String
+//    timecodes resolve through the proxy's fps; anchors that are PRESENT but
+//    unresolvable are COUNTED malformed — never silently pinned to frame 0
+//    (the pre-fix bug). Frame.io `duration` (int FRAMES) becomes the range end.
+// ============================================================================
+
+#[test]
+fn sense_parse_timestamp_oneof_int_and_timecode() {
+    let result = json!({ "data": [
+        { "id": "c-int",  "text": "int frames",     "timestamp": 1008 },
+        { "id": "c-tc",   "text": "string timecode","timestamp": "00:00:02:12" },
+        { "id": "c-none", "text": "general comment" },
+        { "id": "c-null", "text": "null anchor",    "timestamp": null },
+    ]});
+    let (comments, malformed) = rl::parse_sense_comments(&result, Some(24.0));
+    assert_eq!(malformed, 0);
+    let by_id = |id: &str| comments.iter().find(|c| c.id == id).expect(id);
+    assert_eq!(by_id("c-int").frame, 1008, "int variant passes through as frames");
+    assert_eq!(by_id("c-tc").frame, 60, "00:00:02:12 @ 24fps = 2*24+12");
+    assert_eq!(by_id("c-none").frame, 0, "no anchor = general file comment");
+    assert_eq!(by_id("c-null").frame, 0, "null anchor = general file comment");
+}
+
+#[test]
+fn sense_parse_timecode_ntsc_base_rounds_up() {
+    // 23.976 uses the nominal integer timecode base (24) — SMPTE NDF math.
+    let result = json!({ "data": [
+        { "id": "c1", "text": "one second in", "timestamp": "00:00:01:00" },
+    ]});
+    let (comments, malformed) = rl::parse_sense_comments(&result, Some(23.976));
+    assert_eq!(malformed, 0);
+    assert_eq!(comments[0].frame, 24);
+}
+
+#[test]
+fn sense_parse_unresolvable_anchor_is_malformed_never_frame_zero() {
+    let cases = [
+        // timecode string but NO fps on the proxy
+        (json!({ "data": [ { "id": "c", "text": "t", "timestamp": "00:00:02:12" } ] }), None),
+        // drop-frame form — unsupported, surfaced not guessed
+        (json!({ "data": [ { "id": "c", "text": "t", "timestamp": "00;00;02;12" } ] }), Some(29.97)),
+        // garbage string
+        (json!({ "data": [ { "id": "c", "text": "t", "timestamp": "at the top" } ] }), Some(24.0)),
+        // frame field out of timecode range (ff >= base)
+        (json!({ "data": [ { "id": "c", "text": "t", "timestamp": "00:00:01:24" } ] }), Some(24.0)),
+    ];
+    for (result, fps) in cases {
+        let (comments, malformed) = rl::parse_sense_comments(&result, fps);
+        assert_eq!(comments.len(), 0, "unresolvable anchor never yields a comment: {result}");
+        assert_eq!(malformed, 1, "unresolvable anchor is COUNTED: {result}");
+    }
+}
+
+#[test]
+fn sense_parse_duration_becomes_range_end() {
+    // Frame.io V4: `duration` is int32 FRAMES, requires timestamp.
+    let result = json!({ "data": [
+        { "id": "c-range", "text": "fix this span", "timestamp": 100, "duration": 48 },
+        { "id": "c-tc-range", "text": "tc span", "timestamp": "00:00:02:00", "duration": 12 },
+        { "id": "c-explicit", "text": "explicit wins", "timestamp": 10, "frame_out": 20, "duration": 99 },
+    ]});
+    let (comments, malformed) = rl::parse_sense_comments(&result, Some(24.0));
+    assert_eq!(malformed, 0);
+    let by_id = |id: &str| comments.iter().find(|c| c.id == id).expect(id);
+    assert_eq!(by_id("c-range").frame_out, Some(148), "frame_out = anchor + duration");
+    assert_eq!(by_id("c-tc-range").frame, 48);
+    assert_eq!(by_id("c-tc-range").frame_out, Some(60), "duration stacks on a timecode anchor");
+    assert_eq!(by_id("c-explicit").frame_out, Some(20), "an explicit frame_out wins over duration");
+}
+
+#[test]
+fn sense_ingest_string_timecode_lands_at_master_coords() {
+    let conn = db();
+    seed_published_round1(&conn, "file_tc1");
+
+    // Round 1 = identity map (fixture registers the proxy at fps 24): a string
+    // timecode comment must land at the SAME master frame as its int twin would.
+    let result = json!({ "data": [
+        { "id": "c-tc-live", "text": "music too loud here", "timestamp": "00:00:42:00" },
+    ]});
+    let ingest = rl::ingest_sense_result(&conn, T, "file_tc1", &result).expect("ingest");
+    assert_eq!(ingest.malformed, 0);
+    assert_eq!(ingest.appended.len(), 1);
+    assert_eq!(ingest.appended[0].tc_in, 42 * 24, "00:00:42:00 @ 24fps → frame 1008 on the master");
+}
