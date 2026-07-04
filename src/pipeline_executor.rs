@@ -457,6 +457,20 @@ pub async fn execute_pipeline_step(
     // present, not just `local` — a bound step never reaches the resolver.
     // Ordinary steps (no `mcp_tool`) fall straight through unchanged.
     if let Some(step) = metadata.as_ref().and_then(parse_mcp_tool_step) {
+        // ── REVIEW-LOOP CONFORM: the "apply confirmed mechanical edits and conform
+        // proxy" step binds @cyan-media.conform. It must NOT run as a bare tool call —
+        // that would render a proxy but SKIP the loop bookkeeping (gather the APPROVED
+        // ops in seq order → register the returned proxy as a derived asset → freeze a
+        // new ledger Version → advance the round so the NEXT SENSE remaps through
+        // conform_map). Route it to the loop-aware engine (`execute_conform_step` →
+        // `review_loop::conform_proxy`) whenever we can resolve the current round's
+        // proxy_ref (an explicit arg, else board state). A conform with no resolvable
+        // proxy — a non-loop use — falls through to the plain bind, unchanged.
+        if step.tool == "conform"
+            && let Some(proxy_ref) = resolve_conform_proxy_ref(board_id, &step.args)
+        {
+            return run_review_loop_conform_step(board_id, step_id, &proxy_ref, event_tx);
+        }
         return execute_local_mcp_tool_step(board_id, step_id, step, command_tx, event_tx).await;
     }
 
@@ -1042,6 +1056,110 @@ pub fn execute_conform_step(
     crate::review_loop::conform_proxy(&lock, tenant_id, proxy_ref, None, &dispatch)
 }
 
+/// The current round's proxy Frame.io ref for a conform step. An explicit ref threaded
+/// into the bound args wins (`proxy_ref`, else a bare-id `input`); otherwise fall back
+/// to board state via `review_loop::current_proxy_ref`. `None` ⇒ the caller runs the
+/// plain tool bind (a non-loop conform is untouched).
+fn resolve_conform_proxy_ref(board_id: &str, args: &serde_json::Value) -> Option<String> {
+    if let Some(r) = proxy_ref_from_args(args) {
+        return Some(r);
+    }
+    let tenant = device_tenant();
+    let conn = crate::storage::db().lock().ok()?;
+    crate::review_loop::current_proxy_ref(&conn, &tenant, board_id)
+        .ok()
+        .flatten()
+}
+
+/// The explicit proxy ref an orchestrator may thread into the conform step's args:
+/// `proxy_ref` (authoritative), else `input` when it is a bare Frame.io file id — not a
+/// filesystem path / URL the media-arg resolver injects (those carry `/` or a `.ext`).
+/// Pure — unit-tested.
+fn proxy_ref_from_args(args: &serde_json::Value) -> Option<String> {
+    if let Some(r) = args.get("proxy_ref").and_then(|v| v.as_str()) {
+        let r = r.trim();
+        if !r.is_empty() {
+            return Some(r.to_string());
+        }
+    }
+    if let Some(r) = args.get("input").and_then(|v| v.as_str()) {
+        let r = r.trim();
+        if !r.is_empty() && !r.contains('/') && !r.contains('.') {
+            return Some(r.to_string());
+        }
+    }
+    None
+}
+
+/// Run the review-loop conform step: drive `execute_conform_step` (gather approved ops
+/// → cyan-media `conform` → register the derived proxy → freeze a Version → round++)
+/// and shape its `ConformOutcome` into the pipeline's `(summary, findings)` envelope
+/// plus the status / dashboard events every other step emits.
+fn run_review_loop_conform_step(
+    board_id: &str,
+    step_id: &str,
+    proxy_ref: &str,
+    event_tx: &UnboundedSender<SwiftEvent>,
+) -> Result<(String, Vec<Finding>)> {
+    let tenant = device_tenant();
+    let _ = event_tx.send(SwiftEvent::StatusUpdate {
+        message: format!("🎬 Step '{step_id}' → conform proxy (apply approved edits)"),
+    });
+
+    let outcome = execute_conform_step(board_id, step_id, &tenant, proxy_ref)?;
+    let round = outcome.state.as_ref().map(|s| s.round);
+    let summary = serde_json::to_string(&json!({
+        "conformed": true,
+        "proxy_ref": proxy_ref,
+        "new_proxy_hash": outcome.new_proxy_hash,
+        "output_path": outcome.output_path,
+        "new_version_id": outcome.new_version_id,
+        "applied_ops": outcome.sent_ops.len(),
+        "needs_manual": outcome.needs_manual.len(),
+        "escalated_asks": outcome.escalated_asks.len(),
+        "round": round,
+    }))
+    .unwrap_or_else(|_| "conform complete".to_string());
+
+    let hash_short = &outcome.new_proxy_hash[..outcome.new_proxy_hash.len().min(12)];
+    let _ = event_tx.send(SwiftEvent::StatusUpdate {
+        message: format!(
+            "✅ Step '{}' conformed {} op(s) → new proxy {} (round {})",
+            step_id,
+            outcome.sent_ops.len(),
+            hash_short,
+            round.map(|r| r.to_string()).unwrap_or_else(|| "?".to_string()),
+        ),
+    });
+    publish_pipeline_event(
+        event_tx,
+        PipelineEvent {
+            event_type: "step_completed".into(),
+            board_id: board_id.into(),
+            step_id: step_id.into(),
+            run_id: step_id.into(),
+            timestamp: chrono::Utc::now().timestamp(),
+            data: json!({
+                "summary": summary,
+                "source": "conform",
+                "new_proxy_hash": outcome.new_proxy_hash,
+                "new_version_id": outcome.new_version_id,
+                "applied_ops": outcome.sent_ops.len(),
+                "needs_manual": outcome.needs_manual.len(),
+            }),
+        },
+    );
+
+    let finding = Finding {
+        timecode_seconds: 0.0,
+        content: summary.clone(),
+        finding_type: "conform_result".to_string(),
+        severity: "info".to_string(),
+        suggested_action: None,
+    };
+    Ok((summary, vec![finding]))
+}
+
 // ============================================================================
 // Helpers (imported from pipeline.rs)
 // ============================================================================
@@ -1299,6 +1417,39 @@ fn load_cached_step_result(step_id: &str) -> Option<CachedStepResult> {
         Err(e) => { eprintln!("📺 CACHE DEBUG: JSON parse FAILED: {}", e); return None; },
     };
     Some(cached)
+}
+
+#[cfg(test)]
+mod conform_proxy_ref_tests {
+    use super::proxy_ref_from_args;
+    use serde_json::json;
+
+    #[test]
+    fn explicit_proxy_ref_wins() {
+        let args = json!({ "proxy_ref": "file_r1", "input": "/opt/cyan/media/x.mp4" });
+        assert_eq!(proxy_ref_from_args(&args).as_deref(), Some("file_r1"));
+    }
+
+    #[test]
+    fn bare_id_input_is_accepted_but_a_path_is_not() {
+        // A bare Frame.io file id (UUID-ish, no slash / dot) is a valid proxy ref.
+        let id = json!({ "input": "1eea303e-ed4a-4421-8025-2bd4f542544a" });
+        assert_eq!(
+            proxy_ref_from_args(&id).as_deref(),
+            Some("1eea303e-ed4a-4421-8025-2bd4f542544a")
+        );
+        // A filesystem path / URL is the media-arg resolver's injection, NOT a proxy ref.
+        assert_eq!(proxy_ref_from_args(&json!({ "input": "/opt/cyan/media/x.mp4" })), None);
+        assert_eq!(proxy_ref_from_args(&json!({ "input": "x.mp4" })), None);
+        assert_eq!(proxy_ref_from_args(&json!({ "input": "https://f.io/a" })), None);
+    }
+
+    #[test]
+    fn empty_or_absent_yields_none() {
+        assert_eq!(proxy_ref_from_args(&json!({})), None);
+        assert_eq!(proxy_ref_from_args(&json!({ "proxy_ref": "  " })), None);
+        assert_eq!(proxy_ref_from_args(&serde_json::Value::Null), None);
+    }
 }
 
 #[cfg(test)]

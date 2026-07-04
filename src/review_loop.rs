@@ -174,6 +174,33 @@ pub fn get_loop(
     .map_err(Into::into)
 }
 
+/// Resolve the CURRENT round's proxy Frame.io ref for a workflow board — the input
+/// the conform step needs. Walks board → its active review loop(s) → the master asset,
+/// then the newest published proxy derived from that master
+/// (`asset_registry::latest_published_proxy`). Returns the first board loop that has a
+/// published proxy; `None` if the board drives no loop yet or nothing is published.
+/// This is the board-state fallback the run-loop conform wire uses when the step does
+/// not already carry an explicit `proxy_ref`.
+pub fn current_proxy_ref(
+    conn: &Connection,
+    tenant_id: &str,
+    board_id: &str,
+) -> Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT asset_hash FROM review_loop \
+         WHERE tenant_id=?1 AND board_id=?2 AND status='active' ORDER BY updated_at DESC",
+    )?;
+    let masters = stmt
+        .query_map(params![tenant_id, board_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for master in masters {
+        if let Some(proxy_ref) = asset_registry::latest_published_proxy(conn, tenant_id, &master)? {
+            return Ok(Some(proxy_ref));
+        }
+    }
+    Ok(None)
+}
+
 // ============================================================================
 // SENSE → ledger glue.
 // ============================================================================

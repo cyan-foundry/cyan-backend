@@ -452,3 +452,71 @@ fn conform_requires_confirmed_state_no_rogue_render() {
         "no proxy registered from a rejected conform"
     );
 }
+
+// ============================================================================
+// 5. THE RUN-LOOP WIRE: `current_proxy_ref(board)` resolves the CURRENT round's
+//    published proxy from board state — the fallback the pipeline conform step uses
+//    when no explicit proxy_ref is threaded in. It follows board → active loop →
+//    master → newest published (frameio-ref'd) proxy, and skips an unpublished
+//    (freshly-conformed) proxy so it returns the last cut actually sent for review.
+// ============================================================================
+
+#[test]
+fn current_proxy_ref_resolves_board_to_published_proxy() {
+    let conn = db();
+    let board = "board-review-1";
+    seed_published_round1(&conn, "proxy-r1", "file_r1", 24.0);
+    // Link the board to the master (what the workflow does when the loop registers).
+    rl::register(&conn, T, board, MASTER, B, 10).expect("register loop");
+
+    // The board resolves to the round-1 published proxy's Frame.io ref.
+    let got = rl::current_proxy_ref(&conn, T, board).expect("resolve");
+    assert_eq!(got.as_deref(), Some("file_r1"));
+
+    // An unknown board resolves to nothing (no accidental cross-board conform).
+    assert_eq!(
+        rl::current_proxy_ref(&conn, T, "no-such-board").expect("resolve"),
+        None
+    );
+
+    // Register a NEWER published proxy (round 2) → it becomes the current one.
+    // `upsert` stamps `now()` when created_at==0, so pin both explicitly to make the
+    // ordering deterministic (r2 strictly newer than r1).
+    register_proxy(&conn, "proxy-r2", "v-later", "file_r2", 24.0);
+    conn.execute("UPDATE asset SET created_at=10 WHERE hash='proxy-r1'", [])
+        .expect("pin r1");
+    conn.execute("UPDATE asset SET created_at=20 WHERE hash='proxy-r2'", [])
+        .expect("pin r2");
+    assert_eq!(
+        rl::current_proxy_ref(&conn, T, board).expect("resolve").as_deref(),
+        Some("file_r2"),
+        "the newest PUBLISHED proxy is the current round's proxy"
+    );
+
+    // A derived proxy with NO frameio ref (a conformed-but-unpublished cut) must NOT
+    // shadow the last published one.
+    asset_registry::upsert(
+        &conn,
+        &asset_registry::Asset {
+            hash: "proxy-unpublished".to_string(),
+            tenant_id: T.to_string(),
+            kind: Some("proxy".to_string()),
+            fps: Some(24.0),
+            duration_ms: None,
+            derived_from_asset: None,
+            derived_from_version: None,
+            remote_refs: json!({}),
+            profile_json: json!({}),
+            render_profile: Some("proxy-540p".to_string()),
+            created_at: 999,
+        },
+    )
+    .expect("register unpublished proxy");
+    asset_registry::set_derivation(&conn, T, "proxy-unpublished", MASTER, "v-later")
+        .expect("derivation");
+    assert_eq!(
+        rl::current_proxy_ref(&conn, T, board).expect("resolve").as_deref(),
+        Some("file_r2"),
+        "an unpublished (no frameio ref) proxy never shadows the last published one"
+    );
+}

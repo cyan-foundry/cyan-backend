@@ -225,6 +225,35 @@ pub fn find_by_remote_ref(
         .find(|a| a.remote_refs.get(key).and_then(|v| v.as_str()) == Some(value)))
 }
 
+/// latest_published_proxy(master) → the Frame.io file id of the newest proxy asset
+/// DERIVED FROM `master` that carries a `frameio` remote ref, i.e. the CURRENT round's
+/// published proxy (the one the SENSE step listed comments for). A freshly-conformed
+/// proxy has NOT been published yet (no frameio ref until the human-gated upload), so
+/// it is correctly skipped — this returns the last proxy actually sent for review.
+/// `None` if the master has no published proxy. Tenant-scoped; filtered in Rust.
+pub fn latest_published_proxy(
+    conn: &Connection,
+    tenant_id: &str,
+    master_hash: &str,
+) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT * FROM asset WHERE tenant_id=?1")?;
+    let rows = stmt
+        .query_map(params![tenant_id], row_to_asset)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|a| a.derived_from_asset.as_deref() == Some(master_hash))
+        .filter_map(|a| {
+            let created = a.created_at;
+            a.remote_refs
+                .get("frameio")
+                .and_then(|v| v.as_str())
+                .map(|r| (created, r.to_string()))
+        })
+        .max_by_key(|(created, _)| *created)
+        .map(|(_, r)| r))
+}
+
 /// set_derivation(hash, derived_from_asset, derived_from_version) → record the
 /// derivation edge: this asset was rendered FROM `derived_from_asset` at ledger
 /// version `derived_from_version` (proxy → {master, version}; deliverable →
