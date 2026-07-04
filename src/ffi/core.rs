@@ -901,6 +901,74 @@ pub extern "C" fn cyan_upload_file_to_workspace(workspace_id: *const c_char, pat
     });
 }
 
+/// Install a signed `.cyanplugin` bundle into a group's local "Plugins" workspace
+/// (BURST C2 — the cyan-backend receiver half of the Market install leg).
+///
+/// The app fetches the bundle bytes from the Lens marketplace endpoint, base64-encodes
+/// them, and calls this. We base64-decode, hand the tar bytes to
+/// `storage::install_plugin_bundle`, and — on success — emit a fresh `TreeLoaded` (via the
+/// command actor's `Snapshot`) so the Explorer/authoring surface refreshes and
+/// `workflow::autocomplete_index` finds the plugin under `@`.
+///
+/// Idempotent: a re-install replaces the prior bundle (deterministic file id + overwrite).
+///
+/// Returns a JSON string the caller frees with `cyan_free_string`:
+///   `{"success":true,"plugin_id":"<id>","file_id":"<id>"}` on success, else
+///   `{"success":false,"error":"<why>"}`. Never null unless the JSON encode itself fails.
+///
+/// TODO(C2 signature): the bundle carries an XaeroID signature over its embedded
+/// `manifest.yaml`; this repo has no `.cyanplugin` unpack path yet, so signature
+/// verification is deferred (documented) — the bytes come from the authenticated Lens
+/// endpoint (same auth as `/browse`). Wire verification here once the unpack lands.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_install_plugin_bundle(
+    group_id: *const c_char,
+    plugin_id: *const c_char,
+    bundle_bytes_b64: *const c_char,
+) -> *mut c_char {
+    use base64::Engine as _;
+
+    let err = |msg: String| -> *mut c_char {
+        json_cstring(&serde_json::json!({ "success": false, "error": msg }).to_string())
+    };
+
+    let Some(gid) = (unsafe { cstr_arg(group_id) }) else {
+        return err("missing group_id".to_string());
+    };
+    let Some(pid) = (unsafe { cstr_arg(plugin_id) }) else {
+        return err("missing plugin_id".to_string());
+    };
+    let Some(b64) = (unsafe { cstr_arg(bundle_bytes_b64) }) else {
+        return err("missing bundle_bytes_b64".to_string());
+    };
+
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+        Ok(b) => b,
+        Err(e) => return err(format!("base64 decode failed: {e}")),
+    };
+    if bytes.is_empty() {
+        return err("empty bundle bytes".to_string());
+    }
+
+    match storage::install_plugin_bundle(&gid, &pid, &bytes) {
+        Ok(file_id) => {
+            // Refresh the tree so the app sees the new plugin (emits TreeLoaded).
+            if let Some(sys) = SYSTEM.get() {
+                let _ = sys.command_tx.send(CommandMsg::Snapshot {});
+            }
+            json_cstring(
+                &serde_json::json!({
+                    "success": true,
+                    "plugin_id": pid,
+                    "file_id": file_id,
+                })
+                .to_string(),
+            )
+        }
+        Err(e) => err(format!("install failed: {e}")),
+    }
+}
+
 /// R10FB §D: demo seeding has been REMOVED. This symbol is kept (inert) only so the C ABI
 /// stays stable until iOS stops calling it — the command it sends is a no-op and a fresh
 /// DB never gets a "Demo Group"/"Demo Board".
@@ -4724,6 +4792,39 @@ pub extern "C" fn cyan_autocomplete_path(
     let json = serde_json::to_string(&result).unwrap_or_else(|_| "[]".to_string());
     match CString::new(json) {
         Ok(cs) => cs.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Workflow authoring autocomplete (BURST C1). ADDITIVE — the `g\` file-tree grammar
+/// `cyan_autocomplete_path` stays for the Explorer; this speaks the `@`/`#`/`/` workflow
+/// grammar the notebook step editor uses.
+///
+/// Delegates to `workflow::filter_autocomplete(board_id, partial)`: it builds the board's
+/// tenant-scoped index (`@` installed plugins · `#` group files + this board's prior-step
+/// outputs · `/` control actions) and filters it by the trailing trigger + query in
+/// `partial`. A `@sl` cursor returns only matching plugins; `#`/`​/` behave likewise; no
+/// active trigger returns the full index.
+///
+/// Returns JSON (caller frees with `cyan_free_string`):
+///   `{"tenant_id":"…","plugins":[{"trigger":"@","kind":"plugin","value":"…","label":"…"}],
+///     "artifacts":[…],"actions":[…]}`.
+/// Null only on a bad `board_id`/`partial` pointer or a JSON encode failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_workflow_autocomplete(
+    board_id: *const c_char,
+    partial: *const c_char,
+) -> *mut c_char {
+    let board_id_str = match unsafe { CStr::from_ptr(board_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    // A null/invalid `partial` degrades to the empty query (full index), not a failure.
+    let partial_str = unsafe { cstr_arg(partial) }.unwrap_or_default();
+
+    let idx = crate::workflow::filter_autocomplete(board_id_str, &partial_str);
+    match serde_json::to_string(&idx) {
+        Ok(json) => json_cstring(&json),
         Err(_) => std::ptr::null_mut(),
     }
 }

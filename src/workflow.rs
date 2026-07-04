@@ -243,6 +243,70 @@ pub fn request_unlock(
     Ok(storage::workflow_state_get(board_id))
 }
 
+/// The trailing autocomplete trigger token in `partial`: the last run that begins with a
+/// `@`/`#`/`/` trigger and has no whitespace after the trigger. Returns `(trigger, query)`
+/// where `query` is the text typed after the trigger (may be empty → list all for that
+/// trigger). `None` means there is no active trigger at the cursor.
+///
+/// Examples: `"probe @sl"` → `('@', "sl")`, `"use #"` → `('#', "")`, `"/ru"` → `('/', "ru")`,
+/// `"plain text"` → `None`.
+pub fn parse_trigger(partial: &str) -> Option<(char, String)> {
+    // The token at the cursor is the text after the last whitespace.
+    let tail = partial.rsplit(|c: char| c.is_whitespace()).next().unwrap_or(partial);
+    let mut chars = tail.chars();
+    let trigger = chars.next()?;
+    if !matches!(trigger, '@' | '#' | '/') {
+        return None;
+    }
+    let query = chars.as_str();
+    // A query with an embedded trigger char isn't an active completion (e.g. "a@b/c").
+    if query.contains(['@', '#', '/']) {
+        return None;
+    }
+    Some((trigger, query.to_string()))
+}
+
+/// Case-insensitive substring match used by the autocomplete filter: an entry matches when
+/// its `value` OR `label` contains `query` (empty query matches everything).
+fn entry_matches(entry: &AutocompleteEntry, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let q = query.to_ascii_lowercase();
+    entry.value.to_ascii_lowercase().contains(&q) || entry.label.to_ascii_lowercase().contains(&q)
+}
+
+/// Filter a board's `autocomplete_index` by the trailing trigger + query in `partial`
+/// (BURST C1). When `partial` carries a `@`/`#`/`/` trigger at the cursor, only that
+/// trigger's list is populated (filtered by the query); the other two are empty. When there
+/// is no active trigger, the full index passes through (all three lists, unfiltered) so the
+/// caller can decide what to show.
+pub fn filter_autocomplete(board_id: &str, partial: &str) -> AutocompleteIndex {
+    let mut idx = autocomplete_index(board_id);
+    let Some((trigger, query)) = parse_trigger(partial) else {
+        return idx;
+    };
+    match trigger {
+        '@' => {
+            idx.plugins.retain(|e| entry_matches(e, &query));
+            idx.artifacts.clear();
+            idx.actions.clear();
+        }
+        '#' => {
+            idx.artifacts.retain(|e| entry_matches(e, &query));
+            idx.plugins.clear();
+            idx.actions.clear();
+        }
+        '/' => {
+            idx.actions.retain(|e| entry_matches(e, &query));
+            idx.plugins.clear();
+            idx.artifacts.clear();
+        }
+        _ => {}
+    }
+    idx
+}
+
 /// First non-empty line of a step's text, trimmed — the artifact display label.
 fn first_line(text: &str) -> String {
     text.lines()
