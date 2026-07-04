@@ -930,6 +930,119 @@ async fn execute_local_mcp_tool_step(
 }
 
 // ============================================================================
+// CONFORM step — the auto-technical-edit loop's actuator (FORMAT_SUPERSET 7a/8b).
+//
+// The prod wiring for `review_loop::conform_proxy`: it wraps the SAME supervised
+// cyan-mcp `dispatch_mcp_tool` path `execute_local_mcp_tool_step` uses as a
+// `ConformDispatch`, so the engine function runs the REAL cyan-media `conform`
+// tool on-device. `conform` is `side_effects: none`, so it dispatches un-gated;
+// the PUBLISH/upload of the resulting proxy that follows in the workflow stays
+// `external_send`-gated (a separate @frameio.upload step).
+// ============================================================================
+
+/// A `ConformDispatch` backed by the on-device cyan-mcp host — the prod adapter.
+/// One-shot per conform step; carries everything `dispatch_mcp_tool` needs.
+struct HostConformDispatch {
+    tenant: String,
+    run_id: String,
+    plugins_root: std::path::PathBuf,
+    board_id: String,
+}
+
+impl crate::review_loop::ConformDispatch for HostConformDispatch {
+    fn conform(&self, mut args: serde_json::Value) -> Result<serde_json::Value> {
+        // Path-resolve the proxy `input` the SAME way every cyan-media step does, so
+        // the plugin opens the board's real container (not the frameio ref). The engine
+        // seeds `input` with the proxy ref as a non-empty fallback; a resolvable board
+        // URI wins (author intent / bound asset), matching `resolve_media_args`.
+        if let Some(uri) = find_video_uri(&self.board_id)
+            && let Some(obj) = args.as_object_mut()
+        {
+            obj.insert("input".to_string(), json!(uri));
+        }
+
+        let mut step = McpTool {
+            plugin_id: "cyan-media".to_string(),
+            tool: "conform".to_string(),
+            args,
+        };
+        // Keep any author-supplied media keys consistent (no-op for cyan-media conform,
+        // which reads `input`, but harmless and future-proof).
+        resolve_media_args(&self.board_id, &mut step);
+
+        let host = PluginHost::new(
+            Arc::new(cyan_mcp::RecordingSink::new()) as Arc<dyn cyan_mcp::EventSink>,
+            Arc::new(cyan_mcp::LogEmitter::new()) as Arc<dyn cyan_mcp::Emitter>,
+            Arc::new(cyan_mcp::SystemClock::new()) as Arc<dyn cyan_mcp::Clock>,
+            cyan_mcp::BackoffPolicy {
+                base: std::time::Duration::from_millis(500),
+                max: std::time::Duration::from_secs(30),
+                max_restarts: 3,
+            },
+            self.tenant.clone(),
+        );
+        let side_effects = host
+            .resolve_installed_tool(&self.plugins_root, &step.tool)
+            .map_err(|e| anyhow!("resolve conform tool: {e}"))?
+            .map(|(_, tb)| tb.side_effects)
+            .ok_or_else(|| anyhow!("cyan-media conform tool not installed in {}", self.plugins_root.display()))?;
+
+        let scope = RunScope { tenant_id: self.tenant.clone(), run_id: self.run_id.clone() };
+        let ledger = RunCostLedger::new();
+        let bundle_dir = self.plugins_root.join(&step.plugin_id);
+        let plugin_id = step.plugin_id.clone();
+        let connect = move || -> Result<Box<dyn cyan_mcp::PluginTransport>> {
+            let mut transport = cyan_mcp::StdioTransport::new();
+            let config = cyan_mcp::SpawnConfig {
+                plugin_id: plugin_id.clone(),
+                command: bundle_dir.join("run").to_string_lossy().to_string(),
+                args: vec![],
+                creds: vec![],
+            };
+            transport
+                .spawn(&config)
+                .map_err(|e| anyhow!("spawn cyan-media: {e}"))?;
+            Ok(Box::new(transport))
+        };
+
+        // conform is side_effects:none, so `approved=false` still runs (never gated).
+        match host.dispatch_mcp_tool(&scope, &step, &side_effects, false, &ledger, connect)? {
+            McpDispatch::Ran(result) => Ok(result.result),
+            McpDispatch::Gated { side_effects } => Err(anyhow!(
+                "conform unexpectedly gated (side effects: {}) — conform must be side_effects:none",
+                side_effects.join(", ")
+            )),
+        }
+    }
+}
+
+/// Run the workflow's "apply confirmed mechanical edits and conform proxy" step:
+/// drive `review_loop::conform_proxy` (gather approved ops → conform → register the
+/// new proxy → freeze a Version → advance the round) through the real cyan-mcp host.
+///
+/// `proxy_ref` is the Frame.io id of the CURRENT round's proxy (the one the SENSE
+/// step listed comments for). `new_proxy_frameio_ref` is `None` here — the new proxy
+/// is published by the FOLLOWING @frameio.upload step (external_send, human-gated),
+/// which then stamps the forward breadcrumb.
+pub fn execute_conform_step(
+    board_id: &str,
+    step_id: &str,
+    tenant_id: &str,
+    proxy_ref: &str,
+) -> Result<crate::review_loop::ConformOutcome> {
+    let dispatch = HostConformDispatch {
+        tenant: tenant_id.to_string(),
+        run_id: step_id.to_string(),
+        plugins_root: plugins_root(),
+        board_id: board_id.to_string(),
+    };
+    let lock = crate::storage::db()
+        .lock()
+        .map_err(|e| anyhow!("db lock: {e}"))?;
+    crate::review_loop::conform_proxy(&lock, tenant_id, proxy_ref, None, &dispatch)
+}
+
+// ============================================================================
 // Helpers (imported from pipeline.rs)
 // ============================================================================
 

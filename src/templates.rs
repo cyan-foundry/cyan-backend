@@ -104,7 +104,10 @@ pub fn seed_templates() -> Vec<Template> {
                     Some("frameio"),
                 ),
                 s("get review comments from @frameio.list_comments", Some("frameio")),
-                s("apply confirmed mechanical edits and conform proxy", None),
+                s(
+                    "apply confirmed mechanical edits and conform proxy via @cyan-media.conform",
+                    Some("cyan-media"),
+                ),
                 s(
                     "publish revised cut to @frameio.upload /needs-approval",
                     Some("frameio"),
