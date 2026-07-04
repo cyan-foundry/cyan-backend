@@ -1589,6 +1589,78 @@ pub fn plugin_bundles_in_group(
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+/// Where installed `.cyanplugin` bundle files are written on disk. Mirrors the
+/// pipeline executor's `plugins_root` (env `CYAN_PLUGINS_ROOT`, else
+/// `$HOME/.cyan/plugins`) so a bundle written here is the same file the on-device
+/// MCP host later reads. Kept in storage so the install receiver and the reader
+/// agree on one path.
+pub fn plugin_bundles_dir() -> PathBuf {
+    if let Ok(root) = std::env::var("CYAN_PLUGINS_ROOT") {
+        return PathBuf::from(root);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home).join(".cyan").join("plugins")
+}
+
+/// Install a `.cyanplugin` bundle into a group's "Plugins" workspace as a real
+/// installed file — the receiver half of the Market install leg (BURST C2).
+///
+/// The already-decoded tar `bytes` are written to `plugin_bundles_dir()/<plugin_id>.cyanplugin`
+/// and an `objects` file row is inserted into the group's system "Plugins" workspace with its
+/// `local_path` set, so both `plugin_bundles_in_group` and `workflow::autocomplete_index` find
+/// it immediately (they key on: type='file', that workspace, a set `local_path`, name ending
+/// `.cyanplugin`).
+///
+/// Idempotent: the file id is deterministic (`blake3("plugin-bundle:{group}:{plugin_id}")`) so a
+/// re-install REPLACES the prior row and overwrites the bytes on disk instead of duplicating.
+///
+/// The bundle's own XaeroID signature (over its embedded `manifest.yaml`) is a cyan-forge
+/// artifact; this repo has no unpack-and-verify path for the `.cyanplugin` internal layout yet,
+/// so signature verification is a documented TODO (see the FFI wrapper) — the install still
+/// records the bundle so the authoring surface can reference it. Returns the file id used.
+pub fn install_plugin_bundle(group_id: &str, plugin_id: &str, bytes: &[u8]) -> Result<String> {
+    if group_id.trim().is_empty() {
+        return Err(anyhow!("install_plugin_bundle: empty group_id"));
+    }
+    if plugin_id.trim().is_empty() {
+        return Err(anyhow!("install_plugin_bundle: empty plugin_id"));
+    }
+
+    // Ensure the group's system "Plugins" workspace exists (deterministic id, INSERT OR IGNORE).
+    provision_group_workspaces(group_id, None)?;
+    let plugins_ws = plugins_workspace_id(group_id);
+
+    // Write the bundle bytes to the shared bundles dir (overwrite on re-install).
+    let dir = plugin_bundles_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| anyhow!("install_plugin_bundle: mkdir {}: {e}", dir.display()))?;
+    let file_name = format!("{plugin_id}{}", crate::mcp_host::PLUGIN_BUNDLE_SUFFIX);
+    let path = dir.join(&file_name);
+    std::fs::write(&path, bytes)
+        .map_err(|e| anyhow!("install_plugin_bundle: write {}: {e}", path.display()))?;
+    let local_path = path.to_string_lossy().to_string();
+
+    // Deterministic id ⇒ re-install replaces rather than duplicates.
+    let file_id = blake3::hash(format!("plugin-bundle:{group_id}:{plugin_id}").as_bytes())
+        .to_hex()
+        .to_string();
+    let hash = blake3::hash(bytes).to_hex().to_string();
+    let now = chrono::Utc::now().timestamp();
+
+    {
+        let conn = db().lock_safe();
+        conn.execute(
+            "INSERT OR REPLACE INTO objects
+               (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, local_path, created_at, deleted)
+             VALUES (?1, ?2, ?3, NULL, 'file', ?4, ?5, ?6, 'install', ?7, ?8, 0)",
+            params![
+                file_id, group_id, plugins_ws, file_name, hash, bytes.len() as i64, local_path, now
+            ],
+        )?;
+    }
+    Ok(file_id)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // FILE TRANSFERS (resumable download state)
 // ═══════════════════════════════════════════════════════════════════════════
