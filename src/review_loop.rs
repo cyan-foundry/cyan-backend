@@ -446,6 +446,307 @@ pub fn ingest_sense_result(
 }
 
 // ============================================================================
+// Confirm → CONFORM → register → round++  (FORMAT_SUPERSET Part 7a + 8b).
+//
+// The auto-technical-edit loop closes HERE: when a review-loop workflow reaches
+// its "apply confirmed mechanical edits and conform proxy" step, Cyan APPLIES the
+// approved mechanical ops itself — via the cyan-media `conform` tool — to render a
+// NEW proxy, registers it as a derived asset, freezes a new ledger Version over the
+// now-applied ops, surfaces any op the engine couldn't apply (`needs_manual`), and
+// advances the review round. NO Avid, no editor: the conform engine (a typed op →
+// deterministic ffmpeg, Part 8b) turns the ledger into the next review cut.
+//
+// The cyan-media `conform` tool (branch feat/conform-tool) is `side_effects: none`,
+// so it runs un-gated through the SAME McpDispatch path `pipeline_executor` uses;
+// the PUBLISH/upload of the new proxy that FOLLOWS stays `external_send`-gated
+// (publish_proxy is HUMAN-fired). This module owns steps (a)–(e); it does NOT
+// publish.
+// ============================================================================
+
+/// The dispatch seam for the cyan-media `conform` tool — the ONE external thing in
+/// this leg, behind a trait so unit tests run against a fake (no ffmpeg, no plugin
+/// process). Prod wires it to the supervised cyan-mcp host (see
+/// `pipeline_executor::execute_conform_step`); tests pass a scripted fake.
+///
+/// The `args` are exactly the cyan-media `conform.in.json` shape
+/// (`{ input, fps, ops:[{op, tc_in, tc_out, params}] }`); the returned value is the
+/// `conform.out.json` shape (`{ output_path, applied:[…], needs_manual:[…],
+/// size_bytes? }`). Both are agreed with cyan-media — a schema mismatch is a bug in
+/// one of the two repos, flagged in VERIFY_CONFORM_IN_LOOP.md.
+pub trait ConformDispatch {
+    /// Run the `conform` tool with `args`, returning its JSON result.
+    fn conform(&self, args: serde_json::Value) -> Result<serde_json::Value>;
+}
+
+/// One op the conform tool couldn't mechanically apply — surfaced, never dropped
+/// (FORMAT_SUPERSET Part 7a: "Creative or unresolvable ops are reported as
+/// needs_manual, never guessed").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NeedsManual {
+    pub op: String,
+    pub reason: String,
+}
+
+/// What one `conform_proxy` run produced — every op is accounted for.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConformOutcome {
+    /// The approved ops that were sent to the conform tool, in seq order — exactly
+    /// the confirmed mechanical edits (never the creative notes).
+    pub sent_ops: Vec<changelist::ConformOp>,
+    /// The new proxy's content-addressed asset hash (derived from the tool's
+    /// `output_path`), registered as a derived asset.
+    pub new_proxy_hash: String,
+    /// The tool's returned proxy path (`output_path`).
+    pub output_path: String,
+    /// The new ledger Version frozen over the now-applied ops (asset_hash +
+    /// new list_hash).
+    pub new_version_id: String,
+    /// Ops the engine escalated as needs_manual — surfaced as a ledger ask, never
+    /// silently dropped (see `escalated_asks`).
+    pub needs_manual: Vec<NeedsManual>,
+    /// The durable `kind=note, source=cyan` ask entry ids minted for each
+    /// needs_manual op (one per op, content-addressed → dedups on re-run).
+    pub escalated_asks: Vec<String>,
+    /// The review state after the round advanced (CONFORMING).
+    pub state: Option<review_state::ReviewState>,
+}
+
+/// Derive the new proxy asset's content hash from the conform tool's `output_path`.
+/// cyan-media already content-addresses the output over the full op list + fps
+/// (`derived_path`), so the path IS a stable identity; we Blake3 it into a hash the
+/// asset registry can key on. (When cyan-media later returns a real essence hash we
+/// switch to that — flagged in VERIFY_CONFORM_IN_LOOP.md. Until then this keeps the
+/// derivation edge deterministic and re-runnable, which is what the ledger needs.)
+fn proxy_hash_from_output(output_path: &str) -> String {
+    blake3::hash(output_path.as_bytes()).to_hex().to_string()
+}
+
+/// **conform_proxy** — steps (a)–(e) of the auto-technical-edit loop.
+///
+/// * (a) resolve the current proxy (by its `frameio` remote_ref) → its source
+///   MASTER (`derived_from_asset`) + the frozen conform plan version
+///   (`derived_from_version`) + the master asset's `fps`.
+/// * (b) gather the ACTIVE + APPROVED `kind=op` entries for the master/branch, in
+///   seq order — the confirmed mechanical edits (`changelist::approved_ops`).
+///   Notes/creative (`kind=note`) are NEVER conformed.
+/// * (c) build the cyan-media `conform` args and dispatch through `ConformDispatch`
+///   (side_effects:none → runs; the follow-up upload stays human-gated).
+/// * (d) register the returned proxy as a DERIVED asset (derived_from = master, at
+///   the NEW version), freeze a new ledger Version over the applied ops, and
+///   surface every `needs_manual` op as a durable `source=cyan` ledger ask.
+/// * (e) advance the review round (`conform_run`, AUTO) so the next SENSE ingest on
+///   the new proxy remaps through `conform_map::for_version(new_version)`.
+///
+/// The machine must be in `CONFORMING` (the human already fired `confirm_notes`);
+/// `conform_run` is the AUTO advance this fires once the render lands. The new proxy
+/// is registered but NOT published — `publish_proxy` (external_send) stays the
+/// human's move.
+pub fn conform_proxy(
+    conn: &Connection,
+    tenant_id: &str,
+    proxy_ref: &str,
+    new_proxy_frameio_ref: Option<&str>,
+    dispatch: &dyn ConformDispatch,
+) -> Result<ConformOutcome> {
+    // (a) Backward walk: proxy remote_ref → proxy asset → master + frozen version.
+    let proxy = asset_registry::find_by_remote_ref(conn, tenant_id, "frameio", proxy_ref)?
+        .ok_or_else(|| anyhow!("no registered asset carries frameio ref '{proxy_ref}'"))?;
+    let master = proxy
+        .derived_from_asset
+        .clone()
+        .ok_or_else(|| anyhow!("proxy asset {} has no derived_from_asset (master)", proxy.hash))?;
+    let version_id = proxy.derived_from_version.clone().ok_or_else(|| {
+        anyhow!("proxy asset {} has no derived_from_version (conform plan)", proxy.hash)
+    })?;
+    let version = changelist::get_version(conn, tenant_id, &version_id)?;
+    let branch = version.branch.clone();
+
+    // GUARD: the machine must be CONFORMING (the human already fired `confirm_notes`).
+    // Check BEFORE dispatching so an un-confirmed round never triggers a (potentially
+    // expensive) render — the round only conforms what a human confirmed. The AUTO
+    // `conform_run` advance at the end re-validates this, but failing early avoids the
+    // rogue tool call.
+    let cur = review_state::get(conn, tenant_id, &master, &branch)
+        .map_err(|e| anyhow!("review_state get: {e}"))?
+        .ok_or_else(|| anyhow!("no review_state row for master {master}"))?;
+    if cur.state != "CONFORMING" {
+        return Err(anyhow!(
+            "conform_run rejected: master {master} is '{}', not CONFORMING (confirm the notes first)",
+            cur.state
+        ));
+    }
+
+    // fps: the master's frame denominator (the ops are anchored in master frames).
+    // cyan-media's schema defaults fps to 25.0; we always send the real one when the
+    // asset carries it, so timecode → frame math never silently uses the wrong base.
+    let master_asset = asset_registry::get(conn, tenant_id, &master)?;
+    let fps = master_asset.fps.or(proxy.fps);
+
+    // (b) The confirmed mechanical edits — active + approved + kind=op, seq order.
+    let sent_ops = changelist::approved_ops(conn, tenant_id, &master, &branch)?;
+
+    // (c) Build the cyan-media `conform` args and dispatch (side_effects:none → runs).
+    //     `input` is the proxy the ops apply to; the plugin path-resolves it on the
+    //     executing node. We send the CONFIRMED ops only — never the creative notes.
+    let op_args: Vec<serde_json::Value> = sent_ops
+        .iter()
+        .map(|o| {
+            let mut m = serde_json::json!({ "op": o.op, "tc_in": o.tc_in });
+            if let Some(out) = o.tc_out {
+                m["tc_out"] = serde_json::json!(out);
+            }
+            if o.params.is_object() {
+                m["params"] = o.params.clone();
+            }
+            m
+        })
+        .collect();
+    let mut args = serde_json::json!({ "ops": op_args });
+    // The proxy path the ops apply to: prod injects the resolved container path (like
+    // `resolve_media_args`); here we carry the proxy asset's remote_ref so the arg is
+    // never empty. cyan-media requires a non-empty `input`.
+    args["input"] = serde_json::json!(proxy_ref);
+    if let Some(f) = fps {
+        args["fps"] = serde_json::json!(f);
+    }
+
+    let result = dispatch
+        .conform(args)
+        .map_err(|e| anyhow!("conform dispatch failed: {e}"))?;
+
+    let output_path = result
+        .get("output_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("conform result missing 'output_path'"))?
+        .to_string();
+    let needs_manual: Vec<NeedsManual> = result
+        .get("needs_manual")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    let op = v.get("op").and_then(|o| o.as_str())?.to_string();
+                    let reason = v
+                        .get("reason")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("unspecified")
+                        .to_string();
+                    Some(NeedsManual { op, reason })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // (e-first) Advance the round: conform_run (AUTO) snapshots the active set as the
+    // next version. Doing this BEFORE the derivation stamp gives us the new version id
+    // the proxy is derived_from — the version whose conform_map the NEXT SENSE remaps
+    // through. The machine must be CONFORMING (confirm_notes already fired).
+    let state = review_state::conform_run(conn, tenant_id, &master, &branch, review_state::Actor::Auto)
+        .map_err(|e| anyhow!("conform_run: {e}"))?;
+    let new_version = changelist::get(conn, tenant_id, &master, &branch)?
+        .head_version
+        .ok_or_else(|| anyhow!("conform_run left no head version"))?;
+
+    // (d) Register the rendered proxy as a DERIVED asset: derived_from = master, at
+    //     the NEW version. Idempotent by content hash (re-running the same conform
+    //     yields the same output_path → same hash → same row).
+    let new_proxy_hash = proxy_hash_from_output(&output_path);
+    asset_registry::upsert(
+        conn,
+        &asset_registry::Asset {
+            hash: new_proxy_hash.clone(),
+            tenant_id: tenant_id.to_string(),
+            kind: Some("proxy".to_string()),
+            fps,
+            duration_ms: None,
+            derived_from_asset: None,
+            derived_from_version: None,
+            remote_refs: serde_json::json!({}),
+            profile_json: serde_json::json!({ "output_path": output_path }),
+            render_profile: proxy.render_profile.clone(),
+            created_at: 0,
+        },
+    )?;
+    asset_registry::set_derivation(conn, tenant_id, &new_proxy_hash, &master, &new_version.version_id)?;
+    // If the actuator already knows the new proxy's Frame.io id (it published in the
+    // same run), stamp the forward breadcrumb now so the NEXT SENSE walk resolves it.
+    if let Some(fio) = new_proxy_frameio_ref {
+        asset_registry::set_remote_ref(conn, tenant_id, &new_proxy_hash, "frameio", fio)?;
+    }
+
+    // Surface needs_manual: a durable `kind=note, source=cyan` ask per escalated op,
+    // exactly as the loop escalates a creative note — never a silent drop.
+    let mut escalated_asks = Vec::with_capacity(needs_manual.len());
+    for nm in &needs_manual {
+        let ask = conform_needs_manual_ask(conn, tenant_id, &master, &branch, nm)?;
+        escalated_asks.push(ask.id);
+    }
+
+    Ok(ConformOutcome {
+        sent_ops,
+        new_proxy_hash,
+        output_path,
+        new_version_id: new_version.version_id,
+        needs_manual,
+        escalated_asks,
+        state: Some(state),
+    })
+}
+
+/// The durable ask for one op the conform engine couldn't apply: a `kind=note,
+/// source=cyan` ledger entry (visible on the review rail, replicated like every
+/// entry). Content-addressed (op + reason in params) so re-running the same conform
+/// returns the SAME ask — no spam.
+fn conform_needs_manual_ask(
+    conn: &Connection,
+    tenant_id: &str,
+    asset_hash: &str,
+    branch: &str,
+    nm: &NeedsManual,
+) -> Result<changelist::ChangeEntry> {
+    let entry = changelist::ChangeEntry {
+        id: String::new(),
+        entry_hash: String::new(),
+        asset_hash: asset_hash.to_string(),
+        tenant_id: tenant_id.to_string(),
+        branch: None,
+        track: None,
+        tc_in: 0,
+        tc_out: None,
+        kind: "note".to_string(),
+        op: None,
+        params: serde_json::json!({
+            "ask": "conform_needs_manual",
+            "op": nm.op,
+            "reason": nm.reason,
+        }),
+        intent: format!(
+            "Conform could not apply '{}' automatically ({}). A human must apply it manually or in a DCC.",
+            nm.op, nm.reason
+        ),
+        source: Some("cyan".to_string()),
+        source_ref: None,
+        author: None,
+        role: Some("agent".to_string()),
+        proposed_by: Some("agent".to_string()),
+        created_at: 0,
+        state: String::new(),
+        active: true,
+        approved_by: None,
+        approved_at: None,
+        supersedes: None,
+        superseded_by: None,
+        seq: 0,
+        depends_on: None,
+        version_ref: None,
+        outcome: None,
+        updated_at: 0,
+        updated_by: None,
+    };
+    changelist::append(conn, asset_hash, branch, entry)
+}
+
+// ============================================================================
 // The loop controller — pause / resume / exit / escalate.
 // ============================================================================
 

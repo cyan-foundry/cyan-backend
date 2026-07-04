@@ -1092,6 +1092,47 @@ pub fn conform_plan(conn: &Connection, tenant_id: &str, version_id: &str) -> Res
     Ok(ops)
 }
 
+/// approved_ops(asset, branch) → the CONFIRMED mechanical edits, in apply order.
+///
+/// The confirm→conform leg's op source (FORMAT_SUPERSET Part 7a — "Cyan applies
+/// MECHANICAL edits itself"): the currently `active`, `approved`, `kind=op` entries
+/// for `(asset, branch)`, ordered by `seq` then `id`. Unlike `conform_plan` (which
+/// projects a FROZEN version's ops) this reads the LIVE active set, so it reflects
+/// exactly the ops a human confirmed via `confirm_op` this round. Notes/markers
+/// (`kind != "op"`) and unconfirmed proposals (`state != "approved"`) and reversed
+/// entries (`active = 0`) are excluded — creative taste is NEVER conformed.
+pub fn approved_ops(
+    conn: &Connection,
+    tenant_id: &str,
+    asset_hash: &str,
+    branch: &str,
+) -> Result<Vec<ConformOp>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM change_entry \
+         WHERE tenant_id=?1 AND asset_hash=?2 AND branch=?3 \
+           AND kind='op' AND active=1 AND state='approved' \
+         ORDER BY seq ASC, id ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![tenant_id, asset_hash, branch], row_to_entry)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut ops = Vec::with_capacity(rows.len());
+    for e in rows {
+        if let Some(op) = e.op.clone() {
+            ops.push(ConformOp {
+                entry_id: e.id,
+                seq: e.seq,
+                track: e.track,
+                tc_in: e.tc_in,
+                tc_out: e.tc_out,
+                op,
+                params: e.params,
+            });
+        }
+    }
+    Ok(ops)
+}
+
 /// get(asset, branch) → entries + head version (the review rail).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangeListView {
