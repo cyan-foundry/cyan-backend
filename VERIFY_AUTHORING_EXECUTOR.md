@@ -4,7 +4,26 @@ Additive changes for BURST contracts C1, C2 (backend receiver half), and C4. No 
 `cyan_*` FFI, `SwiftEvent`, or `NetworkCommand` variant renamed. `cyan_autocomplete_path`
 untouched. No `unwrap()`/`panic!` on any new FFI/engine path.
 
-**NOT BUILT by agent — Rick: run `cargo test` + `cargo clippy --all-targets -- -D warnings`.**
+**BUILT + GREEN (verified 2026-07-03).** On branch `feat/authoring-and-executor-fixes`:
+- `cargo build --all-targets` — clean (only pre-existing multi-target manifest notes + the
+  external `xaeroid` crate warnings; none from cyan-backend).
+- `cargo test` — all suites pass, **0 failed**. Ignored = the documented relay/Docker
+  red-scaffolds only (no in-process capability faked).
+- `cargo clippy --all-targets -- -D warnings` — **exit 0**, no cyan-backend lint warnings.
+
+Working tree clean; the 4 prior commits stand as-is (no fixes were needed — the code compiled
+and tested green as written). The cyan-media arg key was reviewed against `tests/mcp_tool_test.rs`
+(fixture uses `"src"`) and the C3 frameio precedent: the injected superset `src`/`input`/`uri`
+always includes the confirmed canonical `src`, so no change required.
+
+## Confirmed FFI C signatures for the iOS side
+```c
+char* cyan_workflow_autocomplete(const char* board_id, const char* partial);
+char* cyan_install_plugin_bundle(const char* group_id,
+                                 const char* plugin_id,
+                                 const char* bundle_bytes_b64);
+// both: NULL only on a bad pointer / JSON-encode failure; free with cyan_free_string(ptr).
+```
 
 ---
 
