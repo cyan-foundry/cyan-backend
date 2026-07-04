@@ -385,3 +385,127 @@ async fn compile_preserves_manual_executor() {
     );
     println!("S5-PROOF package executor after compile = {}", meta["pipeline"]["executor"]);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// C1 — workflow autocomplete FILTER (the @/# / grammar the notebook editor drives).
+// `parse_trigger` extracts the trailing trigger+query; `filter_autocomplete` narrows
+// the tenant-scoped index to just that trigger's matches. This is the logic the new
+// `cyan_workflow_autocomplete` FFI wraps.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn parse_trigger_reads_the_trailing_trigger_and_query() {
+    use cyan_backend::workflow::parse_trigger;
+    assert_eq!(parse_trigger("probe @sl"), Some(('@', "sl".to_string())));
+    assert_eq!(parse_trigger("use the #mas"), Some(('#', "mas".to_string())));
+    assert_eq!(parse_trigger("/ru"), Some(('/', "ru".to_string())));
+    // trigger with no query yet → list-all for that trigger
+    assert_eq!(parse_trigger("bind @"), Some(('@', String::new())));
+    // no active trigger at the cursor
+    assert_eq!(parse_trigger("just plain text"), None);
+    // an email-ish token is not an active @-completion (trigger not at token start)
+    assert_eq!(parse_trigger("me@host"), None);
+}
+
+#[test]
+fn filter_autocomplete_narrows_to_the_active_trigger() {
+    ensure_db();
+    let now = 1_700_000_000i64;
+    let (group, board) = ("wf-flt-grp", "wf-flt-board");
+    seed_board(group, board);
+
+    // Installed plugins in the Plugins workspace.
+    let plugins_ws = format!("{group}-plugins");
+    storage::workspace_insert_simple(&plugins_ws, group, "Plugins").expect("plugins ws");
+    for (id, name) in [("flt-slack", "slack.cyanplugin"), ("flt-media", "cyan-media.cyanplugin")] {
+        storage::file_insert(id, Some(group), Some(&plugins_ws), None, name, id, 10, "peer", now)
+            .expect("plugin file");
+        storage::file_set_local_path(id, &format!("/tmp/{name}")).expect("local path");
+    }
+    // A board artifact file.
+    storage::file_insert(
+        "flt-file", Some(group), Some(&format!("{group}-ws")), Some(board),
+        "master.mov", "flt-file", 99, "peer", now,
+    ).expect("artifact file");
+
+    use cyan_backend::workflow::filter_autocomplete;
+
+    // '@sl' → only the slack plugin, no artifacts/actions.
+    let at = filter_autocomplete(board, "probe @sl");
+    assert!(at.plugins.iter().any(|e| e.value.contains("slack")), "slack matched under @sl");
+    assert!(at.plugins.iter().all(|e| !e.value.contains("cyan-media")), "cyan-media filtered out by 'sl'");
+    assert!(at.artifacts.is_empty() && at.actions.is_empty(), "an @ trigger shows only plugins");
+
+    // '#' (empty query) → all artifacts, no plugins/actions.
+    let hash = filter_autocomplete(board, "use #");
+    assert!(hash.artifacts.iter().any(|e| e.label.contains("master.mov")), "artifact under #");
+    assert!(hash.plugins.is_empty() && hash.actions.is_empty(), "a # trigger shows only artifacts");
+
+    // '/ru' → the 'run' action, no plugins/artifacts.
+    let slash = filter_autocomplete(board, "/ru");
+    assert!(slash.actions.iter().any(|e| e.value == "run"), "run action under /ru");
+    assert!(slash.plugins.is_empty() && slash.artifacts.is_empty(), "a / trigger shows only actions");
+
+    // No active trigger → the full index (all three lists present).
+    let full = filter_autocomplete(board, "plain step text");
+    assert!(!full.plugins.is_empty() && !full.actions.is_empty(), "no-trigger returns the full index");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// C2 — plugin bundle install (the receiver half). `storage::install_plugin_bundle`
+// writes the bundle + inserts the objects row so `plugin_bundles_in_group` +
+// `autocomplete_index` find it under `@`; a re-install replaces, never duplicates.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn install_plugin_bundle_is_discoverable_and_idempotent() {
+    ensure_db();
+    // Isolate the on-disk bundle dir so the test never touches a real ~/.cyan/plugins.
+    let dir = tempfile::tempdir().expect("tmp plugins dir");
+    unsafe { std::env::set_var("CYAN_PLUGINS_ROOT", dir.path()); }
+
+    let (group, board) = ("wf-inst-grp", "wf-inst-board");
+    seed_board(group, board);
+
+    let bytes_v1 = b"cyanplugin-tar-bytes-v1";
+    let id1 = storage::install_plugin_bundle(group, "acme-tool", bytes_v1).expect("install v1");
+
+    // Discoverable via the registry read the MCP host + autocomplete both use.
+    let bundles = storage::plugin_bundles_in_group(
+        group,
+        cyan_backend::mcp_host::PLUGINS_WORKSPACE_NAME,
+        cyan_backend::mcp_host::PLUGIN_BUNDLE_SUFFIX,
+    )
+    .expect("list bundles");
+    assert!(
+        bundles.iter().any(|b| b.name == "acme-tool.cyanplugin"),
+        "installed bundle appears in plugin_bundles_in_group"
+    );
+    // Bytes landed on disk at the reader's path.
+    let installed = bundles.iter().find(|b| b.name == "acme-tool.cyanplugin").expect("bundle row");
+    assert_eq!(std::fs::read(&installed.local_path).expect("read bundle"), bytes_v1);
+
+    // Surfaces under @ in the board's autocomplete index.
+    let idx = workflow::autocomplete_index(board);
+    assert!(
+        idx.plugins.iter().any(|e| e.value == "acme-tool"),
+        "installed plugin surfaces under @ in autocomplete_index"
+    );
+
+    // Re-install with new bytes REPLACES (same file id, overwritten bytes, no dup row).
+    let bytes_v2 = b"cyanplugin-tar-bytes-v2-updated";
+    let id2 = storage::install_plugin_bundle(group, "acme-tool", bytes_v2).expect("install v2");
+    assert_eq!(id1, id2, "deterministic id ⇒ re-install replaces");
+    let bundles2 = storage::plugin_bundles_in_group(
+        group,
+        cyan_backend::mcp_host::PLUGINS_WORKSPACE_NAME,
+        cyan_backend::mcp_host::PLUGIN_BUNDLE_SUFFIX,
+    )
+    .expect("list bundles v2");
+    let count = bundles2.iter().filter(|b| b.name == "acme-tool.cyanplugin").count();
+    assert_eq!(count, 1, "re-install must not duplicate the bundle row");
+    let installed2 = bundles2.iter().find(|b| b.name == "acme-tool.cyanplugin").expect("bundle row v2");
+    assert_eq!(std::fs::read(&installed2.local_path).expect("read v2"), bytes_v2);
+
+    unsafe { std::env::remove_var("CYAN_PLUGINS_ROOT"); }
+}
