@@ -235,7 +235,7 @@ fn arrive_notes_confirm_two_ops(conn: &Connection) -> (String, String, String) {
         .expect("confirm mute");
     rv::confirm_notes(conn, T, MASTER, B, Actor::Human).expect("confirm_notes");
     assert_eq!(
-        rv::get(conn, T, MASTER, B).unwrap().unwrap().state,
+        rv::get(conn, T, MASTER, B).expect("get review_state").expect("review_state exists").state,
         "CONFORMING",
         "confirm_notes advanced to CONFORMING"
     );
