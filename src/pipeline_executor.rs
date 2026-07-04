@@ -443,14 +443,20 @@ pub async fn execute_pipeline_step(
     event_tx: &UnboundedSender<SwiftEvent>,
 ) -> Result<(String, Vec<Finding>)> {
 
-    // ── LOCAL MCP PLUGIN TOOL: run on-device, NO cloud round-trip ───────
-    // A `local` step whose metadata names a plugin tool (`{ "mcp_tool": {
-    // plugin_id, tool, args } }`) is dispatched through the supervised cyan-mcp
-    // host on this device — the local mirror of the lens cloud `McpTool` path.
-    // Guarded: ordinary steps (no `mcp_tool`) fall straight through unchanged.
-    if executor_type == "local"
-        && let Some(step) = metadata.as_ref().and_then(parse_mcp_tool_step)
-    {
+    // ── DIRECT PLUGIN-TOOL BIND: dispatch on-device, intent resolver STANDS DOWN ──
+    // A step whose metadata names a plugin tool (`{ "mcp_tool": { plugin_id, tool,
+    // args } }`) is a RESOLVED bind (an `@plugin.tool` the author chose). It is
+    // dispatched through the supervised cyan-mcp host on this device — the local
+    // mirror of the lens cloud `McpTool` path.
+    //
+    // BURST C4: the direct bind is authoritative, so the SkillRegistry/intent resolver
+    // (whether the local `resolve_intent` or the Lens ReAct loop) must NOT run — running
+    // it wastes a turn and risks binding the WRONG tool (the live run "resolved"
+    // ingest→qc_analysis / upload→ssai_break_detection at score 1 BEFORE the @-bind
+    // overrode it). We therefore take this path for ANY executor_type when a bind is
+    // present, not just `local` — a bound step never reaches the resolver.
+    // Ordinary steps (no `mcp_tool`) fall straight through unchanged.
+    if let Some(step) = metadata.as_ref().and_then(parse_mcp_tool_step) {
         return execute_local_mcp_tool_step(board_id, step_id, step, command_tx, event_tx).await;
     }
 
@@ -730,10 +736,18 @@ fn step_is_approved(board_id: &str, step_id: &str) -> bool {
 async fn execute_local_mcp_tool_step(
     board_id: &str,
     step_id: &str,
-    step: McpTool,
+    mut step: McpTool,
     command_tx: &UnboundedSender<CommandMsg>,
     event_tx: &UnboundedSender<SwiftEvent>,
 ) -> Result<(String, Vec<Finding>)> {
+    // BURST C4 (path resolution): a cyan-media tool needs a concrete input path. The
+    // compiled step only carries `{plugin_id, tool}` (no args), so EVERY consuming step —
+    // ingest AND proxy/conform/etc. — must have the board's asset resolved to the SAME
+    // container path here, or the plugin reports `path_denied` / `input_bytes:0`. We resolve
+    // it ONCE, through the same `find_video_uri` the ingest path uses, and inject it into the
+    // args under the keys cyan-media accepts — unless the author already supplied one.
+    resolve_media_args(board_id, &mut step);
+
     let run_id = format!(
         "run_{}_{}",
         &step_id[..step_id.len().min(8)],
@@ -987,6 +1001,50 @@ fn find_video_uri(board_id: &str) -> Option<String> {
     candidate.and_then(|name| resolve_media_uri(&name))
 }
 
+/// The arg keys a cyan-media tool accepts as its input clip. `src` is the canonical one
+/// (matches the plugin + the `mcp_tool_test` fixture); the rest are tolerated aliases.
+const MEDIA_INPUT_KEYS: &[&str] = &["src", "input", "uri", "path", "input_uri", "source_url"];
+
+/// BURST C4: ensure a `cyan-media` step's args carry a concrete, resolvable input path — the
+/// SAME container path `find_video_uri` yields for the board — so every consumer (not just
+/// ingest) resolves identically instead of failing `path_denied` / `input_bytes:0`.
+///
+/// No-op unless `step.plugin_id == "cyan-media"`. If the author already supplied any of
+/// `MEDIA_INPUT_KEYS` with a non-empty value, we leave it (explicit author intent wins). Only
+/// injects when we can resolve a URI; if resolution fails we leave args untouched so the
+/// plugin surfaces its own clear "no input" error rather than us fabricating a bad path.
+fn resolve_media_args(board_id: &str, step: &mut McpTool) {
+    if step.plugin_id != "cyan-media" {
+        return;
+    }
+    // Already has an input path? Respect it.
+    if let Some(obj) = step.args.as_object() {
+        let has_input = MEDIA_INPUT_KEYS.iter().any(|k| {
+            obj.get(*k)
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+        });
+        if has_input {
+            return;
+        }
+    }
+    let Some(uri) = find_video_uri(board_id) else {
+        return;
+    };
+    // Normalize to an object we can extend (a Null/array/scalar args becomes `{}`).
+    if !step.args.is_object() {
+        step.args = json!({});
+    }
+    if let Some(obj) = step.args.as_object_mut() {
+        // `src` is the canonical key; mirror onto `input`/`uri` so tools keyed differently
+        // still find it (extra keys are harmless — the plugin reads the one it wants).
+        obj.insert("src".to_string(), json!(uri));
+        obj.insert("input".to_string(), json!(uri));
+        obj.insert("uri".to_string(), json!(uri));
+    }
+}
+
 /// True if `s` ends with a recognized video container extension (case-insensitive).
 fn is_media_filename(s: &str) -> bool {
     let l = s.to_ascii_lowercase();
@@ -1174,5 +1232,51 @@ mod video_uri_tests {
         // no media root + bare name → None (caller surfaces a clear error, not garbage)
         unsafe { std::env::remove_var("CYAN_MEDIA_ROOT"); }
         assert_eq!(resolve_media_uri("sintel-clip.mp4"), None);
+    }
+}
+
+#[cfg(test)]
+mod media_args_tests {
+    use super::{resolve_media_args, McpTool};
+    use serde_json::json;
+
+    // BURST C4: a non-cyan-media step is never touched (no DB access, args unchanged).
+    #[test]
+    fn non_cyan_media_step_is_untouched() {
+        let mut step = McpTool {
+            plugin_id: "frameio".into(),
+            tool: "upload".into(),
+            args: json!({ "folder_id": "abc" }),
+        };
+        resolve_media_args("board-x", &mut step);
+        assert_eq!(step.args, json!({ "folder_id": "abc" }));
+    }
+
+    // An author-supplied input path wins — we must not overwrite explicit intent (and the
+    // early return means no DB lookup, so this is DB-free).
+    #[test]
+    fn author_supplied_src_is_respected() {
+        let mut step = McpTool {
+            plugin_id: "cyan-media".into(),
+            tool: "proxy".into(),
+            args: json!({ "src": "s3://bucket/master.mov", "profile": "h264" }),
+        };
+        resolve_media_args("board-x", &mut step);
+        assert_eq!(step.args["src"], json!("s3://bucket/master.mov"));
+        assert_eq!(step.args["profile"], json!("h264"));
+    }
+
+    // Any of the accepted input aliases (here `input`) counts as author-supplied.
+    #[test]
+    fn author_supplied_input_alias_is_respected() {
+        let mut step = McpTool {
+            plugin_id: "cyan-media".into(),
+            tool: "transcode".into(),
+            args: json!({ "input": "/opt/cyan/media/clip.mp4" }),
+        };
+        resolve_media_args("board-x", &mut step);
+        assert_eq!(step.args["input"], json!("/opt/cyan/media/clip.mp4"));
+        // No `src` was fabricated over the existing `input`.
+        assert!(step.args.get("src").is_none());
     }
 }
