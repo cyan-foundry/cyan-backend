@@ -181,20 +181,33 @@ impl Node {
         });
     }
 
-    /// Await `SwiftEvent::FileDownloaded { file_id, local_path }` for `file_id`, returning
-    /// the local path the bytes landed at. (The engine blake3-verifies before emitting this,
-    /// so the event already implies an intact transfer; tests re-verify the bytes too.)
+    /// Await the transfer's TERMINAL event for `file_id`: `FileDownloaded` returns the
+    /// local path the bytes landed at (the engine blake3-verifies before emitting it, so
+    /// the event already implies an intact transfer; tests re-verify the bytes too), and
+    /// `FileDownloadFailed` fails FAST with the engine's reason — a refused/failed
+    /// transfer must never be a blind timeout (the 2026-07-05 disk-full gate burned
+    /// 2×120s exactly that way). Passing still requires `FileDownloaded`.
     pub async fn wait_file_downloaded(&self, file_id: &str, timeout: Duration) -> Result<String> {
         let want = file_id.to_string();
         let ev = self
             .wait_for(
-                move |e| matches!(e, SwiftEvent::FileDownloaded { file_id, .. } if *file_id == want),
+                move |e| {
+                    matches!(
+                        e,
+                        SwiftEvent::FileDownloaded { file_id, .. }
+                        | SwiftEvent::FileDownloadFailed { file_id, .. }
+                        if *file_id == want
+                    )
+                },
                 timeout,
             )
             .await?;
         match ev {
             SwiftEvent::FileDownloaded { local_path, .. } => Ok(local_path),
-            _ => unreachable!("predicate guarantees FileDownloaded"),
+            SwiftEvent::FileDownloadFailed { file_id, error } => Err(anyhow!(
+                "engine reported FileDownloadFailed for {file_id}: {error}"
+            )),
+            _ => unreachable!("predicate guarantees a terminal transfer event"),
         }
     }
 
@@ -420,6 +433,44 @@ impl Node {
 /// The backing tempdir is intentionally leaked so it outlives every node.
 static SHARED_DB: OnceLock<PathBuf> = OnceLock::new();
 
+/// Parent under the OS tempdir for every harness data dir. Named (not tempfile's
+/// anonymous `.tmpXXXX`, which other software shares) so stale dirs from finished
+/// runs are identifiable and safely reclaimable — nothing else writes here.
+pub fn harness_tmp_parent() -> PathBuf {
+    std::env::temp_dir().join("cyan-substrate")
+}
+
+/// Reclaim harness dirs left by DEAD test processes. Each dir is named
+/// `pid-<pid>-<rand>` by [`shared_db`]; a dir whose pid no longer exists
+/// (`kill(pid, 0)` ⇒ `ESRCH`) is deleted. Live pids are kept (`EPERM` counts as
+/// alive), and unparseable names are left alone. This exists because each test
+/// process must keep its dir for its whole lifetime (the engine's `DATA_DIR` is a
+/// process-global `OnceCell`), so reclamation can only happen ACROSS runs. Without
+/// it the substrate suite leaks multi-GB staged fixtures every run — the 2026-07-05
+/// backend gate failed on a 100%-full disk from exactly that.
+pub fn sweep_dead_harness_dirs(parent: &Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("pid-"))
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|p| p.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        // Signal 0 probes existence without touching the process.
+        let dead = unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if dead {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Ensure the process-global substrate DB is initialised (base schema + `storage::init_db`)
 /// and return its path. For storage-oracle UNIT tests that exercise `storage`/`snapshot`/
 /// `group_bundle` directly without spinning nodes. Idempotent (the `OnceLock` inits once).
@@ -430,7 +481,15 @@ pub fn ensure_db() -> PathBuf {
 fn shared_db() -> PathBuf {
     SHARED_DB
         .get_or_init(|| {
-            let dir = tempfile::tempdir().expect("create tempdir for shared substrate db");
+            // Reclaim what finished runs left behind, then take a pid-tagged dir the
+            // NEXT run can identify and reclaim. See `sweep_dead_harness_dirs`.
+            let parent = harness_tmp_parent();
+            std::fs::create_dir_all(&parent).expect("create harness tmp parent");
+            sweep_dead_harness_dirs(&parent);
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("pid-{}-", std::process::id()))
+                .tempdir_in(&parent)
+                .expect("create tempdir for shared substrate db");
             let path = dir.path().join("substrate.db");
             init_base_schema(&path).expect("init base schema");
             storage::init_db(path.to_str().expect("utf8 db path")).expect("storage::init_db");
@@ -439,7 +498,9 @@ fn shared_db() -> PathBuf {
             let data_dir = dir.path().join("data");
             std::fs::create_dir_all(&data_dir).expect("create data dir");
             let _ = cyan_backend::DATA_DIR.set(data_dir);
-            std::mem::forget(dir); // keep the dir alive for the whole test process
+            // Keep the dir alive for the whole test process (DATA_DIR must outlive every
+            // node); the pid-liveness sweep above reclaims it on the next run.
+            std::mem::forget(dir);
             path
         })
         .clone()
@@ -596,10 +657,27 @@ pub fn unique_discovery_key() -> String {
     format!("cyan-test-{n:016x}")
 }
 
+/// Opt-in engine log visibility: the engine's transfer/snapshot error trail is
+/// `tracing`-only (tests otherwise see just its `eprintln` breadcrumbs), so a wedged
+/// transfer is undiagnosable from test output alone. Setting `RUST_LOG` (e.g.
+/// `RUST_LOG=cyan_backend=debug`) installs a stderr subscriber; unset ⇒ no-op.
+fn init_tracing() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        if std::env::var("RUST_LOG").is_ok() {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_writer(std::io::stderr)
+                .try_init();
+        }
+    });
+}
+
 /// Spawn one node with the given config. Mirrors the existing test bins
 /// (`tests/network_actor_test.rs`): shared DB, ephemeral key, channels, a fresh
 /// per-node `peers_per_group`, `NetworkActor::new(.., cfg)`, `spawn(actor.start(..))`.
 pub async fn spawn_node(name: &str, cfg: NodeCfg) -> Result<Node> {
+    init_tracing();
     let db_path = shared_db();
 
     let mut rng = ChaCha8Rng::from_os_rng();

@@ -13,8 +13,8 @@ mod support;
 use std::time::{Duration, Instant};
 
 use support::{
-    meet, serial, spawn_mesh, stage_file, stage_file_streamed, unique_discovery_key,
-    unique_group_id, NodeCfg, SYNC_TIMEOUT,
+    harness_tmp_parent, meet, serial, spawn_mesh, stage_file, stage_file_streamed,
+    sweep_dead_harness_dirs, unique_discovery_key, unique_group_id, NodeCfg, SYNC_TIMEOUT,
 };
 
 fn cfg() -> NodeCfg {
@@ -491,6 +491,84 @@ async fn partial_direct_transfer_resumes_from_tmp_prefix() {
         hash,
         "resumed bytes blake3-match the source"
     );
+}
+
+/// Hardening (2026-07-05 disk-full gate incident): a transfer that CANNOT complete must
+/// surface as a prompt, terminal `FileDownloadFailed` — never a silent stall the caller
+/// can only time out on. Fixture: the host KNOWS the file (synced row) but holds no
+/// bytes (`local_path` empty), so every transfer path answers NotFound — size ≥ the
+/// parallel cutoff so the striped path runs first, errors, falls back to single-stream,
+/// and errors again. Oracles: `wait_file_downloaded` returns the engine's terminal
+/// failure (not the harness timeout) and it carries the engine's reason.
+#[tokio::test]
+async fn failed_transfer_surfaces_failure_event_promptly() {
+    use cyan_backend::storage;
+
+    let _serial = serial().await;
+    let nodes = spawn_mesh(2, cfg()).await.expect("mesh spawns");
+    let group = unique_group_id();
+    meet(&nodes, &group, SYNC_TIMEOUT).await.expect("nodes meet");
+
+    let len: u64 = 16 * 1024 * 1024;
+    let hash = blake3::hash(b"ghost").to_hex().to_string();
+    let file_id = format!("file-ghost-{}", &group[16..32]);
+    let _ = storage::file_insert_simple(
+        &file_id,
+        Some(&group),
+        None,
+        None,
+        "ghost.bin",
+        &hash,
+        len,
+        Some(&nodes[0].node_id),
+        1,
+    );
+
+    nodes[1].request_download(&file_id, &hash, &nodes[0].node_id);
+    let err = nodes[1]
+        .wait_file_downloaded(&file_id, SYNC_TIMEOUT)
+        .await
+        .expect_err("a transfer with no bytes to serve must fail, not succeed");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("FileDownloadFailed"),
+        "must fail via the engine's terminal event, not the harness timeout: {msg}"
+    );
+    assert!(
+        msg.contains("not found on peer"),
+        "the terminal event must carry the engine's reason: {msg}"
+    );
+}
+
+/// Harness hygiene (2026-07-05 gate incident): per-run data dirs are pid-tagged and
+/// dirs from DEAD runs are swept at init — the suite must not leak its multi-GB staged
+/// fixtures across runs (~1.8k leaked dirs filled the disk, the engine's disk preflight
+/// then rightly refused the large transfers, and the tests burned 120s timeouts).
+/// Oracles: a dir named for a dead pid is reclaimed; one named for THIS live process
+/// survives.
+#[tokio::test]
+async fn stale_harness_dirs_are_swept() {
+    let parent = harness_tmp_parent();
+    std::fs::create_dir_all(&parent).expect("create harness parent");
+
+    // A pid that is REALLY dead: spawn a trivial child and reap it.
+    let mut child = std::process::Command::new("/usr/bin/true")
+        .spawn()
+        .expect("spawn /usr/bin/true");
+    let dead_pid = child.id();
+    child.wait().expect("reap child");
+
+    let dead_dir = parent.join(format!("pid-{dead_pid}-sweeptest"));
+    let live_dir = parent.join(format!("pid-{}-sweeptest", std::process::id()));
+    std::fs::create_dir_all(&dead_dir).expect("create dead-pid dir");
+    std::fs::write(dead_dir.join("marker"), b"stale fixture").expect("write marker");
+    std::fs::create_dir_all(&live_dir).expect("create live-pid dir");
+
+    sweep_dead_harness_dirs(&parent);
+
+    assert!(!dead_dir.exists(), "a dead run's dir must be reclaimed");
+    assert!(live_dir.exists(), "a live process's dir must survive the sweep");
+    std::fs::remove_dir_all(&live_dir).expect("tidy this test's live fixture");
 }
 
 /// G8: 1 GB blob — `#[ignore]` for CI cost; runnable on demand to confirm the headline.

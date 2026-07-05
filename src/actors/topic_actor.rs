@@ -497,6 +497,10 @@ impl TopicActor {
                             // ride the same relay; don't fall back around the policy.
                             Err(e) if e.downcast_ref::<crate::xfer_policy::RelayRefused>().is_some() => {
                                 tracing::warn!("⛔ [TOPIC] transfer refused by relay policy: {}", e);
+                                let _ = event_tx.send(SwiftEvent::FileDownloadFailed {
+                                    file_id,
+                                    error: e.to_string(),
+                                });
                                 return;
                             }
                             Err(e) => {
@@ -515,9 +519,17 @@ impl TopicActor {
                         &source_peer,
                         resume_offset,
                         &group_id,
-                        event_tx,
+                        event_tx.clone(),
                     ).await {
                         tracing::error!("🔴 [TOPIC] File download failed: {}", e);
+                        // Terminal failure surface (disk-full gate incident 2026-07-05): a
+                        // download that ends in error must ALWAYS emit exactly one
+                        // `FileDownloadFailed` — a silent tracing line leaves callers (UI,
+                        // tests) staring at a stall they can only time out on.
+                        let _ = event_tx.send(SwiftEvent::FileDownloadFailed {
+                            file_id,
+                            error: e.to_string(),
+                        });
                     }
                 });
             }
@@ -1476,7 +1488,7 @@ async fn swarm_download_file(
 
     // Disk preflight: refuse a transfer that cannot land (advertised size + margin vs free
     // space) with a clean error instead of failing at 99% on a full disk.
-    preflight_disk_space(&downloads_dir, advertised_size, file_id, &event_tx)?;
+    preflight_disk_space(&downloads_dir, advertised_size, file_id)?;
 
     // RAM-flat: fetch into the fs-backed store (chunks land on disk as they arrive), export
     // file-to-file, stream-verify. Never the whole blob in memory.
@@ -1504,14 +1516,11 @@ async fn swarm_download_file(
 const DISK_FREE_MARGIN: u64 = 512 * 1024 * 1024;
 
 /// Refuse a transfer whose `needed` bytes don't fit in the destination filesystem's free
-/// space plus [`DISK_FREE_MARGIN`]. `needed == 0` (size unknown) skips the check. Emits the
-/// typed `FileDownloadFailed` so the app surfaces the reason instead of a mid-transfer stall.
-fn preflight_disk_space(
-    dir: &std::path::Path,
-    needed: u64,
-    file_id: &str,
-    event_tx: &UnboundedSender<SwiftEvent>,
-) -> Result<()> {
+/// space plus [`DISK_FREE_MARGIN`]. `needed == 0` (size unknown) skips the check. The
+/// refusal error propagates to the `DownloadFile` task's terminal `FileDownloadFailed`
+/// emission (exactly once per failed download), so the app sees the reason instead of a
+/// mid-transfer stall.
+fn preflight_disk_space(dir: &std::path::Path, needed: u64, file_id: &str) -> Result<()> {
     if needed == 0 {
         return Ok(());
     }
@@ -1529,10 +1538,6 @@ fn preflight_disk_space(
             needed, DISK_FREE_MARGIN, free
         );
         let _ = storage::transfer_set_status(file_id, "no_disk_space");
-        let _ = event_tx.send(SwiftEvent::FileDownloadFailed {
-            file_id: file_id.to_string(),
-            error: msg.clone(),
-        });
         return Err(anyhow!(msg));
     }
     Ok(())
@@ -1558,21 +1563,17 @@ fn relay_only_path(endpoint: &Endpoint, pk: &PublicKey) -> bool {
 }
 
 /// Apply the relay policy to a transfer of `total_size` bytes toward `pk`: above the
-/// threshold, a relay-only path is refused with the typed error surfaced as a clean
-/// `FileDownloadFailed` (never a mid-transfer stall on a saturated relay).
+/// threshold, a relay-only path is refused with the typed error propagated to the
+/// `DownloadFile` task's terminal `FileDownloadFailed` emission (never a mid-transfer
+/// stall on a saturated relay).
 fn enforce_relay_policy(
     endpoint: &Endpoint,
     pk: &PublicKey,
     total_size: u64,
     file_id: &str,
-    event_tx: &UnboundedSender<SwiftEvent>,
 ) -> Result<()> {
     if let Err(e) = crate::xfer_policy::enforce(total_size, relay_only_path(endpoint, pk)) {
         let _ = storage::transfer_set_status(file_id, "relay_refused");
-        let _ = event_tx.send(SwiftEvent::FileDownloadFailed {
-            file_id: file_id.to_string(),
-            error: e.to_string(),
-        });
         return Err(e.into());
     }
     Ok(())
@@ -1612,7 +1613,7 @@ async fn download_file_parallel(
     let data_dir = crate::DATA_DIR.get().cloned().unwrap_or_else(|| std::path::PathBuf::from("."));
     let downloads_dir = data_dir.join("downloads");
     tokio::fs::create_dir_all(&downloads_dir).await?;
-    preflight_disk_space(&downloads_dir, total_size, file_id, &event_tx)?;
+    preflight_disk_space(&downloads_dir, total_size, file_id)?;
     let temp_path = downloads_dir.join(format!("{}.tmp", file_id));
 
     tracing::info!(
@@ -1636,7 +1637,7 @@ async fn download_file_parallel(
         .map_err(|e| anyhow!("File transfer connect failed: {}", e))?;
 
         // Relay policy (fix 5): the small relay is signaling, not a media plane.
-        enforce_relay_policy(&endpoint, &pk, total_size, file_id, &event_tx)?;
+        enforce_relay_policy(&endpoint, &pk, total_size, file_id)?;
 
         // Preallocate the tmp file so every stream writes at its true offsets.
         {
@@ -1862,7 +1863,7 @@ async fn download_file(
 
             // Relay policy (fix 5): the header names the media's true size — refuse a
             // relay-only path for large media before a byte of payload moves.
-            enforce_relay_policy(&endpoint, &pk, total_size, &file_id, &event_tx)?;
+            enforce_relay_policy(&endpoint, &pk, total_size, &file_id)?;
 
             // Create temp file for download
             let data_dir = crate::DATA_DIR.get().cloned().unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -1870,7 +1871,7 @@ async fn download_file(
             std::fs::create_dir_all(&downloads_dir)?;
 
             // Disk preflight: refuse up front what cannot land (clean error, not a 99% stall).
-            preflight_disk_space(&downloads_dir, byte_length, &file_id, &event_tx)?;
+            preflight_disk_space(&downloads_dir, byte_length, &file_id)?;
 
             let temp_path = downloads_dir.join(format!("{}.tmp", file_id));
             let final_path = downloads_dir.join(&file_name);
@@ -1987,11 +1988,11 @@ async fn download_file(
         }
 
         FileTransferMsg::NotFound { file_id } => {
+            // Propagate as an error: the DownloadFile task's terminal handler emits the one
+            // `FileDownloadFailed` (previously this emitted here but returned Ok, so the
+            // caller could not tell "not found" from success).
             tracing::warn!("⚠️ [FILE] File not found on peer: {}", &file_id[..16.min(file_id.len())]);
-            let _ = event_tx.send(SwiftEvent::FileDownloadFailed {
-                file_id,
-                error: "File not found on peer".to_string(),
-            });
+            return Err(anyhow!("file {} not found on peer", file_id));
         }
 
         _ => {
