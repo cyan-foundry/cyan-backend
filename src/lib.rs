@@ -173,7 +173,11 @@ pub struct CyanSystem {
     pub ai_bridge: Arc<AIBridge>,
 }
 
-fn ensure_schema(conn: &Connection) -> Result<()> {
+/// The engine's base DDL — the FK clauses on `workspaces.group_id` / `objects.*` are
+/// load-bearing (the bundled SQLite is compiled with `SQLITE_DEFAULT_FOREIGN_KEYS=1`,
+/// so they are ENFORCED in prod). Public so integration tests can run the exact
+/// schema the shipping app runs instead of a drifted FK-less copy.
+pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
         PRAGMA journal_mode=WAL;

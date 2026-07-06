@@ -1626,6 +1626,22 @@ pub fn install_plugin_bundle(group_id: &str, plugin_id: &str, bytes: &[u8]) -> R
         return Err(anyhow!("install_plugin_bundle: empty plugin_id"));
     }
 
+    // The workspace/objects rows below reference the group by FK (enforced — the
+    // bundled SQLite defaults foreign_keys ON). A group id with no `groups` row
+    // (e.g. a stale or placeholder id from the caller) must fail as a clear
+    // precondition, not SQLite's cryptic "FOREIGN KEY constraint failed".
+    {
+        let conn = db().lock_safe();
+        let exists: Option<i64> = conn
+            .query_row("SELECT 1 FROM groups WHERE id = ?1", params![group_id], |r| r.get(0))
+            .optional()?;
+        if exists.is_none() {
+            return Err(anyhow!(
+                "install_plugin_bundle: unknown group '{group_id}' — select an existing group before installing a plugin"
+            ));
+        }
+    }
+
     // Ensure the group's system "Plugins" workspace exists (deterministic id, INSERT OR IGNORE).
     provision_group_workspaces(group_id, None)?;
     let plugins_ws = plugins_workspace_id(group_id);
