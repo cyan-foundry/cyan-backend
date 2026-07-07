@@ -1609,6 +1609,54 @@ pub fn plugin_bundles_dir() -> PathBuf {
     PathBuf::from(home).join(".cyan").join("plugins")
 }
 
+/// Ensure the installed bundle for `plugin_id` is UNPACKED at
+/// `plugin_bundles_dir()/<plugin_id>/` so the on-device MCP host (registry index,
+/// tool autocomplete, rung-1 binding, spawn) can read its manifest. Best-effort
+/// by design: a bundle that fails to unpack/parse degrades to "not locally
+/// dispatchable" (the step stays on the lens path) — it must never fail the
+/// install that recorded the file row.
+pub fn ensure_bundle_unpacked(plugin_id: &str) -> Option<PathBuf> {
+    let root = plugin_bundles_dir();
+    let dest = root.join(plugin_id);
+    if dest.join("manifest.json").is_file() || dest.join("manifest.yaml").is_file() {
+        return Some(dest);
+    }
+    let bundle = root.join(format!("{plugin_id}{}", crate::mcp_host::PLUGIN_BUNDLE_SUFFIX));
+    if !bundle.is_file() {
+        return None;
+    }
+    // The served bundle is a POSIX tar whose single top-level dir is the plugin
+    // id (verified against the live forge artifact). bsdtar without -P already
+    // refuses absolute and `..`-traversing member paths, so extraction cannot
+    // escape the plugins root.
+    let status = std::process::Command::new("/usr/bin/tar")
+        .arg("-xf")
+        .arg(&bundle)
+        .arg("-C")
+        .arg(&root)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            tracing::warn!("ensure_bundle_unpacked({plugin_id}): tar exited {s}");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!("ensure_bundle_unpacked({plugin_id}): spawn tar: {e}");
+            return None;
+        }
+    }
+    // Only report unpacked if the manifest actually parses — a bundle the
+    // registry can't index is not locally dispatchable.
+    match cyan_mcp::Manifest::from_bundle(&dest) {
+        Ok(_) => Some(dest),
+        Err(e) => {
+            tracing::warn!("ensure_bundle_unpacked({plugin_id}): manifest: {e}");
+            None
+        }
+    }
+}
+
 /// Install a `.cyanplugin` bundle into a group's "Plugins" workspace as a real
 /// installed file — the receiver half of the Market install leg (BURST C2).
 ///
@@ -1681,6 +1729,9 @@ pub fn install_plugin_bundle(group_id: &str, plugin_id: &str, bytes: &[u8]) -> R
             ],
         )?;
     }
+    // Unpack for the on-device MCP host (registry/autocomplete/binding/spawn).
+    // Best-effort: a bundle that won't unpack still installs as a file row.
+    let _ = ensure_bundle_unpacked(plugin_id);
     Ok(file_id)
 }
 

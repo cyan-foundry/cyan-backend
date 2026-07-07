@@ -266,6 +266,92 @@ impl PluginHost {
     }
 }
 
+/// The env var a manifest credential resolves from, by convention (kept
+/// IDENTICAL to the lens host so a bundle behaves the same on device and
+/// cloud): `<PLUGIN>_<PROVIDER-LAST-SEGMENT>_TOKEN`, uppercased. The frameio
+/// manifest's `oauth2`/`adobe_ims` credential resolves `FRAMEIO_IMS_TOKEN`.
+pub fn cred_env_var(plugin_name: &str, provider: &str) -> String {
+    let segment = provider.rsplit(['_', '-']).next().unwrap_or(provider);
+    format!("{}_{}_TOKEN", env_token(plugin_name), env_token(segment))
+}
+
+/// Uppercase + squash non-alphanumerics to `_` (env-var-safe).
+fn env_token(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Build the `SpawnConfig` for an unpacked bundle dir: the manifest's declared
+/// runtime picks the launch command (a forge `python-uv` bundle ships
+/// `src/plugin.py` + `uv.lock`, so `uv run` inside the bundle dir is the whole
+/// launch — same recipe as the lens host), and its declared credentials resolve
+/// from the DEVICE process env at spawn ("inject at plugin spawn" — the value
+/// never lives in the bundle). A missing credential refuses the spawn with a
+/// clear error, never a half-started process. A bundle with a legacy `run`
+/// entrypoint keeps working.
+pub fn bundle_spawn_config(
+    plugin_id: &str,
+    bundle_dir: &Path,
+    tenant_id: &str,
+) -> anyhow::Result<cyan_mcp::SpawnConfig> {
+    let manifest = cyan_mcp::Manifest::from_bundle(bundle_dir)
+        .map_err(|e| anyhow!("bundle manifest {}: {e}", bundle_dir.display()))?;
+
+    let mut creds = vec![(
+        "CYAN_TENANT_ID".to_string(),
+        cyan_mcp::SecretString::new(tenant_id.to_string()),
+    )];
+    for c in manifest
+        .credentials
+        .iter()
+        .chain(manifest.extra_credentials.iter())
+    {
+        let env_var = cred_env_var(&manifest.name, &c.provider);
+        let val = std::env::var(&env_var)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "plugin '{plugin_id}' requires credential env var '{env_var}' which is not set: spawn refused"
+                )
+            })?;
+        creds.push((env_var, cyan_mcp::SecretString::new(val)));
+    }
+
+    let run_entry = bundle_dir.join("run");
+    let (command, args) = match manifest.runtime.as_deref() {
+        Some("python-uv") => (
+            "uv".to_string(),
+            vec![
+                "run".to_string(),
+                "--directory".to_string(),
+                bundle_dir.to_string_lossy().into_owned(),
+                "src/plugin.py".to_string(),
+            ],
+        ),
+        _ if run_entry.is_file() => (run_entry.to_string_lossy().into_owned(), vec![]),
+        other => {
+            return Err(anyhow!(
+                "plugin '{plugin_id}' declares runtime {other:?}, which the device host cannot spawn (supported: python-uv, or a bundled `run` entrypoint)"
+            ))
+        }
+    };
+
+    Ok(cyan_mcp::SpawnConfig {
+        plugin_id: plugin_id.to_string(),
+        command,
+        args,
+        creds,
+    })
+}
+
 /// Side effect that requires the human-approval gate before a tool runs.
 pub const SIDE_EFFECT_EXTERNAL_SEND: &str = "external_send";
 /// Side effect that requires the human-approval gate before a tool runs.
