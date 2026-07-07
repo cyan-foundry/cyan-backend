@@ -38,6 +38,10 @@ path = "tests/delta_sync_test.rs"
 name = "cyan_node"
 path = "src/bin/cyan_node.rs"
 
+[[bin]]
+name = "phase3_reverse_loop"
+path = "src/bin/phase3_reverse_loop.rs"
+
 
 [dependencies]
 regex = "1"
