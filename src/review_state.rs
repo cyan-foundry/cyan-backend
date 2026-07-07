@@ -929,6 +929,19 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value, ReviewError> {
             .and_then(|v| v.as_i64())
             .unwrap_or(DEFAULT_MAX_ROUNDS)
     };
+    // The app-driven verbs accept `tenant_id` OR `board_id` (board → its group).
+    let tenant_or_board = |c: &serde_json::Value| -> Result<String, ReviewError> {
+        if let Some(t) = c.get("tenant_id").and_then(|v| v.as_str()) {
+            if !t.is_empty() {
+                return Ok(t.to_string());
+            }
+        }
+        let board = c
+            .get("board_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ReviewError::Other("missing 'tenant_id' (or 'board_id')".to_string()))?;
+        Ok(crate::review_loop::board_tenant(board))
+    };
 
     let out: serde_json::Value = match op.as_str() {
         "get" => {
@@ -939,13 +952,46 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value, ReviewError> {
             let st = start_draft(conn, &s("tenant_id")?, &s("asset_hash")?, &branch())?;
             serde_json::to_value(st).map_err(|e| ReviewError::Other(e.to_string()))?
         }
-        "publish" => tv(publish_draft(
-            conn,
-            &s("tenant_id")?,
-            &s("asset_hash")?,
-            &branch(),
-            actor()?,
-        )?)?,
+        "publish" => {
+            // Tenant-keyed (original shape) — unchanged.
+            if cmd.get("tenant_id").is_some() {
+                tv(publish_draft(
+                    conn,
+                    &s("tenant_id")?,
+                    &s("asset_hash")?,
+                    &branch(),
+                    actor()?,
+                )?)?
+            } else {
+                // BOARD-keyed (the app player dialect): resolve the board's review and
+                // publish by state — DRAFT → publish_draft (v1), CONFORMING →
+                // publish_proxy (round++). The app surface is the human.
+                let board = s("board_id")?;
+                let (tenant, asset, br) = crate::review_loop::resolve_board_review(
+                    conn,
+                    &board,
+                    cmd.get("asset_hash").and_then(|v| v.as_str()),
+                )
+                .map_err(|e| ReviewError::Other(e.to_string()))?;
+                let cur = get(conn, &tenant, &asset, &br)?
+                    .ok_or_else(|| ReviewError::Other("no review state".to_string()))?;
+                match cur.state.as_str() {
+                    "DRAFT" => {
+                        publish_draft(conn, &tenant, &asset, &br, Actor::Human)?;
+                    }
+                    "CONFORMING" => {
+                        publish_proxy(conn, &tenant, &asset, &br, Actor::Human, max_rounds())?;
+                    }
+                    other => {
+                        return Err(ReviewError::Other(format!(
+                            "publish from state {other} is not a transition"
+                        )))
+                    }
+                }
+                crate::review_loop::board_envelope(conn, &tenant, &asset, &br)
+                    .map_err(|e| ReviewError::Other(e.to_string()))?
+            }
+        }
         "notes_arrived" => tv(notes_arrived(
             conn,
             &s("tenant_id")?,
@@ -989,13 +1035,29 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value, ReviewError> {
             actor()?,
             max_rounds(),
         )?)?,
-        "finish" => tv(finish(
-            conn,
-            &s("tenant_id")?,
-            &s("asset_hash")?,
-            &branch(),
-            actor()?,
-        )?)?,
+        "finish" => {
+            if cmd.get("tenant_id").is_some() {
+                tv(finish(
+                    conn,
+                    &s("tenant_id")?,
+                    &s("asset_hash")?,
+                    &branch(),
+                    actor()?,
+                )?)?
+            } else {
+                // BOARD-keyed (the app player dialect); the app surface is the human.
+                let board = s("board_id")?;
+                let (tenant, asset, br) = crate::review_loop::resolve_board_review(
+                    conn,
+                    &board,
+                    cmd.get("asset_hash").and_then(|v| v.as_str()),
+                )
+                .map_err(|e| ReviewError::Other(e.to_string()))?;
+                finish(conn, &tenant, &asset, &br, Actor::Human)?;
+                crate::review_loop::board_envelope(conn, &tenant, &asset, &br)
+                    .map_err(|e| ReviewError::Other(e.to_string()))?
+            }
+        }
         "delivered" => tv(delivered(
             conn,
             &s("tenant_id")?,
@@ -1117,13 +1179,111 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value, ReviewError> {
                 .get("result")
                 .cloned()
                 .ok_or_else(|| ReviewError::Other("missing 'result'".to_string()))?;
+            let tenant = tenant_or_board(&cmd)?;
             let out = crate::review_loop::ingest_sense_result(
                 conn,
-                &s("tenant_id")?,
+                &tenant,
                 &s("proxy_ref")?,
                 &result,
             )?;
             serde_json::to_value(out).map_err(|e| ReviewError::Other(e.to_string()))?
+        }
+        // ── APP-DRIVEN loop verbs (Frame.io integration) — ADDITIVE. The macOS app
+        // drives the reverse loop over this same JSON surface; the loop-level logic
+        // lives in `review_loop` (see its "APP-DRIVEN loop verbs" section). Each verb
+        // accepts `tenant_id` OR `board_id` (the app's boards resolve to their group).
+        "register_review_media" => {
+            let tenant = tenant_or_board(&cmd)?;
+            let out = crate::review_loop::register_review_media(
+                conn,
+                &tenant,
+                &s("master_path")?,
+                &s("proxy_ref")?,
+                &branch(),
+                actor()?,
+            )
+            .map_err(|e| ReviewError::Other(e.to_string()))?;
+            serde_json::to_value(out).map_err(|e| ReviewError::Other(e.to_string()))?
+        }
+        "propose_from_note" => {
+            let tenant = tenant_or_board(&cmd)?;
+            let out = crate::review_loop::propose_from_note(
+                conn,
+                &tenant,
+                &s("asset_hash")?,
+                &branch(),
+            )
+            .map_err(|e| ReviewError::Other(e.to_string()))?;
+            serde_json::to_value(out).map_err(|e| ReviewError::Other(e.to_string()))?
+        }
+        "conform_proxy" => {
+            let tenant = tenant_or_board(&cmd)?;
+            let (outcome, out_abs) =
+                crate::review_loop::conform_via_env(conn, &tenant, &s("proxy_ref")?)
+                    .map_err(|e| ReviewError::Other(e.to_string()))?;
+            let mut v = serde_json::to_value(outcome)
+                .map_err(|e| ReviewError::Other(e.to_string()))?;
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "output_abs".to_string(),
+                    serde_json::Value::String(out_abs.display().to_string()),
+                );
+            }
+            v
+        }
+        "review_media_info" => {
+            let tenant = tenant_or_board(&cmd)?;
+            crate::review_loop::review_media_info(conn, &tenant, &s("proxy_ref")?)
+                .map_err(|e| ReviewError::Other(e.to_string()))?
+        }
+        // The app player's confirm gate (BOARD-keyed): approve / reject / edit one
+        // proposed entry; when the LAST open agent proposal resolves and the machine
+        // sits at NOTES_IN, the same human confirm advances NOTES_IN → CONFORMING
+        // (`confirm_notes`) — the phase-3 semantic, one human action. Returns the
+        // full envelope the player re-renders from.
+        "confirm" => {
+            let board = s("board_id")?;
+            let (tenant, asset, br) = crate::review_loop::resolve_board_review(
+                conn,
+                &board,
+                cmd.get("asset_hash").and_then(|v| v.as_str()),
+            )
+            .map_err(|e| ReviewError::Other(e.to_string()))?;
+            let entry_id = s("entry_id")?;
+            let decision = s("decision")?;
+            let edited = cmd.get("params").cloned();
+            match decision.as_str() {
+                "approve" => {
+                    confirm_op(conn, &tenant, &entry_id, None, ConfirmDecision::Approve, Actor::Human)?;
+                }
+                "edit" => {
+                    confirm_op(conn, &tenant, &entry_id, edited, ConfirmDecision::Approve, Actor::Human)?;
+                }
+                "reject" => {
+                    confirm_op(conn, &tenant, &entry_id, None, ConfirmDecision::Reject, Actor::Human)?;
+                }
+                other => {
+                    return Err(ReviewError::Other(format!("unknown decision '{other}'")))
+                }
+            }
+            // Same-human advance: no open proposals left + NOTES_IN ⇒ CONFORMING.
+            let view = crate::changelist::get(conn, &tenant, &asset, &br)
+                .map_err(|e| ReviewError::Other(e.to_string()))?;
+            let open = view.entries.iter().any(|e| {
+                e.kind == "op"
+                    && e.proposed_by.as_deref() == Some("agent")
+                    && e.active
+                    && e.state == "proposed"
+            });
+            if !open {
+                if let Some(cur) = get(conn, &tenant, &asset, &br)? {
+                    if cur.state == "NOTES_IN" {
+                        confirm_notes(conn, &tenant, &asset, &br, Actor::Human)?;
+                    }
+                }
+            }
+            crate::review_loop::board_envelope(conn, &tenant, &asset, &br)
+                .map_err(|e| ReviewError::Other(e.to_string()))?
         }
         other => return Err(ReviewError::Other(format!("unknown op '{}'", other))),
     };

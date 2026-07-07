@@ -1814,6 +1814,17 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
     };
 
     match op {
+        // ── BOARD-keyed app dialect (the macOS review player): the full envelope
+        // {asset_hash, branch, version, review_state, entries}. Additive.
+        "list" => {
+            let board = s(&cmd, "board_id")?;
+            let (tenant_r, asset, br) = crate::review_loop::resolve_board_review(
+                conn,
+                &board,
+                cmd.get("asset_hash").and_then(|v| v.as_str()),
+            )?;
+            Ok(crate::review_loop::board_envelope(conn, &tenant_r, &asset, &br)?)
+        }
         "append" => {
             let asset = s(&cmd, "asset_hash")?;
             let branch = cmd

@@ -987,3 +987,437 @@ pub fn runs_for(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
+
+// ============================================================================
+// APP-DRIVEN loop verbs (Frame.io integration) — the three loop-level ops the
+// macOS app reaches over `cyan_review_command` to run the reverse loop against
+// a REAL Frame.io file id, without the phase-3 harness bin:
+//
+//   * `register_review_media`  — bootstrap the ledger for a media board: probe
+//     the LOCAL master (ffprobe), register it (kind=master, profile_json.path),
+//     publish v1 (DRAFT → IN_REVIEW, human-gated), and register the v1 proxy
+//     carrying `remote_refs.frameio = <file id>` — the backward-walk anchor
+//     `sense_ingest`/`conform_proxy` resolve through.
+//   * `propose_from_note`      — the AGENT half: infer a mechanical op from the
+//     newest active frameio note (note_inference — never guessed; uninferable
+//     notes stay notes) and propose it (`propose_op`, actor=agent).
+//   * `conform_via_env`        — run the REAL `StdioConformDispatch` into
+//     cyan-media (`cyan-media-mcp` on PATH or `CYAN_MEDIA_MCP_CMD`), rooted at
+//     `CYAN_MEDIA_ROOT`, deriving the conform input from the registered
+//     master's `profile_json.path`. Wraps `conform_proxy` (same guard: the
+//     machine must already be CONFORMING — a human confirmed).
+//
+// All additive; nothing existing is renamed or repurposed. No panics — every
+// failure surfaces as an Err the JSON surface maps to `{"error": ...}`.
+// ============================================================================
+
+/// ffprobe a local media file → (fps, total frames). Requires `ffprobe` on PATH.
+fn probe_media(path: &std::path::Path) -> Result<(f64, i64)> {
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v", "error", "-select_streams", "v:0", "-count_frames",
+            "-show_entries", "stream=r_frame_rate,nb_read_frames", "-of", "json",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|e| anyhow!("run ffprobe: {e}"))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "ffprobe failed on {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| anyhow!("ffprobe JSON: {e}"))?;
+    let stream = v["streams"]
+        .get(0)
+        .ok_or_else(|| anyhow!("no video stream in {}", path.display()))?;
+    let rate = stream["r_frame_rate"]
+        .as_str()
+        .ok_or_else(|| anyhow!("no r_frame_rate"))?;
+    let (num, den) = rate.split_once('/').unwrap_or((rate, "1"));
+    let fps = num.parse::<f64>().map_err(|e| anyhow!("fps num: {e}"))?
+        / den.parse::<f64>().map_err(|e| anyhow!("fps den: {e}"))?;
+    if fps <= 0.0 {
+        return Err(anyhow!("non-positive fps {rate}"));
+    }
+    let frames: i64 = stream["nb_read_frames"]
+        .as_str()
+        .ok_or_else(|| anyhow!("no nb_read_frames"))?
+        .parse()
+        .map_err(|e| anyhow!("frame count: {e}"))?;
+    Ok((fps, frames))
+}
+
+/// The `register_review_media` outcome the JSON surface returns.
+#[derive(Debug, Serialize)]
+pub struct RegisteredMedia {
+    pub master_hash: String,
+    pub proxy_hash: String,
+    pub version_id: String,
+    pub fps: f64,
+    pub duration_frames: i64,
+    pub state: review_state::ReviewState,
+}
+
+/// Bootstrap the review ledger for an app media board (idempotent — a re-run on
+/// an already-published master reuses the existing review/version/proxy rows).
+pub fn register_review_media(
+    conn: &Connection,
+    tenant_id: &str,
+    master_path: &str,
+    proxy_ref: &str,
+    branch: &str,
+    actor: review_state::Actor,
+) -> Result<RegisteredMedia> {
+    let path = std::path::Path::new(master_path);
+    let bytes =
+        std::fs::read(path).map_err(|e| anyhow!("read master {}: {e}", path.display()))?;
+    let master = blake3::hash(&bytes).to_hex().to_string();
+    let (fps, frames) = probe_media(path)?;
+    let duration_ms = ((frames as f64 / fps) * 1000.0).round() as i64;
+
+    asset_registry::upsert(
+        conn,
+        &asset_registry::Asset {
+            hash: master.clone(),
+            tenant_id: tenant_id.to_string(),
+            kind: Some("master".to_string()),
+            fps: Some(fps),
+            duration_ms: Some(duration_ms),
+            derived_from_asset: None,
+            derived_from_version: None,
+            remote_refs: serde_json::json!({}),
+            profile_json: serde_json::json!({ "path": master_path }),
+            render_profile: None,
+            created_at: 0,
+        },
+    )?;
+
+    // DRAFT → IN_REVIEW (publish freezes v1). Idempotent: only publish from DRAFT.
+    let state = review_state::start_draft(conn, tenant_id, &master, branch)
+        .map_err(|e| anyhow!("start_draft: {e}"))?;
+    let state = if state.state == "DRAFT" {
+        review_state::publish_draft(conn, tenant_id, &master, branch, actor)
+            .map_err(|e| anyhow!("publish: {e}"))?
+    } else {
+        state
+    };
+
+    let head = changelist::get(conn, tenant_id, &master, branch)?
+        .head_version
+        .ok_or_else(|| anyhow!("no head version — publish did not freeze v1"))?;
+
+    let proxy_hash = blake3::hash(format!("{master}:proxy:v{}", head.version_no).as_bytes())
+        .to_hex()
+        .to_string();
+    asset_registry::upsert(
+        conn,
+        &asset_registry::Asset {
+            hash: proxy_hash.clone(),
+            tenant_id: tenant_id.to_string(),
+            kind: Some("proxy".to_string()),
+            fps: Some(fps),
+            duration_ms: Some(duration_ms),
+            derived_from_asset: None,
+            derived_from_version: None,
+            remote_refs: serde_json::json!({}),
+            profile_json: serde_json::json!({ "path": master_path }),
+            render_profile: Some("app-review".to_string()),
+            created_at: 0,
+        },
+    )?;
+    asset_registry::set_derivation(conn, tenant_id, &proxy_hash, &master, &head.version_id)?;
+    asset_registry::set_remote_ref(conn, tenant_id, &proxy_hash, "frameio", proxy_ref)?;
+
+    Ok(RegisteredMedia {
+        master_hash: master,
+        proxy_hash,
+        version_id: head.version_id,
+        fps,
+        duration_frames: frames,
+        state,
+    })
+}
+
+/// The AGENT half of the loop: infer a mechanical op from the newest active
+/// frameio note and propose it. An already-proposed/approved agent op is
+/// returned as-is (idempotent). An uninferable (creative) note errs — it stays
+/// a note for the human, never guessed.
+pub fn propose_from_note(
+    conn: &Connection,
+    tenant_id: &str,
+    asset_hash: &str,
+    branch: &str,
+) -> Result<changelist::ChangeEntry> {
+    let view = changelist::get(conn, tenant_id, asset_hash, branch)?;
+    let note = view
+        .entries
+        .iter()
+        .filter(|e| e.kind == "note" && e.source.as_deref() == Some("frameio") && e.active)
+        .max_by_key(|e| (e.created_at, e.seq))
+        .cloned()
+        .ok_or_else(|| anyhow!("no frameio note in the ledger — sense first"))?;
+    if let Some(existing) = view
+        .entries
+        .iter()
+        .find(|e| {
+            e.kind == "op"
+                && e.proposed_by.as_deref() == Some("agent")
+                && e.active
+                && (e.state == "proposed" || e.state == "approved")
+        })
+        .cloned()
+    {
+        return Ok(existing);
+    }
+
+    let asset = asset_registry::get(conn, tenant_id, asset_hash)?;
+    let duration_frames = match (asset.duration_ms, asset.fps) {
+        (Some(ms), Some(fps)) => Some(((ms as f64 / 1000.0) * fps).round() as i64),
+        _ => None,
+    };
+    let inferred =
+        crate::note_inference::infer_op(&note.intent, note.tc_in, note.tc_out, duration_frames)
+            .ok_or_else(|| {
+                anyhow!(
+                    "note {:?} is not a fully-specified mechanical edit — escalate to the human",
+                    note.intent
+                )
+            })?;
+    let entry = changelist::ChangeEntry {
+        id: String::new(),
+        entry_hash: String::new(),
+        asset_hash: asset_hash.to_string(),
+        tenant_id: tenant_id.to_string(),
+        branch: None,
+        track: Some("V1".to_string()),
+        tc_in: inferred.tc_in,
+        tc_out: inferred.tc_out,
+        kind: "op".to_string(),
+        op: Some(inferred.op.clone()),
+        params: inferred.params.clone(),
+        intent: format!("{}: {}", inferred.op, note.intent),
+        source: Some("cyan".to_string()),
+        source_ref: None,
+        author: Some("cyan-agent".to_string()),
+        role: Some("agent".to_string()),
+        proposed_by: None, // forced to agent by propose_op
+        created_at: 0,
+        state: String::new(),
+        active: true,
+        approved_by: None,
+        approved_at: None,
+        supersedes: None,
+        superseded_by: None,
+        seq: 0,
+        depends_on: Some(note.id.clone()),
+        version_ref: None,
+        outcome: None,
+        updated_at: 0,
+        updated_by: None,
+    };
+    review_state::propose_op(conn, asset_hash, branch, entry, review_state::Actor::Agent)
+        .map_err(|e| anyhow!("propose_op: {e}"))
+}
+
+/// Run the REAL conform through cyan-media for an app-registered proxy ref:
+/// build the `StdioConformDispatch` from the environment (`CYAN_MEDIA_MCP_CMD`
+/// or `cyan-media-mcp` on PATH; media root from `CYAN_MEDIA_ROOT`), derive the
+/// conform input from the registered MASTER's `profile_json.path`, and drive
+/// `conform_proxy`. Returns the outcome plus the absolute output path.
+pub fn conform_via_env(
+    conn: &Connection,
+    tenant_id: &str,
+    proxy_ref: &str,
+) -> Result<(ConformOutcome, std::path::PathBuf)> {
+    let media_root = std::path::PathBuf::from(std::env::var("CYAN_MEDIA_ROOT").map_err(|_| {
+        anyhow!("CYAN_MEDIA_ROOT not set — the conform sandbox root is required")
+    })?);
+
+    // proxy_ref → proxy asset → master asset → its registered local path.
+    let proxy = asset_registry::find_by_remote_ref(conn, tenant_id, "frameio", proxy_ref)?
+        .ok_or_else(|| anyhow!("no registered asset carries frameio ref '{proxy_ref}'"))?;
+    let master_hash = proxy
+        .derived_from_asset
+        .clone()
+        .ok_or_else(|| anyhow!("proxy {} has no derived_from_asset", proxy.hash))?;
+    let master = asset_registry::get(conn, tenant_id, &master_hash)?;
+    let master_path = master
+        .profile_json
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("master {master_hash} has no registered local path"))?;
+    let input_rel = std::path::Path::new(master_path)
+        .strip_prefix(&media_root)
+        .map_err(|_| {
+            anyhow!(
+                "master {} is outside CYAN_MEDIA_ROOT {} — cyan-media confines inputs to its root",
+                master_path,
+                media_root.display()
+            )
+        })?
+        .to_string_lossy()
+        .to_string();
+
+    let command: Vec<String> = match std::env::var("CYAN_MEDIA_MCP_CMD") {
+        Ok(cmd) => cmd.split_whitespace().map(str::to_string).collect(),
+        Err(_) => vec!["cyan-media-mcp".to_string()],
+    };
+    let dispatch = crate::conform_dispatch::StdioConformDispatch {
+        command,
+        media_root: media_root.clone(),
+        input_rel,
+        timeout: std::time::Duration::from_secs(600),
+    };
+
+    let outcome = conform_proxy(conn, tenant_id, proxy_ref, None, &dispatch)?;
+    let out_abs = media_root.join(&outcome.output_path);
+    if !out_abs.is_file() {
+        return Err(anyhow!(
+            "conform reported {} but no file exists at {}",
+            outcome.output_path,
+            out_abs.display()
+        ));
+    }
+    Ok((outcome, out_abs))
+}
+
+// ── Board-keyed app dialect ─────────────────────────────────────────────────
+//
+// The macOS review player (`ReviewPlayerViewModel`) speaks a BOARD-keyed JSON
+// dialect over the same two FFI entrypoints:
+//
+//   changelist: {"op":"list","board_id",["asset_hash"]}            → envelope
+//   review:     {"op":"confirm","board_id","entry_id","decision"}  → envelope
+//               {"op":"publish","board_id"} / {"op":"finish","board_id"}
+//
+// The ENVELOPE is `{asset_hash, branch, version, review_state:{state,round},
+// entries:[ChangeEntry…]}` — the exact shape the app's `ListEnvelope` decoder
+// consumes (proven against the phase-3 player harness). These helpers resolve
+// a board to its (tenant, asset, branch) and build that envelope. Additive —
+// the tenant/asset-keyed verbs above are untouched.
+
+/// The tenant a board's ledger lives under (its group; "device" when unknown).
+pub fn board_tenant(board_id: &str) -> String {
+    crate::storage::board_get_group_id(board_id)
+        .filter(|g| !g.is_empty())
+        .unwrap_or_else(|| "device".to_string())
+}
+
+/// Resolve a board-keyed command to (tenant, asset, branch): an explicit
+/// `asset_hash` wins; else the tenant's most-recently-updated review row.
+pub fn resolve_board_review(
+    conn: &Connection,
+    board_id: &str,
+    asset_hash: Option<&str>,
+) -> Result<(String, String, String)> {
+    let tenant = board_tenant(board_id);
+    if let Some(h) = asset_hash {
+        if !h.is_empty() {
+            // Branch: the review row when one exists, else main.
+            let branch = review_state::list_by_tenant(conn, &tenant)
+                .map_err(|e| anyhow!("{e}"))?
+                .into_iter()
+                .find(|r| r.asset_hash == h)
+                .map(|r| r.branch)
+                .unwrap_or_else(|| "main".to_string());
+            return Ok((tenant, h.to_string(), branch));
+        }
+    }
+    let newest = review_state::list_by_tenant(conn, &tenant)
+        .map_err(|e| anyhow!("{e}"))?
+        .into_iter()
+        .max_by_key(|r| r.updated_at)
+        .ok_or_else(|| anyhow!("no review ledger for board '{board_id}' (tenant '{tenant}')"))?;
+    Ok((tenant, newest.asset_hash, newest.branch))
+}
+
+/// Build the app player envelope for one (tenant, asset, branch).
+pub fn board_envelope(
+    conn: &Connection,
+    tenant: &str,
+    asset: &str,
+    branch: &str,
+) -> Result<serde_json::Value> {
+    let view = changelist::get(conn, tenant, asset, branch)?;
+    let state = review_state::get(conn, tenant, asset, branch).map_err(|e| anyhow!("{e}"))?;
+    let version = view.head_version.as_ref().map(|v| v.version_no).unwrap_or(0);
+    Ok(serde_json::json!({
+        "asset_hash": asset,
+        "branch": branch,
+        "version": version,
+        "review_state": state.map(|s| serde_json::json!({ "state": s.state, "round": s.round })),
+        "entries": view.entries,
+    }))
+}
+
+/// What the app needs to OPEN the review player on real local media: the
+/// master's registered path, the LATEST derived (conformed) proxy's absolute
+/// output path (if any conform ran), and the ledger version. `proxy_ref` is
+/// the Frame.io file id the v1 proxy was registered under.
+pub fn review_media_info(
+    conn: &Connection,
+    tenant: &str,
+    proxy_ref: &str,
+) -> Result<serde_json::Value> {
+    let proxy = asset_registry::find_by_remote_ref(conn, tenant, "frameio", proxy_ref)?
+        .ok_or_else(|| anyhow!("no registered asset carries frameio ref '{proxy_ref}'"))?;
+    let master_hash = proxy
+        .derived_from_asset
+        .clone()
+        .ok_or_else(|| anyhow!("proxy {} has no derived_from_asset", proxy.hash))?;
+    let master = asset_registry::get(conn, tenant, &master_hash)?;
+    let master_path = master
+        .profile_json
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("master {master_hash} has no registered local path"))?;
+
+    // The newest conform-derived proxy (it carries profile_json.output_path).
+    let media_root = std::env::var("CYAN_MEDIA_ROOT").ok();
+    let mut stmt = conn.prepare(
+        "SELECT hash, profile_json FROM asset \
+         WHERE tenant_id=?1 AND derived_from_asset=?2 AND kind='proxy' \
+         ORDER BY created_at DESC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![tenant, master_hash], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut derived_abs: Option<String> = None;
+    let mut derived_hash: Option<String> = None;
+    for (hash, profile) in rows {
+        let p: serde_json::Value = serde_json::from_str(&profile).unwrap_or_default();
+        if let Some(out) = p.get("output_path").and_then(|v| v.as_str()) {
+            let abs = match &media_root {
+                Some(root) => std::path::Path::new(root).join(out).display().to_string(),
+                None => out.to_string(),
+            };
+            if std::path::Path::new(&abs).is_file() {
+                derived_abs = Some(abs);
+                derived_hash = Some(hash);
+                break;
+            }
+        }
+    }
+
+    let branch = review_state::list_by_tenant(conn, tenant)
+        .map_err(|e| anyhow!("{e}"))?
+        .into_iter()
+        .find(|r| r.asset_hash == master_hash)
+        .map(|r| r.branch)
+        .unwrap_or_else(|| "main".to_string());
+    let view = changelist::get(conn, tenant, &master_hash, &branch)?;
+    Ok(serde_json::json!({
+        "master_hash": master_hash,
+        "master_path": master_path,
+        "derived_proxy_hash": derived_hash,
+        "derived_proxy_path": derived_abs,
+        "version": view.head_version.as_ref().map(|v| v.version_no).unwrap_or(0),
+        "frameio_ref": proxy_ref,
+    }))
+}
