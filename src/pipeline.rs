@@ -415,6 +415,26 @@ fn step_stage(config: &PipelineStepConfig) -> String {
 /// drives the lens ReAct at RUN time; this only materializes the DAG so Compile is
 /// instant and reliable (never "0 steps"). Returns the pipeline stage and, when a
 /// media verb is recognized, the cyan-media tool the step should bind to.
+/// Authored-executor convention (REVIEW_LOOP_ONE_BOARD Stage 3): placeholder /
+/// manual steps and the await-sense park are HUMAN gates; everything else
+/// defaults to the lens (creative) unless a deterministic bind claims it.
+fn infer_executor(content: &str) -> String {
+    let c = content.to_lowercase();
+    if c.contains("placeholder") || c.starts_with("manual:") || c.contains("(manual)")
+        || is_await_sense(content)
+    {
+        "manual".to_string()
+    } else {
+        "lens".to_string()
+    }
+}
+
+/// The await-sense park marker: "await … note(s)/review/feedback".
+fn is_await_sense(content: &str) -> bool {
+    let c = content.to_lowercase();
+    c.contains("await") && (c.contains("note") || c.contains("review") || c.contains("feedback"))
+}
+
 fn infer_step(content: &str) -> (String, Option<String>) {
     let c = content.to_lowercase();
     let has = |kws: &[&str]| kws.iter().any(|k| c.contains(k));
@@ -1301,14 +1321,18 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
         // S5 — PRESERVE the authored executor (esp. "manual", the human-approval gate) so a
         // Run/recompile never drops it to "lens" (which made the package/human step EXECUTE
         // forever instead of pausing as a gate). A cell with a bound config keeps its
-        // executor; a brand-new/unconfigured cell defaults to "lens". Stable across recompiles
-        // because compile writes this executor back into the cell's pipeline config below.
+        // executor; a brand-new/unconfigured cell defaults by AUTHORED CONVENTION
+        // (REVIEW_LOOP_ONE_BOARD Stage 3): a step that says "placeholder" /
+        // "manual:" / "(manual)" is a HUMAN step (the Pro Tools / Resolve "done"
+        // placeholders — parked for Complete, never dispatched anywhere), and an
+        // "await … notes/review" step is the AWAIT-SENSE PARK (a human-shaped
+        // gate the app auto-approves when the reviewer's note is SENSED).
         let executor = cell
             .pipeline_config
             .as_ref()
             .map(|c| c.executor.clone())
             .filter(|e| !e.is_empty())
-            .unwrap_or_else(|| "lens".to_string());
+            .unwrap_or_else(|| infer_executor(&cell.content));
 
         let config = PipelineStepConfig {
             step_id: step_id.clone(),
@@ -1333,6 +1357,12 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or(json!({}));
         metadata["pipeline"] = serde_json::to_value(&config)?;
+        if is_await_sense(&cell.content) {
+            // The AWAIT-SENSE PARK marker: the app's live loop senses Frame.io
+            // notes while this gate is open and fires the SAME approve/resume
+            // machinery when one lands — the loop is one continuous pass.
+            metadata["await_sense"] = json!(true);
+        }
         if let Some(tool) = &media_tool {
             metadata["mcp_tool"] = json!({ "plugin_id": "cyan-media", "tool": tool });
         }

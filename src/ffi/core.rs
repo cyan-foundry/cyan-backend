@@ -4559,6 +4559,32 @@ pub extern "C" fn cyan_pipeline_run_step_local(
                 metadata["mcp_tool"]["args"][key] = v.clone();
             }
         }
+        // A media INPUT still unfilled resolves to the board's CONFORMED v2
+        // when the review loop has produced one — the "produce master" step
+        // renders from the frame-accurate conform output, never a stale
+        // source, and still with zero LLM involvement.
+        for key in ["input", "file_path"] {
+            if pending.iter().any(|p| p == key)
+                && metadata["mcp_tool"]["args"].get(key).is_none()
+            {
+                let v2: Option<String> = {
+                    let conn = crate::storage::db().lock_safe();
+                    let tenant = crate::review_loop::board_tenant(&conn, &board_id_str);
+                    crate::review_loop::current_proxy_ref(&conn, &tenant, &board_id_str)
+                        .ok()
+                        .flatten()
+                        .and_then(|pref| {
+                            crate::review_loop::review_media_info(&conn, &tenant, &pref).ok()
+                        })
+                        .and_then(|info| {
+                            info["derived_proxy_path"].as_str().map(str::to_string)
+                        })
+                };
+                if let Some(v2) = v2 {
+                    metadata["mcp_tool"]["args"][key] = serde_json::json!(v2);
+                }
+            }
+        }
     }
 
     let executor_type = metadata["pipeline"]["executor"].as_str().unwrap_or("local").to_string();

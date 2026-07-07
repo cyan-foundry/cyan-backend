@@ -731,8 +731,13 @@ fn step_is_approved(board_id: &str, step_id: &str) -> bool {
             Ok(v) => v,
             Err(_) => continue,
         };
+        // The approval survives two shapes: the settled status, OR the
+        // `approved: true` the coordinator carries onto its in-flight write (a
+        // side-effect re-dispatch runs immediately after the approve, and that
+        // write replaces the state object wholesale — found live, Stage 2).
         if v["pipeline"]["step_id"] == json!(step_id)
-            && v["pipeline"]["state"]["status"] == json!("human_approved")
+            && (v["pipeline"]["state"]["status"] == json!("human_approved")
+                || v["pipeline"]["state"]["approved"] == json!(true))
         {
             return true;
         }
