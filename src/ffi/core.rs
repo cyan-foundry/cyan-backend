@@ -4487,18 +4487,31 @@ pub extern "C" fn cyan_pipeline_run_step_local(
         None => return json_cstring(r#"{"success":false,"error":"Runtime not available"}"#),
     };
 
-    // Locate the compiled cell for this step and its metadata.
-    let (content, metadata): (String, serde_json::Value) = {
+    // Locate the compiled cell for this step and its metadata, plus every PRIOR
+    // step's persisted result (`pipeline.state.ai_result`) — the deterministic
+    // source for `pending` arg completion below.
+    let (content, mut metadata, upstream): (String, serde_json::Value, Vec<serde_json::Value>) = {
         let cells = crate::storage::cell_list_by_boards(std::slice::from_ref(&board_id_str))
             .unwrap_or_default();
-        let hit = cells.into_iter().find_map(|c| {
+        let mut found: Option<(String, serde_json::Value)> = None;
+        let mut upstream: Vec<serde_json::Value> = Vec::new();
+        for c in cells {
             let meta: serde_json::Value =
-                serde_json::from_str(c.metadata_json.as_deref().unwrap_or("{}")).ok()?;
-            (meta["pipeline"]["step_id"].as_str() == Some(step_id_str.as_str()))
-                .then(|| (c.content.unwrap_or_default(), meta))
-        });
-        match hit {
-            Some(v) => v,
+                serde_json::from_str(c.metadata_json.as_deref().unwrap_or("{}"))
+                    .unwrap_or(serde_json::Value::Null);
+            if meta["pipeline"]["step_id"].as_str() == Some(step_id_str.as_str()) {
+                found = Some((c.content.unwrap_or_default(), meta));
+                break; // cells arrive in cell_order — everything before is upstream
+            }
+            if let Some(res) = meta["pipeline"]["state"]["ai_result"].as_str()
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(res)
+                && v.is_object()
+            {
+                upstream.push(v);
+            }
+        }
+        match found {
+            Some((content, meta)) => (content, meta, upstream),
             None => {
                 return json_cstring(
                     r#"{"success":false,"error":"step not found (compile first)"}"#,
@@ -4508,6 +4521,26 @@ pub extern "C" fn cyan_pipeline_run_step_local(
     };
     if metadata.get("mcp_tool").is_none() {
         return json_cstring(r#"{"success":false,"error":"not_locally_bound"}"#);
+    }
+
+    // PENDING ARG COMPLETION (deterministic, zero-LLM): required props Review
+    // couldn't resolve fill from the LATEST upstream output carrying the key —
+    // e.g. `list_comments.file_id` from the upload step's `{"file_id": …}`.
+    // A prop still missing dispatches anyway; the plugin's own validation
+    // reports it clearly (never guessed, never routed to a model).
+    let pending: Vec<String> = metadata["mcp_tool"]["pending"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if !pending.is_empty() {
+        for key in &pending {
+            if metadata["mcp_tool"]["args"].get(key).is_some() {
+                continue;
+            }
+            if let Some(v) = upstream.iter().rev().find_map(|o| o.get(key)) {
+                metadata["mcp_tool"]["args"][key] = v.clone();
+            }
+        }
     }
 
     let executor_type = metadata["pipeline"]["executor"].as_str().unwrap_or("local").to_string();

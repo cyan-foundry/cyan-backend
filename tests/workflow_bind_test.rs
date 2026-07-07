@@ -302,12 +302,17 @@ fn review_time_bind_resolves_specific_file_and_inline_args() {
         other => panic!("expected Bound, got {other:?}"),
     }
 
-    // Missing required args ⇒ Miss (never guess) with the observable reason.
+    // Required args not resolvable at Review ⇒ still BOUND (mechanical by
+    // declaration), with the gaps stamped `pending` for dispatch-time
+    // completion from upstream outputs — never guessed by a model.
     match workflow_bind::bind_step(board, "push @testio.upload_file #sig_source.mp4") {
-        workflow_bind::BindOutcome::Miss { reason, .. } => {
-            assert_eq!(reason, "required_args_unresolved")
+        workflow_bind::BindOutcome::Bound(b) => {
+            assert_eq!(b.args["file_path"], "/data/files/feedfacecafe");
+            let mut pending = b.pending.clone();
+            pending.sort();
+            assert_eq!(pending, vec!["account_id".to_string(), "folder_id".to_string()]);
         }
-        other => panic!("expected Miss, got {other:?}"),
+        other => panic!("expected Bound with pending, got {other:?}"),
     }
 
     // Unknown tool ⇒ Miss tool_not_in_manifest.

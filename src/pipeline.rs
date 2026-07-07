@@ -1349,6 +1349,10 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
                     "tool": b.tool,
                     "args": b.args,
                     "side_effects": b.side_effects,
+                    // Required props not resolvable at Review: the dispatch fills
+                    // them from UPSTREAM step outputs by key (e.g. list_comments'
+                    // file_id from the upload step's result) — still zero-LLM.
+                    "pending": b.pending,
                     "bound": true,
                 });
                 if let Some(m) = metadata.as_object_mut() {

@@ -38,13 +38,18 @@ pub enum BindOutcome {
     None,
 }
 
-/// A fully-resolved deterministic bind.
+/// A resolved deterministic bind. `pending` lists required schema props not
+/// resolvable at Review time (inline/`#file`) — the dispatch fills them from
+/// UPSTREAM STEP OUTPUTS by exact key match (still deterministic, zero LLM;
+/// e.g. `list_comments.file_id` from the upload step's `{"file_id": …}`
+/// result). A prop still missing at dispatch is a CLEAR error, never a guess.
 #[derive(Debug, Clone)]
 pub struct StepBind {
     pub plugin_id: String,
     pub tool: String,
     pub args: Value,
     pub side_effects: Vec<String>,
+    pub pending: Vec<String>,
 }
 
 /// Parse the FIRST `@plugin`/`@plugin.tool` mention in `content`, if any.
@@ -212,30 +217,31 @@ pub fn bind_with_manifest(
         };
     };
 
-    match synthesize_args(board_id, tenant_id, &tool_block.input_schema, content) {
-        Some(args) => BindOutcome::Bound(StepBind {
-            plugin_id: manifest.name.clone(),
-            tool: tool_block.name.clone(),
-            args,
-            side_effects: tool_block.side_effects.clone(),
-        }),
-        None => BindOutcome::Miss {
-            mention: mention_str,
-            reason: "required_args_unresolved".to_string(),
-        },
-    }
+    // A resolved `@plugin.tool` mention is MECHANICAL by declaration — it always
+    // binds locally. Required args that inline/`#file` can't fill are stamped
+    // `pending` for the dispatch to resolve from upstream step outputs (a model
+    // must NEVER guess a mechanical tool's args — that was the wrong-file bug).
+    let (args, pending) = synthesize_args(board_id, tenant_id, &tool_block.input_schema, content);
+    BindOutcome::Bound(StepBind {
+        plugin_id: manifest.name.clone(),
+        tool: tool_block.name.clone(),
+        args,
+        side_effects: tool_block.side_effects.clone(),
+        pending,
+    })
 }
 
 /// Build the bound tool's `args` from deterministic sources only: inline
 /// `key=value` tokens, then `#file` references resolved to the board's real
-/// rows (path prop + a `name` default). `None` if any `required` prop remains
-/// unfilled — the caller degrades to the lens path rather than guessing.
+/// rows (path prop + a `name` default). Returns `(args, pending)` where
+/// `pending` = required props still unfilled (the dispatch resolves them from
+/// upstream outputs by key; missing there ⇒ a clear error, never a guess).
 fn synthesize_args(
     board_id: &str,
     tenant_id: &str,
     input_schema: &Value,
     content: &str,
-) -> Option<Value> {
+) -> (Value, Vec<String>) {
     let properties = input_schema
         .get("properties")
         .and_then(Value::as_object)
@@ -288,10 +294,12 @@ fn synthesize_args(
         }
     }
 
-    if required.iter().any(|r| !args.contains_key(*r)) {
-        return None;
-    }
-    Some(Value::Object(args))
+    let pending: Vec<String> = required
+        .iter()
+        .filter(|r| !args.contains_key(**r))
+        .map(|r| r.to_string())
+        .collect();
+    (Value::Object(args), pending)
 }
 
 /// `key=value` tokens in the step text (single-token values; quotes trimmed) —
