@@ -1334,6 +1334,19 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
             .filter(|e| !e.is_empty())
             .unwrap_or_else(|| infer_executor(&cell.content));
 
+        // Rung-1 DETERMINISTIC BIND runs FIRST so the step's config carries the
+        // TRUTH of where it executes. `command` is the authoring surface's
+        // route label — for a bound step it must read `@plugin.tool`, never the
+        // "cyan-lens" placeholder (found live: every bound step displayed
+        // "unbound + send to AI (Lens)" because the view only had the
+        // placeholder to render).
+        let bind_outcome = crate::workflow_bind::bind_step(board_id, &cell.content);
+        let bound_command = match &bind_outcome {
+            crate::workflow_bind::BindOutcome::Bound(b) =>
+                Some(format!("@{}.{}", b.plugin_id, b.tool)),
+            _ => None,
+        };
+
         let config = PipelineStepConfig {
             step_id: step_id.clone(),
             depends_on: prev_step_id.clone().into_iter().collect(),
@@ -1343,7 +1356,7 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
             model_config: None,
             tools: media_tool.iter().cloned().collect(),
             output_format: "markdown".to_string(),
-            command: None,
+            command: bound_command,
             timeout_seconds: Some(300),
             retry_count: Some(1),
             auto_advance: false,
@@ -1368,11 +1381,11 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
         }
         // Rung-1 DETERMINISTIC BIND (the load-bearing fix): an `@plugin.tool`
         // step whose required args resolve from inline `key=value` + `#file`
-        // references binds HERE, at Review time — the run path dispatches it
+        // references binds at Review time — the run path dispatches it
         // through the LOCAL cyan-mcp host with zero LLM turns, so the
         // mechanical spine never needs the GPU. A miss is stamped for
         // authoring feedback and the step stays on the lens path (creative).
-        match crate::workflow_bind::bind_step(board_id, &cell.content) {
+        match bind_outcome {
             crate::workflow_bind::BindOutcome::Bound(b) => {
                 metadata["mcp_tool"] = json!({
                     "plugin_id": b.plugin_id,

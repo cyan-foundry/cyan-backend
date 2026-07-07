@@ -1609,67 +1609,120 @@ pub fn plugin_bundles_dir() -> PathBuf {
     PathBuf::from(home).join(".cyan").join("plugins")
 }
 
+/// Marker file stamped inside an unpacked bundle dir: the blake3 of the EXACT
+/// `.cyanplugin` bytes it was extracted from. Content-addressed freshness — the
+/// only trustworthy oracle here, because tar RESTORES the archive's stored (old)
+/// mtimes on extraction, so the installed bundle file is "newer" than its own
+/// unpack forever and an mtime comparison re-extracts on every call.
+const BUNDLE_HASH_MARKER: &str = ".cyan_bundle_hash";
+
+/// Serializes unpack work process-wide. `ensure_bundle_unpacked` is called from
+/// every `@` autocomplete keystroke, every Review-time bind, and every spawn —
+/// concurrently. Unserialized, two tar extractions into the same dir collide
+/// ("Can't create …: File exists") and a reader sees a HALF-EXTRACTED manifest
+/// (found live 2026-07-07: installed plugins intermittently failed to bind).
+static UNPACK_LOCK: Mutex<()> = Mutex::new(());
+
 /// Ensure the installed bundle for `plugin_id` is UNPACKED at
 /// `plugin_bundles_dir()/<plugin_id>/` so the on-device MCP host (registry index,
 /// tool autocomplete, rung-1 binding, spawn) can read its manifest. Best-effort
 /// by design: a bundle that fails to unpack/parse degrades to "not locally
 /// dispatchable" (the step stays on the lens path) — it must never fail the
 /// install that recorded the file row.
+///
+/// Hardened (Tier 0, 2026-07-07):
+///   * SHORT-CIRCUIT is content-addressed: the unpack stands iff its
+///     `.cyan_bundle_hash` marker equals the bundle's current blake3 AND the
+///     manifest parses (a corrupt/partial unpack self-heals on the next call).
+///   * REFRESH is atomic: extract into a temp sibling, verify the manifest,
+///     stamp the marker, then swap into place — a concurrent reader never sees
+///     a half-written manifest, and spawn debris in the old dir (`.venv`) can
+///     never fail the extraction (tar-over-existing-dir did, found live).
+///   * All unpack work is serialized process-wide (`UNPACK_LOCK`).
 pub fn ensure_bundle_unpacked(plugin_id: &str) -> Option<PathBuf> {
     let root = plugin_bundles_dir();
     let dest = root.join(plugin_id);
     let bundle = root.join(format!("{plugin_id}{}", crate::mcp_host::PLUGIN_BUNDLE_SUFFIX));
-    let manifest = [dest.join("manifest.json"), dest.join("manifest.yaml")]
-        .into_iter()
-        .find(|p| p.is_file());
-    if let Some(manifest) = manifest {
-        // FRESHNESS: a RE-installed bundle (its file is newer than the unpacked
-        // manifest) must refresh the unpack, or a plugin update never lands its
-        // new tools on the device. Same-or-older bundle ⇒ the unpack stands.
-        let bundle_newer = match (bundle.metadata(), manifest.metadata()) {
-            (Ok(b), Ok(m)) => match (b.modified(), m.modified()) {
-                (Ok(bt), Ok(mt)) => bt > mt,
-                _ => false,
-            },
-            _ => false,
-        };
-        if !bundle_newer {
-            return Some(dest);
-        }
-    }
+
+    let _guard = UNPACK_LOCK.lock_safe();
+
+    // No bundle file: a pre-placed dir with a valid manifest is still usable
+    // (dev drop-ins); otherwise there is nothing to unpack.
     if !bundle.is_file() {
+        return cyan_mcp::Manifest::from_bundle(&dest).ok().map(|_| dest);
+    }
+    let bundle_hash = match std::fs::read(&bundle) {
+        Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
+        Err(e) => {
+            tracing::warn!("ensure_bundle_unpacked({plugin_id}): read bundle: {e}");
+            return None;
+        }
+    };
+
+    // Fast path: same bytes already unpacked AND readable — nothing to do.
+    // (`.venv` and other spawn debris in the dir is expected and preserved.)
+    let marker = dest.join(BUNDLE_HASH_MARKER);
+    if std::fs::read_to_string(&marker).is_ok_and(|h| h.trim() == bundle_hash)
+        && cyan_mcp::Manifest::from_bundle(&dest).is_ok()
+    {
+        return Some(dest);
+    }
+
+    // Refresh: extract into a TEMP sibling under the same root (same volume ⇒
+    // rename is atomic), verify, stamp, swap. bsdtar without -P already refuses
+    // absolute and `..`-traversing member paths, so extraction cannot escape
+    // the plugins root. The served bundle is a POSIX tar whose single top-level
+    // dir is the plugin id (verified against the live forge artifact).
+    let staging = root.join(format!(".unpack-{plugin_id}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    if let Err(e) = std::fs::create_dir_all(&staging) {
+        tracing::warn!("ensure_bundle_unpacked({plugin_id}): staging dir: {e}");
         return None;
     }
-    // The served bundle is a POSIX tar whose single top-level dir is the plugin
-    // id (verified against the live forge artifact). bsdtar without -P already
-    // refuses absolute and `..`-traversing member paths, so extraction cannot
-    // escape the plugins root.
     let status = std::process::Command::new("/usr/bin/tar")
         .arg("-xf")
         .arg(&bundle)
         .arg("-C")
-        .arg(&root)
+        .arg(&staging)
         .status();
+    let cleanup = |reason: &str| {
+        tracing::warn!("ensure_bundle_unpacked({plugin_id}): {reason}");
+        let _ = std::fs::remove_dir_all(&staging);
+    };
     match status {
         Ok(s) if s.success() => {}
         Ok(s) => {
-            tracing::warn!("ensure_bundle_unpacked({plugin_id}): tar exited {s}");
+            cleanup(&format!("tar exited {s}"));
             return None;
         }
         Err(e) => {
-            tracing::warn!("ensure_bundle_unpacked({plugin_id}): spawn tar: {e}");
+            cleanup(&format!("spawn tar: {e}"));
             return None;
         }
     }
-    // Only report unpacked if the manifest actually parses — a bundle the
-    // registry can't index is not locally dispatchable.
-    match cyan_mcp::Manifest::from_bundle(&dest) {
-        Ok(_) => Some(dest),
-        Err(e) => {
-            tracing::warn!("ensure_bundle_unpacked({plugin_id}): manifest: {e}");
-            None
-        }
+    let extracted = staging.join(plugin_id);
+    // Only swap in a bundle the registry can index — otherwise the previous
+    // (still-valid) unpack keeps serving.
+    if let Err(e) = cyan_mcp::Manifest::from_bundle(&extracted) {
+        cleanup(&format!("manifest: {e}"));
+        return cyan_mcp::Manifest::from_bundle(&dest).ok().map(|_| dest);
     }
+    if let Err(e) = std::fs::write(extracted.join(BUNDLE_HASH_MARKER), &bundle_hash) {
+        cleanup(&format!("write marker: {e}"));
+        return None;
+    }
+    if dest.exists()
+        && let Err(e) = std::fs::remove_dir_all(&dest)
+    {
+        cleanup(&format!("clear old unpack: {e}"));
+        return None;
+    }
+    if let Err(e) = std::fs::rename(&extracted, &dest) {
+        cleanup(&format!("swap unpack into place: {e}"));
+        return None;
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+    Some(dest)
 }
 
 /// Install a `.cyanplugin` bundle into a group's "Plugins" workspace as a real

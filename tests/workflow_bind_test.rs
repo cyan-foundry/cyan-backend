@@ -462,6 +462,183 @@ fn spawn_config_maps_python_uv_and_injects_creds() {
     }
 }
 
+/// TIER 0 (found live 2026-07-07): the unpack freshness oracle must be the
+/// BUNDLE'S CONTENT, never mtimes — tar restores the archive's stored (old)
+/// mtimes, so "bundle newer than manifest" was true FOREVER after any install
+/// and every autocomplete keystroke / Review bind re-ran tar over a live dir.
+/// Once the plugin had SPAWNED (uv drops `.venv` inside the unpacked dir), the
+/// re-tar collided and the manifest became intermittently unreadable — the
+/// installed plugin stopped binding in the live app.
+#[test]
+fn unpack_short_circuits_on_same_bundle_and_survives_spawn_debris() {
+    ensure_db();
+    let group = "bind-group-debris";
+    create_fresh_group(group, "Debris Group");
+    let tar = make_bundle_tar("debrio");
+    storage::install_plugin_bundle(group, "debrio", &tar).expect("install");
+    let dir = storage::ensure_bundle_unpacked("debrio").expect("unpacked");
+
+    // Reproduce the live dir state: a spawn dropped `.venv` (with a symlink)
+    // into the unpack, and the manifest's restored mtime is far OLDER than the
+    // bundle file (tar restores archived mtimes — the live smoking gun).
+    let venv_bin = dir.join(".venv").join("bin");
+    std::fs::create_dir_all(&venv_bin).expect("venv dirs");
+    std::os::unix::fs::symlink("/usr/bin/true", venv_bin.join("python")).expect("venv symlink");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+    let manifest = dir.join("manifest.json");
+    let f = std::fs::File::options().append(true).open(&manifest).expect("open manifest");
+    f.set_modified(old).expect("age manifest");
+    drop(f);
+
+    // Same bundle bytes ⇒ the unpack STANDS: no re-extract, spawn debris intact.
+    let again = storage::ensure_bundle_unpacked("debrio").expect("short-circuit");
+    assert_eq!(again, dir);
+    assert!(
+        venv_bin.join("python").symlink_metadata().is_ok(),
+        "a same-content call must not re-extract (the spawn's .venv survives)"
+    );
+
+    // A CORRUPT unpack self-heals from the bundle even with debris present.
+    std::fs::write(&manifest, b"{ definitely not json }").expect("corrupt manifest");
+    let healed = storage::ensure_bundle_unpacked("debrio").expect("self-heal");
+    let m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(healed.join("manifest.json")).expect("read"))
+            .expect("healed manifest parses");
+    assert_eq!(m["name"], "debrio");
+}
+
+/// TIER 0 — the live call pattern: autocomplete (every keystroke), Review-time
+/// binds, and installs all hit `ensure_bundle_unpacked` CONCURRENTLY. Every
+/// caller must receive a directory whose manifest parses — a half-extracted
+/// manifest visible to a reader is exactly the live "installed plugin won't
+/// bind" failure.
+#[test]
+fn concurrent_unpack_callers_always_get_a_readable_manifest() {
+    ensure_db();
+    let group = "bind-group-race";
+    create_fresh_group(group, "Race Group");
+    let tar = make_bundle_tar("racio");
+    storage::install_plugin_bundle(group, "racio", &tar).expect("install");
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Chaos writer: keep deleting the freshness marker so readers must re-extract.
+    let chaos = {
+        let stop = stop.clone();
+        let marker = storage::plugin_bundles_dir().join("racio").join(".cyan_bundle_hash");
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = std::fs::remove_file(&marker);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })
+    };
+    let readers: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(|| {
+                for _ in 0..25 {
+                    let dir = storage::ensure_bundle_unpacked("racio")
+                        .expect("every concurrent caller gets an unpacked dir");
+                    cyan_mcp::Manifest::from_bundle(&dir)
+                        .expect("every concurrent caller reads a WHOLE manifest");
+                }
+            })
+        })
+        .collect();
+    for r in readers {
+        r.join().expect("reader thread");
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    chaos.join().expect("chaos thread");
+}
+
+/// TIER 0 — the Review (compile) pass must stamp ENGINE TRUTH the authoring
+/// surface can render: a bound step's `pipeline.command` reads `@plugin.tool`
+/// and `metadata.mcp_tool.bound == true`; a step naming an UNINSTALLED plugin
+/// stamps `mcp_tool_miss` with the actionable reason. (Found live: the view
+/// only had the "cyan-lens" placeholder, so every step displayed
+/// "unbound + send to AI (Lens)" even when the engine had bound it.)
+#[test]
+fn compile_stamps_bound_tool_command_and_miss_reason() {
+    ensure_db();
+    let group = "bind-group-compile";
+    let (default_ws, _) = create_fresh_group(group, "Compile Group");
+    let board = "bind-board-compile";
+    storage::board_insert(board, &default_ws, "Compile Board", chrono::Utc::now().timestamp())
+        .expect("board insert");
+    let tar = make_bundle_tar("testio");
+    storage::install_plugin_bundle(group, "testio", &tar).expect("install");
+    storage::file_insert(
+        "compile-clip",
+        Some(group),
+        Some(&default_ws),
+        Some(board),
+        "cut_v1.mp4",
+        "c0ffee01",
+        7,
+        "peer",
+        1,
+    )
+    .expect("file insert");
+    storage::file_set_local_path("compile-clip", "/data/files/c0ffee01").expect("path");
+
+    storage::cell_insert(
+        "cell-bound",
+        board,
+        "step",
+        0,
+        Some("push the cut @testio.upload_file account_id=a folder_id=f #cut_v1.mp4"),
+    )
+    .expect("cell 1");
+    storage::cell_insert(
+        "cell-miss",
+        board,
+        "step",
+        1,
+        Some("publish via @notinstalled.publish now"),
+    )
+    .expect("cell 2");
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let out = rt
+        .block_on(cyan_backend::pipeline::compile_via_llm(board, &tx))
+        .expect("compile succeeds");
+    assert_eq!(out["applied"], 2);
+
+    let mut by_cell: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    while let Ok(msg) = rx.try_recv() {
+        if let cyan_backend::models::commands::CommandMsg::UpdateNotebookCell {
+            id,
+            metadata_json: Some(meta),
+            ..
+        } = msg
+        {
+            by_cell.insert(id, serde_json::from_str(&meta).expect("metadata json"));
+        }
+    }
+
+    let bound = &by_cell["cell-bound"];
+    assert_eq!(bound["mcp_tool"]["bound"], true, "engine truth: bound");
+    assert_eq!(bound["mcp_tool"]["plugin_id"], "testio");
+    assert_eq!(bound["mcp_tool"]["tool"], "upload_file");
+    assert_eq!(
+        bound["pipeline"]["command"], "@testio.upload_file",
+        "the config's command must carry the REAL route for the authoring surface"
+    );
+
+    let miss = &by_cell["cell-miss"];
+    assert_eq!(miss["mcp_tool_miss"]["mention"], "@notinstalled.publish");
+    assert_eq!(miss["mcp_tool_miss"]["reason"], "plugin_not_installed_in_group");
+    assert!(
+        miss["pipeline"]["command"].is_null(),
+        "a missed mention must not fabricate a command"
+    );
+}
+
 /// A RE-installed (newer) bundle refreshes the unpack — a plugin update must
 /// land its new tools on the device (the old short-circuit kept the stale
 /// manifest forever).
