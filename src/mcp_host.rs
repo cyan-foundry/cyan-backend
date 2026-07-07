@@ -276,7 +276,7 @@ pub fn cred_env_var(plugin_name: &str, provider: &str) -> String {
 }
 
 /// Uppercase + squash non-alphanumerics to `_` (env-var-safe).
-fn env_token(s: &str) -> String {
+pub(crate) fn env_token(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() {

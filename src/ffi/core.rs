@@ -4559,6 +4559,21 @@ pub extern "C" fn cyan_pipeline_run_step_local(
                 metadata["mcp_tool"]["args"][key] = v.clone();
             }
         }
+        // ENV-CONTEXT fallback at dispatch too (heals a bind compiled before
+        // the env existed): the plugin's ambient identity, e.g. frameio's
+        // FRAMEIO_ACCOUNT_ID — the same context its token is injected from.
+        let plugin_id = metadata["mcp_tool"]["plugin_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        for key in &pending {
+            if metadata["mcp_tool"]["args"].get(key).is_none()
+                && let Some(v) = crate::workflow_bind::env_context_value(&plugin_id, key)
+            {
+                metadata["mcp_tool"]["args"][key] = serde_json::json!(v);
+            }
+        }
+
         // A media INPUT still unfilled resolves to the board's CONFORMED v2
         // when the review loop has produced one — the "produce master" step
         // renders from the frame-accurate conform output, never a stale

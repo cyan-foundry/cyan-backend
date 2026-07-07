@@ -343,6 +343,98 @@ fn review_time_bind_resolves_specific_file_and_inline_args() {
     ));
 }
 
+/// The create_comment shape (found live): required [account_id, file_id, text] —
+/// `account_id` resolves from the plugin's ENV CONTEXT (the same context the
+/// spawn injects the token from), `text` from the authored intent, and only
+/// `file_id` stays pending for the upstream (upload output) fill. Without this,
+/// a locally-bound comment "completed" while posting NOTHING to Frame.io.
+#[test]
+fn comment_binds_account_from_env_context_and_text_from_intent() {
+    ensure_db();
+    let group = "bind-group-env";
+    let (default_ws, _) = create_fresh_group(group, "Env Group");
+    let board = "bind-board-env";
+    storage::board_insert(board, &default_ws, "Env Board", chrono::Utc::now().timestamp())
+        .expect("board insert");
+    // env-context isolation: match the workflow_bind test plugin id below.
+    unsafe { std::env::set_var("ENVIO_ACCOUNT_ID", "acct-from-env") };
+
+    let manifest_json = serde_json::json!({
+        "name": "envio",
+        "version": "0.1.0",
+        "description": "env-context test plugin",
+        "runtime": "python-uv",
+        "credentials": null,
+        "extra_credentials": [],
+        "events_emitted": [],
+        "tools": [{
+            "name": "create_comment",
+            "when_to_use": "Leave a review comment.",
+            "aliases": [],
+            "io_types": { "input": ["json"], "output": ["json"] },
+            "stage": "review",
+            "side_effects": ["external_send"],
+            "locality": "local",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "account_id": {"type": "string"},
+                    "file_id": {"type": "string"},
+                    "text": {"type": "string"},
+                    "timestamp": {}
+                },
+                "required": ["account_id", "file_id", "text"]
+            },
+            "output_schema": {"type": "object"}
+        }]
+    });
+    let manifest: cyan_mcp::Manifest =
+        serde_json::from_value(manifest_json).expect("strict manifest");
+    let mention = workflow_bind::parse_mention(
+        "tell the reviewer the v2 is up @envio.create_comment timestamp=60",
+    )
+    .expect("mention");
+    match workflow_bind::bind_with_manifest(
+        board,
+        group,
+        "tell the reviewer the v2 is up @envio.create_comment timestamp=60",
+        &mention,
+        &manifest,
+    ) {
+        workflow_bind::BindOutcome::Bound(b) => {
+            assert_eq!(b.args["account_id"], "acct-from-env", "env-context fill");
+            assert_eq!(
+                b.args["text"], "tell the reviewer the v2 is up",
+                "the authored intent is the comment body"
+            );
+            assert_eq!(b.args["timestamp"], "60");
+            assert_eq!(
+                b.pending,
+                vec!["file_id".to_string()],
+                "only the upstream-fed file_id stays pending"
+            );
+        }
+        other => panic!("expected Bound, got {other:?}"),
+    }
+
+    // An INLINE account_id/text always wins over the env/intent fallback.
+    match workflow_bind::bind_with_manifest(
+        board,
+        group,
+        "note @envio.create_comment account_id=inline-a text=inline-note file_id=f1",
+        &workflow_bind::parse_mention("@envio.create_comment").expect("m"),
+        &manifest,
+    ) {
+        workflow_bind::BindOutcome::Bound(b) => {
+            assert_eq!(b.args["account_id"], "inline-a");
+            assert_eq!(b.args["text"], "inline-note");
+            assert!(b.pending.is_empty());
+        }
+        other => panic!("expected Bound, got {other:?}"),
+    }
+    unsafe { std::env::remove_var("ENVIO_ACCOUNT_ID") };
+}
+
 #[test]
 fn spawn_config_maps_python_uv_and_injects_creds() {
     ensure_db();

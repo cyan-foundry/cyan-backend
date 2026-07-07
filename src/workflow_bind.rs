@@ -119,6 +119,34 @@ pub fn resolve_file_ref(board_id: &str, tenant_id: &str, reference: &str) -> Opt
 /// required one wins). Kept tiny and explicit — deterministic, never fuzzy.
 const FILE_PATH_PROPS: [&str; 3] = ["file_path", "input", "path"];
 
+/// The plugin's ENV CONTEXT for a still-unfilled prop — the same context its
+/// credential is injected from at spawn, by the shared convention
+/// `<PLUGIN>_<PROP>` uppercased: `frameio` + `account_id` → `FRAMEIO_ACCOUNT_ID`.
+/// This is how a mechanical step inherits ambient account identity without the
+/// author re-typing it on every step (found live: create_comment bound with
+/// `account_id` pending, nothing upstream carried the key, and the comment
+/// never posted).
+pub fn env_context_value(plugin_id: &str, prop: &str) -> Option<String> {
+    let var = format!(
+        "{}_{}",
+        crate::mcp_host::env_token(plugin_id),
+        crate::mcp_host::env_token(prop)
+    );
+    std::env::var(&var).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// The step's authored INTENT: the English minus the `@mention`, the inline
+/// `key=value` tokens, and the `#file` references — what a human reads as "the
+/// message". Fills an unfilled `text` prop (create_comment's note body) so the
+/// comment the reviewer sees is the sentence the author wrote, deterministically.
+pub fn step_intent(content: &str) -> String {
+    content
+        .split_whitespace()
+        .filter(|t| !t.starts_with('@') && !t.starts_with('#') && !t.contains('='))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Deterministically bind one authored step for a board.
 ///
 /// Rung-1 ladder, all pure lookups:
@@ -221,7 +249,13 @@ pub fn bind_with_manifest(
     // binds locally. Required args that inline/`#file` can't fill are stamped
     // `pending` for the dispatch to resolve from upstream step outputs (a model
     // must NEVER guess a mechanical tool's args — that was the wrong-file bug).
-    let (args, pending) = synthesize_args(board_id, tenant_id, &tool_block.input_schema, content);
+    let (args, pending) = synthesize_args(
+        board_id,
+        tenant_id,
+        &manifest.name,
+        &tool_block.input_schema,
+        content,
+    );
     BindOutcome::Bound(StepBind {
         plugin_id: manifest.name.clone(),
         tool: tool_block.name.clone(),
@@ -239,6 +273,7 @@ pub fn bind_with_manifest(
 fn synthesize_args(
     board_id: &str,
     tenant_id: &str,
+    plugin_id: &str,
     input_schema: &Value,
     content: &str,
 ) -> (Value, Vec<String>) {
@@ -291,6 +326,28 @@ fn synthesize_args(
         // when the schema declares it — most tools don't.
         if properties.contains_key("file_hash") && !args.contains_key("file_hash") {
             args.insert("file_hash".to_string(), json!(file.hash));
+        }
+    }
+
+    // ENV-CONTEXT fallback for required props the author didn't inline — the
+    // plugin's ambient identity (e.g. frameio's FRAMEIO_ACCOUNT_ID, the same
+    // context its token is injected from at spawn). Required-only: an optional
+    // prop from env would surprise; a required one unblocks the bind.
+    for r in &required {
+        if !args.contains_key(*r)
+            && let Some(v) = env_context_value(plugin_id, r)
+        {
+            args.insert((*r).to_string(), json!(v));
+        }
+    }
+
+    // The COMMENT/MESSAGE body: an unfilled `text` prop takes the authored
+    // intent (the step's English minus mention/kv/#ref tokens) — the reviewer
+    // reads the sentence the author wrote, never an empty post.
+    if properties.contains_key("text") && !args.contains_key("text") {
+        let intent = step_intent(content);
+        if !intent.is_empty() {
+            args.insert("text".to_string(), json!(intent));
         }
     }
 
