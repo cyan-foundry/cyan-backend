@@ -144,7 +144,13 @@ pub fn autocomplete_index(board_id: &str) -> AutocompleteIndex {
         if let Some(bundle_dir) = storage::ensure_bundle_unpacked(&plugin_id)
             && let Ok(manifest) = cyan_mcp::Manifest::from_bundle(&bundle_dir)
         {
-            for tool in &manifest.tools {
+            // CURATED tools first (upload_file, list_comments, …) — the raw
+            // machine-generated endpoint names (get_v4_…/post_v4_…) rank last
+            // so they never crowd the flagship verbs out of the picker's
+            // visible rows (the UI shows 6).
+            let mut tools: Vec<&cyan_mcp::ToolBlock> = manifest.tools.iter().collect();
+            tools.sort_by_key(|t| (is_generated_tool_name(&t.name), t.name.clone()));
+            for tool in tools {
                 plugins.push(AutocompleteEntry {
                     trigger: '@',
                     kind: "tool".to_string(),
@@ -335,6 +341,16 @@ pub fn filter_autocomplete(board_id: &str, partial: &str) -> AutocompleteIndex {
         _ => {}
     }
     idx
+}
+
+/// True for a machine-generated (OpenAPI path-shaped) tool name like
+/// `get_v4_accounts_account_id_files_file_id_comments` — real tools, but they
+/// rank BELOW curated names in the picker.
+fn is_generated_tool_name(name: &str) -> bool {
+    ["get_", "post_", "put_", "patch_", "delete_"]
+        .iter()
+        .any(|m| name.starts_with(m))
+        && name.contains("_v4_")
 }
 
 /// First non-empty line of a step's text, trimmed — the artifact display label.
