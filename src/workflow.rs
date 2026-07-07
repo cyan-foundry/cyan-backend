@@ -117,40 +117,70 @@ pub fn autocomplete_index(board_id: &str) -> AutocompleteIndex {
         .filter(|g| !g.is_empty())
         .unwrap_or_else(|| "device".to_string());
 
-    // @ — installed plugins in this tenant's Plugins workspace.
-    let plugins = storage::plugin_bundles_in_group(
+    // @ — installed plugins in this tenant's Plugins workspace, PLUS each
+    // plugin's manifest tools (`@plugin.tool`) read from the unpacked bundle —
+    // the per-group answer to "`@frameio.` shows no functions". The plugin list
+    // is the group's installed set; the tool list comes from the device registry
+    // (unpacked on install, lazily unpacked here for swarm-fetched bundles).
+    let mut plugins: Vec<AutocompleteEntry> = Vec::new();
+    for p in storage::plugin_bundles_in_group(
         &tenant_id,
         PLUGINS_WORKSPACE_NAME,
         PLUGIN_BUNDLE_SUFFIX,
     )
     .unwrap_or_default()
-    .into_iter()
-    .map(|p| {
-        let value = p
+    {
+        let plugin_id = p
             .name
             .strip_suffix(PLUGIN_BUNDLE_SUFFIX)
             .unwrap_or(&p.name)
             .to_string();
-        AutocompleteEntry {
+        plugins.push(AutocompleteEntry {
             trigger: '@',
             kind: "plugin".to_string(),
-            value,
-            label: p.name,
+            value: plugin_id.clone(),
+            label: p.name.clone(),
+        });
+        if let Some(bundle_dir) = storage::ensure_bundle_unpacked(&plugin_id)
+            && let Ok(manifest) = cyan_mcp::Manifest::from_bundle(&bundle_dir)
+        {
+            for tool in &manifest.tools {
+                plugins.push(AutocompleteEntry {
+                    trigger: '@',
+                    kind: "tool".to_string(),
+                    value: format!("{plugin_id}.{}", tool.name),
+                    label: tool.when_to_use.clone(),
+                });
+            }
         }
-    })
-    .collect();
+    }
 
-    // # — the tenant's files, then this board's prior-step outputs.
-    let mut artifacts: Vec<AutocompleteEntry> = storage::file_list_by_group(&tenant_id)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|f| AutocompleteEntry {
+    // # — this board's files FIRST, then the tenant's, deduped by content hash
+    // (same bytes = one entry) and listed by NAME (the value inserted into the
+    // step text is the file NAME the author can read, not an opaque id; binding
+    // resolves it back to the row). A name with whitespace falls back to the id
+    // so the inserted token survives whitespace-delimited parsing.
+    let mut artifacts: Vec<AutocompleteEntry> = Vec::new();
+    let mut seen_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let board_files = storage::file_list_by_board(board_id).unwrap_or_default();
+    let group_files = storage::file_list_by_group(&tenant_id).unwrap_or_default();
+    for f in board_files.into_iter().chain(group_files) {
+        let dedup_key = if f.hash.is_empty() { f.id.clone() } else { f.hash.clone() };
+        if !seen_files.insert(dedup_key) {
+            continue;
+        }
+        let value = if !f.name.is_empty() && !f.name.contains(char::is_whitespace) {
+            f.name.clone()
+        } else {
+            f.id.clone()
+        };
+        artifacts.push(AutocompleteEntry {
             trigger: '#',
             kind: "file".to_string(),
-            value: f.id,
+            value,
             label: f.name,
-        })
-        .collect();
+        });
+    }
 
     for c in storage::cell_list_by_boards(&[board_id.to_string()]).unwrap_or_default() {
         if c.output.as_deref().map(|o| !o.is_empty()).unwrap_or(false) {
