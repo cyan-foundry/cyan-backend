@@ -1336,6 +1336,30 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
         if let Some(tool) = &media_tool {
             metadata["mcp_tool"] = json!({ "plugin_id": "cyan-media", "tool": tool });
         }
+        // Rung-1 DETERMINISTIC BIND (the load-bearing fix): an `@plugin.tool`
+        // step whose required args resolve from inline `key=value` + `#file`
+        // references binds HERE, at Review time — the run path dispatches it
+        // through the LOCAL cyan-mcp host with zero LLM turns, so the
+        // mechanical spine never needs the GPU. A miss is stamped for
+        // authoring feedback and the step stays on the lens path (creative).
+        match crate::workflow_bind::bind_step(board_id, &cell.content) {
+            crate::workflow_bind::BindOutcome::Bound(b) => {
+                metadata["mcp_tool"] = json!({
+                    "plugin_id": b.plugin_id,
+                    "tool": b.tool,
+                    "args": b.args,
+                    "side_effects": b.side_effects,
+                    "bound": true,
+                });
+                if let Some(m) = metadata.as_object_mut() {
+                    m.remove("mcp_tool_miss");
+                }
+            }
+            crate::workflow_bind::BindOutcome::Miss { mention, reason } => {
+                metadata["mcp_tool_miss"] = json!({ "mention": mention, "reason": reason });
+            }
+            crate::workflow_bind::BindOutcome::None => {}
+        }
 
         let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
             id: cell.cell_id.clone(),

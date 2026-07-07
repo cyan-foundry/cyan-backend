@@ -1942,6 +1942,7 @@ pub mod tests {
 pub mod pipeline;
 pub mod seed;
 pub mod workflow;
+pub mod workflow_bind;
 pub mod templates;
 pub mod timecode_notes;
 pub mod changelist;
