@@ -683,7 +683,7 @@ use std::sync::Arc;
 /// Parse an optional `McpTool` step from a step's metadata:
 /// `{ "mcp_tool": { "plugin_id": ..., "tool": ..., "args": {...} } }`.
 /// `None` (the common case) means an ordinary step — the caller falls through.
-fn parse_mcp_tool_step(metadata: &serde_json::Value) -> Option<McpTool> {
+pub(crate) fn parse_mcp_tool_step(metadata: &serde_json::Value) -> Option<McpTool> {
     let spec = metadata.get("mcp_tool")?;
     Some(McpTool {
         plugin_id: spec.get("plugin_id")?.as_str()?.to_string(),
@@ -747,7 +747,7 @@ fn step_is_approved(board_id: &str, step_id: &str) -> bool {
 /// when gated) so the dashboard read-model lights up for on-device plugin steps
 /// exactly as it does for cloud steps (DASHBOARD_CONTRACT §A/§C). The plugin's
 /// JSON result becomes a finding so the step produces a reviewable result.
-async fn execute_local_mcp_tool_step(
+pub(crate) async fn execute_local_mcp_tool_step(
     board_id: &str,
     step_id: &str,
     mut step: McpTool,
@@ -818,23 +818,22 @@ async fn execute_local_mcp_tool_step(
 
     let approved = step_is_approved(board_id, step_id);
     let scope = RunScope {
-        tenant_id: tenant,
+        tenant_id: tenant.clone(),
         run_id: step_id.to_string(),
     };
     let ledger = RunCostLedger::new();
 
     // Spawn the plugin process LAZILY: a gated tool is never spawned (the closure
-    // only runs when `dispatch_mcp_tool` decides to execute).
+    // only runs when `dispatch_mcp_tool` decides to execute). The launch command
+    // comes from the bundle manifest's runtime; credentials (e.g. the frameio
+    // FRAMEIO_IMS_TOKEN) are injected at spawn from the device env — never stored.
     let bundle_dir = root.join(&step.plugin_id);
     let plugin_id = step.plugin_id.clone();
+    let spawn_tenant = tenant.clone();
     let connect = move || -> Result<Box<dyn cyan_mcp::PluginTransport>> {
+        let config =
+            crate::mcp_host::bundle_spawn_config(&plugin_id, &bundle_dir, &spawn_tenant)?;
         let mut transport = cyan_mcp::StdioTransport::new();
-        let config = cyan_mcp::SpawnConfig {
-            plugin_id: plugin_id.clone(),
-            command: bundle_dir.join("run").to_string_lossy().to_string(),
-            args: vec![],
-            creds: vec![],
-        };
         transport
             .spawn(&config)
             .map_err(|e| anyhow!("spawn plugin {}: {}", plugin_id, e))?;
@@ -1005,14 +1004,11 @@ impl crate::review_loop::ConformDispatch for HostConformDispatch {
         let ledger = RunCostLedger::new();
         let bundle_dir = self.plugins_root.join(&step.plugin_id);
         let plugin_id = step.plugin_id.clone();
+        let spawn_tenant = self.tenant.clone();
         let connect = move || -> Result<Box<dyn cyan_mcp::PluginTransport>> {
+            let config =
+                crate::mcp_host::bundle_spawn_config(&plugin_id, &bundle_dir, &spawn_tenant)?;
             let mut transport = cyan_mcp::StdioTransport::new();
-            let config = cyan_mcp::SpawnConfig {
-                plugin_id: plugin_id.clone(),
-                command: bundle_dir.join("run").to_string_lossy().to_string(),
-                args: vec![],
-                creds: vec![],
-            };
             transport
                 .spawn(&config)
                 .map_err(|e| anyhow!("spawn cyan-media: {e}"))?;
@@ -1402,6 +1398,12 @@ fn default_marker_delay() -> u64 { 800 }
 
 /// Load cached step result from ~/.cyan/pipeline_cache/{step_id}.json
 fn load_cached_step_result(step_id: &str) -> Option<CachedStepResult> {
+    // HARD OPT-IN: the demo cache plays back canned step results — it must
+    // never stand in for a live run. Absent an explicit CYAN_DEMO_CACHE=1 the
+    // product path is always real (no seeded harness behind a live gate).
+    if std::env::var("CYAN_DEMO_CACHE").map(|v| v == "1") != Ok(true) {
+        return None;
+    }
     let home = std::env::var("HOME").unwrap_or_else(|e| {
         eprintln!("📺 CACHE DEBUG: HOME env not set: {}", e);
         String::new()

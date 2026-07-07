@@ -1794,30 +1794,62 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
         }
     };
 
-    // Generate file ID
-    let file_id = blake3::hash(format!("file:{}:{}:{}", gid, file_name, now).as_bytes())
-        .to_hex()
-        .to_string();
+    // CONTENT-ADDRESSED DEDUP: the same bytes in the same group are ONE file row.
+    // Re-uploading identical content re-scopes/renames the existing row instead of
+    // minting a second id (the old `blake3("file:{gid}:{name}:{now}")` id folded in
+    // the timestamp, so every re-upload duplicated the file in `#` autocomplete).
+    let existing_id: Option<String> = {
+        let db = sys.db.lock_safe();
+        db.query_row(
+            "SELECT id FROM objects
+             WHERE group_id = ?1 AND hash = ?2 AND type = 'file' AND COALESCE(deleted,0) = 0",
+            params![gid, hash],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    };
+    let file_id = existing_id.clone().unwrap_or_else(|| {
+        blake3::hash(format!("file:{}:{}:{}", gid, file_name, now).as_bytes())
+            .to_hex()
+            .to_string()
+    });
 
-    // Insert into database
+    // Insert into database (or re-scope the deduped row).
     {
         let db = sys.db.lock_safe();
-        let result = db.execute(
-            "INSERT OR REPLACE INTO objects (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, local_path, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                file_id,
-                group_id,
-                workspace_id,
-                board_id,
-                file_name,
-                hash,
-                size as i64,
-                sys.node_id,
-                local_path.to_string_lossy().to_string(),
-                now
-            ],
-        );
+        let result = if existing_id.is_some() {
+            db.execute(
+                "UPDATE objects SET name = ?2, workspace_id = ?3, board_id = ?4,
+                        local_path = ?5, size = ?6 WHERE id = ?1",
+                params![
+                    file_id,
+                    file_name,
+                    workspace_id,
+                    board_id,
+                    local_path.to_string_lossy().to_string(),
+                    size as i64
+                ],
+            )
+        } else {
+            db.execute(
+                "INSERT OR REPLACE INTO objects (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, local_path, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    file_id,
+                    group_id,
+                    workspace_id,
+                    board_id,
+                    file_name,
+                    hash,
+                    size as i64,
+                    sys.node_id,
+                    local_path.to_string_lossy().to_string(),
+                    now
+                ],
+            )
+        };
 
         if let Err(e) = result {
             return CString::new(format!(r#"{{"success":false,"error":"DB error: {}"}}"#, e))
@@ -4396,7 +4428,15 @@ pub extern "C" fn cyan_pipeline_approve(
     // pipeline (approved/skipped steps are skipped) to execute the next step, which
     // then runs → awaits its own approval. This is what lets Rick step THROUGH the
     // workflow one approval at a time, with cost incrementing across steps.
-    if approved {
+    //
+    // REVIEW_LOOP_ONE_BOARD: OPT-IN ONLY. The app's LensRunCoordinator owns the
+    // step chain and resumes it itself after an approve — this engine-side
+    // auto-resume was a SECOND copy of the step-loop racing it (double-execution
+    // on multi-step boards). Kept behind CYAN_ENGINE_AUTORESUME=1 for headless/
+    // engine-driven rigs.
+    let engine_autoresume =
+        std::env::var("CYAN_ENGINE_AUTORESUME").map(|v| v == "1") == Ok(true);
+    if approved && engine_autoresume {
         let command_tx = system.command_tx.clone();
         let event_tx = system.event_tx.clone();
         let bid = board_id_str.to_string();
@@ -4412,6 +4452,100 @@ pub extern "C" fn cyan_pipeline_approve(
     approved
 }
 
+
+/// Run ONE locally-bound pipeline step through the on-device cyan-mcp host —
+/// the MECHANICAL SPINE verb (additive). The step's compiled metadata must
+/// carry `mcp_tool` (a rung-1 deterministic bind stamped at Review, or the
+/// cyan-media hint); dispatch goes straight through `PluginHost` with the
+/// side-effect approval gate — ZERO Lens/LLM involvement, GPU not required.
+///
+/// Returns JSON:
+///   `{"success":true,"summary":...,"findings":N}`
+///   `{"success":false,"gated":true,"error":"needs_human: …"}`  (approve → re-run)
+///   `{"success":false,"error":…}`
+/// A step with no local bind returns `{"success":false,"error":"not_locally_bound"}` —
+/// the caller sends it to the lens instead.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_pipeline_run_step_local(
+    board_id: *const c_char,
+    step_id: *const c_char,
+) -> *mut c_char {
+    let board_id_str = match unsafe { CStr::from_ptr(board_id) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let step_id_str = match unsafe { CStr::from_ptr(step_id) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let system = match SYSTEM.get() {
+        Some(s) => s,
+        None => return json_cstring(r#"{"success":false,"error":"System not initialized"}"#),
+    };
+    let rt = match crate::RUNTIME.get() {
+        Some(rt) => rt,
+        None => return json_cstring(r#"{"success":false,"error":"Runtime not available"}"#),
+    };
+
+    // Locate the compiled cell for this step and its metadata.
+    let (content, metadata): (String, serde_json::Value) = {
+        let cells = crate::storage::cell_list_by_boards(std::slice::from_ref(&board_id_str))
+            .unwrap_or_default();
+        let hit = cells.into_iter().find_map(|c| {
+            let meta: serde_json::Value =
+                serde_json::from_str(c.metadata_json.as_deref().unwrap_or("{}")).ok()?;
+            (meta["pipeline"]["step_id"].as_str() == Some(step_id_str.as_str()))
+                .then(|| (c.content.unwrap_or_default(), meta))
+        });
+        match hit {
+            Some(v) => v,
+            None => {
+                return json_cstring(
+                    r#"{"success":false,"error":"step not found (compile first)"}"#,
+                )
+            }
+        }
+    };
+    if metadata.get("mcp_tool").is_none() {
+        return json_cstring(r#"{"success":false,"error":"not_locally_bound"}"#);
+    }
+
+    let executor_type = metadata["pipeline"]["executor"].as_str().unwrap_or("local").to_string();
+    let command_tx = system.command_tx.clone();
+    let event_tx = system.event_tx.clone();
+    let result = rt.block_on(crate::pipeline_executor::execute_pipeline_step(
+        &board_id_str,
+        &step_id_str,
+        &content,
+        &executor_type,
+        Some(metadata),
+        Vec::new(),
+        &command_tx,
+        &event_tx,
+    ));
+    match result {
+        Ok((summary, findings)) => json_cstring(
+            &serde_json::json!({
+                "success": true,
+                "summary": summary,
+                "findings": findings.len(),
+            })
+            .to_string(),
+        ),
+        Err(e) => {
+            let msg = e.to_string();
+            let gated = msg.starts_with("needs_human:");
+            json_cstring(
+                &serde_json::json!({
+                    "success": false,
+                    "gated": gated,
+                    "error": msg,
+                })
+                .to_string(),
+            )
+        }
+    }
+}
 
 /// Retry a pipeline step (reset to pending, preserve metadata)
 #[unsafe(no_mangle)]

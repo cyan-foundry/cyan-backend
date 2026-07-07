@@ -931,10 +931,10 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value, ReviewError> {
     };
     // The app-driven verbs accept `tenant_id` OR `board_id` (board → its group).
     let tenant_or_board = |c: &serde_json::Value| -> Result<String, ReviewError> {
-        if let Some(t) = c.get("tenant_id").and_then(|v| v.as_str()) {
-            if !t.is_empty() {
-                return Ok(t.to_string());
-            }
+        if let Some(t) = c.get("tenant_id").and_then(|v| v.as_str())
+            && !t.is_empty()
+        {
+            return Ok(t.to_string());
         }
         let board = c
             .get("board_id")
@@ -1275,12 +1275,11 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value, ReviewError> {
                     && e.active
                     && e.state == "proposed"
             });
-            if !open {
-                if let Some(cur) = get(conn, &tenant, &asset, &br)? {
-                    if cur.state == "NOTES_IN" {
-                        confirm_notes(conn, &tenant, &asset, &br, Actor::Human)?;
-                    }
-                }
+            if !open
+                && let Some(cur) = get(conn, &tenant, &asset, &br)?
+                && cur.state == "NOTES_IN"
+            {
+                confirm_notes(conn, &tenant, &asset, &br, Actor::Human)?;
             }
             crate::review_loop::board_envelope(conn, &tenant, &asset, &br)
                 .map_err(|e| ReviewError::Other(e.to_string()))?

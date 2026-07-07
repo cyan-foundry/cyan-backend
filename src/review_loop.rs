@@ -1316,17 +1316,17 @@ pub fn resolve_board_review(
     asset_hash: Option<&str>,
 ) -> Result<(String, String, String)> {
     let tenant = board_tenant(conn, board_id);
-    if let Some(h) = asset_hash {
-        if !h.is_empty() {
-            // Branch: the review row when one exists, else main.
-            let branch = review_state::list_by_tenant(conn, &tenant)
-                .map_err(|e| anyhow!("{e}"))?
-                .into_iter()
-                .find(|r| r.asset_hash == h)
-                .map(|r| r.branch)
-                .unwrap_or_else(|| "main".to_string());
-            return Ok((tenant, h.to_string(), branch));
-        }
+    if let Some(h) = asset_hash
+        && !h.is_empty()
+    {
+        // Branch: the review row when one exists, else main.
+        let branch = review_state::list_by_tenant(conn, &tenant)
+            .map_err(|e| anyhow!("{e}"))?
+            .into_iter()
+            .find(|r| r.asset_hash == h)
+            .map(|r| r.branch)
+            .unwrap_or_else(|| "main".to_string());
+        return Ok((tenant, h.to_string(), branch));
     }
     let newest = review_state::list_by_tenant(conn, &tenant)
         .map_err(|e| anyhow!("{e}"))?
