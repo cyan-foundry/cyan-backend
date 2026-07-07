@@ -1300,8 +1300,10 @@ pub fn conform_via_env(
 // the tenant/asset-keyed verbs above are untouched.
 
 /// The tenant a board's ledger lives under (its group; "device" when unknown).
-pub fn board_tenant(board_id: &str) -> String {
-    crate::storage::board_get_group_id(board_id)
+/// Takes the ALREADY-HELD connection — every caller runs inside a dispatch that
+/// owns the global DB mutex (re-locking would self-deadlock).
+pub fn board_tenant(conn: &Connection, board_id: &str) -> String {
+    crate::storage::board_get_group_id_with(conn, board_id)
         .filter(|g| !g.is_empty())
         .unwrap_or_else(|| "device".to_string())
 }
@@ -1313,7 +1315,7 @@ pub fn resolve_board_review(
     board_id: &str,
     asset_hash: Option<&str>,
 ) -> Result<(String, String, String)> {
-    let tenant = board_tenant(board_id);
+    let tenant = board_tenant(conn, board_id);
     if let Some(h) = asset_hash {
         if !h.is_empty() {
             // Branch: the review row when one exists, else main.

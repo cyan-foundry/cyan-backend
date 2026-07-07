@@ -940,7 +940,7 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value, ReviewError> {
             .get("board_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ReviewError::Other("missing 'tenant_id' (or 'board_id')".to_string()))?;
-        Ok(crate::review_loop::board_tenant(board))
+        Ok(crate::review_loop::board_tenant(conn, board))
     };
 
     let out: serde_json::Value = match op.as_str() {

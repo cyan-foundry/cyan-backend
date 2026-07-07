@@ -466,6 +466,13 @@ pub fn workspace_get_group_id(workspace_id: &str) -> Option<String> {
 /// Get group_id for a board (via its workspace)
 pub fn board_get_group_id(board_id: &str) -> Option<String> {
     let conn = db().lock_safe();
+    board_get_group_id_with(&conn, board_id)
+}
+
+/// `board_get_group_id` against an ALREADY-HELD connection — for callers running
+/// inside a dispatch that owns the global DB mutex (re-locking self-deadlocks;
+/// the std Mutex is not reentrant).
+pub fn board_get_group_id_with(conn: &rusqlite::Connection, board_id: &str) -> Option<String> {
     // Board -> workspace_id -> group_id
     let mut stmt = conn.prepare(
         "SELECT w.group_id FROM workspaces w
