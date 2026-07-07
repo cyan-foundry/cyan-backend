@@ -461,3 +461,40 @@ fn spawn_config_maps_python_uv_and_injects_creds() {
         Ok(_) => panic!("must refuse a spawn with a missing credential"),
     }
 }
+
+/// A RE-installed (newer) bundle refreshes the unpack — a plugin update must
+/// land its new tools on the device (the old short-circuit kept the stale
+/// manifest forever).
+#[test]
+fn reinstall_refreshes_a_stale_unpack() {
+    ensure_db();
+    let group = "bind-group-fresh";
+    create_fresh_group(group, "Fresh Group");
+    let tar1 = make_bundle_tar("freshio");
+    storage::install_plugin_bundle(group, "freshio", &tar1).expect("install v1");
+    let dir = storage::ensure_bundle_unpacked("freshio").expect("unpacked v1");
+    // Simulate a STALE unpack: age the manifest far behind, then re-install.
+    let manifest = dir.join("manifest.json");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    let f = std::fs::File::options()
+        .append(true)
+        .open(&manifest)
+        .expect("open manifest");
+    f.set_modified(old).expect("age manifest");
+    drop(f);
+    std::fs::write(&manifest, b"{ not even json }").expect("corrupt stale manifest");
+    let f2 = std::fs::File::options()
+        .append(true)
+        .open(&manifest)
+        .expect("reopen manifest");
+    f2.set_modified(old).expect("re-age manifest");
+    drop(f2);
+    // Re-install (a NEWER bundle file) — the unpack must refresh.
+    let tar2 = make_bundle_tar("freshio");
+    storage::install_plugin_bundle(group, "freshio", &tar2).expect("re-install");
+    let dir2 = storage::ensure_bundle_unpacked("freshio").expect("unpacked v2");
+    let m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir2.join("manifest.json")).expect("read"))
+            .expect("the refreshed manifest parses again");
+    assert_eq!(m["name"], "freshio");
+}

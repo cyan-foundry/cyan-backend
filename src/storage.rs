@@ -1618,10 +1618,25 @@ pub fn plugin_bundles_dir() -> PathBuf {
 pub fn ensure_bundle_unpacked(plugin_id: &str) -> Option<PathBuf> {
     let root = plugin_bundles_dir();
     let dest = root.join(plugin_id);
-    if dest.join("manifest.json").is_file() || dest.join("manifest.yaml").is_file() {
-        return Some(dest);
-    }
     let bundle = root.join(format!("{plugin_id}{}", crate::mcp_host::PLUGIN_BUNDLE_SUFFIX));
+    let manifest = [dest.join("manifest.json"), dest.join("manifest.yaml")]
+        .into_iter()
+        .find(|p| p.is_file());
+    if let Some(manifest) = manifest {
+        // FRESHNESS: a RE-installed bundle (its file is newer than the unpacked
+        // manifest) must refresh the unpack, or a plugin update never lands its
+        // new tools on the device. Same-or-older bundle ⇒ the unpack stands.
+        let bundle_newer = match (bundle.metadata(), manifest.metadata()) {
+            (Ok(b), Ok(m)) => match (b.modified(), m.modified()) {
+                (Ok(bt), Ok(mt)) => bt > mt,
+                _ => false,
+            },
+            _ => false,
+        };
+        if !bundle_newer {
+            return Some(dest);
+        }
+    }
     if !bundle.is_file() {
         return None;
     }
