@@ -225,6 +225,34 @@ fn agent_may_only_propose_not_confirm() {
     }
 }
 
+// ── the confirm gate spine: EVERY non-human actor bounces off confirm_op ──────
+
+#[test]
+fn confirm_op_rejects_every_non_human_actor() {
+    let conn = db();
+    let proposed = rv::propose_op(
+        &conn,
+        A,
+        B,
+        op_entry("trim", 0, json!({"edge":"tail","frames":12}), "agent"),
+        Actor::Agent,
+    )
+    .expect("agent proposes");
+
+    for actor in [Actor::Agent, Actor::Auto] {
+        let err = rv::confirm_op(&conn, T, &proposed.id, None, ConfirmDecision::Approve, actor)
+            .unwrap_err();
+        assert!(
+            matches!(err, ReviewError::GatedNonHuman { .. }),
+            "confirm_op must reject {actor:?} with GatedNonHuman, got {err}"
+        );
+        // The gate left the proposal untouched: still proposed, approved by nobody.
+        let row = changelist::get_entry(&conn, T, &proposed.id).expect("entry");
+        assert_eq!(row.state, "proposed");
+        assert_eq!(row.approved_by, None);
+    }
+}
+
 // ── invalid transition is a typed error, not a panic ──────────────────────────
 
 #[test]
