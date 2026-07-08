@@ -35,8 +35,10 @@
 //! (`cyan_ingest_command`) drives the process-global `storage::db()` through
 //! the JSON dispatch in [`command`].
 
+use std::path::{Path, PathBuf};
+
 use anyhow::{anyhow, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 fn now() -> i64 {
@@ -174,6 +176,305 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         "#,
     )?;
     Ok(())
+}
+
+// ============================================================================
+// Sources.
+// ============================================================================
+
+/// Register a watched source on a board. `kind` is closed vocab
+/// ([`INGEST_KIND_VOCAB`]); `schedule_secs` is the poll cadence (the Schedule
+/// button) or `None` for manual-only.
+pub fn source_add(
+    conn: &Connection,
+    tenant_id: &str,
+    board_id: &str,
+    kind: &str,
+    uri: &str,
+    schedule_secs: Option<i64>,
+) -> Result<IngestSource> {
+    if tenant_id.trim().is_empty() {
+        return Err(anyhow!("tenant_id required"));
+    }
+    if board_id.trim().is_empty() {
+        return Err(anyhow!("board_id required"));
+    }
+    if !INGEST_KIND_VOCAB.contains(&kind) {
+        return Err(anyhow!(
+            "ingest kind '{}' not in closed vocab {:?}",
+            kind,
+            INGEST_KIND_VOCAB
+        ));
+    }
+    if uri.trim().is_empty() {
+        return Err(anyhow!("uri required"));
+    }
+    if let Some(s) = schedule_secs
+        && s <= 0
+    {
+        return Err(anyhow!("schedule_secs must be positive (or absent for manual-only)"));
+    }
+    let source = IngestSource {
+        id: uuid::Uuid::new_v4().to_string(),
+        tenant_id: tenant_id.to_string(),
+        board_id: board_id.to_string(),
+        kind: kind.to_string(),
+        uri: uri.to_string(),
+        schedule_secs,
+        last_scan_at: None,
+        created_at: now(),
+    };
+    conn.execute(
+        "INSERT INTO ingest_source (id, tenant_id, board_id, kind, uri, schedule_secs, last_scan_at, created_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,NULL,?7)",
+        params![
+            source.id,
+            source.tenant_id,
+            source.board_id,
+            source.kind,
+            source.uri,
+            source.schedule_secs,
+            source.created_at
+        ],
+    )?;
+    Ok(source)
+}
+
+fn row_to_source(row: &rusqlite::Row) -> rusqlite::Result<IngestSource> {
+    Ok(IngestSource {
+        id: row.get("id")?,
+        tenant_id: row.get("tenant_id")?,
+        board_id: row.get("board_id")?,
+        kind: row.get("kind")?,
+        uri: row.get("uri")?,
+        schedule_secs: row.get("schedule_secs")?,
+        last_scan_at: row.get("last_scan_at")?,
+        created_at: row.get("created_at")?,
+    })
+}
+
+/// Every source a tenant holds, oldest first.
+pub fn source_list(conn: &Connection, tenant_id: &str) -> Result<Vec<IngestSource>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM ingest_source WHERE tenant_id=?1 ORDER BY created_at ASC, rowid ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![tenant_id], row_to_source)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// One source by id (the scan entrypoint's lookup). Errors if unknown.
+pub fn source_get(conn: &Connection, source_id: &str) -> Result<IngestSource> {
+    conn.query_row(
+        "SELECT * FROM ingest_source WHERE id=?1",
+        params![source_id],
+        row_to_source,
+    )
+    .map_err(|e| anyhow!("ingest source {} not found: {}", source_id, e))
+}
+
+/// Remove a source (tenant-scoped). Already-ingested assets and their runs are
+/// untouched — removing a sensor never deletes what it ingested.
+pub fn source_remove(conn: &Connection, tenant_id: &str, source_id: &str) -> Result<()> {
+    let n = conn.execute(
+        "DELETE FROM ingest_source WHERE tenant_id=?1 AND id=?2",
+        params![tenant_id, source_id],
+    )?;
+    if n == 0 {
+        return Err(anyhow!("ingest source {} not found", source_id));
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Scan.
+// ============================================================================
+
+/// Scan one source now. `folder` is fully live; `s3` / `frameio_c2c` return
+/// [`NotSupportedYet`]. On success `last_scan_at` advances (the scheduling
+/// clock); a failed scan leaves it untouched so the next tick retries.
+pub fn scan(conn: &Connection, source_id: &str) -> Result<ScanReport> {
+    let source = source_get(conn, source_id)?;
+    let report = match source.kind.as_str() {
+        "folder" => scan_folder(conn, &source)?,
+        kind @ ("s3" | "frameio_c2c") => {
+            return Err(NotSupportedYet { kind: kind.to_string() }.into());
+        }
+        other => return Err(anyhow!("ingest kind '{}' not in closed vocab", other)),
+    };
+    conn.execute(
+        "UPDATE ingest_source SET last_scan_at=?1 WHERE id=?2",
+        params![now(), source.id],
+    )?;
+    Ok(report)
+}
+
+/// The live v1 transport: a non-recursive directory walk over the media
+/// extensions, content-hashed with Blake3. A file is NEW iff its hash is in
+/// neither the asset registry nor the board's objects rows; each NEW file is
+/// registered (kind=master, class=clip, location=file://…), attached to the
+/// board (objects row with its real local path — the bind seam), and
+/// materialized as its own run.
+fn scan_folder(conn: &Connection, source: &IngestSource) -> Result<ScanReport> {
+    let dir = PathBuf::from(source.uri.strip_prefix("file://").unwrap_or(&source.uri));
+    let entries = std::fs::read_dir(&dir)
+        .map_err(|e| anyhow!("cannot read watched folder {}: {}", dir.display(), e))?;
+
+    // Deterministic walk order (names), media extensions only, non-recursive.
+    let mut media: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file() && is_media(p))
+        .collect();
+    media.sort();
+
+    // The board's workspace, so ingested rows carry the same linkage a
+    // hand-attached file would.
+    let workspace_id: Option<String> = conn
+        .query_row(
+            "SELECT workspace_id FROM objects WHERE id=?1 AND type='whiteboard'",
+            params![source.board_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+
+    let mut report = ScanReport { discovered: media.len(), ..Default::default() };
+    for path in &media {
+        let hash = blake3_file(path)?;
+
+        // Content-identity dedup against BOTH prior ingests (asset registry)
+        // and prior attachments (the objects hash seam).
+        let known_asset =
+            crate::asset_registry::get(conn, &source.tenant_id, &hash).is_ok();
+        let known_object: bool = conn
+            .query_row(
+                "SELECT 1 FROM objects WHERE type='file' AND hash=?1 \
+                 AND COALESCE(deleted,0)=0 AND COALESCE(board_id,'')=?2 LIMIT 1",
+                params![hash, source.board_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if known_asset || known_object {
+            report.deduped += 1;
+            continue;
+        }
+
+        let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        let name = abs
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("ingested-file")
+            .to_string();
+        let size = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+
+        // 1 — register the MASTER: Cyan references it (location), needn't hold it.
+        crate::asset_registry::upsert(
+            conn,
+            &crate::asset_registry::Asset {
+                hash: hash.clone(),
+                tenant_id: source.tenant_id.clone(),
+                kind: Some("master".to_string()),
+                fps: None,
+                duration_ms: None,
+                derived_from_asset: None,
+                derived_from_version: None,
+                remote_refs: serde_json::json!({}),
+                profile_json: serde_json::json!({}),
+                render_profile: None,
+                created_at: 0,
+            },
+        )?;
+        crate::asset_registry::set_class_location(
+            conn,
+            &source.tenant_id,
+            &hash,
+            Some("clip"),
+            Some(&format!("file://{}", abs.display())),
+        )?;
+
+        // 2 — land the objects row on the source's board (the existing
+        // insert/dedup seam), with the real local path so the run's explicit
+        // bind resolves it.
+        crate::storage::file_insert_conn(
+            conn,
+            &uuid::Uuid::new_v4().to_string(),
+            Some(&source.tenant_id),
+            workspace_id.as_deref(),
+            Some(&source.board_id),
+            &name,
+            &hash,
+            size,
+            "ingest",
+            abs.to_str(),
+            now(),
+        )?;
+
+        // 3 — this asset gets ITS OWN pipeline run.
+        materialize_run(conn, &source.board_id, &hash)?;
+        report.ingested += 1;
+    }
+    Ok(report)
+}
+
+fn is_media(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| MEDIA_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Blake3 over the file's bytes — content identity, never a filename.
+fn blake3_file(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| anyhow!("cannot open {}: {}", path.display(), e))?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher)
+        .map_err(|e| anyhow!("cannot hash {}: {}", path.display(), e))?;
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+// ============================================================================
+// Scheduling — polling, app-driven (no engine thread; see module docs).
+// ============================================================================
+
+/// Sources whose poll cadence has elapsed at `now`: `schedule_secs` set and
+/// either never scanned or `now - last_scan_at >= schedule_secs`. Manual-only
+/// sources (`schedule_secs = None`) are never due.
+pub fn due_sources(conn: &Connection, now: i64) -> Result<Vec<IngestSource>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM ingest_source \
+         WHERE schedule_secs IS NOT NULL \
+           AND (last_scan_at IS NULL OR ?1 - last_scan_at >= schedule_secs) \
+         ORDER BY created_at ASC, rowid ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![now], row_to_source)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Scan every due source (the app tick's one call). Per-source failures are
+/// carried in the outcome, never thrown — one bad source must not stall the
+/// sweep.
+pub fn scan_due(conn: &Connection, now: i64) -> Result<Vec<ScanDueOutcome>> {
+    let mut out = Vec::new();
+    for source in due_sources(conn, now)? {
+        match scan(conn, &source.id) {
+            Ok(report) => out.push(ScanDueOutcome {
+                source_id: source.id,
+                report: Some(report),
+                error: None,
+            }),
+            Err(e) => out.push(ScanDueOutcome {
+                source_id: source.id,
+                report: None,
+                error: Some(e.to_string()),
+            }),
+        }
+    }
+    Ok(out)
 }
 
 // ============================================================================

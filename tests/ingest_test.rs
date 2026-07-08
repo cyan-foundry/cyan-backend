@@ -17,13 +17,13 @@ use rusqlite::Connection;
 
 // ── conn-level rail ────────────────────────────────────────────────────────────
 
-/// An isolated DB carrying the engine's REAL schema plus the STAGE-4 tables.
+/// An isolated DB carrying the engine's REAL schema + migrations (the same two
+/// steps the FFI init runs — `run_migrations` covers `objects.deleted` and the
+/// changelist/asset/ingest tables).
 fn conn_db() -> Connection {
     let conn = Connection::open_in_memory().expect("in-memory db");
     cyan_backend::ensure_schema(&conn).expect("engine schema");
-    cyan_backend::changelist::migrate(&conn).expect("changelist migrate");
-    cyan_backend::asset_registry::migrate(&conn).expect("asset migrate");
-    ingest::migrate(&conn).expect("ingest migrate");
+    storage::run_migrations(&conn).expect("storage migrations");
     conn
 }
 
@@ -77,6 +77,195 @@ fn materialize_run_mints_per_asset_rows_with_tenant() {
     assert!(ingest::runs_for_board(&conn, "no-such-board").expect("empty").is_empty());
     assert!(ingest::materialize_run(&conn, "", "h").is_err());
     assert!(ingest::materialize_run(&conn, "b-runs", " ").is_err());
+}
+
+// ── sources ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn source_add_list_remove_round_trip_and_closed_vocab() {
+    let conn = conn_db();
+    mk_board(&conn, "g-src", "b-src");
+
+    // Closed vocab: an unknown kind is rejected with the vocab named.
+    let err = ingest::source_add(&conn, "g-src", "b-src", "dropbox", "/watch", None)
+        .expect_err("dropbox is not a v1 kind");
+    assert!(err.to_string().contains("folder"), "error names the vocab; got: {err}");
+    // Blank uri / non-positive schedule are rejected.
+    assert!(ingest::source_add(&conn, "g-src", "b-src", "folder", " ", None).is_err());
+    assert!(ingest::source_add(&conn, "g-src", "b-src", "folder", "/watch", Some(0)).is_err());
+
+    let s1 = ingest::source_add(&conn, "g-src", "b-src", "folder", "/watch/dailies", Some(300))
+        .expect("folder source");
+    let s2 = ingest::source_add(&conn, "g-src", "b-src", "s3", "s3://bucket/dailies", None)
+        .expect("s3 source registers (scan is the gated part)");
+    let listed = ingest::source_list(&conn, "g-src").expect("list");
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].id, s1.id);
+    assert_eq!(listed[0].schedule_secs, Some(300));
+    assert_eq!(listed[1].kind, "s3");
+    assert!(listed[0].last_scan_at.is_none(), "never scanned yet");
+
+    // Tenant-scoped list + remove; removing twice errors clearly.
+    assert!(ingest::source_list(&conn, "other-tenant").expect("empty").is_empty());
+    assert!(ingest::source_remove(&conn, "other-tenant", &s1.id).is_err());
+    ingest::source_remove(&conn, "g-src", &s2.id).expect("remove");
+    assert_eq!(ingest::source_list(&conn, "g-src").expect("list again").len(), 1);
+    assert!(ingest::source_remove(&conn, "g-src", &s2.id).is_err());
+}
+
+#[test]
+fn s3_and_frameio_scans_are_typed_not_supported_yet() {
+    let conn = conn_db();
+    mk_board(&conn, "g-nsy", "b-nsy");
+    for kind in ["s3", "frameio_c2c"] {
+        let s = ingest::source_add(&conn, "g-nsy", "b-nsy", kind, "remote://somewhere", Some(60))
+            .expect("registers");
+        let err = ingest::scan(&conn, &s.id).expect_err("scan must be honest");
+        let typed = err
+            .downcast_ref::<ingest::NotSupportedYet>()
+            .unwrap_or_else(|| panic!("expected typed NotSupportedYet, got: {err}"));
+        assert_eq!(typed.kind, kind, "the error names the kind");
+        // A failed scan must NOT advance the scheduling clock.
+        let listed = ingest::source_list(&conn, "g-nsy").expect("list");
+        assert!(listed.iter().all(|s| s.last_scan_at.is_none()));
+    }
+}
+
+// ── the live folder scan ───────────────────────────────────────────────────────
+
+#[test]
+fn folder_scan_ingests_dedups_and_rematerializes_on_content_change() {
+    let conn = conn_db();
+    mk_board(&conn, "g-scan", "b-scan");
+    let dir = tempfile::tempdir().expect("watched dir");
+    std::fs::write(dir.path().join("daily_a.mp4"), b"clip A bytes v1").expect("a");
+    std::fs::write(dir.path().join("daily_b.MOV"), b"clip B bytes").expect("b (upper ext)");
+    std::fs::write(dir.path().join("notes.txt"), b"not media").expect("txt ignored");
+    std::fs::create_dir(dir.path().join("subdir")).expect("subdir ignored (non-recursive v1)");
+    std::fs::write(dir.path().join("subdir").join("nested.mp4"), b"nested").expect("nested");
+
+    let src = ingest::source_add(
+        &conn,
+        "g-scan",
+        "b-scan",
+        "folder",
+        dir.path().to_str().expect("utf8"),
+        None,
+    )
+    .expect("source");
+
+    // 1 — two distinct files ⇒ two assets, two runs, two board attachments.
+    let report = ingest::scan(&conn, &src.id).expect("scan 1");
+    assert_eq!(report, ingest::ScanReport { discovered: 2, ingested: 2, deduped: 0 });
+    let runs = ingest::runs_for_board(&conn, "b-scan").expect("runs");
+    assert_eq!(runs.len(), 2, "one run PER ASSET");
+    assert_ne!(runs[0].asset_hash, runs[1].asset_hash);
+    assert!(runs.iter().all(|r| r.status == "materialized"));
+
+    // Each run's asset is registered as a located clip master…
+    for run in &runs {
+        let asset = cyan_backend::asset_registry::get(&conn, "g-scan", &run.asset_hash)
+            .expect("asset registered");
+        assert_eq!(asset.kind.as_deref(), Some("master"));
+        let (class, location) =
+            cyan_backend::asset_registry::class_location(&conn, "g-scan", &run.asset_hash)
+                .expect("class/location");
+        assert_eq!(class.as_deref(), Some("clip"));
+        let location = location.expect("ingested master carries its location");
+        assert!(location.starts_with("file://"), "canonical file location; got {location}");
+        // …and each run's objects row is on the board with real local bytes,
+        // hash-matched to ITS run (the explicit-bind seam).
+        let (name, local_path): (String, Option<String>) = conn
+            .query_row(
+                "SELECT name, local_path FROM objects WHERE type='file' AND board_id='b-scan' AND hash=?1",
+                [&run.asset_hash],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("objects row for the run's asset");
+        let local_path = local_path.expect("local path stamped at insert");
+        assert!(std::path::Path::new(&local_path).is_file(), "local bytes exist: {local_path}");
+        assert!(location.ends_with(&name), "location and attachment agree on the file");
+    }
+
+    // 2 — re-scan, nothing changed ⇒ all deduped, no new runs.
+    let report = ingest::scan(&conn, &src.id).expect("scan 2");
+    assert_eq!(report, ingest::ScanReport { discovered: 2, ingested: 0, deduped: 2 });
+    assert_eq!(ingest::runs_for_board(&conn, "b-scan").expect("runs").len(), 2);
+
+    // 3 — CONTENT change ⇒ new hash ⇒ new asset + new run (b stays deduped).
+    std::fs::write(dir.path().join("daily_a.mp4"), b"clip A bytes v2 RESHOT").expect("a v2");
+    let report = ingest::scan(&conn, &src.id).expect("scan 3");
+    assert_eq!(report, ingest::ScanReport { discovered: 2, ingested: 1, deduped: 1 });
+    let runs = ingest::runs_for_board(&conn, "b-scan").expect("runs after edit");
+    assert_eq!(runs.len(), 3, "the edited content is a NEW asset with ITS OWN run");
+    let hashes: std::collections::HashSet<&str> =
+        runs.iter().map(|r| r.asset_hash.as_str()).collect();
+    assert_eq!(hashes.len(), 3, "three distinct content identities");
+}
+
+// ── scheduling (polling; the app drives the tick) ──────────────────────────────
+
+#[test]
+fn due_sources_and_scan_due_follow_the_poll_cadence() {
+    let conn = conn_db();
+    mk_board(&conn, "g-due", "b-due");
+    let dir = tempfile::tempdir().expect("watched dir");
+    std::fs::write(dir.path().join("clip.mp4"), b"scheduled clip").expect("clip");
+
+    let scheduled = ingest::source_add(
+        &conn,
+        "g-due",
+        "b-due",
+        "folder",
+        dir.path().to_str().expect("utf8"),
+        Some(60),
+    )
+    .expect("scheduled folder");
+    let manual = ingest::source_add(&conn, "g-due", "b-due", "folder", "/nowhere", None)
+        .expect("manual-only folder");
+    let remote = ingest::source_add(&conn, "g-due", "b-due", "s3", "s3://b/p", Some(60))
+        .expect("scheduled s3");
+
+    let now = chrono::Utc::now().timestamp();
+
+    // Never-scanned scheduled sources are due immediately; manual-only never is.
+    let due: Vec<String> = ingest::due_sources(&conn, now)
+        .expect("due")
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    assert!(due.contains(&scheduled.id) && due.contains(&remote.id));
+    assert!(!due.contains(&manual.id), "manual-only sources are never due");
+
+    // One sweep: the folder scans (and ingests), the s3 failure is CARRIED.
+    let outcomes = ingest::scan_due(&conn, now).expect("sweep");
+    assert_eq!(outcomes.len(), 2);
+    let folder_outcome = outcomes.iter().find(|o| o.source_id == scheduled.id).expect("folder");
+    assert_eq!(
+        folder_outcome.report,
+        Some(ingest::ScanReport { discovered: 1, ingested: 1, deduped: 0 })
+    );
+    let s3_outcome = outcomes.iter().find(|o| o.source_id == remote.id).expect("s3");
+    assert!(s3_outcome.report.is_none());
+    assert!(
+        s3_outcome.error.as_deref().unwrap_or("").contains("not supported yet"),
+        "the s3 failure is carried, not thrown; got {:?}",
+        s3_outcome.error
+    );
+
+    // The successful scan advanced the clock: not due until the cadence elapses.
+    let due_soon: Vec<String> = ingest::due_sources(&conn, now + 30)
+        .expect("due at +30")
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    assert!(!due_soon.contains(&scheduled.id), "inside the cadence window");
+    let due_later: Vec<String> = ingest::due_sources(&conn, now + 61)
+        .expect("due at +61")
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    assert!(due_later.contains(&scheduled.id), "cadence elapsed ⇒ due again");
 }
 
 // ── global-DB rail ─────────────────────────────────────────────────────────────

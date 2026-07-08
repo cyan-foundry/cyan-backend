@@ -1185,17 +1185,33 @@ pub fn file_insert(
     name: &str, hash: &str, size: u64, source_peer: &str, created_at: i64,
 ) -> Result<()> {
     let conn = db().lock_safe();
-    conn.execute(
-        "INSERT OR IGNORE INTO objects (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, created_at)
-         SELECT ?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7, ?8, ?9
+    file_insert_conn(&conn, id, group_id, workspace_id, board_id, name, hash, size, source_peer, None, created_at)?;
+    Ok(())
+}
+
+/// `file_insert` against an ALREADY-HELD connection (the `board_get_group_id_with`
+/// pattern) — same two idempotency layers — plus an optional `local_path` stamped
+/// at insert time (the ingest leg knows the file's real on-disk path up front).
+/// Returns whether a row was actually inserted (`false` = the content-dedup guard
+/// collapsed it onto an existing row in that board scope).
+#[allow(clippy::too_many_arguments)]
+pub fn file_insert_conn(
+    conn: &Connection,
+    id: &str, group_id: Option<&str>, workspace_id: Option<&str>, board_id: Option<&str>,
+    name: &str, hash: &str, size: u64, source_peer: &str, local_path: Option<&str>,
+    created_at: i64,
+) -> Result<bool> {
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO objects (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, local_path, created_at)
+         SELECT ?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7, ?8, ?9, ?10
          WHERE NOT EXISTS (
              SELECT 1 FROM objects
              WHERE type = 'file' AND hash = ?6 AND COALESCE(deleted, 0) = 0
                AND COALESCE(board_id, '') = COALESCE(?4, '')
          )",
-        params![id, group_id, workspace_id, board_id, name, hash, size as i64, source_peer, created_at],
+        params![id, group_id, workspace_id, board_id, name, hash, size as i64, source_peer, local_path, created_at],
     )?;
-    Ok(())
+    Ok(n > 0)
 }
 
 pub fn file_set_local_path(id: &str, local_path: &str) -> Result<()> {
@@ -2879,6 +2895,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     // behavior changes.
     if let Err(e) = crate::review_loop::migrate(conn) {
         tracing::warn!("Migration: review_loop tables failed: {e}");
+    }
+
+    // STAGE 4 ingest (AUTHORING_FIXES_ROUND2 §STAGE 4): watched sources
+    // (folder / s3 / frameio_c2c) + per-asset workflow runs. Creates
+    // `ingest_source` / `workflow_run`. Idempotent (CREATE TABLE IF NOT
+    // EXISTS); additive — no existing table or behavior changes.
+    if let Err(e) = crate::ingest::migrate(conn) {
+        tracing::warn!("Migration: ingest tables failed: {e}");
     }
 
     Ok(())
