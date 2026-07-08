@@ -1936,8 +1936,26 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
             Ok(serde_json::to_value(out)?)
         }
         // The proxy ⇄ master frame map for a version (src/conform_map.rs) — the
-        // sensor leg's remap entry point (CYAN_FORMAT_QA gap 1).
+        // sensor leg's remap entry point (CYAN_FORMAT_QA gap 1). Additively also
+        // BOARD-keyed (WOW-2, the macOS review player): `board_id` resolves the
+        // board's review context → its branch head → that version's map, so the
+        // player can pin a master-anchored comment onto the conformed proxy
+        // (master 30 IS proxy 18 after a 12-frame head trim). No head version
+        // yet ⇒ the identity map (v1 — nothing moved).
         "conform_map" => {
+            if let Some(board) = cmd.get("board_id").and_then(|v| v.as_str()) {
+                let (tenant_r, asset, br) = crate::review_loop::resolve_board_review(
+                    conn,
+                    board,
+                    cmd.get("asset_hash").and_then(|v| v.as_str()),
+                )?;
+                let head = get_branch(conn, &tenant_r, &asset, &br)?.and_then(|b| b.head_version);
+                let out = match head {
+                    Some(v) => crate::conform_map::for_version(conn, &tenant_r, &v)?,
+                    None => crate::conform_map::build(&[]),
+                };
+                return Ok(serde_json::to_value(out)?);
+            }
             let out = crate::conform_map::for_version(conn, &tenant(&cmd)?, &s(&cmd, "version_id")?)?;
             Ok(serde_json::to_value(out)?)
         }
