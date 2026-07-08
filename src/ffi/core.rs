@@ -4789,6 +4789,25 @@ pub extern "C" fn cyan_changelist_command(cmd_json: *const c_char) -> *mut c_cha
 }
 
 // ============================================================================
+// STAGE-4 ingest FFI (AUTHORING_FIXES_ROUND2 §STAGE 4)
+// ============================================================================
+
+/// Drive watched ingest sources + per-asset workflow runs. Additive `cyan_*`
+/// surface mirroring `cyan_changelist_command`: `cmd_json` is
+/// `{ "op": <name>, ... }` where `op` is one of: source_add, source_list,
+/// source_remove, scan_now, scan_due, runs_for_board, produce_master_plan.
+/// Returns a JSON string the caller owns and must free with `cyan_free_string`;
+/// errors surface as `{ "error": "<msg>" }` — never a panic across the boundary.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_ingest_command(cmd_json: *const c_char) -> *mut c_char {
+    let json_str = match unsafe { cstr_arg(cmd_json) } {
+        Some(s) => s,
+        None => return json_cstring(&serde_json::json!({ "error": "null command" }).to_string()),
+    };
+    json_cstring(&crate::ingest::command(&json_str))
+}
+
+// ============================================================================
 // Review-loop state machine FFI (CYAN_REVIEW_LOOP_TRANSITION_CONTRACT)
 // ============================================================================
 

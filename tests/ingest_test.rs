@@ -406,6 +406,181 @@ fn explicit_run_asset_binds_its_own_file_never_a_guess() {
     }
 }
 
+// ── the cyan_ingest_command JSON dialect ───────────────────────────────────────
+
+fn cmd(json: serde_json::Value) -> serde_json::Value {
+    let out = ingest::command(&json.to_string());
+    serde_json::from_str(&out).expect("dispatch output is always valid JSON")
+}
+
+/// The FFI dialect end-to-end on the process-global DB: source_add → scan_now
+/// (a real folder) → runs_for_board → source_list/remove, plus
+/// produce_master_plan over a real frozen version.
+#[test]
+fn ingest_command_dialect_round_trip() {
+    ensure_db();
+    let group = "ingest-ffi-group";
+    let (default_ws, _) = create_fresh_group(group, "FFI Group");
+    let board = "ingest-ffi-board";
+    storage::board_insert(board, &default_ws, "FFI Board", chrono::Utc::now().timestamp())
+        .expect("board insert");
+
+    let dir = tempfile::tempdir().expect("watched dir");
+    std::fs::write(dir.path().join("ffi_daily.mp4"), b"ffi clip bytes").expect("clip");
+
+    // source_add (with the Schedule button's cadence) → the row comes back.
+    let added = cmd(serde_json::json!({
+        "op": "source_add", "tenant_id": group, "board_id": board,
+        "kind": "folder", "uri": dir.path().to_str().expect("utf8"), "schedule_secs": 120
+    }));
+    assert!(added.get("error").is_none(), "source_add must succeed; got {added}");
+    let source_id = added["id"].as_str().expect("source id").to_string();
+    assert_eq!(added["schedule_secs"], 120);
+
+    // scan_now → one ingested; runs_for_board sees the materialized run.
+    let report = cmd(serde_json::json!({ "op": "scan_now", "source_id": source_id }));
+    assert_eq!(report["discovered"], 1, "got {report}");
+    assert_eq!(report["ingested"], 1);
+    let runs = cmd(serde_json::json!({ "op": "runs_for_board", "board_id": board }));
+    let runs = runs.as_array().expect("runs array");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["status"], "materialized");
+    let run_asset = runs[0]["asset_hash"].as_str().expect("asset hash").to_string();
+
+    // scan_due at +121s: due again, all content deduped (carried per-source).
+    let now = chrono::Utc::now().timestamp();
+    let outcomes = cmd(serde_json::json!({ "op": "scan_due", "now": now + 121 }));
+    let outcome = outcomes
+        .as_array()
+        .expect("outcomes array")
+        .iter()
+        .find(|o| o["source_id"] == source_id.as_str())
+        .expect("our source swept")
+        .clone();
+    assert_eq!(outcome["report"]["deduped"], 1, "got {outcome}");
+
+    // produce_master_plan: freeze a version whose cut uses the ingested master
+    // (anchor) + one located insert, then resolve the SELECTIVE retrieve list.
+    {
+        use cyan_backend::util::MutexExt;
+        let conn = storage::db().lock_safe();
+        cyan_backend::asset_registry::upsert(
+            &conn,
+            &cyan_backend::asset_registry::Asset {
+                hash: "ffi-insert-master".to_string(),
+                tenant_id: group.to_string(),
+                kind: Some("master".to_string()),
+                fps: None,
+                duration_ms: None,
+                derived_from_asset: None,
+                derived_from_version: None,
+                remote_refs: serde_json::json!({}),
+                profile_json: serde_json::json!({}),
+                render_profile: None,
+                created_at: 0,
+            },
+        )
+        .expect("insert master registered");
+        cyan_backend::asset_registry::set_class_location(
+            &conn,
+            group,
+            "ffi-insert-master",
+            Some("clip"),
+            Some("s3://bucket/ffi-insert-master.mxf"),
+        )
+        .expect("insert master located");
+    }
+    let appended = serde_json::from_str::<serde_json::Value>(&cyan_backend::changelist::command(
+        &serde_json::json!({
+            "op": "append", "tenant_id": group, "asset_hash": run_asset, "branch": "main",
+            "entry": {
+                "id": "", "entry_hash": "", "asset_hash": run_asset, "tenant_id": group,
+                "track": "V1", "tc_in": 24, "tc_out": 48, "kind": "op", "op": "insert",
+                "params": { "asset_hash": "ffi-insert-master", "at": 24 },
+                "intent": "insert pickup", "proposed_by": "human",
+                "created_at": 0, "state": "", "active": true, "seq": 0, "updated_at": 0
+            }
+        })
+        .to_string(),
+    ))
+    .expect("append json");
+    assert!(appended.get("error").is_none(), "append must succeed; got {appended}");
+    let version = serde_json::from_str::<serde_json::Value>(&cyan_backend::changelist::command(
+        &serde_json::json!({
+            "op": "snapshot", "tenant_id": group, "asset_hash": run_asset, "branch": "main"
+        })
+        .to_string(),
+    ))
+    .expect("snapshot json");
+    let version_id = version["version_id"].as_str().expect("version id");
+
+    let plan = cmd(serde_json::json!({
+        "op": "produce_master_plan", "tenant_id": group, "version_id": version_id
+    }));
+    let masters = plan["masters"].as_array().expect("masters array");
+    let listed: Vec<&str> = masters
+        .iter()
+        .map(|m| m["asset"]["hash"].as_str().expect("hash"))
+        .collect();
+    assert_eq!(
+        listed,
+        vec![run_asset.as_str(), "ffi-insert-master"],
+        "the retrieve list is exactly the used masters, anchor first"
+    );
+    assert!(
+        masters[0]["location"].as_str().expect("loc").starts_with("file://"),
+        "the ingested anchor resolves to its file:// location"
+    );
+    assert_eq!(masters[1]["location"], "s3://bucket/ffi-insert-master.mxf");
+
+    // source_list / source_remove close the loop.
+    let listed = cmd(serde_json::json!({ "op": "source_list", "tenant_id": group }));
+    assert_eq!(listed.as_array().expect("list").len(), 1);
+    let removed = cmd(serde_json::json!({ "op": "source_remove", "tenant_id": group, "id": source_id }));
+    assert_eq!(removed["removed"], true);
+    let listed = cmd(serde_json::json!({ "op": "source_list", "tenant_id": group }));
+    assert!(listed.as_array().expect("list").is_empty());
+}
+
+/// Bad input never panics across the boundary — {"error": ...} JSON, always
+/// (the cyan_changelist_command regression rail, mirrored).
+#[test]
+fn ingest_command_dispatch_returns_clean_json_errors() {
+    ensure_db();
+    for bad in [
+        "not json at all",
+        r#"{"no_op_field": 1}"#,
+        r#"{"op": "definitely_not_an_op"}"#,
+        r#"{"op": "scan_now", "source_id": "no-such-source"}"#,
+        r#"{"op": "source_add", "tenant_id": "t", "board_id": "b", "kind": "dropbox", "uri": "u"}"#,
+        r#"{"op": "produce_master_plan", "tenant_id": "t", "version_id": "no-such-version"}"#,
+    ] {
+        let out = ingest::command(bad);
+        let v: serde_json::Value =
+            serde_json::from_str(&out).expect("dispatch output is always valid JSON");
+        assert!(
+            v.get("error").and_then(|e| e.as_str()).is_some(),
+            "bad command {bad:?} surfaces a clean error, got: {out}"
+        );
+    }
+
+    // The typed transport gap surfaces through the dialect too.
+    let group = "ingest-ffi-nsy";
+    let (default_ws, _) = create_fresh_group(group, "FFI NSY Group");
+    let board = "ingest-ffi-nsy-board";
+    storage::board_insert(board, &default_ws, "NSY Board", chrono::Utc::now().timestamp())
+        .expect("board insert");
+    let added = cmd(serde_json::json!({
+        "op": "source_add", "tenant_id": group, "board_id": board,
+        "kind": "frameio_c2c", "uri": "c2c://project-1"
+    }));
+    let scan = cmd(serde_json::json!({ "op": "scan_now", "source_id": added["id"] }));
+    assert!(
+        scan["error"].as_str().unwrap_or("").contains("frameio_c2c"),
+        "the seam error names the kind; got {scan}"
+    );
+}
+
 /// With ONE attachment and no explicit asset, the Tier-2 implicit fill still
 /// works exactly as before (the additive parameter changes nothing).
 #[test]

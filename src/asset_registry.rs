@@ -47,6 +47,7 @@ pub const ASSET_CLASS_VOCAB: [&str; 2] = ["clip", "sequence"];
 ///   * `location` — the MASTER's canonical location (`s3://…`, `file://…`, a NAS
 ///     path, an LTO/MAM ref). Cyan REFERENCES masters — it need not hold the
 ///     bytes; "produce master" resolves locations and retrieves selectively.
+///
 /// Read/write them via [`class_location`] / [`set_class_location`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Asset {

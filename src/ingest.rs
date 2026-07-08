@@ -534,3 +534,92 @@ pub fn runs_for_board(conn: &Connection, board_id: &str) -> Result<Vec<Materiali
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
+
+// ============================================================================
+// FFI command/event JSON dispatch — the `cyan_changelist_command` pattern.
+// ============================================================================
+
+/// Run an ingest command against the process-global DB. JSON in, JSON out.
+/// Errors surface as `{ "error": "<msg>" }` — never a panic across the boundary.
+///
+/// Ops: `source_add`, `source_list`, `source_remove`, `scan_now`, `scan_due`,
+/// `runs_for_board`, `produce_master_plan`.
+pub fn command(json_str: &str) -> String {
+    match dispatch(json_str) {
+        Ok(v) => v.to_string(),
+        Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
+    }
+}
+
+fn dispatch(json_str: &str) -> Result<serde_json::Value> {
+    let cmd: serde_json::Value =
+        serde_json::from_str(json_str).map_err(|e| anyhow!("bad command JSON: {}", e))?;
+    let op = cmd
+        .get("op")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("missing 'op'"))?;
+
+    let lock = crate::storage::try_db()
+        .ok_or_else(|| anyhow!("DB not initialized"))?
+        .lock()
+        .map_err(|e| anyhow!("DB lock: {}", e))?;
+    let conn: &Connection = &lock;
+
+    let s = |k: &str| -> Result<String> {
+        cmd.get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("missing '{}'", k))
+    };
+
+    match op {
+        "source_add" => {
+            let schedule_secs = cmd.get("schedule_secs").and_then(|v| v.as_i64());
+            let out = source_add(
+                conn,
+                &s("tenant_id")?,
+                &s("board_id")?,
+                &s("kind")?,
+                &s("uri")?,
+                schedule_secs,
+            )?;
+            Ok(serde_json::to_value(out)?)
+        }
+        "source_list" => {
+            let out = source_list(conn, &s("tenant_id")?)?;
+            Ok(serde_json::to_value(out)?)
+        }
+        "source_remove" => {
+            source_remove(conn, &s("tenant_id")?, &s("id")?)?;
+            Ok(serde_json::json!({ "removed": true }))
+        }
+        "scan_now" => {
+            let out = scan(conn, &s("source_id")?)?;
+            Ok(serde_json::to_value(out)?)
+        }
+        "scan_due" => {
+            let at = cmd.get("now").and_then(|v| v.as_i64()).unwrap_or_else(now);
+            let out = scan_due(conn, at)?;
+            Ok(serde_json::to_value(out)?)
+        }
+        "runs_for_board" => {
+            let out = runs_for_board(conn, &s("board_id")?)?;
+            Ok(serde_json::to_value(out)?)
+        }
+        // "Produce master" leg 1: the SELECTIVE retrieve list for a frozen
+        // version — (asset, location) for exactly the masters the cut uses.
+        "produce_master_plan" => {
+            let masters = crate::asset_registry::resolve_final_cut_masters(
+                conn,
+                &s("tenant_id")?,
+                &s("version_id")?,
+            )?;
+            let out: Vec<serde_json::Value> = masters
+                .into_iter()
+                .map(|(asset, location)| serde_json::json!({ "asset": asset, "location": location }))
+                .collect();
+            Ok(serde_json::json!({ "masters": out }))
+        }
+        other => Err(anyhow!("unknown op '{}'", other)),
+    }
+}
