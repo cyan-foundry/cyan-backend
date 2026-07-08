@@ -463,10 +463,15 @@ impl CommandActor {
 
                     {
                         let db = self.db.lock_safe();
-                        let _ = db.execute(
+                        // A failed group INSERT cascades (workspaces/objects FK-reference
+                        // groups, and the bundled SQLite ENFORCES FKs) — log it loudly
+                        // instead of letting downstream provisioning fail mysteriously.
+                        if let Err(e) = db.execute(
                             "INSERT INTO groups (id, name, icon, color, created_at, owner_node_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                             params![g.id, g.name, g.icon, g.color, g.created_at, self.node_id],
-                        );
+                        ) {
+                            tracing::error!(tenant_id = %id, "CreateGroup: groups INSERT failed: {e}");
+                        }
                     }
 
                     // ROUND8 §W3: a group is never born empty — auto-seed the default
@@ -513,31 +518,27 @@ impl CommandActor {
                             // (INSERT OR IGNORE) ⇒ idempotent on re-delivery; creator-
                             // only (this handler never runs on sync receivers — the
                             // board reaches them via the same broadcast/snapshot path
-                            // any board does).
-                            let board_name = "Board 1".to_string();
-                            let board_id = blake3::hash(
-                                format!("board:{}-{}", default_ws_id, board_name).as_bytes(),
-                            )
-                            .to_hex()
-                            .to_string();
-                            {
-                                let db = self.db.lock_safe();
-                                let _ = db.execute(
-                                    "INSERT OR IGNORE INTO objects (id, workspace_id, type, name, created_at, owner_node_id) VALUES (?1, ?2, 'whiteboard', ?3, ?4, ?5)",
-                                    params![board_id, default_ws_id, board_name, now, self.node_id],
-                                );
+                            // any board does). Seeding lives in storage so the real-
+                            // schema regression test drives the identical code path.
+                            match storage::provision_default_board(&default_ws_id, &self.node_id, now) {
+                                Ok((board_id, board_name)) => {
+                                    let board_event = NetworkEvent::BoardCreated {
+                                        id: board_id,
+                                        workspace_id: default_ws_id,
+                                        name: board_name,
+                                        created_at: now,
+                                    };
+                                    let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                                        group_id: id.clone(),
+                                        event: board_event.clone(),
+                                    });
+                                    let _ = self.event_tx.send(SwiftEvent::Network(board_event));
+                                }
+                                Err(e) => tracing::error!(
+                                    tenant_id = %id,
+                                    "CreateGroup: default-board seed failed: {e}"
+                                ),
                             }
-                            let board_event = NetworkEvent::BoardCreated {
-                                id: board_id,
-                                workspace_id: default_ws_id,
-                                name: board_name,
-                                created_at: now,
-                            };
-                            let _ = self.network_tx.send(NetworkCommand::Broadcast {
-                                group_id: id.clone(),
-                                event: board_event.clone(),
-                            });
-                            let _ = self.event_tx.send(SwiftEvent::Network(board_event));
                         }
                         Err(e) => tracing::error!(tenant_id = %id, "group provisioning failed: {e}"),
                     }

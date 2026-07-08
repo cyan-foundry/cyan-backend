@@ -369,6 +369,32 @@ pub fn provision_group_workspaces(
     Ok((default, plugins))
 }
 
+/// TIER 3.5 (AUTHORING_FIXES_ROUND2): deterministic id of a workspace's default board
+/// ("Board 1"). Deterministic ⇒ `INSERT OR IGNORE` makes seeding idempotent on
+/// re-delivery.
+pub fn default_board_id(workspace_id: &str) -> String {
+    blake3::hash(format!("board:{workspace_id}-Board 1").as_bytes()).to_hex().to_string()
+}
+
+/// Seed the default board ("Board 1") in a group's landing workspace so a new group is
+/// never born board-less. Returns `(board_id, board_name)`. Errors surface (FK to the
+/// workspaces row is ENFORCED — the bundled SQLite defaults foreign_keys ON), so a
+/// failed seed is a loud log line in the CreateGroup handler, never a silent no-board.
+pub fn provision_default_board(
+    workspace_id: &str,
+    owner_node_id: &str,
+    now: i64,
+) -> Result<(String, String)> {
+    let board_name = "Board 1".to_string();
+    let board_id = default_board_id(workspace_id);
+    let conn = db().lock_safe();
+    conn.execute(
+        "INSERT OR IGNORE INTO objects (id, workspace_id, type, name, created_at, owner_node_id) VALUES (?1, ?2, 'whiteboard', ?3, ?4, ?5)",
+        params![board_id, workspace_id, board_name, now, owner_node_id],
+    )?;
+    Ok((board_id, board_name))
+}
+
 pub fn workspace_insert(ws: &Workspace) -> Result<()> {
     let conn = db().lock_safe();
     conn.execute(
