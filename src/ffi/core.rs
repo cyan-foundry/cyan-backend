@@ -40,10 +40,27 @@ pub extern "C" fn cyan_set_discovery_key(key: *const c_char) -> bool {
     DISCOVERY_KEY.set(s).is_ok()
 }
 
+/// The git commit this engine was compiled from ("abc123def" / "abc123def-dirty" /
+/// "unknown"), embedded by build.rs. The `cyan-build-commit:` prefix makes the stamp
+/// greppable in the raw .a / app binary (`strings … | grep cyan-build-commit:`) — how
+/// build_static_lib.sh proves the copied xcframework really carries HEAD's bits.
+pub const BUILD_STAMP: &str = concat!("cyan-build-commit:", env!("CYAN_BUILD_COMMIT"));
+
+/// FFI: the engine's build commit ("abc123def" or "abc123def-dirty"). Static storage —
+/// the caller must NOT free the returned pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_build_commit() -> *const c_char {
+    static COMMIT: OnceLock<CString> = OnceLock::new();
+    COMMIT
+        .get_or_init(|| CString::new(env!("CYAN_BUILD_COMMIT")).unwrap_or_default())
+        .as_ptr()
+}
+
 /// Initialize Cyan with ephemeral identity (for testing).
 /// Different NodeID each launch - use for P2P mesh testing.
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_init(db_path: *const c_char) -> bool {
+    eprintln!("🏗 {BUILD_STAMP}");
     if SYSTEM.get().is_some() {
         return true;
     }
@@ -90,7 +107,7 @@ use std::ffi::{c_char, CStr, CString};
 use std::path::{Path, PathBuf};
 // Initialize tracing (only once)
 // Initialize tracing (only once)
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 
 static TRACING_INIT: Once = Once::new();
 
@@ -144,6 +161,10 @@ pub extern "C" fn cyan_init_with_identity(
         tracing::info!("🔵 Tracing initialized - log file: {:?}", log_path);
     });
     eprintln!("🔥 cyan_init_with_identity");
+    // Phase-0 fingerprint guardrail: the FIRST thing a booting engine states is which
+    // source it was built from, so a stale binary can never be tested against silently.
+    eprintln!("🏗 {BUILD_STAMP}");
+    tracing::info!("{BUILD_STAMP}");
     if SYSTEM.get().is_some() {
         return true;
     }

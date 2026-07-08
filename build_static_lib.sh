@@ -190,6 +190,49 @@ echo "📦 Checking Rust targets..."
 check_target "aarch64-apple-darwin"
 
 # =============================================================================
+# Phase-0 HEAD-fingerprint guardrail (FABLE_OVERNIGHT_PROMPT §0.2/§0.3)
+#
+# Two failure modes this defeats, both hit on 2026-07-07:
+#   1. cargo's mtime no-op: a git checkout can leave src/*.rs OLDER than the
+#      compiled .a, so `cargo build` ships stale bits in 0.6s. We fingerprint
+#      HEAD + the working-tree diff; when it moves, we `touch` every crate
+#      source so cargo MUST recompile.
+#   2. silent stale artifacts: after the copy we ASSERT the .a actually
+#      contains this build's `cyan-build-commit:` stamp, aborting loudly if not.
+# =============================================================================
+
+GIT_SHA="$(git rev-parse --short=9 HEAD 2>/dev/null || echo unknown)"
+if [[ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+    BUILD_STAMP="${GIT_SHA}-dirty"
+else
+    BUILD_STAMP="${GIT_SHA}"
+fi
+export CYAN_BUILD_COMMIT="$BUILD_STAMP"
+
+# Content fingerprint: HEAD + a digest of the uncommitted diff (mtime-independent).
+DIFF_DIGEST="$(git diff HEAD 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"
+FINGERPRINT="${GIT_SHA}:${DIFF_DIGEST}"
+FP_FILE="build/.build-fingerprint"
+mkdir -p build
+if [[ ! -f "$FP_FILE" || "$(cat "$FP_FILE" 2>/dev/null)" != "$FINGERPRINT" ]]; then
+    echo "🔁 Source fingerprint moved → touching crate sources (defeats the cargo mtime no-op)"
+    find src -name '*.rs' -exec touch {} + 2>/dev/null || true
+    touch build.rs Cargo.toml 2>/dev/null || true
+else
+    echo "⭕ Source fingerprint unchanged ($FINGERPRINT)"
+fi
+
+echo "🏗  Build stamp: cyan-build-commit:${BUILD_STAMP}"
+
+# 0.1 single source of truth: the orphan xcframework (the one the .xcodeproj does
+# NOT link) must not exist — a cp to it silently tests stale bits.
+ORPHAN_XCFW="$HOME/cyan-iOS/Cyan/CyanBackend.xcframework"
+if [[ -e "$ORPHAN_XCFW" ]]; then
+    echo "🗑  Removing ORPHAN xcframework: $ORPHAN_XCFW (only Cyan/Libraries/ is linked)"
+    rm -rf "$ORPHAN_XCFW"
+fi
+
+# =============================================================================
 # Build Library (unless --skip-lib)
 # =============================================================================
 
@@ -344,6 +387,19 @@ if [[ "$SKIP_LIB" == "false" ]]; then
         rm -rf "$XCODE_PATH/CyanBackend.xcframework"
         cp -R build/CyanBackend.xcframework "$XCODE_PATH/"
         echo "✅ Copied to Xcode project"
+
+        # ── Fingerprint assertion: the COPIED library must carry THIS build's stamp ──
+        COPIED_A="$(find "$XCODE_PATH/CyanBackend.xcframework" -name '*.a' | head -1)"
+        if [[ -z "$COPIED_A" ]] || ! strings "$COPIED_A" | grep -q "cyan-build-commit:${BUILD_STAMP}"; then
+            echo ""
+            echo "❌ STALE-BUILD GUARD TRIPPED: the copied xcframework does NOT contain"
+            echo "   cyan-build-commit:${BUILD_STAMP} — the bits on disk are not this HEAD."
+            echo "   Re-run with --clean. Do NOT test against this artifact."
+            rm -f "$FP_FILE"
+            exit 1
+        fi
+        echo "✅ Verified: copied .a carries cyan-build-commit:${BUILD_STAMP}"
+        echo "$FINGERPRINT" > "$FP_FILE"
     fi
 
     # =============================================================================
