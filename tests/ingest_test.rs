@@ -505,6 +505,18 @@ fn ingest_command_dialect_round_trip() {
     ))
     .expect("append json");
     assert!(appended.get("error").is_none(), "append must succeed; got {appended}");
+    // The human gate: produce_master_plan rides conform_plan, which carries only
+    // APPROVED ops — approve through the same JSON dialect the app drives.
+    let approved = serde_json::from_str::<serde_json::Value>(&cyan_backend::changelist::command(
+        &serde_json::json!({
+            "op": "set_state", "tenant_id": group,
+            "entry_id": appended["id"].as_str().expect("appended id"),
+            "state": "approved", "by": "rick"
+        })
+        .to_string(),
+    ))
+    .expect("set_state json");
+    assert!(approved.get("error").is_none(), "approve must succeed; got {approved}");
     let version = serde_json::from_str::<serde_json::Value>(&cyan_backend::changelist::command(
         &serde_json::json!({
             "op": "snapshot", "tenant_id": group, "asset_hash": run_asset, "branch": "main"
