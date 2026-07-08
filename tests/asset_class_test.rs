@@ -142,13 +142,18 @@ fn resolve_final_cut_masters_lists_only_used_masters_with_locations() {
         asset_registry::set_class_location(&conn, t, hash, Some("clip"), Some(loc)).expect("loc");
     }
 
-    // The cut: trim (no asset params) + insert(m-insert) + swap(m-swap).
-    changelist::append(&conn, "m-anchor", "main", op_entry(t, "trim", 0, json!({"edge": "head", "frames": 12})))
-        .expect("trim");
-    changelist::append(&conn, "m-anchor", "main", op_entry(t, "insert", 24, json!({"asset_hash": "m-insert", "at": 24})))
-        .expect("insert");
-    changelist::append(&conn, "m-anchor", "main", op_entry(t, "swap", 48, json!({"new_asset_hash": "m-swap"})))
-        .expect("swap");
+    // The cut: trim (no asset params) + insert(m-insert) + swap(m-swap) — all
+    // APPROVED: retrieve-then-conform only ever pulls masters the HUMAN-approved
+    // final cut uses (conform_plan carries only approved|applied ops).
+    for (op, tc, params) in [
+        ("trim", 0, json!({"edge": "head", "frames": 12})),
+        ("insert", 24, json!({"asset_hash": "m-insert", "at": 24})),
+        ("swap", 48, json!({"new_asset_hash": "m-swap"})),
+    ] {
+        let e = changelist::append(&conn, "m-anchor", "main", op_entry(t, op, tc, params))
+            .expect("append");
+        changelist::set_state(&conn, t, &e.id, "approved", Some("rick")).expect("approve");
+    }
     let version = changelist::snapshot(&conn, t, "m-anchor", "main").expect("snapshot");
 
     let masters =
@@ -183,8 +188,9 @@ fn resolve_final_cut_masters_errors_on_missing_location_or_registration() {
     asset_registry::set_class_location(&conn, t, "m-base", Some("clip"), Some("file:///nas/base.mxf"))
         .expect("base loc");
     asset_registry::upsert(&conn, &master(t, "m-noloc")).expect("upsert noloc");
-    changelist::append(&conn, "m-base", "main", op_entry(t, "insert", 10, json!({"asset_hash": "m-noloc", "at": 10})))
+    let e = changelist::append(&conn, "m-base", "main", op_entry(t, "insert", 10, json!({"asset_hash": "m-noloc", "at": 10})))
         .expect("insert");
+    changelist::set_state(&conn, t, &e.id, "approved", Some("rick")).expect("approve");
     let v1 = changelist::snapshot(&conn, t, "m-base", "main").expect("v1");
     let err = asset_registry::resolve_final_cut_masters(&conn, t, &v1.version_id)
         .expect_err("a used master without a location must not silently resolve");
@@ -197,8 +203,9 @@ fn resolve_final_cut_masters_errors_on_missing_location_or_registration() {
     asset_registry::upsert(&conn, &master(t, "m-base2")).expect("upsert base2");
     asset_registry::set_class_location(&conn, t, "m-base2", Some("clip"), Some("file:///nas/base2.mxf"))
         .expect("base2 loc");
-    changelist::append(&conn, "m-base2", "main", op_entry(t, "swap", 5, json!({"new_asset_hash": "m-ghost"})))
+    let e2 = changelist::append(&conn, "m-base2", "main", op_entry(t, "swap", 5, json!({"new_asset_hash": "m-ghost"})))
         .expect("swap");
+    changelist::set_state(&conn, t, &e2.id, "approved", Some("rick")).expect("approve");
     let v2 = changelist::snapshot(&conn, t, "m-base2", "main").expect("v2");
     let err = asset_registry::resolve_final_cut_masters(&conn, t, &v2.version_id)
         .expect_err("an unregistered used master must not silently resolve");
