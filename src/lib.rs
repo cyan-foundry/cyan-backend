@@ -490,6 +490,7 @@ impl CommandActor {
 
                     match seeded {
                         Ok((default, plugins)) => {
+                            let default_ws_id = default.id.clone();
                             for ws in [default, plugins] {
                                 tracing::info!(
                                     tenant_id = %id,
@@ -504,6 +505,39 @@ impl CommandActor {
                                     NetworkEvent::WorkspaceCreated(ws),
                                 ));
                             }
+
+                            // TIER 3.5 (AUTHORING_FIXES_ROUND2): a new group is never
+                            // born board-less either — auto-create a DEFAULT BOARD in
+                            // the landing workspace so the first click lands on an
+                            // authorable Workflow, not an empty grid. Deterministic id
+                            // (INSERT OR IGNORE) ⇒ idempotent on re-delivery; creator-
+                            // only (this handler never runs on sync receivers — the
+                            // board reaches them via the same broadcast/snapshot path
+                            // any board does).
+                            let board_name = "Board 1".to_string();
+                            let board_id = blake3::hash(
+                                format!("board:{}-{}", default_ws_id, board_name).as_bytes(),
+                            )
+                            .to_hex()
+                            .to_string();
+                            {
+                                let db = self.db.lock_safe();
+                                let _ = db.execute(
+                                    "INSERT OR IGNORE INTO objects (id, workspace_id, type, name, created_at, owner_node_id) VALUES (?1, ?2, 'whiteboard', ?3, ?4, ?5)",
+                                    params![board_id, default_ws_id, board_name, now, self.node_id],
+                                );
+                            }
+                            let board_event = NetworkEvent::BoardCreated {
+                                id: board_id,
+                                workspace_id: default_ws_id,
+                                name: board_name,
+                                created_at: now,
+                            };
+                            let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                                group_id: id.clone(),
+                                event: board_event.clone(),
+                            });
+                            let _ = self.event_tx.send(SwiftEvent::Network(board_event));
                         }
                         Err(e) => tracing::error!(tenant_id = %id, "group provisioning failed: {e}"),
                     }
