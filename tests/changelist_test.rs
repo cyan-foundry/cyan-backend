@@ -92,6 +92,10 @@ fn reverse_set_active_false_excluded_from_conform_plan() {
         .expect("keep");
     let reverse = changelist::append(&conn, "a", "main", op_entry("t", "a", "mute", 50, json!({})))
         .expect("reverse");
+    // The plan only carries APPROVED ops (the human gate) — approve both so the
+    // exclusion below is proven by the active flag alone.
+    changelist::set_state(&conn, "t", &keep.id, "approved", Some("u-editor")).expect("approve keep");
+    changelist::set_state(&conn, "t", &reverse.id, "approved", Some("u-editor")).expect("approve reverse");
 
     // Non-destructive reverse: flip active=false on the second op.
     changelist::set_active(&conn, "t", &reverse.id, false, Some("u-editor")).expect("set_active false");
@@ -116,6 +120,7 @@ fn redo_supersede_chain() {
     let conn = db();
     let old = changelist::append(&conn, "a", "main", op_entry("t", "a", "trim", 0, json!({"edge":"head","frames":10})))
         .expect("old");
+    changelist::set_state(&conn, "t", &old.id, "approved", Some("u-editor")).expect("approve old");
 
     let new = changelist::supersede(
         &conn,
@@ -135,7 +140,8 @@ fn redo_supersede_chain() {
     assert_eq!(old_row.superseded_by.as_deref(), Some(new.id.as_str()));
     assert!(new_row.active);
 
-    // The conform plan reflects only the new op.
+    // The conform plan reflects only the new op (approved — the human gate).
+    changelist::set_state(&conn, "t", &new.id, "approved", Some("u-editor")).expect("approve new");
     let v = changelist::snapshot(&conn, "t", "a", "main").expect("snapshot");
     let plan = changelist::conform_plan(&conn, "t", &v.version_id).expect("plan");
     assert_eq!(plan.len(), 1);
@@ -316,6 +322,7 @@ fn notes_excluded_from_conform_plan() {
     changelist::append(&conn, "a", "main", note).expect("note");
 
     let op = changelist::append(&conn, "a", "main", op_entry("t", "a", "trim", 10, json!({"edge":"head","frames":2}))).expect("op");
+    changelist::set_state(&conn, "t", &op.id, "approved", Some("u-editor")).expect("approve op");
 
     let v = changelist::snapshot(&conn, "t", "a", "main").expect("snapshot");
     let plan = changelist::conform_plan(&conn, "t", &v.version_id).expect("plan");

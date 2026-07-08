@@ -313,16 +313,18 @@ fn round1_identity_map_round2_remaps() {
         .expect("round-1 note");
     assert_eq!(mech.tc_in, 1008, "round 1: identity map");
 
-    // Round 2: a STRUCTURAL op (lift master [48,72) — 24 frames gone from the
-    // proxy) is confirmed and conformed into v2; the v2 proxy publishes.
+    // Round 2: a STRUCTURAL op (delete master [48,72) — 24 frames gone from the
+    // proxy) is confirmed and conformed into v2; the v2 proxy publishes. (Was a
+    // lift; 2026-07-08 WOW verification aligned the map with the renderer —
+    // lift blanks IN PLACE (identity), delete is the op that ripples frames.)
     let v2 = drive_round_to_publish(
         &conn,
-        op_entry("lift", 48, Some(72), json!({})),
+        op_entry("delete", 48, Some(72), json!({})),
         rv::DEFAULT_MAX_ROUNDS,
     );
     register_proxy(&conn, "proxy-asset-2", &v2, "file_p2");
 
-    // A round-2 comment at proxy frame 100 sits PAST the lifted range: master
+    // A round-2 comment at proxy frame 100 sits PAST the deleted range: master
     // coordinate = 100 + 24 = 124. The raw proxy observation is preserved.
     let r2_fixture = json!({
         "data": [
@@ -332,7 +334,7 @@ fn round1_identity_map_round2_remaps() {
     let r2 = rl::ingest_sense_result(&conn, T, "file_p2", &r2_fixture).expect("ingest r2");
     assert_eq!(r2.appended.len(), 1);
     let note = &r2.appended[0];
-    assert_eq!(note.tc_in, 124, "round 2: proxy 100 remaps past the 24-frame lift to master 124");
+    assert_eq!(note.tc_in, 124, "round 2: proxy 100 remaps past the 24-frame cut to master 124");
     assert_eq!(note.params["observed"]["proxy_ref"], json!("file_p2"));
     assert_eq!(note.params["observed"]["tc_in"], json!(100), "raw proxy observation preserved");
     assert_eq!(

@@ -200,20 +200,22 @@ fn register_proxy(conn: &Connection, proxy_hash: &str, version_id: &str, frameio
     asset_registry::set_remote_ref(conn, T, proxy_hash, "frameio", frameio_ref).expect("remote ref");
 }
 
-/// Bring the machine to CONFORMING with two APPROVED ops (a lift and a mute) plus a
-/// kept creative NOTE, ready for `conform_proxy`. Returns (lift_id, mute_id, note_id).
+/// Bring the machine to CONFORMING with two APPROVED ops (a delete and a mute) plus a
+/// kept creative NOTE, ready for `conform_proxy`. Returns (delete_id, mute_id, note_id).
+/// (Was a lift; 2026-07-08 WOW verification aligned the map with the renderer —
+/// lift blanks IN PLACE (identity map), delete is the op that ripples frames.)
 fn arrive_notes_confirm_two_ops(conn: &Connection) -> (String, String, String) {
     rv::notes_arrived(conn, T, MASTER, B, Actor::Auto).expect("notes_arrived");
 
-    // Agent proposes a structural op (lift) and an audio op (mute).
+    // Agent proposes a structural op (delete) and an audio op (mute).
     let prop_lift = rv::propose_op(
         conn,
         MASTER,
         B,
-        op_entry("lift", 48, Some(72), json!({})),
+        op_entry("delete", 48, Some(72), json!({})),
         Actor::Agent,
     )
-    .expect("propose lift");
+    .expect("propose delete");
     let prop_mute = rv::propose_op(
         conn,
         MASTER,
@@ -230,7 +232,7 @@ fn arrive_notes_confirm_two_ops(conn: &Connection) -> (String, String, String) {
 
     // Human confirms BOTH ops, then batch-confirms → CONFORMING.
     let lift = rv::confirm_op(conn, T, &prop_lift.id, None, ConfirmDecision::Approve, Actor::Human)
-        .expect("confirm lift");
+        .expect("confirm delete");
     let mute = rv::confirm_op(conn, T, &prop_mute.id, None, ConfirmDecision::Approve, Actor::Human)
         .expect("confirm mute");
     rv::confirm_notes(conn, T, MASTER, B, Actor::Human).expect("confirm_notes");
@@ -259,7 +261,7 @@ fn conform_applies_approved_ops_registers_proxy_and_advances_round() {
     // ── (b) the CONFIRMED mechanical edits, in seq order — NOT the creative note ──
     assert_eq!(
         outcome.sent_ops.iter().map(|o| o.op.as_str()).collect::<Vec<_>>(),
-        vec!["lift", "mute"],
+        vec!["delete", "mute"],
         "exactly the two approved ops, in seq order"
     );
     assert_eq!(outcome.sent_ops[0].entry_id, lift_id);
@@ -276,7 +278,7 @@ fn conform_applies_approved_ops_registers_proxy_and_advances_round() {
     let ops = args["ops"].as_array().expect("ops is an array");
     assert_eq!(ops.len(), 2, "only the two approved ops are sent — never the note");
     // Each op carries exactly {op, tc_in, tc_out, params} (the cyan-media item shape).
-    assert_eq!(ops[0]["op"], json!("lift"));
+    assert_eq!(ops[0]["op"], json!("delete"));
     assert_eq!(ops[0]["tc_in"], json!(48));
     assert_eq!(ops[0]["tc_out"], json!(72));
     assert_eq!(ops[0]["params"], json!({}));
@@ -315,7 +317,7 @@ fn conform_applies_approved_ops_registers_proxy_and_advances_round() {
     let plan = changelist::conform_plan(&conn, T, &new_version.version_id).expect("plan");
     assert_eq!(
         plan.iter().map(|o| o.op.as_str()).collect::<Vec<_>>(),
-        vec!["lift", "mute"],
+        vec!["delete", "mute"],
         "the new version freezes the applied ops"
     );
 
@@ -386,7 +388,7 @@ fn round2_sense_on_new_proxy_remaps_through_conform_map() {
     let conn = db();
     // Round 1 identity map (no structural op yet); publish, register proxy r1.
     seed_published_round1(&conn, "proxy-r1", "file_r1", 24.0);
-    // Confirm a STRUCTURAL lift ([48,72) — 24 frames gone) + a mute, then conform.
+    // Confirm a STRUCTURAL delete ([48,72) — 24 frames gone) + a mute, then conform.
     arrive_notes_confirm_two_ops(&conn);
 
     let fake = FakeConform::new("/media/derived/conform-r2.mp4");
@@ -394,11 +396,11 @@ fn round2_sense_on_new_proxy_remaps_through_conform_map() {
 
     // The new proxy's derived_from_version is the version the NEXT SENSE remaps through.
     let new_version_id = outcome.new_version_id.clone();
-    // Its conform_map is NOT identity (the lift is structural).
+    // Its conform_map is NOT identity (the delete is structural).
     let map = conform_map::for_version(&conn, T, &new_version_id).expect("map for new version");
     assert!(!map.is_identity(), "the new version has a structural op → a real remap");
-    // A comment at PROXY frame 100 sits past the 24-frame lift ⇒ MASTER 124.
-    assert_eq!(map.proxy_to_master(100), Some(124), "proxy 100 remaps past the lift to master 124");
+    // A comment at PROXY frame 100 sits past the 24-frame cut ⇒ MASTER 124.
+    assert_eq!(map.proxy_to_master(100), Some(124), "proxy 100 remaps past the cut to master 124");
 
     // Publish the new proxy (human) and stamp its frameio ref — the actuator's
     // breadcrumb the next SENSE walks. (In prod this is the FOLLOWING @frameio.upload

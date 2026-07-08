@@ -170,6 +170,32 @@ fn approved_creative_note_conforms_exactly_like_a_mechanical_op() {
 }
 
 #[test]
+fn conform_plan_carries_only_approved_ops() {
+    // WOW verification finding (2026-07-08): the frozen plan feeds the
+    // proxy⇄master conform map — a proposed-but-never-approved op in it would
+    // shape marker coordinates for a cut nobody approved or rendered.
+    let conn = db();
+    let approved = entry("op", Some("delete"), 24, Some(36), json!({}));
+    let approved = changelist::append(&conn, ASSET, BRANCH, approved).expect("append approved");
+    changelist::set_state(&conn, T, &approved.id, "approved", Some("rick")).expect("approve");
+
+    let proposed = entry("op", Some("trim"), 0, Some(96), json!({"edge":"head","frames":12}));
+    let proposed = changelist::append(&conn, ASSET, BRANCH, proposed).expect("append proposed");
+
+    let v = changelist::snapshot(&conn, T, ASSET, BRANCH).expect("snapshot");
+    let plan = changelist::conform_plan(&conn, T, &v.version_id).expect("plan");
+    assert_eq!(plan.len(), 1, "only the approved op shapes the plan/map: {plan:?}");
+    assert_eq!(plan[0].entry_id, approved.id);
+    assert!(!plan.iter().any(|o| o.entry_id == proposed.id));
+
+    // A post-snapshot rejection falls out of the frozen plan too — the map must
+    // never describe a cut that was rejected before it could render.
+    changelist::set_state(&conn, T, &approved.id, "rejected", Some("rick")).expect("reject");
+    let plan2 = changelist::conform_plan(&conn, T, &v.version_id).expect("plan after reject");
+    assert!(plan2.is_empty(), "a rejected op no longer shapes the frozen plan: {plan2:?}");
+}
+
+#[test]
 fn only_approved_and_active_ops_project() {
     let conn = db();
 

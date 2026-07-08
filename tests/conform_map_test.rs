@@ -2,7 +2,8 @@
 //!
 //! `conform_map` is pure over a version's ordered ops; the version-backed tests run
 //! against an isolated in-memory SQLite DB (the store is the oracle). Non-structural
-//! versions map identity; trim/lift/delete/insert offset; speed retimes piecewise;
+//! versions map identity; trim/delete/insert offset (lift keeps duration — the
+//! renderer blanks in place); speed retimes piecewise;
 //! and an observation made in proxy coordinates is stored in MASTER coordinates
 //! with the raw `observed` object inside `params` — content-hashed with the entry.
 
@@ -74,12 +75,15 @@ fn conform_op(seq: i64, op: &str, tc_in: i64, tc_out: Option<i64>, params: serde
 fn identity_map_on_non_structural_version() {
     let conn = db();
     // level / mute / fade decorate frames in place; none moves a frame.
-    changelist::append(&conn, A, B, entry("op", Some("level"), 0, Some(240), json!({"gain_db": -3})))
-        .expect("append level");
-    changelist::append(&conn, A, B, entry("op", Some("mute"), 100, Some(140), json!({})))
-        .expect("append mute");
-    changelist::append(&conn, A, B, entry("op", Some("fade"), 200, Some(240), json!({"dir":"out","frames":12})))
-        .expect("append fade");
+    for (op, tc_in, tc_out, params) in [
+        ("level", 0, 240, json!({"gain_db": -3})),
+        ("mute", 100, 140, json!({})),
+        ("fade", 200, 240, json!({"dir":"out","frames":12})),
+    ] {
+        let e = changelist::append(&conn, A, B, entry("op", Some(op), tc_in, Some(tc_out), params))
+            .expect("append");
+        changelist::set_state(&conn, T, &e.id, "approved", Some("u1")).expect("approve");
+    }
     let v = changelist::snapshot(&conn, T, A, B).expect("snapshot v1");
 
     let map = conform_map::for_version(&conn, T, &v.version_id).expect("map for version");
@@ -90,32 +94,60 @@ fn identity_map_on_non_structural_version() {
     assert_eq!(map.master_to_proxy(99_999), Some(99_999), "identity is unbounded");
 }
 
-// ── the QA-doc lift example: 100 removed frames offset the pin by 100 ──────────
+// ── the QA-doc removal example: 100 removed frames offset the pin by 100 ───────
+//
+// 2026-07-08 (WOW-2 verification): this example originally rode a `lift` op, but
+// the RENDERER (cyan-media conform) blanks a lifted range IN PLACE — black +
+// silence, duration KEPT (true NLE lift; only delete/extract ripples). A map
+// that dropped lifted frames disagreed with the rendered pixels by exactly the
+// lifted length — the round-2 mis-pin all over again, just one op further down.
+// The rippling example is therefore pinned on DELETE (which the renderer really
+// removes), and lift is pinned as IDENTITY below. Decision made overnight per
+// the renderer's tested behavior; flagged in the run report for Rick.
 
 #[test]
-fn lift_offsets_map_correctly() {
+fn delete_offsets_map_correctly() {
     let conn = db();
-    // lift master [100, 200) out of the proxy. A reviewer's comment at PROXY frame
-    // 150 sits 50 frames past the lift point ⇒ MASTER frame 250. Without the remap
+    // delete master [100, 200) out of the proxy. A reviewer's comment at PROXY
+    // frame 150 sits 50 frames past the cut ⇒ MASTER frame 250. Without the remap
     // it would pin to master 150 — inside the removed range: the round-2 mis-pin.
-    changelist::append(&conn, A, B, entry("op", Some("lift"), 100, Some(200), json!({})))
-        .expect("append lift");
+    let e = changelist::append(&conn, A, B, entry("op", Some("delete"), 100, Some(200), json!({})))
+        .expect("append delete");
+    changelist::set_state(&conn, T, &e.id, "approved", Some("u1")).expect("approve");
     let v = changelist::snapshot(&conn, T, A, B).expect("snapshot");
     let map = conform_map::for_version(&conn, T, &v.version_id).expect("map");
 
-    assert!(!map.is_identity(), "a lift is structural");
-    // Before the lift point: untouched.
+    assert!(!map.is_identity(), "a delete is structural");
+    // Before the cut point: untouched.
     assert_eq!(map.proxy_to_master(99), Some(99));
     assert_eq!(map.master_to_proxy(99), Some(99));
     // The example: proxy 150 → master 250, and the inverse walks back.
-    assert_eq!(map.proxy_to_master(150), Some(250), "proxy 150 = 50 past the lift ⇒ master 250");
+    assert_eq!(map.proxy_to_master(150), Some(250), "proxy 150 = 50 past the cut ⇒ master 250");
     assert_eq!(map.master_to_proxy(250), Some(150));
-    // The lifted master range has NO proxy frame — it is gone from the render.
-    assert_eq!(map.master_to_proxy(150), None, "lifted master frames don't exist in the proxy");
+    // The deleted master range has NO proxy frame — it is gone from the render.
+    assert_eq!(map.master_to_proxy(150), None, "deleted master frames don't exist in the proxy");
     assert_eq!(map.master_to_proxy(100), None);
     assert_eq!(map.master_to_proxy(199), None);
-    // Boundary: master 200 is the first surviving frame after the lift.
+    // Boundary: master 200 is the first surviving frame after the cut.
     assert_eq!(map.master_to_proxy(200), Some(100));
+}
+
+#[test]
+fn lift_is_identity_because_the_renderer_keeps_duration() {
+    let conn = db();
+    // lift master [100, 200): the renderer blanks the range in place (black +
+    // silence) and KEEPS duration, so frame coordinates do not move — an anchor
+    // at master 150 still sits at proxy 150 (on a black frame, which is correct:
+    // that IS what the reviewer's frame looks like in this version).
+    let e = changelist::append(&conn, A, B, entry("op", Some("lift"), 100, Some(200), json!({})))
+        .expect("append lift");
+    changelist::set_state(&conn, T, &e.id, "approved", Some("u1")).expect("approve");
+    let v = changelist::snapshot(&conn, T, A, B).expect("snapshot");
+    let map = conform_map::for_version(&conn, T, &v.version_id).expect("map");
+
+    assert!(map.is_identity(), "lift keeps duration ⇒ identity map (matches the renderer)");
+    assert_eq!(map.master_to_proxy(150), Some(150));
+    assert_eq!(map.proxy_to_master(150), Some(150));
 }
 
 // ── roundtrip master → proxy → master across offsets, inserts and a retime ─────
@@ -173,8 +205,9 @@ fn roundtrip_master_to_proxy_to_master() {
 #[test]
 fn observed_preserved_and_hashed() {
     let conn = db();
-    changelist::append(&conn, A, B, entry("op", Some("lift"), 100, Some(200), json!({})))
-        .expect("append lift");
+    let e = changelist::append(&conn, A, B, entry("op", Some("delete"), 100, Some(200), json!({})))
+        .expect("append delete");
+    changelist::set_state(&conn, T, &e.id, "approved", Some("u1")).expect("approve");
     let v = changelist::snapshot(&conn, T, A, B).expect("snapshot");
     let map = conform_map::for_version(&conn, T, &v.version_id).expect("map");
 

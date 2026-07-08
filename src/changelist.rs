@@ -1075,6 +1075,14 @@ pub fn conform_plan(conn: &Connection, tenant_id: &str, version_id: &str) -> Res
             )
             .optional()?
             && e.kind == "op"
+            // WOW verification finding (2026-07-08): the frozen plan feeds the
+            // proxy⇄master conform map — the coordinates the player pins markers
+            // with and the sensor remaps comments through. Only HUMAN-APPROVED
+            // (or applied) ops may shape it: a proposed-but-never-approved op in
+            // the plan describes a cut that was never approved or rendered, and
+            // a post-snapshot rejection must fall out too. The render path
+            // (approved_ops) already enforces this; the plan now matches it.
+            && matches!(e.state.as_str(), "approved" | "applied")
             && let Some(op) = e.op.clone()
         {
             ops.push(ConformOp {

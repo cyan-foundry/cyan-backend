@@ -4,12 +4,13 @@
 // (CYAN_FORMAT_QA gap 1, "the round-2 mis-pin bug").
 //
 // A review proxy is the master with the version's STRUCTURAL ops applied:
-// trim/lift/delete remove master ranges, insert splices foreign frames in, speed
+// trim/delete remove master ranges, insert splices foreign frames in, speed
 // retimes a range. A Frame.io comment arrives in PROXY coordinates; the ledger
 // stores MASTER coordinates (entries anchor to the source asset — the spine). This
 // module builds the piecewise frame map between the two from a version's ordered
-// ops, plus its inverse. Non-structural ops (level/mute/fade/reframe/color/slip/
-// swap/markers/notes) never move frames — a version with none of the five
+// ops, plus its inverse. Non-structural ops (level/mute/fade/lift/reframe/color/
+// slip/swap/markers/notes) never move frames — lift blanks its range IN PLACE
+// (duration kept), matching the cyan-media renderer. A version with none of the
 // structural verbs maps identity, which is why round 1 "works" without a remap and
 // round 2+ silently mis-pins.
 //
@@ -21,9 +22,17 @@ use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-/// The five ops that move frames between master and proxy. Everything else in the
+/// The ops that move frames between master and proxy. Everything else in the
 /// closed vocab decorates frames in place (identity for the map).
-pub const STRUCTURAL_OPS: &[&str] = &["trim", "lift", "delete", "insert", "speed"];
+///
+/// `lift` is deliberately NOT here (WOW-2 verification finding, 2026-07-08):
+/// true NLE lift semantics — and the cyan-media renderer's tested behavior —
+/// KEEP the timeline duration and blank the range in place (black + silence);
+/// only delete/extract ripples. A map that dropped lifted frames disagreed
+/// with the rendered pixels by exactly the lifted length, mis-pinning every
+/// anchor after the lift point. `slip` is likewise identity: the renderer
+/// refuses it (needs_manual) until real per-range slip assembly exists.
+pub const STRUCTURAL_OPS: &[&str] = &["trim", "delete", "insert", "speed"];
 
 /// One piece of the piecewise-linear map: proxy frames `[proxy_start, proxy_end)`
 /// (`proxy_end == None` = the unbounded tail) cover master frames starting at
@@ -121,10 +130,11 @@ pub fn build(ops: &[ConformOp]) -> ConformMap {
                     removals.push((op.tc_in, op.tc_in + frames));
                 }
             }
-            // lift leaves a gap on the NLE timeline, delete ripples — but the
-            // rendered proxy drops the range either way, so both remove frames
-            // from the map.
-            "lift" | "delete" => {
+            // delete RIPPLES — the rendered proxy drops the range. lift does
+            // NOT: cyan-media blanks the range IN PLACE (black + silence,
+            // duration kept — true NLE lift), so lift stays identity here or
+            // every anchor after the lift point mis-pins by the lift length.
+            "delete" => {
                 if let Some(out) = op.tc_out
                     && out > op.tc_in
                 {
