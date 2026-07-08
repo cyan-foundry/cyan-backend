@@ -32,8 +32,22 @@ fn default_json_object() -> serde_json::Value {
     serde_json::json!({})
 }
 
+/// STAGE 4 — the closed ASSET-CLASS vocab. A **clip** (daily) is the per-asset
+/// review unit; a **sequence** (timeline) is the edit referencing many clips
+/// (where lock + conform live). Stored in the nullable `asset.class` column via
+/// [`set_class_location`]; anything else is rejected, never guessed.
+pub const ASSET_CLASS_VOCAB: [&str; 2] = ["clip", "sequence"];
+
 /// One registered asset. `hash` is the Blake3 of the essence — the primary key and
 /// the spine every ChangeEntry anchors to.
+///
+/// Two STAGE-4 columns ride on the row but NOT on this struct (the struct is
+/// constructed exhaustively across shipping call sites; the columns are additive):
+///   * `class`    — clip | sequence ([`ASSET_CLASS_VOCAB`]).
+///   * `location` — the MASTER's canonical location (`s3://…`, `file://…`, a NAS
+///     path, an LTO/MAM ref). Cyan REFERENCES masters — it need not hold the
+///     bytes; "produce master" resolves locations and retrieves selectively.
+/// Read/write them via [`class_location`] / [`set_class_location`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Asset {
     pub hash: String,
@@ -92,6 +106,24 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             ON asset(tenant_id, derived_from_asset);
         "#,
     )?;
+    // STAGE 4 additive columns (class / location) — idempotent ALTERs so a DB
+    // created before this migration upgrades in place, and a fresh one is a no-op
+    // on the second boot.
+    add_column_if_missing(conn, "asset", "class", "TEXT")?;
+    add_column_if_missing(conn, "asset", "location", "TEXT")?;
+    Ok(())
+}
+
+/// Idempotent `ALTER TABLE … ADD COLUMN` — checks `PRAGMA table_info` first so
+/// re-running the migration on an already-upgraded DB is a clean no-op.
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let existing = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !existing.iter().any(|c| c == column) {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])?;
+    }
     Ok(())
 }
 
@@ -274,4 +306,101 @@ pub fn set_derivation(
         return Err(anyhow!("asset {} not found", hash));
     }
     get(conn, tenant_id, hash)
+}
+
+/// set_class_location(hash, class, location) → stamp the STAGE-4 columns.
+/// `class` is validated against [`ASSET_CLASS_VOCAB`]; a `None` for either field
+/// keeps the stored value (accrete, never clobber — the `set_remote_ref` rule).
+/// Errors if the asset is not registered for this tenant.
+pub fn set_class_location(
+    conn: &Connection,
+    tenant_id: &str,
+    hash: &str,
+    class: Option<&str>,
+    location: Option<&str>,
+) -> Result<()> {
+    if let Some(c) = class
+        && !ASSET_CLASS_VOCAB.contains(&c)
+    {
+        return Err(anyhow!(
+            "asset class '{}' not in closed vocab {:?}",
+            c,
+            ASSET_CLASS_VOCAB
+        ));
+    }
+    let n = conn.execute(
+        "UPDATE asset SET class=COALESCE(?1, class), location=COALESCE(?2, location) \
+         WHERE tenant_id=?3 AND hash=?4",
+        params![class, location, tenant_id, hash],
+    )?;
+    if n == 0 {
+        return Err(anyhow!("asset {} not found", hash));
+    }
+    Ok(())
+}
+
+/// class_location(hash) → `(class, location)`, tenant-scoped. Errors if the
+/// asset is not registered (non-enumerable, like [`get`]).
+pub fn class_location(
+    conn: &Connection,
+    tenant_id: &str,
+    hash: &str,
+) -> Result<(Option<String>, Option<String>)> {
+    conn.query_row(
+        "SELECT class, location FROM asset WHERE tenant_id=?1 AND hash=?2",
+        params![tenant_id, hash],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .map_err(|e| anyhow!("asset {} not found: {}", hash, e))
+}
+
+/// resolve_final_cut_masters(version) → the SELECTIVE "produce master" retrieve
+/// list: `(asset, location)` for every master the final cut actually USES —
+/// the version's anchor asset plus any `insert`/`swap` media its conform plan
+/// references (`params.asset_hash` / `params.new_asset_hash`). Unused dailies
+/// stay archived (they are simply not in the list). Errors clearly when a used
+/// master is unregistered or has no `location` — the retrieve leg must never
+/// guess where a master lives.
+pub fn resolve_final_cut_masters(
+    conn: &Connection,
+    tenant_id: &str,
+    version_id: &str,
+) -> Result<Vec<(Asset, String)>> {
+    // The anchor: the asset the version snapshots (the cut's base master).
+    let anchor: String = conn
+        .query_row(
+            "SELECT asset_hash FROM change_version WHERE tenant_id=?1 AND version_id=?2",
+            params![tenant_id, version_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| anyhow!("version {} not found: {}", version_id, e))?;
+
+    // Ordered, deduped hash walk: anchor first, then op order.
+    let mut hashes: Vec<String> = vec![anchor];
+    let mut seen: std::collections::HashSet<String> = hashes.iter().cloned().collect();
+    for op in crate::changelist::conform_plan(conn, tenant_id, version_id)? {
+        for key in ["asset_hash", "new_asset_hash"] {
+            if let Some(h) = op.params.get(key).and_then(|v| v.as_str())
+                && !h.is_empty()
+                && seen.insert(h.to_string())
+            {
+                hashes.push(h.to_string());
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(hashes.len());
+    for h in &hashes {
+        let asset = get(conn, tenant_id, h)
+            .map_err(|_| anyhow!("used master {} is not registered in the asset registry", h))?;
+        let (_, location) = class_location(conn, tenant_id, h)?;
+        let location = location.filter(|l| !l.trim().is_empty()).ok_or_else(|| {
+            anyhow!(
+                "used master {} has no location — set asset.location (s3://…, file://…, NAS/MAM ref) before producing the master",
+                h
+            )
+        })?;
+        out.push((asset, location));
+    }
+    Ok(out)
 }
