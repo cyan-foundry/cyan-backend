@@ -1188,6 +1188,19 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value, ReviewError> {
             )?;
             serde_json::to_value(out).map_err(|e| ReviewError::Other(e.to_string()))?
         }
+        // TIER 3 — the decision-relay echo rail (ADDITIVE): after the app posts a
+        // review decision to Frame.io as a comment, it records the returned
+        // comment id as OUR OWN write-back so the next sense pass drops it
+        // (`is_own_source_ref`) instead of re-ingesting it as a fresh reviewer
+        // note — un-recorded, the loop would sense its own relay and
+        // auto-approve an open await-sense gate (it would talk to itself).
+        "record_relay" => {
+            let tenant = tenant_or_board(&cmd)?;
+            let source_ref = s("source_ref")?;
+            crate::changelist::record_own_ref(conn, &tenant, "frameio", &source_ref)
+                .map_err(|e| ReviewError::Other(e.to_string()))?;
+            serde_json::json!({ "recorded": true, "source_ref": source_ref })
+        }
         // ── APP-DRIVEN loop verbs (Frame.io integration) — ADDITIVE. The macOS app
         // drives the reverse loop over this same JSON surface; the loop-level logic
         // lives in `review_loop` (see its "APP-DRIVEN loop verbs" section). Each verb

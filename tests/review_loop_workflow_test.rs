@@ -238,6 +238,63 @@ fn sense_result_ingests_remapped_deduped_and_filters_own_refs() {
 }
 
 // ============================================================================
+// 1b. TIER 3 (found live): a reviewer leaves a MECHANICAL note and then a
+//     CREATIVE one in the same round — the newest note is creative, but the
+//     agent must still propose from the mechanical one; escalate ONLY when no
+//     open note is mechanical.
+// ============================================================================
+
+#[test]
+fn propose_picks_the_mechanical_note_even_when_the_newest_is_creative() {
+    let conn = db();
+    seed_published_round1(&conn, "file_pmix");
+
+    // The mechanical trim lands FIRST, the creative reaction SECOND (newest).
+    let fixture = json!({
+        "data": [
+            { "id": "c-mix-mech", "text": "Please trim 12 frames off the tail — it hangs too long",
+              "frame": 60 },
+            { "id": "c-mix-creative", "text": "I don't love the vibe of the middle section — thoughts?",
+              "timestamp": 0 }
+        ]
+    });
+    let ingest = rl::ingest_sense_result(&conn, T, "file_pmix", &fixture).expect("ingest");
+    assert_eq!(ingest.appended.len(), 2, "both notes land");
+
+    // The OLD behavior looked only at the newest (creative) note and escalated,
+    // so the trim never proposed — the live Tier-3 gate caught it.
+    let prop = rl::propose_from_note(&conn, T, MASTER, B)
+        .expect("the mechanical note must yield a proposal despite a newer creative note");
+    assert_eq!(prop.op.as_deref(), Some("trim"));
+    assert_eq!(prop.params["frames"], json!(12));
+    assert!(
+        prop.intent.contains("trim 12 frames off the tail")
+            || prop.intent.contains("Trim 12 frames off the tail")
+            || prop.intent.to_lowercase().contains("trim 12 frames"),
+        "the proposal carries the note's intent; got {:?}",
+        prop.intent
+    );
+
+    // With ONLY creative notes open, propose still ESCALATES (never guesses) —
+    // and the error names every escalated note.
+    let conn2 = db();
+    seed_published_round1(&conn2, "file_pcreative");
+    let creative_only = json!({
+        "data": [
+            { "id": "c-only-creative", "text": "the ending needs more energy", "timestamp": 0 }
+        ]
+    });
+    rl::ingest_sense_result(&conn2, T, "file_pcreative", &creative_only).expect("ingest");
+    let err = rl::propose_from_note(&conn2, T, MASTER, B)
+        .expect_err("creative-only notes must escalate");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("escalate to the human") && msg.contains("the ending needs more energy"),
+        "the escalation names the note; got: {msg}"
+    );
+}
+
+// ============================================================================
 // 2. Round 1 is the identity map; round 2 REMAPS once a structural op landed
 //    in the v2 conform plan (the burst-2 tc-remap, exercised through the glue).
 // ============================================================================

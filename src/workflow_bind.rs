@@ -298,7 +298,7 @@ fn synthesize_args(
     }
 
     // `#file` references fill the first unfilled path-ish prop + `name`.
-    let mut fill_file = |file: &FileDTO, args: &mut Map<String, Value>| {
+    let fill_file = |file: &FileDTO, args: &mut Map<String, Value>| {
         if let Some(path) = file.local_path.as_deref().filter(|p| !p.is_empty()) {
             for prop in FILE_PATH_PROPS {
                 if properties.contains_key(prop) && !args.contains_key(prop) {

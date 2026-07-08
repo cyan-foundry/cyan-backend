@@ -1152,13 +1152,23 @@ pub fn propose_from_note(
     branch: &str,
 ) -> Result<changelist::ChangeEntry> {
     let view = changelist::get(conn, tenant_id, asset_hash, branch)?;
-    let note = view
+    // A note already CONSUMED by a non-rejected op (the `"{op}: {note}"` intent
+    // linkage `propose` stamps below) must not re-propose in a later round.
+    let consumed = |n: &changelist::ChangeEntry| {
+        view.entries.iter().any(|e| {
+            e.kind == "op" && e.state != "rejected" && e.intent.ends_with(n.intent.as_str())
+        })
+    };
+    let mut notes: Vec<&changelist::ChangeEntry> = view
         .entries
         .iter()
-        .filter(|e| e.kind == "note" && e.source.as_deref() == Some("frameio") && e.active)
-        .max_by_key(|e| (e.created_at, e.seq))
-        .cloned()
-        .ok_or_else(|| anyhow!("no frameio note in the ledger — sense first"))?;
+        .filter(|e| {
+            e.kind == "note" && e.source.as_deref() == Some("frameio") && e.active && !consumed(e)
+        })
+        .collect();
+    if notes.is_empty() {
+        return Err(anyhow!("no frameio note in the ledger — sense first"));
+    }
     if let Some(existing) = view
         .entries
         .iter()
@@ -1178,14 +1188,29 @@ pub fn propose_from_note(
         (Some(ms), Some(fps)) => Some(((ms as f64 / 1000.0) * fps).round() as i64),
         _ => None,
     };
-    let inferred =
-        crate::note_inference::infer_op(&note.intent, note.tc_in, note.tc_out, duration_frames)
-            .ok_or_else(|| {
-                anyhow!(
-                    "note {:?} is not a fully-specified mechanical edit — escalate to the human",
-                    note.intent
-                )
-            })?;
+    // TIER 3 (found live): the NEWEST open note may be creative while an older
+    // open note is a mechanical edit — a reviewer leaves both in one round.
+    // Scan newest-first and propose from the FIRST mechanical note; escalate
+    // only when NONE of the open notes is mechanical. Never a guess.
+    notes.sort_by_key(|e| std::cmp::Reverse((e.created_at, e.seq)));
+    let mut escalated: Vec<String> = Vec::new();
+    let mut chosen: Option<(&changelist::ChangeEntry, crate::note_inference::InferredOp)> = None;
+    for n in &notes {
+        match crate::note_inference::infer_op(&n.intent, n.tc_in, n.tc_out, duration_frames) {
+            Some(op) => {
+                chosen = Some((n, op));
+                break;
+            }
+            None => escalated.push(format!("{:?}", n.intent)),
+        }
+    }
+    let Some((note, inferred)) = chosen else {
+        return Err(anyhow!(
+            "no open note is a fully-specified mechanical edit — escalate to the human ({})",
+            escalated.join("; ")
+        ));
+    };
+    let note = (*note).clone();
     let entry = changelist::ChangeEntry {
         id: String::new(),
         entry_hash: String::new(),
