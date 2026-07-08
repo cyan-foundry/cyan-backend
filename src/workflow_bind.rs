@@ -298,10 +298,7 @@ fn synthesize_args(
     }
 
     // `#file` references fill the first unfilled path-ish prop + `name`.
-    for reference in file_refs(content) {
-        let Some(file) = resolve_file_ref(board_id, tenant_id, &reference) else {
-            continue;
-        };
+    let mut fill_file = |file: &FileDTO, args: &mut Map<String, Value>| {
         if let Some(path) = file.local_path.as_deref().filter(|p| !p.is_empty()) {
             for prop in FILE_PATH_PROPS {
                 if properties.contains_key(prop) && !args.contains_key(prop) {
@@ -326,6 +323,38 @@ fn synthesize_args(
         // when the schema declares it — most tools don't.
         if properties.contains_key("file_hash") && !args.contains_key("file_hash") {
             args.insert("file_hash".to_string(), json!(file.hash));
+        }
+    };
+    let refs = file_refs(content);
+    for reference in &refs {
+        let Some(file) = resolve_file_ref(board_id, tenant_id, reference) else {
+            continue;
+        };
+        fill_file(&file, &mut args);
+    }
+
+    // TIER 2 — the IMPLICIT "attached master": a step authored WITHOUT a
+    // `#reference` binds the board's REAL attachment when that is unambiguous
+    // (exactly one content-distinct BOARD file with local bytes). Never a
+    // seed, never the group's other files, never a guess between two clips —
+    // ambiguity stays `pending` (dispatch fills from upstream outputs or
+    // errors clearly).
+    if refs.is_empty()
+        && FILE_PATH_PROPS
+            .iter()
+            .any(|p| properties.contains_key(*p) && !args.contains_key(*p))
+    {
+        let board_files = crate::storage::file_list_by_board(board_id).unwrap_or_default();
+        let mut with_bytes: Vec<&FileDTO> = board_files
+            .iter()
+            .filter(|f| f.local_path.as_deref().is_some_and(|p| !p.is_empty()))
+            .collect();
+        let mut distinct = std::collections::HashSet::new();
+        with_bytes.retain(|f| {
+            distinct.insert(if f.hash.is_empty() { f.id.clone() } else { f.hash.clone() })
+        });
+        if let [only] = with_bytes.as_slice() {
+            fill_file(only, &mut args);
         }
     }
 

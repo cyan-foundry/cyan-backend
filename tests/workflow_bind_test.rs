@@ -462,6 +462,113 @@ fn spawn_config_maps_python_uv_and_injects_creds() {
     }
 }
 
+/// TIER 2 — the IMPLICIT "attached master": a step with NO `#reference` binds
+/// the board's REAL attachment when it is the only content-distinct board file
+/// with local bytes; two DIFFERENT clips stay pending (never a guess), and a
+/// group-scoped decoy (big-buck-bunny) is never picked.
+#[test]
+fn implicit_attachment_binds_the_single_board_file_never_a_guess() {
+    ensure_db();
+    let group = "bind-group-implicit";
+    let (default_ws, _) = create_fresh_group(group, "Implicit Group");
+    let board = "bind-board-implicit";
+    storage::board_insert(board, &default_ws, "Implicit Board", chrono::Utc::now().timestamp())
+        .expect("board insert");
+    let tar = make_bundle_tar("testio");
+    storage::install_plugin_bundle(group, "testio", &tar).expect("install");
+
+    // A GROUP decoy that must never be picked implicitly.
+    storage::file_insert(
+        "imp-decoy",
+        Some(group),
+        Some(&default_ws),
+        None,
+        "big-buck-bunny.mp4",
+        "0ddba11baad",
+        99,
+        "peer",
+        0,
+    )
+    .expect("decoy");
+    storage::file_set_local_path("imp-decoy", "/data/files/0ddba11baad").expect("decoy path");
+
+    // No board attachment yet ⇒ the path prop stays PENDING (clear, not guessed).
+    match workflow_bind::bind_step(board, "push the cut @testio.upload_file account_id=a folder_id=f name=n") {
+        workflow_bind::BindOutcome::Bound(b) => {
+            assert!(
+                b.pending.contains(&"file_path".to_string()),
+                "no attachment ⇒ file_path pending, never the group decoy; got args {:?}",
+                b.args
+            );
+        }
+        other => panic!("expected Bound, got {other:?}"),
+    }
+
+    // ONE board attachment (twice, same bytes — the dedup case) ⇒ implicit fill.
+    storage::file_insert(
+        "imp-clip",
+        Some(group),
+        Some(&default_ws),
+        Some(board),
+        "master.mp4",
+        "feedface99",
+        42,
+        "peer",
+        1,
+    )
+    .expect("clip");
+    storage::file_set_local_path("imp-clip", "/data/files/feedface99").expect("clip path");
+    storage::file_insert(
+        "imp-clip-dup",
+        Some(group),
+        Some(&default_ws),
+        Some(board),
+        "master.mp4",
+        "feedface99",
+        42,
+        "peer",
+        2,
+    )
+    .expect("clip dup");
+    storage::file_set_local_path("imp-clip-dup", "/data/files/feedface99").expect("dup path");
+    match workflow_bind::bind_step(board, "push the cut @testio.upload_file account_id=a folder_id=f") {
+        workflow_bind::BindOutcome::Bound(b) => {
+            assert_eq!(
+                b.args["file_path"], "/data/files/feedface99",
+                "the board's single attachment fills the implicit master"
+            );
+            assert_eq!(b.args["name"], "master.mp4");
+            assert!(b.pending.is_empty(), "pending must be empty; got {:?}", b.pending);
+        }
+        other => panic!("expected Bound, got {other:?}"),
+    }
+
+    // A SECOND, DIFFERENT clip ⇒ ambiguous ⇒ pending again (no guessing).
+    storage::file_insert(
+        "imp-clip-2",
+        Some(group),
+        Some(&default_ws),
+        Some(board),
+        "other.mp4",
+        "c0ffee77",
+        7,
+        "peer",
+        3,
+    )
+    .expect("clip 2");
+    storage::file_set_local_path("imp-clip-2", "/data/files/c0ffee77").expect("clip2 path");
+    match workflow_bind::bind_step(board, "push the cut @testio.upload_file account_id=a folder_id=f name=n") {
+        workflow_bind::BindOutcome::Bound(b) => {
+            assert!(
+                b.pending.contains(&"file_path".to_string()),
+                "two distinct clips ⇒ ambiguous ⇒ pending; got args {:?}",
+                b.args
+            );
+        }
+        other => panic!("expected Bound, got {other:?}"),
+    }
+}
+
 /// TIER 0 (found live 2026-07-07): the unpack freshness oracle must be the
 /// BUNDLE'S CONTENT, never mtimes — tar restores the archive's stored (old)
 /// mtimes, so "bundle newer than manifest" was true FOREVER after any install
