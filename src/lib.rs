@@ -1988,6 +1988,7 @@ pub mod review_loop;
 pub mod note_inference;
 pub mod xfer_policy;
 pub mod asset_registry;
+pub mod ingest;
 pub mod skills;
 pub mod pipeline_executor;
 pub mod dashboard;

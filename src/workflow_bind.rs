@@ -158,6 +158,21 @@ pub fn step_intent(content: &str) -> String {
 ///   4. `args` synthesized from inline `key=value` tokens + `#file` references (schema-typed
 ///      coercion). Any unfilled `required` prop ⇒ Miss, never a guess.
 pub fn bind_step(board_id: &str, content: &str) -> BindOutcome {
+    bind_step_for_asset(board_id, content, None)
+}
+
+/// [`bind_step`] with an EXPLICIT per-run asset (STAGE 4): `explicit_asset` is
+/// the objects-row id or content hash of THE file this run processes (a
+/// materialized `workflow_run`'s `asset_hash`). It fills the file-path prop the
+/// way a `#reference` would — and when present, the Tier-2 implicit
+/// single-attachment fallback is OFF: an unresolvable explicit asset stays
+/// `pending` (a clear dispatch error), never "whichever file the board has".
+/// `None` behaves exactly like [`bind_step`] always has.
+pub fn bind_step_for_asset(
+    board_id: &str,
+    content: &str,
+    explicit_asset: Option<&str>,
+) -> BindOutcome {
     let Some(mention) = parse_mention(content) else {
         return BindOutcome::None;
     };
@@ -206,7 +221,7 @@ pub fn bind_step(board_id: &str, content: &str) -> BindOutcome {
                 reason: "manifest_unreadable".to_string(),
             },
     };
-    bind_with_manifest(board_id, &tenant_id, content, &mention, &manifest)
+    bind_with_manifest_for_asset(board_id, &tenant_id, content, &mention, &manifest, explicit_asset)
 }
 
 /// The manifest-driven half of [`bind_step`], split out so tests can drive it
@@ -217,6 +232,19 @@ pub fn bind_with_manifest(
     content: &str,
     mention: &Mention,
     manifest: &cyan_mcp::Manifest,
+) -> BindOutcome {
+    bind_with_manifest_for_asset(board_id, tenant_id, content, mention, manifest, None)
+}
+
+/// [`bind_with_manifest`] with the STAGE-4 explicit per-run asset (see
+/// [`bind_step_for_asset`]).
+pub fn bind_with_manifest_for_asset(
+    board_id: &str,
+    tenant_id: &str,
+    content: &str,
+    mention: &Mention,
+    manifest: &cyan_mcp::Manifest,
+    explicit_asset: Option<&str>,
 ) -> BindOutcome {
     let mention_str = match &mention.tool {
         Some(t) => format!("@{}.{}", mention.plugin, t),
@@ -255,6 +283,7 @@ pub fn bind_with_manifest(
         &manifest.name,
         &tool_block.input_schema,
         content,
+        explicit_asset,
     );
     BindOutcome::Bound(StepBind {
         plugin_id: manifest.name.clone(),
@@ -276,6 +305,7 @@ fn synthesize_args(
     plugin_id: &str,
     input_schema: &Value,
     content: &str,
+    explicit_asset: Option<&str>,
 ) -> (Value, Vec<String>) {
     let properties = input_schema
         .get("properties")
@@ -333,13 +363,32 @@ fn synthesize_args(
         fill_file(&file, &mut args);
     }
 
+    // STAGE 4 — the EXPLICIT per-run asset: a materialized run names THE file it
+    // processes (objects-row id or content hash, on this board), and it fills
+    // like a `#reference` (authored inline/`#ref` tokens still win — they filled
+    // first). Rows with local bytes are preferred; an explicit asset that does
+    // not resolve leaves the prop `pending` — see the Tier-2 gate below.
+    if let Some(asset) = explicit_asset {
+        let board_files = crate::storage::file_list_by_board(board_id).unwrap_or_default();
+        let matched = board_files
+            .iter()
+            .filter(|f| f.hash == asset || f.id == asset)
+            .max_by_key(|f| f.local_path.as_deref().is_some_and(|p| !p.is_empty()));
+        if let Some(file) = matched {
+            fill_file(file, &mut args);
+        }
+    }
+
     // TIER 2 — the IMPLICIT "attached master": a step authored WITHOUT a
     // `#reference` binds the board's REAL attachment when that is unambiguous
     // (exactly one content-distinct BOARD file with local bytes). Never a
     // seed, never the group's other files, never a guess between two clips —
     // ambiguity stays `pending` (dispatch fills from upstream outputs or
-    // errors clearly).
+    // errors clearly). A run carrying an EXPLICIT asset turns this fallback
+    // OFF: if its file didn't resolve, binding a different file would be the
+    // wrong-file bug all over again.
     if refs.is_empty()
+        && explicit_asset.is_none()
         && FILE_PATH_PROPS
             .iter()
             .any(|p| properties.contains_key(*p) && !args.contains_key(*p))
