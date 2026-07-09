@@ -239,6 +239,27 @@ impl PluginHost {
             .initialize()
             .map_err(|e| anyhow!("mcp initialize {}: {e}", step.plugin_id))?;
 
+        // THE ADVERTISED-vs-REGISTERED CONTRACT (mcp_tool_test.rs): the bound
+        // tool must be one the plugin PROCESS actually registers. A stale or
+        // mis-curated bundle can advertise a tool (e.g. the raw
+        // `post_…_files_local_upload` twin) the process never registers — that
+        // died as a bare "Unknown tool" mid-run (live 2026-07-09). Reconcile at
+        // spawn time and refuse LOUDLY, naming both sides, before any
+        // tools/call fires.
+        let registered = client
+            .list_tool_names()
+            .map_err(|e| anyhow!("mcp tools/list {}: {e}", step.plugin_id))?;
+        if !registered.iter().any(|n| n == &step.tool) {
+            return Err(anyhow!(
+                "plugin '{}' contract violation: the installed manifest advertises tool '{}' \
+                 but the plugin process registers [{}] — the bundle is stale or mis-curated; \
+                 reinstall the plugin (or pin an exact registered tool name)",
+                step.plugin_id,
+                step.tool,
+                registered.join(", ")
+            ));
+        }
+
         let start = self.clock.now();
         let result = client
             .call_tool(&step.tool, step.args.clone())

@@ -1774,9 +1774,28 @@ pub fn ensure_bundle_unpacked(plugin_id: &str) -> Option<PathBuf> {
     let extracted = staging.join(plugin_id);
     // Only swap in a bundle the registry can index — otherwise the previous
     // (still-valid) unpack keeps serving.
-    if let Err(e) = cyan_mcp::Manifest::from_bundle(&extracted) {
-        cleanup(&format!("manifest: {e}"));
-        return cyan_mcp::Manifest::from_bundle(&dest).ok().map(|_| dest);
+    match cyan_mcp::Manifest::from_bundle(&extracted) {
+        Err(e) => {
+            cleanup(&format!("manifest: {e}"));
+            return cyan_mcp::Manifest::from_bundle(&dest).ok().map(|_| dest);
+        }
+        Ok(manifest) => {
+            // INDEX-TIME CONTRACT FLAG (FABLE_FULL_AUDIT headline 2): an alias
+            // carried by more than one tool is the signature of a stale or
+            // mis-curated bundle — every `@plugin.<alias>` bind over it is
+            // ambiguous (the binder hard-fails those at Review). Flag it loudly
+            // the moment the bundle lands, so the operator learns at INSTALL
+            // time, not mid-run.
+            for (alias, carriers) in manifest.ambiguous_aliases() {
+                tracing::warn!(
+                    "plugin '{plugin_id}' manifest contract: alias '{alias}' is carried by \
+                     {} tools [{}] — @{plugin_id}.{alias} cannot bind; reinstall a curated \
+                     bundle (stale/mis-curated)",
+                    carriers.len(),
+                    carriers.join(", ")
+                );
+            }
+        }
     }
     if let Err(e) = std::fs::write(extracted.join(BUNDLE_HASH_MARKER), &bundle_hash) {
         cleanup(&format!("write marker: {e}"));

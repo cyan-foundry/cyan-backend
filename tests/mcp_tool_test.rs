@@ -49,14 +49,21 @@ fn test_host() -> PluginHost {
     )
 }
 
-/// A scripted transport that answers `initialize` (id=1) then one `tools/call`
-/// (id=2) with `result`. The Client correlates replies by id, so these are the
-/// two requests a single tool dispatch sends.
-fn scripted_call(result_json: &str) -> Box<dyn PluginTransport> {
+/// A scripted transport that answers `initialize` (id=1), the registration
+/// contract check `tools/list` (id=2, registering exactly `tool` — the real
+/// FastMCP reply shape), then one `tools/call` (id=3) with `result`. The Client
+/// correlates replies by id, so these are the three requests a single tool
+/// dispatch sends.
+fn scripted_call(tool: &str, result_json: &str) -> Box<dyn PluginTransport> {
     let mut t = ScriptedTransport::new();
     t.push_reply(jval(r#"{ "jsonrpc": "2.0", "id": 1, "result": {} }"#));
     t.push_reply(jval(&format!(
-        r#"{{ "jsonrpc": "2.0", "id": 2, "result": {result_json} }}"#
+        r#"{{ "jsonrpc": "2.0", "id": 2, "result": {{ "tools": [
+             {{ "name": "{tool}", "description": "scripted", "inputSchema": {{ "type": "object" }} }}
+        ] }} }}"#
+    )));
+    t.push_reply(jval(&format!(
+        r#"{{ "jsonrpc": "2.0", "id": 3, "result": {result_json} }}"#
     )));
     Box::new(t)
 }
@@ -80,7 +87,7 @@ fn pipeline_step_invokes_local_plugin_tool() {
 
     let dispatch = host
         .dispatch_mcp_tool(&scope, &step, &[], false, &ledger, || {
-            Ok(scripted_call(r#"{ "status": "ok", "output_uri": "out.mp4" }"#))
+            Ok(scripted_call("transcode", r#"{ "status": "ok", "output_uri": "out.mp4" }"#))
         })
         .expect("local dispatch succeeds");
 
@@ -115,7 +122,7 @@ fn local_mcp_tool_cost_is_external_not_tokens() {
 
     host.dispatch_mcp_tool(&scope, &step, &[], false, &ledger, || {
         // The partner reports its OWN billing as `cost_usd` (external pass-through).
-        Ok(scripted_call(r#"{ "report": "pass", "cost_usd": 0.42 }"#))
+        Ok(scripted_call("qc", r#"{ "report": "pass", "cost_usd": 0.42 }"#))
     })
     .expect("local dispatch succeeds");
 
@@ -239,7 +246,7 @@ fn local_mcp_tool_external_send_requires_approval_gate() {
     // Approved (the human-approval path flipped the gate): now it runs.
     let ran = host
         .dispatch_mcp_tool(&scope, &step, &side_effects, true, &ledger, || {
-            Ok(scripted_call(r#"{ "delivered": true }"#))
+            Ok(scripted_call("push_to_platform", r#"{ "delivered": true }"#))
         })
         .expect("approved dispatch succeeds");
     match ran {
@@ -292,3 +299,69 @@ const MANIFEST_JSON: &str = r#"{
     }
   ]
 }"#;
+
+/// THE ADVERTISED-vs-REGISTERED CONTRACT (FABLE_FULL_AUDIT headline 2, the
+/// ddb6fb7 `list_comments` fix generalized): every tool a manifest ADVERTISES
+/// must be a tool the plugin PROCESS actually REGISTERS. A stale/mis-curated
+/// bundle advertising the raw `post_…_files_local_upload` twin dispatched a
+/// name the process never registers → a bare "Unknown tool" mid-run, live
+/// 2026-07-09. The host now reconciles at dispatch (spawn) time: the bound tool
+/// must be in the process's `tools/list`, else the dispatch fails LOUDLY naming
+/// both sides — before any tools/call fires.
+#[test]
+fn dispatch_refuses_a_tool_the_process_does_not_register() {
+    let host = test_host();
+    let scope = RunScope {
+        tenant_id: TENANT.to_string(),
+        run_id: "run-contract".to_string(),
+    };
+    // The stale manifest advertised (and the binder picked) the raw twin…
+    let step = McpTool {
+        plugin_id: "frameio".to_string(),
+        tool: "post_v4_accounts_account_id_folders_folder_id_files_local_upload".to_string(),
+        args: jval("{}"),
+    };
+    let ledger = RunCostLedger::new();
+
+    // …but the process registers only the curated verbs.
+    let mut t = ScriptedTransport::new();
+    t.push_reply(jval(r#"{ "jsonrpc": "2.0", "id": 1, "result": {} }"#));
+    t.push_reply(jval(
+        r#"{ "jsonrpc": "2.0", "id": 2, "result": { "tools": [
+             { "name": "upload_file", "description": "real upload", "inputSchema": { "type": "object" } },
+             { "name": "list_comments", "description": "sense", "inputSchema": { "type": "object" } }
+        ] } }"#,
+    ));
+    let log = t.log();
+
+    let err = host
+        .dispatch_mcp_tool(&scope, &step, &[], false, &ledger, || Ok(Box::new(t) as Box<dyn PluginTransport>))
+        .expect_err("an advertised-but-unregistered tool must refuse dispatch");
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("post_v4_accounts_account_id_folders_folder_id_files_local_upload"),
+        "the error names the advertised tool: {msg}"
+    );
+    assert!(
+        msg.contains("upload_file"),
+        "the error names what the process actually registers: {msg}"
+    );
+    assert!(
+        msg.contains("registers") || msg.contains("register"),
+        "the error states the contract violation: {msg}"
+    );
+
+    // The contract check fired BEFORE any tools/call — no tool was invoked.
+    let called: Vec<String> = log
+        .sent()
+        .iter()
+        .filter_map(|m| m.get("method").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    assert!(
+        !called.iter().any(|m| m == "tools/call"),
+        "no tools/call may fire after a failed registration check, sent: {called:?}"
+    );
+    // And nothing was billed.
+    assert!(ledger.external_tool_calls().is_empty());
+}

@@ -898,3 +898,108 @@ fn reinstall_refreshes_a_stale_unpack() {
             .expect("the refreshed manifest parses again");
     assert_eq!(m["name"], "freshio");
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// ALIAS CONTRACT (FABLE_FULL_AUDIT headline 2): an alias that matches more than
+// one manifest tool HARD-FAILS the bind — the resolver never picks arbitrarily.
+// Live repro: the stale installed frameio bundle carried `upload` on BOTH the
+// curated `upload_file` AND the raw generated twin
+// `post_v4_…_files_local_upload` (which the plugin process never registers);
+// first-match bound the twin → "Unknown tool" at dispatch, intermittently.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// A strict manifest with `tools`, for driving `bind_with_manifest` directly.
+fn manifest_with_tools(name: &str, tools: serde_json::Value) -> cyan_mcp::Manifest {
+    let manifest_json = serde_json::json!({
+        "name": name,
+        "version": "0.1.0",
+        "description": "alias contract fixture",
+        "runtime": "python-uv",
+        "credentials": { "kind": "oauth2", "provider": "adobe_ims", "locality": "tenant" },
+        "extra_credentials": [],
+        "events_emitted": [],
+        "tools": tools
+    });
+    serde_json::from_value(manifest_json).expect("strict manifest")
+}
+
+fn upload_tool_json(name: &str, aliases: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "when_to_use": "Push a finished cut to review.",
+        "aliases": aliases,
+        "io_types": { "input": ["video"], "output": ["json"] },
+        "stage": "review",
+        "side_effects": ["external_send"],
+        "locality": "local",
+        "input_schema": {
+            "type": "object",
+            "properties": { "file_path": {"type": "string"} },
+            "required": ["file_path"]
+        },
+        "output_schema": {"type": "object"}
+    })
+}
+
+#[test]
+fn ambiguous_alias_hard_fails_never_binds_arbitrarily() {
+    ensure_db();
+    let group = "bind-group-alias";
+    let (default_ws, _) = create_fresh_group(group, "Bind Group Alias");
+    let board = "bind-board-alias";
+    storage::board_insert(board, &default_ws, "Alias Board", chrono::Utc::now().timestamp())
+        .expect("board insert");
+
+    const RAW_TWIN: &str = "post_v4_accounts_account_id_folders_folder_id_files_local_upload";
+
+    // The STALE-BUNDLE shape: two tools both carry the `upload` alias.
+    let stale = manifest_with_tools(
+        "staleio",
+        serde_json::json!([
+            upload_tool_json("upload_file", &["upload", "push"]),
+            upload_tool_json(RAW_TWIN, &["upload", "push"]),
+        ]),
+    );
+
+    let content = "upload to @staleio.upload for producer review /needs-approval";
+    let mention = workflow_bind::parse_mention(content).expect("mention");
+    match workflow_bind::bind_with_manifest(board, group, content, &mention, &stale) {
+        workflow_bind::BindOutcome::Miss { mention, reason } => {
+            assert_eq!(mention, "@staleio.upload");
+            assert!(
+                reason.starts_with("alias_ambiguous"),
+                "the multi-match alias is a HARD compile failure, got reason {reason:?}"
+            );
+            // The authoring surface must be able to tell the user what collided.
+            assert!(
+                reason.contains("upload_file") && reason.contains(RAW_TWIN),
+                "the miss names every candidate so the author can pin one: {reason:?}"
+            );
+        }
+        other => panic!("a 2-tool alias must NEVER bind arbitrarily, got {other:?}"),
+    }
+
+    // An exact tool NAME stays deterministic even on the stale bundle — the
+    // live workaround (`@frameio.upload_file`) must keep working.
+    let pinned = "upload to @staleio.upload_file for review";
+    let mention = workflow_bind::parse_mention(pinned).expect("mention");
+    match workflow_bind::bind_with_manifest(board, group, pinned, &mention, &stale) {
+        workflow_bind::BindOutcome::Bound(b) => assert_eq!(b.tool, "upload_file"),
+        other => panic!("exact-name pin must bind, got {other:?}"),
+    }
+
+    // The CURATED shape (one upload verb, not two): the alias binds to exactly
+    // `upload_file`, deterministically.
+    let curated = manifest_with_tools(
+        "curatedio",
+        serde_json::json!([upload_tool_json("upload_file", &["upload", "push"])]),
+    );
+    let content = "upload to @curatedio.upload for producer review";
+    let mention = workflow_bind::parse_mention(content).expect("mention");
+    match workflow_bind::bind_with_manifest(board, group, content, &mention, &curated) {
+        workflow_bind::BindOutcome::Bound(b) => {
+            assert_eq!(b.tool, "upload_file", "the curated alias binds to exactly upload_file");
+        }
+        other => panic!("curated alias must bind, got {other:?}"),
+    }
+}

@@ -253,10 +253,40 @@ pub fn bind_with_manifest_for_asset(
     let tool_block = match &mention.tool {
         Some(tool) => {
             let tool_lc = tool.to_lowercase();
-            manifest.tools.iter().find(|t| {
-                t.name.to_lowercase() == tool_lc
-                    || t.aliases.iter().any(|al| al.to_lowercase() == tool_lc)
-            })
+            // Exact tool NAME first — names are unique per manifest, so a name
+            // mention is always deterministic (the `@plugin.upload_file` pin).
+            match manifest.tools.iter().find(|t| t.name.to_lowercase() == tool_lc) {
+                Some(t) => Some(t),
+                None => {
+                    // ALIAS resolution HARD-FAILS on >1 match (FABLE_FULL_AUDIT
+                    // headline 2): a stale/mis-curated bundle carrying one alias
+                    // on two tools must be a loud compile miss naming every
+                    // candidate — never an arbitrary pick that dispatches a tool
+                    // the plugin process doesn't register ("Unknown tool", live
+                    // 2026-07-09 on `@frameio.upload`).
+                    let mut matches = manifest.tools.iter().filter(|t| {
+                        t.aliases.iter().any(|al| al.to_lowercase() == tool_lc)
+                    });
+                    let first = matches.next();
+                    let rest: Vec<&str> =
+                        matches.map(|t| t.name.as_str()).collect();
+                    if let (Some(first_t), false) = (first, rest.is_empty()) {
+                        let mut names = vec![first_t.name.as_str()];
+                        names.extend(rest);
+                        return BindOutcome::Miss {
+                            mention: mention_str,
+                            reason: format!(
+                                "alias_ambiguous: '{}' matches [{}] — pin the exact tool (e.g. @{}.{})",
+                                tool,
+                                names.join(", "),
+                                manifest.name,
+                                first_t.name
+                            ),
+                        };
+                    }
+                    first
+                }
+            }
         }
         None if manifest.tools.len() == 1 => manifest.tools.first(),
         None => None,
