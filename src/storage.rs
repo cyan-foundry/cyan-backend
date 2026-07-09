@@ -80,6 +80,35 @@ pub fn try_db() -> Option<&'static Mutex<Connection>> {
     DB.get()
 }
 
+/// How long a READ/UI path may wait for the DB before giving up and returning
+/// its empty shape. Short enough that a click never feels hung; long enough
+/// that ordinary write contention (single statements) always wins.
+pub const READ_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Bounded acquire for READ paths that cross the FFI into the UI. NEVER parks
+/// the calling thread on the DB mutex: spins `try_lock` up to `budget`, then
+/// yields `None` (callers return their empty shape and the UI's own cadence
+/// retries). Poison recovers like `lock_safe`. Same-thread re-entrancy cannot
+/// deadlock through this door — it burns the budget and returns `None` — but
+/// the envelope read path also threads one `&Connection` down so re-entrant
+/// acquisition doesn't arise in the first place.
+pub fn try_db_read(budget: std::time::Duration) -> Option<std::sync::MutexGuard<'static, Connection>> {
+    let db = try_db()?;
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match db.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // GROUPS
 // ═══════════════════════════════════════════════════════════════════════════

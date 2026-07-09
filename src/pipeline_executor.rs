@@ -1098,10 +1098,10 @@ pub fn execute_conform_step(
         plugins_root: plugins_root(),
         board_id: board_id.to_string(),
     };
-    let lock = crate::storage::db()
-        .lock()
-        .map_err(|e| anyhow!("db lock: {e}"))?;
-    crate::review_loop::conform_proxy(&lock, tenant_id, proxy_ref, None, &dispatch)
+    // Global variant: short read guard → LOCKLESS render → short write guard.
+    // Holding the store across the on-device conform parked every other FFI
+    // verb for the render's duration (the P0 hang family).
+    crate::review_loop::conform_proxy_global(tenant_id, proxy_ref, None, &dispatch)
 }
 
 /// The current round's proxy Frame.io ref for a conform step. An explicit ref threaded
@@ -1226,34 +1226,54 @@ fn run_review_loop_conform_step(
 /// the caller then surfaces the same clear error instead of probing garbage.
 fn find_video_uri(board_id: &str) -> Option<String> {
     // Read everything we need under ONE lock, then release before resolving (the storage
-    // helpers below lock independently — never hold the lock across them).
-    let (cell_texts, bound_files): (Vec<String>, Vec<(String, Option<String>)>) = {
+    // helpers below lock independently — never hold the lock across them; staging COPIES
+    // media and must never run under the DB lock).
+    let (cell_texts, bound_files) = {
         let conn = crate::storage::db().lock().ok()?;
-        let cells = {
-            let mut stmt = conn.prepare(
-                "SELECT content FROM notebook_cells WHERE board_id = ?1 AND cell_type = 'markdown' ORDER BY cell_order"
-            ).ok()?;
-            let rows = stmt
-                .query_map(rusqlite::params![board_id], |row| row.get::<_, Option<String>>(0))
-                .ok()?;
-            rows.filter_map(|r| r.ok()).flatten().collect::<Vec<_>>()
-        };
-        let files = {
-            let mut stmt = conn.prepare(
-                "SELECT name, local_path FROM objects WHERE type='file' AND board_id = ?1 AND COALESCE(deleted,0)=0 ORDER BY created_at"
-            ).ok()?;
-            let rows = stmt
-                .query_map(rusqlite::params![board_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-                })
-                .ok()?;
-            rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
-        };
-        (cells, files)
+        board_media_rows(&conn, board_id)?
     };
+    resolve_video_uri_from(&cell_texts, &bound_files)
+}
 
+/// The DB-read half of `find_video_uri`: the board's markdown cell texts and
+/// bound file rows, read through the CALLER's connection (UI read paths hold a
+/// bounded guard; run paths a blocking one).
+#[allow(clippy::type_complexity)]
+fn board_media_rows(
+    conn: &rusqlite::Connection,
+    board_id: &str,
+) -> Option<(Vec<String>, Vec<(String, Option<String>)>)> {
+    let cells = {
+        let mut stmt = conn.prepare(
+            "SELECT content FROM notebook_cells WHERE board_id = ?1 AND cell_type = 'markdown' ORDER BY cell_order"
+        ).ok()?;
+        let rows = stmt
+            .query_map(rusqlite::params![board_id], |row| row.get::<_, Option<String>>(0))
+            .ok()?;
+        rows.filter_map(|r| r.ok()).flatten().collect::<Vec<_>>()
+    };
+    let files = {
+        let mut stmt = conn.prepare(
+            "SELECT name, local_path FROM objects WHERE type='file' AND board_id = ?1 AND COALESCE(deleted,0)=0 ORDER BY created_at"
+        ).ok()?;
+        let rows = stmt
+            .query_map(rusqlite::params![board_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .ok()?;
+        rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
+    };
+    Some((cells, files))
+}
+
+/// The lock-free resolve half of `find_video_uri` (may STAGE media — file
+/// copies — so callers must have dropped the DB guard).
+fn resolve_video_uri_from(
+    cell_texts: &[String],
+    bound_files: &[(String, Option<String>)],
+) -> Option<String> {
     // (1) explicit URL in any cell.
-    for c in &cell_texts {
+    for c in cell_texts {
         if let Some(u) = c.split_whitespace().find(|w| {
             (w.starts_with("http://") || w.starts_with("https://") || w.starts_with("s3://") || w.starts_with("file://"))
                 && is_media_filename(w.trim_end_matches(['.', ',', ';', ':', ')', '"', '\'']))
@@ -1270,7 +1290,7 @@ fn find_video_uri(board_id: &str) -> Option<String> {
     //     board files by bare hash (no extension), and an extension-less
     //     staged path breaks every extension-sniffing consumer downstream
     //     (found live: the Video face rendered its poster instead of media).
-    for (name, local_path) in &bound_files {
+    for (name, local_path) in bound_files {
         if let Some(p) = local_path
             && !p.is_empty() && std::path::Path::new(p).exists() {
                 let display = (!name.trim().is_empty()).then_some(name.as_str());
@@ -1396,9 +1416,9 @@ pub fn ingest_sensed_comments(
                 }
             }
         }
-    }
-    if fps.is_none() {
-        fps = board_probed_fps(board_id);
+        if fps.is_none() {
+            fps = board_probed_fps(&conn, board_id);
+        }
     }
 
     let (comments, malformed) = crate::review_loop::parse_sense_comments(result, fps);
@@ -1492,12 +1512,14 @@ fn forward_sensed_to_lens(board_id: &str, comments: &[crate::review_loop::SenseC
 /// the cell's `output` column, and — for the FFI single-step dispatch the app
 /// drives, whose state the app re-saves — `metadata_json.pipeline.state.ai_result`.
 /// Reads BOTH per cell, parses, and unwraps the MCP envelope.
-fn board_step_payloads(board_id: &str) -> Vec<serde_json::Value> {
+///
+/// Takes the caller's `&Connection` — NEVER acquires the global DB lock itself.
+/// Every caller of `board_envelope`/`board_probed_fps` already holds the lock
+/// (changelist/review_state dispatch), and a self-acquire here re-entered the
+/// non-reentrant std Mutex on the same thread: the sample-proven P0 hang
+/// (detectReviewState → board_envelope → board_step_payloads → parked forever).
+fn board_step_payloads(conn: &rusqlite::Connection, board_id: &str) -> Vec<serde_json::Value> {
     let raw: Vec<(Option<String>, Option<String>)> = {
-        // try_db: reachable from `board_envelope` before init (isolated-conn
-        // callers/tests) — no data then, NEVER a panic in an engine path.
-        let Some(db) = crate::storage::try_db() else { return Vec::new() };
-        let Ok(conn) = db.lock() else { return Vec::new() };
         let Ok(mut stmt) = conn.prepare(
             "SELECT output, metadata_json FROM notebook_cells WHERE board_id=?1",
         ) else {
@@ -1535,8 +1557,8 @@ fn board_step_payloads(board_id: &str) -> Vec<serde_json::Value> {
 /// The board's probed frame rate, read back from persisted step outputs (the
 /// promo workflow probes before it senses): cyan-media probe reports
 /// `video.frame_rate` as an ffprobe rational ("30000/1001") — parsed to f64.
-pub(crate) fn board_probed_fps(board_id: &str) -> Option<f64> {
-    for v in board_step_payloads(board_id) {
+pub(crate) fn board_probed_fps(conn: &rusqlite::Connection, board_id: &str) -> Option<f64> {
+    for v in board_step_payloads(conn, board_id) {
         let rate = v
             .get("video")
             .and_then(|s| s.get("frame_rate"))
@@ -1805,11 +1827,28 @@ fn success_envelope(plugin_id: &str, tool: &str, result: &serde_json::Value) -> 
 pub fn board_video_media(board_id: &str) -> serde_json::Value {
     let root = crate::media_staging::effective_media_root();
 
+    // UI READ PATH (the app's `detectVideoAsset` calls this on every board
+    // open): ONE bounded guard for every DB read, dropped before any
+    // filesystem stat or media staging. Sustained contention (mesh sync,
+    // plugin unpack) yields the empty shape — the app's cell-scan fallback
+    // and its own reload cadence cover it; a parked thread never does.
+    let (payloads, media_rows) = {
+        let Some(conn) = crate::storage::try_db_read(crate::storage::READ_LOCK_BUDGET) else {
+            return json!({
+                "proxy_path": serde_json::Value::Null,
+                "master_uri": serde_json::Value::Null,
+                "media_root": root.display().to_string(),
+                "busy": true,
+            });
+        };
+        (board_step_payloads(&conn, board_id), board_media_rows(&conn, board_id))
+    };
+
     // Newest derived output among the board's persisted step results — read
     // from BOTH persistence rails (`output` column + metadata `ai_result`),
     // already unwrapped from their MCP envelopes.
     let mut proxy: Option<(std::time::SystemTime, String)> = None;
-    for v in board_step_payloads(board_id) {
+    for v in payloads {
         let Some(rel) = v.get("output_path").and_then(|p| p.as_str()) else { continue };
         if !is_media_filename(rel) {
             continue;
@@ -1832,7 +1871,8 @@ pub fn board_video_media(board_id: &str) -> serde_json::Value {
     // CONTRACT: the app's player receives ONLY an absolute on-disk path or a real
     // URI — never a bare filename. A bare name reads as neither local nor remote
     // upstairs, falls into the S3 presign branch, and plays black (ROUND-2 bug).
-    let master = find_video_uri(board_id)
+    let master = media_rows
+        .and_then(|(cells, files)| resolve_video_uri_from(&cells, &files))
         .filter(|m| m.starts_with('/') || m.contains("://"));
     json!({
         "proxy_path": proxy.map(|(_, p)| p),

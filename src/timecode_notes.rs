@@ -143,13 +143,12 @@ pub fn save_note(
 
 /// Load all timecoded notes for a board
 pub fn load_notes(board_id: &str) -> Result<Vec<TimecodeNote>> {
-    // try_db: this crosses the FFI (`cyan_load_timecode_notes`) — a call
-    // before init must surface as an error the wrapper turns into nil, never
-    // a panic crashing the app (found by the app's Tier-1 harness 2026-07-09).
-    let conn = storage::try_db()
-        .ok_or_else(|| anyhow!("DB not initialized"))?
-        .lock()
-        .map_err(|e| anyhow!("DB lock: {}", e))?;
+    // try_db_read: this crosses the FFI (`cyan_load_timecode_notes`) on a UI
+    // read path — a call before init OR under sustained lock contention must
+    // surface as an error the wrapper turns into nil, never a panic and never
+    // a parked thread (the P0 hang family).
+    let conn = storage::try_db_read(storage::READ_LOCK_BUDGET)
+        .ok_or_else(|| anyhow!("notes store busy or not initialized"))?;
     
     let mut stmt = conn.prepare(
         "SELECT id, board_id, cell_order, content, metadata_json \

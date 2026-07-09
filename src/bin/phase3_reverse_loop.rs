@@ -500,10 +500,8 @@ fn conform(env: &Env) -> Result<()> {
         timeout: Duration::from_secs(600),
     };
 
-    let outcome = {
-        let lock = storage::db().lock().map_err(|e| anyhow!("db lock: {e}"))?;
-        review_loop::conform_proxy(&lock, &env.tenant, &env.file_id, None, &dispatch)?
-    };
+    // Global variant: the render runs with the store lock RELEASED.
+    let outcome = review_loop::conform_proxy_global(&env.tenant, &env.file_id, None, &dispatch)?;
     let out_abs = env.media_root.join(&outcome.output_path);
     if !out_abs.is_file() {
         bail!(

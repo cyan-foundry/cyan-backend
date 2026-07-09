@@ -5016,11 +5016,13 @@ pub extern "C" fn cyan_autocomplete_path(
         Err(_) => return std::ptr::null_mut(),
     };
     
-    let conn = match crate::storage::db().lock() {
-        Ok(c) => c,
-        Err(_) => return std::ptr::null_mut(),
+    // Bounded read acquire: autocomplete fires per keystroke — parking it
+    // behind a mesh sync hangs typing (the P0 hang family). Busy ⇒ no
+    // suggestions this keystroke; the next keystroke retries.
+    let Some(conn) = crate::storage::try_db_read(crate::storage::READ_LOCK_BUDGET) else {
+        return std::ptr::null_mut();
     };
-    
+
     // Strip g\ or g/ prefix
     let cleaned = partial_str
         .trim_start_matches("g\\")

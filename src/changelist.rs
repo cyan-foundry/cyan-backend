@@ -1764,10 +1764,23 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("missing 'op'"))?;
 
-    let lock = crate::storage::try_db()
-        .ok_or_else(|| anyhow!("DB not initialized"))?
-        .lock()
-        .map_err(|e| anyhow!("DB lock: {}", e))?;
+    // READ ops (the app polls "list" on every board open) take a BOUNDED
+    // acquire: try_lock for a short budget, then a clean "busy" error — the
+    // UI shows its existing state and retries on its own cadence. A blocking
+    // `.lock()` here parks the caller behind mesh sync / plugin unpack for
+    // their full duration (the P0 hang family). Mutations keep the blocking
+    // acquire — a write must never be dropped on transient contention.
+    const READ_OPS: &[&str] =
+        &["list", "get", "get_version", "diff", "is_own_source_ref", "asset_get"];
+    let lock = if READ_OPS.contains(&op) {
+        crate::storage::try_db_read(crate::storage::READ_LOCK_BUDGET)
+            .ok_or_else(|| anyhow!("store busy — try again"))?
+    } else {
+        crate::storage::try_db()
+            .ok_or_else(|| anyhow!("DB not initialized"))?
+            .lock()
+            .map_err(|e| anyhow!("DB lock: {}", e))?
+    };
     let conn: &Connection = &lock;
 
     let tenant = |c: &serde_json::Value| -> Result<String> {

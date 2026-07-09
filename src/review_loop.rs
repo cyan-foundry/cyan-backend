@@ -568,6 +568,12 @@ fn proxy_hash_from_output(output_path: &str) -> String {
 /// `conform_run` is the AUTO advance this fires once the render lands. The new proxy
 /// is registered but NOT published — `publish_proxy` (external_send) stays the
 /// human's move.
+///
+/// Structured as READ (`conform_proxy_plan`) → render dispatch → WRITE
+/// (`conform_proxy_commit`) so global-store callers can RELEASE the DB lock
+/// across the render (up to the 600s dispatch timeout — holding it parked
+/// every other FFI verb, the P0 hang family). This one-conn form keeps the
+/// original contract for isolated-connection callers and tests.
 pub fn conform_proxy(
     conn: &Connection,
     tenant_id: &str,
@@ -575,6 +581,53 @@ pub fn conform_proxy(
     new_proxy_frameio_ref: Option<&str>,
     dispatch: &dyn ConformDispatch,
 ) -> Result<ConformOutcome> {
+    let plan = conform_proxy_plan(conn, tenant_id, proxy_ref)?;
+    let result = dispatch
+        .conform(plan.args.clone())
+        .map_err(|e| anyhow!("conform dispatch failed: {e}"))?;
+    conform_proxy_commit(conn, tenant_id, plan, new_proxy_frameio_ref, &result)
+}
+
+/// [`conform_proxy`] against the PROCESS-GLOBAL store: short lock for the read
+/// plan, lock RELEASED across the render dispatch, short lock for the commit.
+/// If the round advanced while the render ran, the commit's `conform_run`
+/// re-validation fails cleanly — never a misfiled version. Callers must NOT
+/// already hold the global DB lock.
+pub fn conform_proxy_global(
+    tenant_id: &str,
+    proxy_ref: &str,
+    new_proxy_frameio_ref: Option<&str>,
+    dispatch: &dyn ConformDispatch,
+) -> Result<ConformOutcome> {
+    let global = || -> Result<std::sync::MutexGuard<'static, Connection>> {
+        crate::storage::try_db()
+            .ok_or_else(|| anyhow!("DB not initialized"))?
+            .lock()
+            .map_err(|e| anyhow!("DB lock: {e}"))
+    };
+    let plan = {
+        let conn = global()?;
+        conform_proxy_plan(&conn, tenant_id, proxy_ref)?
+    };
+    let result = dispatch
+        .conform(plan.args.clone())
+        .map_err(|e| anyhow!("conform dispatch failed: {e}"))?;
+    let conn = global()?;
+    conform_proxy_commit(&conn, tenant_id, plan, new_proxy_frameio_ref, &result)
+}
+
+/// The READ phase of [`conform_proxy`]: steps (a)–(c) — resolve the proxy walk,
+/// guard the state machine, gather the confirmed ops, build the dispatch args.
+pub struct ConformPlan {
+    master: String,
+    branch: String,
+    fps: Option<f64>,
+    render_profile: Option<String>,
+    sent_ops: Vec<changelist::ConformOp>,
+    args: serde_json::Value,
+}
+
+fn conform_proxy_plan(conn: &Connection, tenant_id: &str, proxy_ref: &str) -> Result<ConformPlan> {
     // (a) Backward walk: proxy remote_ref → proxy asset → master + frozen version.
     let proxy = asset_registry::find_by_remote_ref(conn, tenant_id, "frameio", proxy_ref)?
         .ok_or_else(|| anyhow!("no registered asset carries frameio ref '{proxy_ref}'"))?;
@@ -637,9 +690,26 @@ pub fn conform_proxy(
         args["fps"] = serde_json::json!(f);
     }
 
-    let result = dispatch
-        .conform(args)
-        .map_err(|e| anyhow!("conform dispatch failed: {e}"))?;
+    Ok(ConformPlan {
+        master,
+        branch,
+        fps,
+        render_profile: proxy.render_profile.clone(),
+        sent_ops,
+        args,
+    })
+}
+
+/// The WRITE phase of [`conform_proxy`]: parse the render result, advance the
+/// round, register the derived proxy, surface `needs_manual` asks.
+fn conform_proxy_commit(
+    conn: &Connection,
+    tenant_id: &str,
+    plan: ConformPlan,
+    new_proxy_frameio_ref: Option<&str>,
+    result: &serde_json::Value,
+) -> Result<ConformOutcome> {
+    let ConformPlan { master, branch, fps, render_profile, sent_ops, args: _ } = plan;
 
     let output_path = result
         .get("output_path")
@@ -690,7 +760,7 @@ pub fn conform_proxy(
             derived_from_version: None,
             remote_refs: serde_json::json!({}),
             profile_json: serde_json::json!({ "output_path": output_path }),
-            render_profile: proxy.render_profile.clone(),
+            render_profile,
             created_at: 0,
         },
     )?;
@@ -1061,6 +1131,33 @@ pub struct RegisteredMedia {
     pub state: review_state::ReviewState,
 }
 
+/// The LOCKLESS prelude of [`register_review_media`]: stage the master into
+/// the confined root, hash it, ffprobe it. Pure filesystem/subprocess work —
+/// on a multi-GB master this is the slow part (full copy + full read + full
+/// `-count_frames` decode), so global-store callers run it with the DB lock
+/// RELEASED and pass the product into [`register_review_media_probed`].
+pub struct ProbedMaster {
+    pub staged_path: String,
+    pub master_hash: String,
+    pub fps: f64,
+    pub frames: i64,
+}
+
+pub fn probe_master_for_registration(master_path: &str) -> Result<ProbedMaster> {
+    // Stage the master into the confined media root FIRST: registration is the
+    // moment "a file the user picked" becomes "a review asset", and every
+    // downstream consumer (conform input derivation, the player's
+    // review_media_info) reads the registered path expecting it inside the
+    // root. Same-bytes idempotent, so re-registration is safe.
+    let staged = crate::media_staging::stage_local_media(master_path);
+    let path = std::path::Path::new(&staged);
+    let bytes =
+        std::fs::read(path).map_err(|e| anyhow!("read master {}: {e}", path.display()))?;
+    let master_hash = blake3::hash(&bytes).to_hex().to_string();
+    let (fps, frames) = probe_media(path)?;
+    Ok(ProbedMaster { staged_path: staged, master_hash, fps, frames })
+}
+
 /// Bootstrap the review ledger for an app media board (idempotent — a re-run on
 /// an already-published master reuses the existing review/version/proxy rows).
 pub fn register_review_media(
@@ -1071,18 +1168,23 @@ pub fn register_review_media(
     branch: &str,
     actor: review_state::Actor,
 ) -> Result<RegisteredMedia> {
-    // Stage the master into the confined media root FIRST: registration is the
-    // moment "a file the user picked" becomes "a review asset", and every
-    // downstream consumer (conform input derivation, the player's
-    // review_media_info) reads the registered path expecting it inside the
-    // root. Same-bytes idempotent, so re-registration is safe.
-    let staged = crate::media_staging::stage_local_media(master_path);
-    let master_path: &str = &staged;
-    let path = std::path::Path::new(master_path);
-    let bytes =
-        std::fs::read(path).map_err(|e| anyhow!("read master {}: {e}", path.display()))?;
-    let master = blake3::hash(&bytes).to_hex().to_string();
-    let (fps, frames) = probe_media(path)?;
+    let probed = probe_master_for_registration(master_path)?;
+    register_review_media_probed(conn, tenant_id, &probed, proxy_ref, branch, actor)
+}
+
+/// The WRITE phase of [`register_review_media`]: pure DB upserts against the
+/// caller's connection — safe under a short guard.
+pub fn register_review_media_probed(
+    conn: &Connection,
+    tenant_id: &str,
+    probed: &ProbedMaster,
+    proxy_ref: &str,
+    branch: &str,
+    actor: review_state::Actor,
+) -> Result<RegisteredMedia> {
+    let master_path: &str = &probed.staged_path;
+    let master = probed.master_hash.clone();
+    let (fps, frames) = (probed.fps, probed.frames);
     let duration_ms = ((frames as f64 / fps) * 1000.0).round() as i64;
 
     asset_registry::upsert(
@@ -1259,8 +1361,13 @@ pub fn propose_from_note(
 /// or `cyan-media-mcp` on PATH; media root from `CYAN_MEDIA_ROOT`), derive the
 /// conform input from the registered MASTER's `profile_json.path`, and drive
 /// `conform_proxy`. Returns the outcome plus the absolute output path.
+///
+/// Manages its OWN locking against the process-global store: DB reads take a
+/// short guard; the master staging COPY and the (up to 600s) render run with
+/// the lock RELEASED. The old form held the dispatch-wide command lock across
+/// the whole render — every other FFI verb parked for its duration (the P0
+/// hang family). Callers must NOT already hold the global DB lock.
 pub fn conform_via_env(
-    conn: &Connection,
     tenant_id: &str,
     proxy_ref: &str,
 ) -> Result<(ConformOutcome, std::path::PathBuf)> {
@@ -1269,22 +1376,31 @@ pub fn conform_via_env(
     // works when CYAN_MEDIA_ROOT is exported" foot-gun.
     let media_root = crate::media_staging::effective_media_root();
 
-    // proxy_ref → proxy asset → master asset → its registered local path.
-    let proxy = asset_registry::find_by_remote_ref(conn, tenant_id, "frameio", proxy_ref)?
-        .ok_or_else(|| anyhow!("no registered asset carries frameio ref '{proxy_ref}'"))?;
-    let master_hash = proxy
-        .derived_from_asset
-        .clone()
-        .ok_or_else(|| anyhow!("proxy {} has no derived_from_asset", proxy.hash))?;
-    let master = asset_registry::get(conn, tenant_id, &master_hash)?;
-    let master_path = master
-        .profile_json
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("master {master_hash} has no registered local path"))?;
+    // proxy_ref → proxy asset → master asset → its registered local path,
+    // under one SHORT guard (pure DB reads).
+    let master_path: String = {
+        let conn = crate::storage::try_db()
+            .ok_or_else(|| anyhow!("DB not initialized"))?
+            .lock()
+            .map_err(|e| anyhow!("DB lock: {e}"))?;
+        let proxy = asset_registry::find_by_remote_ref(&conn, tenant_id, "frameio", proxy_ref)?
+            .ok_or_else(|| anyhow!("no registered asset carries frameio ref '{proxy_ref}'"))?;
+        let master_hash = proxy
+            .derived_from_asset
+            .clone()
+            .ok_or_else(|| anyhow!("proxy {} has no derived_from_asset", proxy.hash))?;
+        let master = asset_registry::get(&conn, tenant_id, &master_hash)?;
+        master
+            .profile_json
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("master {master_hash} has no registered local path"))?
+            .to_string()
+    };
     // A master registered before staging existed may still point outside the
-    // root — stage it now (idempotent) instead of refusing the conform.
-    let master_abs = crate::media_staging::stage_local_media(master_path);
+    // root — stage it now (idempotent) instead of refusing the conform. The
+    // copy runs LOCKLESS (a multi-GB master must never freeze the store).
+    let master_abs = crate::media_staging::stage_local_media(&master_path);
     let input_rel = std::path::Path::new(&master_abs)
         .strip_prefix(&media_root)
         .map_err(|_| {
@@ -1308,7 +1424,7 @@ pub fn conform_via_env(
         timeout: std::time::Duration::from_secs(600),
     };
 
-    let outcome = conform_proxy(conn, tenant_id, proxy_ref, None, &dispatch)?;
+    let outcome = conform_proxy_global(tenant_id, proxy_ref, None, &dispatch)?;
     let out_abs = media_root.join(&outcome.output_path);
     if !out_abs.is_file() {
         return Err(anyhow!(
@@ -1344,15 +1460,99 @@ pub fn produce_master(
     retrieve: &dyn Fn(&str, &std::path::Path) -> Result<std::path::PathBuf>,
     dispatch: &dyn ConformDispatch,
 ) -> Result<serde_json::Value> {
-    let media_root = crate::media_staging::effective_media_root();
+    let read = produce_master_read(conn, tenant_id, version_id)?;
+    let exec = produce_master_execute(&read, retrieve, dispatch)?;
+    produce_master_commit(conn, tenant_id, version_id, &read, &exec)
+}
+
+/// [`produce_master`] against the PROCESS-GLOBAL store: short guard for the
+/// reads, lock RELEASED across retrieval (network downloads), staging (file
+/// copies) and the render, short guard for the registration writes. Callers
+/// must NOT already hold the global DB lock.
+pub fn produce_master_global(
+    tenant_id: &str,
+    version_id: &str,
+    retrieve: &dyn Fn(&str, &std::path::Path) -> Result<std::path::PathBuf>,
+    dispatch: &dyn ConformDispatch,
+) -> Result<serde_json::Value> {
+    let global = || -> Result<std::sync::MutexGuard<'static, Connection>> {
+        crate::storage::try_db()
+            .ok_or_else(|| anyhow!("DB not initialized"))?
+            .lock()
+            .map_err(|e| anyhow!("DB lock: {e}"))
+    };
+    let read = {
+        let conn = global()?;
+        produce_master_read(&conn, tenant_id, version_id)?
+    };
+    let exec = produce_master_execute(&read, retrieve, dispatch)?;
+    let conn = global()?;
+    produce_master_commit(&conn, tenant_id, version_id, &read, &exec)
+}
+
+/// READ phase: the frozen version, its used-master retrieve plan, the frozen
+/// op list, and the anchor's fps — pure DB reads under the caller's guard.
+struct ProduceMasterRead {
+    anchor_hash: String,
+    plan: Vec<(asset_registry::Asset, String)>,
+    op_args: Vec<serde_json::Value>,
+    ops_applied: usize,
+    anchor_fps: Option<f64>,
+}
+
+/// EXECUTE phase product: retrieval receipts + the rendered, hashed output.
+struct ProduceMasterExec {
+    retrieved: Vec<serde_json::Value>,
+    out_abs: std::path::PathBuf,
+    output_path: String,
+    delivery_hash: String,
+}
+
+fn produce_master_read(
+    conn: &Connection,
+    tenant_id: &str,
+    version_id: &str,
+) -> Result<ProduceMasterRead> {
     let version = changelist::get_version(conn, tenant_id, version_id)?;
     let anchor_hash = version.asset_hash.clone();
-
-    // 1 — selective retrieval: exactly the used masters.
     let plan = asset_registry::resolve_final_cut_masters(conn, tenant_id, version_id)?;
+    let ops = changelist::conform_plan(conn, tenant_id, version_id)?;
+    let anchor_asset = asset_registry::get(conn, tenant_id, &anchor_hash)?;
+    let op_args: Vec<serde_json::Value> = ops
+        .iter()
+        .map(|o| {
+            let mut m = serde_json::json!({ "op": o.op, "tc_in": o.tc_in });
+            if let Some(out) = o.tc_out {
+                m["tc_out"] = serde_json::json!(out);
+            }
+            if o.params.is_object() {
+                m["params"] = o.params.clone();
+            }
+            m
+        })
+        .collect();
+    Ok(ProduceMasterRead {
+        anchor_hash,
+        plan,
+        ops_applied: ops.len(),
+        op_args,
+        anchor_fps: anchor_asset.fps,
+    })
+}
+
+/// EXECUTE phase: retrieval (network), staging (copy), render (subprocess),
+/// output hash — NO DB access; global-store callers run this with the lock
+/// RELEASED (a multi-minute download/render must never freeze the store).
+fn produce_master_execute(
+    read: &ProduceMasterRead,
+    retrieve: &dyn Fn(&str, &std::path::Path) -> Result<std::path::PathBuf>,
+    dispatch: &dyn ConformDispatch,
+) -> Result<ProduceMasterExec> {
+    let media_root = crate::media_staging::effective_media_root();
+    let anchor_hash = read.anchor_hash.as_str();
     let mut retrieved: Vec<serde_json::Value> = Vec::new();
     let mut anchor_local: Option<std::path::PathBuf> = None;
-    for (asset, location) in &plan {
+    for (asset, location) in &read.plan {
         // Already held locally? (profile_json.path is the holding record.)
         let held = asset
             .profile_json
@@ -1380,33 +1580,18 @@ pub fn produce_master(
         }));
     }
     let anchor_local = anchor_local.ok_or_else(|| {
-        anyhow!("version {version_id}'s anchor master {anchor_hash} is not in its own retrieve plan")
+        anyhow!("the version's anchor master {anchor_hash} is not in its own retrieve plan")
     })?;
 
     // 2 — conform the anchor with the FROZEN plan (master frames).
-    let ops = changelist::conform_plan(conn, tenant_id, version_id)?;
-    let anchor_asset = asset_registry::get(conn, tenant_id, &anchor_hash)?;
     let staged = crate::media_staging::stage_local_media(&anchor_local.display().to_string());
     let input_rel = std::path::Path::new(&staged)
         .strip_prefix(&media_root)
         .map_err(|_| anyhow!("anchor master {staged} could not be staged into the media root"))?
         .to_string_lossy()
         .to_string();
-    let op_args: Vec<serde_json::Value> = ops
-        .iter()
-        .map(|o| {
-            let mut m = serde_json::json!({ "op": o.op, "tc_in": o.tc_in });
-            if let Some(out) = o.tc_out {
-                m["tc_out"] = serde_json::json!(out);
-            }
-            if o.params.is_object() {
-                m["params"] = o.params.clone();
-            }
-            m
-        })
-        .collect();
-    let mut args = serde_json::json!({ "ops": op_args, "input": input_rel });
-    if let Some(f) = anchor_asset.fps {
+    let mut args = serde_json::json!({ "ops": read.op_args.clone(), "input": input_rel });
+    if let Some(f) = read.anchor_fps {
         args["fps"] = serde_json::json!(f);
     }
     let result = dispatch
@@ -1424,64 +1609,88 @@ pub fn produce_master(
             out_abs.display()
         ));
     }
-
-    // 3 — register the delivery output (content identity).
     let delivery_hash = blake3_file_hex(&out_abs)?;
+    Ok(ProduceMasterExec { retrieved, out_abs, output_path, delivery_hash })
+}
+
+/// WRITE phase: register the delivery output (content identity) — pure DB
+/// upserts under the caller's guard.
+fn produce_master_commit(
+    conn: &Connection,
+    tenant_id: &str,
+    version_id: &str,
+    read: &ProduceMasterRead,
+    exec: &ProduceMasterExec,
+) -> Result<serde_json::Value> {
     asset_registry::upsert(
         conn,
         &asset_registry::Asset {
-            hash: delivery_hash.clone(),
+            hash: exec.delivery_hash.clone(),
             tenant_id: tenant_id.to_string(),
             kind: Some("delivery".to_string()),
-            fps: anchor_asset.fps,
+            fps: read.anchor_fps,
             duration_ms: None,
             derived_from_asset: None,
             derived_from_version: None,
             remote_refs: serde_json::json!({}),
             profile_json: serde_json::json!({
-                "path": out_abs.display().to_string(),
-                "output_path": output_path,
+                "path": exec.out_abs.display().to_string(),
+                "output_path": exec.output_path,
             }),
             render_profile: None,
             created_at: 0,
         },
     )?;
-    asset_registry::set_derivation(conn, tenant_id, &delivery_hash, &anchor_hash, version_id)?;
+    asset_registry::set_derivation(conn, tenant_id, &exec.delivery_hash, &read.anchor_hash, version_id)?;
 
     Ok(serde_json::json!({
         "version_id": version_id,
-        "masters": retrieved,
-        "ops_applied": ops.len(),
-        "delivery_hash": delivery_hash,
-        "output_path": out_abs.display().to_string(),
+        "masters": exec.retrieved,
+        "ops_applied": read.ops_applied,
+        "delivery_hash": exec.delivery_hash,
+        "output_path": exec.out_abs.display().to_string(),
     }))
 }
 
 /// Prod wiring for [`produce_master`]: location retrieval via the ingest
 /// connectors; conform via the env-configured cyan-media host.
-pub fn produce_master_via_env(
-    conn: &Connection,
-    tenant_id: &str,
-    version_id: &str,
-) -> Result<serde_json::Value> {
+///
+/// Manages its OWN locking against the process-global store: DB reads under
+/// short guards; anchor retrieval (network), staging (copy) and the render run
+/// with the lock RELEASED. The old form held the ingest dispatch-wide lock
+/// across downloads + a full render — every other FFI verb parked for many
+/// minutes (the P0 hang family). Callers must NOT hold the global DB lock.
+pub fn produce_master_via_env(tenant_id: &str, version_id: &str) -> Result<serde_json::Value> {
     let media_root = crate::media_staging::effective_media_root();
     // The dispatch needs the anchor's root-relative input up front — resolve
-    // it the same way produce_master will (held path, else retrieve).
-    let version = changelist::get_version(conn, tenant_id, version_id)?;
-    let anchor = asset_registry::get(conn, tenant_id, &version.asset_hash)?;
-    let held = anchor
-        .profile_json
-        .get("path")
-        .and_then(|v| v.as_str())
-        .map(std::path::PathBuf::from)
-        .filter(|p| p.is_file());
+    // it the same way produce_master will (held path, else retrieve). DB reads
+    // under one SHORT guard; the retrieval download runs lockless after.
+    let (held, anchor_hash, location) = {
+        let conn = crate::storage::try_db()
+            .ok_or_else(|| anyhow!("DB not initialized"))?
+            .lock()
+            .map_err(|e| anyhow!("DB lock: {e}"))?;
+        let version = changelist::get_version(&conn, tenant_id, version_id)?;
+        let anchor = asset_registry::get(&conn, tenant_id, &version.asset_hash)?;
+        let held = anchor
+            .profile_json
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_file());
+        let location = if held.is_none() {
+            asset_registry::class_location(&conn, tenant_id, &anchor.hash)?.1
+        } else {
+            None
+        };
+        (held, anchor.hash.clone(), location)
+    };
     let anchor_local = match held {
         Some(p) => p,
         None => {
-            let (_, location) = asset_registry::class_location(conn, tenant_id, &anchor.hash)?;
             let location =
-                location.ok_or_else(|| anyhow!("anchor master {} has no location", anchor.hash))?;
-            let short: String = anchor.hash.chars().take(12).collect();
+                location.ok_or_else(|| anyhow!("anchor master {anchor_hash} has no location"))?;
+            let short: String = anchor_hash.chars().take(12).collect();
             let name = location.rsplit('/').next().unwrap_or("master").to_string();
             let dest = media_root.join("masters").join(short).join(&name);
             crate::ingest_connectors::retrieve_by_location(&location, &dest)?
@@ -1503,8 +1712,7 @@ pub fn produce_master_via_env(
         input_rel,
         timeout: std::time::Duration::from_secs(600),
     };
-    produce_master(
-        conn,
+    produce_master_global(
         tenant_id,
         version_id,
         &|location, dest| crate::ingest_connectors::retrieve_by_location(location, dest),
@@ -1613,10 +1821,14 @@ fn merge_sensed_notes(
 ) {
     let known: std::collections::HashSet<String> =
         entries.iter().filter_map(|e| e.source_ref.clone()).collect();
+    // `board_probed_fps` reads through OUR conn: every caller of
+    // `board_envelope` already holds the global DB lock, and the old
+    // self-acquiring form re-entered the non-reentrant std Mutex on the same
+    // thread — the sample-proven P0 hang (Boards click parked forever).
     let fps = asset_registry::get(conn, tenant, asset)
         .ok()
         .and_then(|a| a.fps)
-        .or_else(|| crate::pipeline_executor::board_probed_fps(board_id));
+        .or_else(|| crate::pipeline_executor::board_probed_fps(conn, board_id));
     let mut stmt = match conn.prepare(
         "SELECT id, cell_order, content, metadata_json FROM notebook_cells \
          WHERE board_id = ?1 AND cell_type = 'timecode_note' ORDER BY cell_order",

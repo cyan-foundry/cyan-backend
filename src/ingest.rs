@@ -380,7 +380,21 @@ fn ingest_file(
     location: &str,
 ) -> Result<bool> {
     let hash = blake3_file(abs)?;
+    ingest_file_hashed(conn, source, abs, hash, workspace_id, remote, location)
+}
 
+/// [`ingest_file`] with the content hash ALREADY computed — pure DB work under
+/// the caller's guard. Global-store callers hash the (possibly huge) file with
+/// the lock RELEASED and pass the hash in.
+fn ingest_file_hashed(
+    conn: &Connection,
+    source: &IngestSource,
+    abs: &Path,
+    hash: String,
+    workspace_id: Option<&str>,
+    remote: Option<(&str, &str)>,
+    location: &str,
+) -> Result<bool> {
     // Content-identity dedup against BOTH prior ingests (asset registry)
     // and prior attachments (the objects hash seam).
     let known_asset = crate::asset_registry::get(conn, &source.tenant_id, &hash).is_ok();
@@ -542,6 +556,42 @@ fn with_global<T>(f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
     f(&lock)
 }
 
+/// The folder scan against the PROCESS DB: identical logic to [`scan_folder`],
+/// but the directory walk and the per-file Blake3 hashing (the slow part on a
+/// folder of large masters) run with the DB lock RELEASED — each file then
+/// takes one short guard for its dedup check + inserts. The old shape held one
+/// guard across the whole walk (the "folder scans hold one short lock"
+/// docstring was wrong) — the P0 hang family.
+fn scan_folder_global(source: &IngestSource) -> Result<ScanReport> {
+    let dir = PathBuf::from(source.uri.strip_prefix("file://").unwrap_or(&source.uri));
+    let entries = std::fs::read_dir(&dir)
+        .map_err(|e| anyhow!("cannot read watched folder {}: {}", dir.display(), e))?;
+
+    // Deterministic walk order (names), media extensions only, non-recursive.
+    let mut media: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file() && is_media(p))
+        .collect();
+    media.sort();
+
+    let workspace_id = with_global(|conn| board_workspace(conn, &source.board_id))?;
+    let mut report = ScanReport { discovered: media.len(), ..Default::default() };
+    for path in &media {
+        let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        let location = format!("file://{}", abs.display());
+        let hash = blake3_file(&abs)?; // no lock — hashing is the slow part
+        let ingested = with_global(|conn| {
+            ingest_file_hashed(conn, source, &abs, hash.clone(), workspace_id.as_deref(), None, &location)
+        })?;
+        if ingested {
+            report.ingested += 1;
+        } else {
+            report.deduped += 1;
+        }
+    }
+    Ok(report)
+}
+
 /// The remote scan engine against the PROCESS DB: identical logic to
 /// [`scan_remote_with_conn`], but every network phase (LIST, FETCH) runs with
 /// the DB lock RELEASED — a multi-hundred-MB daily download must never freeze
@@ -587,7 +637,7 @@ fn scan_remote_global(source: &IngestSource, connector: &dyn RemoteConnector) ->
 pub fn scan_now_global(source_id: &str) -> Result<ScanReport> {
     let source = with_global(|conn| source_get(conn, source_id))?;
     let report = match source.kind.as_str() {
-        "folder" => with_global(|conn| scan_folder(conn, &source))?,
+        "folder" => scan_folder_global(&source)?,
         kind @ ("s3" | "frameio_c2c") => {
             let connector = crate::ingest_connectors::connector_for(kind)?;
             scan_remote_global(&source, connector.as_ref())?
@@ -783,13 +833,38 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
             let out = scan_due_global(at)?;
             return Ok(serde_json::to_value(out)?);
         }
+        // produce_master downloads masters + renders the delivery (minutes) —
+        // it manages its own locking too (read → LOCKLESS retrieve/render →
+        // write). Holding the dispatch-wide lock across it parked every other
+        // FFI verb for the duration (the P0 hang family).
+        "produce_master" => {
+            let tenant = cmd
+                .get("tenant_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("missing 'tenant_id'"))?;
+            let version_id = cmd
+                .get("version_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("missing 'version_id'"))?;
+            return crate::review_loop::produce_master_via_env(tenant, version_id);
+        }
         _ => {}
     }
 
-    let lock = crate::storage::try_db()
-        .ok_or_else(|| anyhow!("DB not initialized"))?
-        .lock()
-        .map_err(|e| anyhow!("DB lock: {}", e))?;
+    // READ ops the app polls (SourcesViewModel: `source_list` + `runs_for_board`
+    // on every board open and a 60s cadence) take a BOUNDED acquire — parked
+    // behind a mesh sync / plugin unpack they are the P0 hang family. Mutations
+    // keep the blocking acquire.
+    const READ_OPS: &[&str] = &["source_list", "runs_for_board", "produce_master_plan"];
+    let lock = if READ_OPS.contains(&op) {
+        crate::storage::try_db_read(crate::storage::READ_LOCK_BUDGET)
+            .ok_or_else(|| anyhow!("store busy — try again"))?
+    } else {
+        crate::storage::try_db()
+            .ok_or_else(|| anyhow!("DB not initialized"))?
+            .lock()
+            .map_err(|e| anyhow!("DB lock: {}", e))?
+    };
     let conn: &Connection = &lock;
 
     let s = |k: &str| -> Result<String> {
@@ -860,14 +935,8 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
         // Retrieval + render can be slow (network, ffmpeg) but run on the
         // caller's thread with the dispatch-wide lock we already hold — the
         // op is explicitly human-triggered ("Produce master"), not a tick.
-        "produce_master" => {
-            let out = crate::review_loop::produce_master_via_env(
-                conn,
-                &s("tenant_id")?,
-                &s("version_id")?,
-            )?;
-            Ok(out)
-        }
+        // "produce_master" is routed BEFORE the dispatch-wide lock (top of this
+        // fn) — retrieval + render must never run with the store held.
         other => Err(anyhow!("unknown op '{}'", other)),
     }
 }

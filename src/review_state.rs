@@ -899,10 +899,98 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value, ReviewError> {
         .ok_or_else(|| ReviewError::Other("missing 'op'".to_string()))?
         .to_string();
 
-    let lock = crate::storage::try_db()
-        .ok_or_else(|| ReviewError::Other("DB not initialized".to_string()))?
-        .lock()
-        .map_err(|e| ReviewError::Other(format!("DB lock: {}", e)))?;
+    // LONG-RUNNING render ops manage their OWN locking (short read guard →
+    // LOCKLESS ffmpeg render → short write guard) — route them BEFORE the
+    // dispatch-wide lock. The old shape held that lock across the full 600s
+    // conform timeout and parked every other FFI verb (the P0 hang family).
+    if op == "conform_proxy" {
+        let tenant = {
+            let conn = crate::storage::try_db()
+                .ok_or_else(|| ReviewError::Other("DB not initialized".to_string()))?
+                .lock()
+                .map_err(|e| ReviewError::Other(format!("DB lock: {e}")))?;
+            match cmd.get("tenant_id").and_then(|v| v.as_str()).filter(|t| !t.is_empty()) {
+                Some(t) => t.to_string(),
+                None => {
+                    let board = cmd
+                        .get("board_id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            ReviewError::Other("missing 'tenant_id' (or 'board_id')".to_string())
+                        })?;
+                    crate::review_loop::board_tenant(&conn, board)
+                }
+            }
+        };
+        let proxy_ref = cmd
+            .get("proxy_ref")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ReviewError::Other("missing 'proxy_ref'".to_string()))?;
+        let (outcome, out_abs) = crate::review_loop::conform_via_env(&tenant, proxy_ref)
+            .map_err(|e| ReviewError::Other(e.to_string()))?;
+        let mut v = serde_json::to_value(outcome)
+            .map_err(|e| ReviewError::Other(e.to_string()))?;
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert(
+                "output_abs".to_string(),
+                serde_json::Value::String(out_abs.display().to_string()),
+            );
+        }
+        return Ok(v);
+    }
+    // Same shape for registration: the stage/hash/ffprobe of a (multi-GB)
+    // master is pure filesystem/subprocess work — run it LOCKLESS, take the
+    // guard only for the ledger upserts.
+    if op == "register_review_media" {
+        let master_path = cmd
+            .get("master_path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ReviewError::Other("missing 'master_path'".to_string()))?;
+        let proxy_ref = cmd
+            .get("proxy_ref")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ReviewError::Other("missing 'proxy_ref'".to_string()))?;
+        let branch = cmd.get("branch").and_then(|v| v.as_str()).unwrap_or("main");
+        let actor = Actor::parse(
+            cmd.get("actor")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ReviewError::Other("missing 'actor'".to_string()))?,
+        )?;
+        let probed = crate::review_loop::probe_master_for_registration(master_path)
+            .map_err(|e| ReviewError::Other(e.to_string()))?;
+        let conn = crate::storage::try_db()
+            .ok_or_else(|| ReviewError::Other("DB not initialized".to_string()))?
+            .lock()
+            .map_err(|e| ReviewError::Other(format!("DB lock: {e}")))?;
+        let tenant = match cmd.get("tenant_id").and_then(|v| v.as_str()).filter(|t| !t.is_empty()) {
+            Some(t) => t.to_string(),
+            None => {
+                let board = cmd.get("board_id").and_then(|v| v.as_str()).ok_or_else(|| {
+                    ReviewError::Other("missing 'tenant_id' (or 'board_id')".to_string())
+                })?;
+                crate::review_loop::board_tenant(&conn, board)
+            }
+        };
+        let out = crate::review_loop::register_review_media_probed(
+            &conn, &tenant, &probed, proxy_ref, branch, actor,
+        )
+        .map_err(|e| ReviewError::Other(e.to_string()))?;
+        return serde_json::to_value(out).map_err(|e| ReviewError::Other(e.to_string()));
+    }
+
+    // READ ops the app polls take a BOUNDED acquire (see changelist::dispatch):
+    // parked-behind-mesh-sync reads are the P0 hang family. Transitions keep
+    // the blocking acquire — a state change must not drop on contention.
+    const READ_OPS: &[&str] = &["get", "loop_get", "loop_runs", "nudges_for", "review_media_info"];
+    let lock = if READ_OPS.contains(&op.as_str()) {
+        crate::storage::try_db_read(crate::storage::READ_LOCK_BUDGET)
+            .ok_or_else(|| ReviewError::Other("store busy — try again".to_string()))?
+    } else {
+        crate::storage::try_db()
+            .ok_or_else(|| ReviewError::Other("DB not initialized".to_string()))?
+            .lock()
+            .map_err(|e| ReviewError::Other(format!("DB lock: {}", e)))?
+    };
     let conn: &Connection = &lock;
 
     let s = |k: &str| -> Result<String, ReviewError> {
@@ -1205,19 +1293,9 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value, ReviewError> {
         // drives the reverse loop over this same JSON surface; the loop-level logic
         // lives in `review_loop` (see its "APP-DRIVEN loop verbs" section). Each verb
         // accepts `tenant_id` OR `board_id` (the app's boards resolve to their group).
-        "register_review_media" => {
-            let tenant = tenant_or_board(&cmd)?;
-            let out = crate::review_loop::register_review_media(
-                conn,
-                &tenant,
-                &s("master_path")?,
-                &s("proxy_ref")?,
-                &branch(),
-                actor()?,
-            )
-            .map_err(|e| ReviewError::Other(e.to_string()))?;
-            serde_json::to_value(out).map_err(|e| ReviewError::Other(e.to_string()))?
-        }
+        // "register_review_media" is routed BEFORE the dispatch-wide lock (see
+        // the top of this fn) — stage/hash/ffprobe must never run with the
+        // store held.
         "propose_from_note" => {
             let tenant = tenant_or_board(&cmd)?;
             let out = crate::review_loop::propose_from_note(
@@ -1229,21 +1307,8 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value, ReviewError> {
             .map_err(|e| ReviewError::Other(e.to_string()))?;
             serde_json::to_value(out).map_err(|e| ReviewError::Other(e.to_string()))?
         }
-        "conform_proxy" => {
-            let tenant = tenant_or_board(&cmd)?;
-            let (outcome, out_abs) =
-                crate::review_loop::conform_via_env(conn, &tenant, &s("proxy_ref")?)
-                    .map_err(|e| ReviewError::Other(e.to_string()))?;
-            let mut v = serde_json::to_value(outcome)
-                .map_err(|e| ReviewError::Other(e.to_string()))?;
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert(
-                    "output_abs".to_string(),
-                    serde_json::Value::String(out_abs.display().to_string()),
-                );
-            }
-            v
-        }
+        // "conform_proxy" is routed BEFORE the dispatch-wide lock (see the top of
+        // this fn) — the render must never run with the store held.
         "review_media_info" => {
             let tenant = tenant_or_board(&cmd)?;
             crate::review_loop::review_media_info(conn, &tenant, &s("proxy_ref")?)
