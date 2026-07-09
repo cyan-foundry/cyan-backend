@@ -113,22 +113,116 @@ fn source_add_list_remove_round_trip_and_closed_vocab() {
     assert!(ingest::source_remove(&conn, "g-src", &s2.id).is_err());
 }
 
-#[test]
-fn s3_and_frameio_scans_are_typed_not_supported_yet() {
-    let conn = conn_db();
-    mk_board(&conn, "g-nsy", "b-nsy");
-    for kind in ["s3", "frameio_c2c"] {
-        let s = ingest::source_add(&conn, "g-nsy", "b-nsy", kind, "remote://somewhere", Some(60))
-            .expect("registers");
-        let err = ingest::scan(&conn, &s.id).expect_err("scan must be honest");
-        let typed = err
-            .downcast_ref::<ingest::NotSupportedYet>()
-            .unwrap_or_else(|| panic!("expected typed NotSupportedYet, got: {err}"));
-        assert_eq!(typed.kind, kind, "the error names the kind");
-        // A failed scan must NOT advance the scheduling clock.
-        let listed = ingest::source_list(&conn, "g-nsy").expect("list");
-        assert!(listed.iter().all(|s| s.last_scan_at.is_none()));
+// ── the remote scan engine (STAGE-4 C2 — real connectors, faked transport) ──
+//
+// (Supersedes `s3_and_frameio_scans_are_typed_not_supported_yet`: the s3 /
+// frameio_c2c transports are now LIVE behind the `RemoteConnector` seam, so
+// the honest-stub contract is replaced by the engine contract below.)
+
+/// Env-mutating tests in this binary serialize on this (process-global env).
+static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A scripted transport: LIST returns the scripted items; FETCH writes the
+/// scripted bytes. No network — the engine's dedup/register/materialize logic
+/// is what's under test.
+struct FakeConnector {
+    items: Vec<ingest::RemoteItem>,
+    bytes: std::collections::HashMap<String, Vec<u8>>,
+}
+
+impl ingest::RemoteConnector for FakeConnector {
+    fn provider(&self) -> &'static str {
+        "frameio"
     }
+    fn list(&self, _source: &ingest::IngestSource) -> anyhow::Result<Vec<ingest::RemoteItem>> {
+        Ok(self.items.clone())
+    }
+    fn fetch(
+        &self,
+        _source: &ingest::IngestSource,
+        item: &ingest::RemoteItem,
+        dest: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        if let Some(dir) = dest.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(dest, self.bytes.get(&item.ref_id).cloned().unwrap_or_default())?;
+        Ok(())
+    }
+    fn location(&self, _source: &ingest::IngestSource, item: &ingest::RemoteItem) -> String {
+        format!("frameio://acct/file/{}", item.ref_id)
+    }
+}
+
+fn remote_item(name: &str, ref_id: &str, size: u64) -> ingest::RemoteItem {
+    ingest::RemoteItem { name: name.into(), provider: "frameio", ref_id: ref_id.into(), size }
+}
+
+#[test]
+fn remote_scan_ingests_registers_by_location_and_dedupes() {
+    // The landing area rides the media root — confine it for this test.
+    let _g = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+    let root = tempfile::tempdir().expect("media root");
+    unsafe { std::env::set_var("CYAN_MEDIA_ROOT", root.path()) };
+
+    let conn = conn_db();
+    mk_board(&conn, "g-rem", "b-rem");
+    let source = ingest::source_add(&conn, "g-rem", "b-rem", "frameio_c2c", "frameio://a/p", None)
+        .expect("registers");
+
+    let fake = FakeConnector {
+        items: vec![
+            remote_item("daily-1.mp4", "f-1", 4),
+            remote_item("same-bytes.mov", "f-2", 4), // same CONTENT as f-1 → content dedup
+            remote_item("notes.txt", "f-3", 2),      // not media → filtered out entirely
+        ],
+        bytes: [
+            ("f-1".to_string(), b"AAAA".to_vec()),
+            ("f-2".to_string(), b"AAAA".to_vec()),
+            ("f-3".to_string(), b"xx".to_vec()),
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    let report = ingest::scan_remote_with_conn(&conn, &source, &fake).expect("scan");
+    assert_eq!(
+        report,
+        ingest::ScanReport { discovered: 2, ingested: 1, deduped: 1 },
+        "media-only discovery; one NEW asset; identical bytes dedupe"
+    );
+
+    // The master registered with class=clip, the provider remote-ref, and its
+    // canonical REMOTE location (master-by-location).
+    let asset = cyan_backend::asset_registry::find_by_remote_ref(&conn, "g-rem", "frameio", "f-1")
+        .expect("lookup")
+        .expect("registered");
+    assert_eq!(asset.kind.as_deref(), Some("master"));
+    let (class, location) =
+        cyan_backend::asset_registry::class_location(&conn, "g-rem", &asset.hash).expect("cl");
+    assert_eq!(class.as_deref(), Some("clip"));
+    assert_eq!(location.as_deref(), Some("frameio://acct/file/f-1"));
+
+    // The downloaded master landed inside the confined media root.
+    let path = asset.profile_json["path"].as_str().expect("landing path");
+    assert!(
+        std::path::Path::new(path).starts_with(root.path()),
+        "landed in media root: {path}"
+    );
+    assert!(std::path::Path::new(path).is_file());
+
+    // One run materialized for the one new asset.
+    let runs = ingest::runs_for_board(&conn, "b-rem").expect("runs");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].asset_hash, asset.hash);
+
+    // Re-scan: the remote-ref pre-check (f-1) + content dedup (f-2) skip both;
+    // nothing new ingests, no second run mints.
+    let again = ingest::scan_remote_with_conn(&conn, &source, &fake).expect("re-scan");
+    assert_eq!(again, ingest::ScanReport { discovered: 2, ingested: 0, deduped: 2 });
+    assert_eq!(ingest::runs_for_board(&conn, "b-rem").expect("runs").len(), 1);
+
+    unsafe { std::env::remove_var("CYAN_MEDIA_ROOT") };
 }
 
 // ── the live folder scan ───────────────────────────────────────────────────────
@@ -223,8 +317,10 @@ fn due_sources_and_scan_due_follow_the_poll_cadence() {
     .expect("scheduled folder");
     let manual = ingest::source_add(&conn, "g-due", "b-due", "folder", "/nowhere", None)
         .expect("manual-only folder");
-    let remote = ingest::source_add(&conn, "g-due", "b-due", "s3", "s3://b/p", Some(60))
-        .expect("scheduled s3");
+    // A scheduled source whose scan always fails (unreadable folder) — the
+    // sweep must CARRY its error, never stall on it.
+    let remote = ingest::source_add(&conn, "g-due", "b-due", "folder", "/nowhere/really", Some(60))
+        .expect("scheduled broken folder");
 
     let now = chrono::Utc::now().timestamp();
 
@@ -245,12 +341,12 @@ fn due_sources_and_scan_due_follow_the_poll_cadence() {
         folder_outcome.report,
         Some(ingest::ScanReport { discovered: 1, ingested: 1, deduped: 0 })
     );
-    let s3_outcome = outcomes.iter().find(|o| o.source_id == remote.id).expect("s3");
-    assert!(s3_outcome.report.is_none());
+    let broken_outcome = outcomes.iter().find(|o| o.source_id == remote.id).expect("broken");
+    assert!(broken_outcome.report.is_none());
     assert!(
-        s3_outcome.error.as_deref().unwrap_or("").contains("not supported yet"),
-        "the s3 failure is carried, not thrown; got {:?}",
-        s3_outcome.error
+        broken_outcome.error.as_deref().unwrap_or("").contains("cannot read watched folder"),
+        "the failure is carried, not thrown; got {:?}",
+        broken_outcome.error
     );
 
     // The successful scan advanced the clock: not due until the cadence elapses.
@@ -576,7 +672,17 @@ fn ingest_command_dispatch_returns_clean_json_errors() {
         );
     }
 
-    // The typed transport gap surfaces through the dialect too.
+    // A remote scan without credentials surfaces a clean, NAMED error through
+    // the dialect (no panic, no network) — creds resolve fresh per scan from
+    // the credential env file, which we point at an empty temp file here.
+    let _g = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+    let empty = tempfile::NamedTempFile::new().expect("temp cred file");
+    let old_cred = std::env::var("CYAN_CRED_ENV_FILE").ok();
+    let old_tok = std::env::var("FRAMEIO_IMS_TOKEN").ok();
+    unsafe {
+        std::env::set_var("CYAN_CRED_ENV_FILE", empty.path());
+        std::env::remove_var("FRAMEIO_IMS_TOKEN");
+    }
     let group = "ingest-ffi-nsy";
     let (default_ws, _) = create_fresh_group(group, "FFI NSY Group");
     let board = "ingest-ffi-nsy-board";
@@ -588,9 +694,18 @@ fn ingest_command_dispatch_returns_clean_json_errors() {
     }));
     let scan = cmd(serde_json::json!({ "op": "scan_now", "source_id": added["id"] }));
     assert!(
-        scan["error"].as_str().unwrap_or("").contains("frameio_c2c"),
-        "the seam error names the kind; got {scan}"
+        scan["error"].as_str().unwrap_or("").contains("FRAMEIO_IMS_TOKEN"),
+        "the missing credential is named; got {scan}"
     );
+    unsafe {
+        match old_cred {
+            Some(v) => std::env::set_var("CYAN_CRED_ENV_FILE", v),
+            None => std::env::remove_var("CYAN_CRED_ENV_FILE"),
+        }
+        if let Some(v) = old_tok {
+            std::env::set_var("FRAMEIO_IMS_TOKEN", v);
+        }
+    }
 }
 
 /// With ONE attachment and no explicit asset, the Tier-2 implicit fill still

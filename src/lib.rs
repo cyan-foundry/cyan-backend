@@ -1989,6 +1989,7 @@ pub mod note_inference;
 pub mod xfer_policy;
 pub mod asset_registry;
 pub mod ingest;
+pub mod ingest_connectors;
 pub mod skills;
 pub mod pipeline_executor;
 pub mod media_staging;

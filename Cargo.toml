@@ -98,6 +98,7 @@ crypto_box = { version = "0.10.0-pre.0", features = ["seal"] }
 # Dailies-grade transfers (G8/G10 hardening): disk-space preflight (statvfs) and the
 # peak-RSS oracle (getrusage). Already in the tree transitively; std exposes neither.
 libc = "0.2"
+rusty-s3 = "0.8"
 
 [dev-dependencies]
 # The `testing` feature exposes the embedded RS256 keypair + entitlement

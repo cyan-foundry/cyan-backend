@@ -402,7 +402,7 @@ fn resolve_credential(
 /// The credential dotenv file consulted at spawn (fresh read). Overridable for
 /// tests/deploys via `CYAN_CRED_ENV_FILE`; defaults to the auto-refreshed
 /// `~/.frameio.env` the demo loader maintains.
-fn cred_env_file() -> std::path::PathBuf {
+pub(crate) fn cred_env_file() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("CYAN_CRED_ENV_FILE")
         && !p.trim().is_empty()
     {
@@ -415,7 +415,7 @@ fn cred_env_file() -> std::path::PathBuf {
 /// Minimal dotenv lookup: `KEY=VALUE` lines, tolerating a leading `export `,
 /// surrounding quotes, and comment/blank lines. Returns the LAST match (the
 /// refresher appends/rewrites; last write wins).
-fn dotenv_lookup(path: &std::path::Path, key: &str) -> Option<String> {
+pub(crate) fn dotenv_lookup(path: &std::path::Path, key: &str) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut found = None;
     for line in text.lines() {
