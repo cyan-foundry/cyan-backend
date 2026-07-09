@@ -888,8 +888,9 @@ pub(crate) async fn execute_local_mcp_tool_step(
                 return Err(anyhow!("{}", envelope));
             }
 
-            let summary = serde_json::to_string(&result.result)
-                .unwrap_or_else(|_| result.result.to_string());
+            // ROUND-2 P2: the app shows a STRUCTURED summary for success too —
+            // never the raw MCP envelope. Same polish as the error path.
+            let summary = success_envelope(&step.plugin_id, &step.tool, &result.result).to_string();
 
             // TWO-WAY REVIEW (sense → player): a frameio list_comments result
             // materializes PER-COMMENT timecoded notes on the board — the Video
@@ -1437,7 +1438,53 @@ pub fn ingest_sensed_comments(
     }
     if !comments.is_empty() {
         tracing::info!("sense→notes: {} reviewer comment(s) on board {board_id}", comments.len());
+        forward_sensed_to_lens(board_id, &comments);
     }
+}
+
+/// A4: sensed reviewer comments ALSO feed the Lens focus engine (`POST
+/// /api/v1/events`), which extracts asks/decisions/blockers — noise rejected
+/// there, per the careful-enrichment contract — and surfaces them as
+/// nudges/asks/decisions on this board's rail. Strictly best-effort and
+/// non-blocking: the mechanical review path must work with Lens off, so a
+/// dead/unreachable Lens only logs. Outside a tokio runtime (unit tests, sync
+/// callers) it skips — the notes rail above is the durable record.
+fn forward_sensed_to_lens(board_id: &str, comments: &[crate::review_loop::SenseComment]) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::debug!("sense→lens: no async runtime — skipping forward");
+        return;
+    };
+    let now = chrono::Utc::now().timestamp() as u64;
+    let events: Vec<crate::cyan_lens_client::EventRequest> = comments
+        .iter()
+        .map(|c| crate::cyan_lens_client::EventRequest {
+            id: format!("frameio-comment-{}", c.id), // stable ⇒ re-sense is idempotent upstream
+            group_id: board_id.to_string(),          // lens scopes its graph by this id
+            workspace_id: String::new(),
+            source: "frameio".to_string(),
+            content_kind: "review_comment".to_string(),
+            external_id: c.id.clone(),
+            content: c.text.clone(),
+            author_id: String::new(),
+            author_name: c.author.clone().unwrap_or_else(|| "frameio reviewer".to_string()),
+            url: String::new(),
+            title: None,
+            thread_id: None,
+            parent_id: None,
+            ts: now,
+            captured_at: now,
+        })
+        .collect();
+    handle.spawn(async move {
+        let client = crate::cyan_lens_client::CyanLensClient::from_env();
+        for event in events {
+            let id = event.id.clone();
+            match client.send_event(event).await {
+                Ok(resp) => tracing::info!("sense→lens: {id} status={}", resp.status),
+                Err(e) => tracing::debug!("sense→lens: forward failed (non-fatal): {e:#}"),
+            }
+        }
+    });
 }
 
 /// The board's persisted step-result payloads, UNWRAPPED. Results persist on
@@ -1447,7 +1494,10 @@ pub fn ingest_sensed_comments(
 /// Reads BOTH per cell, parses, and unwraps the MCP envelope.
 fn board_step_payloads(board_id: &str) -> Vec<serde_json::Value> {
     let raw: Vec<(Option<String>, Option<String>)> = {
-        let Ok(conn) = crate::storage::db().lock() else { return Vec::new() };
+        // try_db: reachable from `board_envelope` before init (isolated-conn
+        // callers/tests) — no data then, NEVER a panic in an engine path.
+        let Some(db) = crate::storage::try_db() else { return Vec::new() };
+        let Ok(conn) = db.lock() else { return Vec::new() };
         let Ok(mut stmt) = conn.prepare(
             "SELECT output, metadata_json FROM notebook_cells WHERE board_id=?1",
         ) else {
@@ -1485,7 +1535,7 @@ fn board_step_payloads(board_id: &str) -> Vec<serde_json::Value> {
 /// The board's probed frame rate, read back from persisted step outputs (the
 /// promo workflow probes before it senses): cyan-media probe reports
 /// `video.frame_rate` as an ffprobe rational ("30000/1001") — parsed to f64.
-fn board_probed_fps(board_id: &str) -> Option<f64> {
+pub(crate) fn board_probed_fps(board_id: &str) -> Option<f64> {
     for v in board_step_payloads(board_id) {
         let rate = v
             .get("video")
@@ -1523,6 +1573,15 @@ fn parse_rational_fps(rate: &str) -> Option<f64> {
 /// the failure check and the sense glue silently miss. Non-envelope values
 /// pass through unchanged.
 pub fn unwrap_tool_payload(result: &serde_json::Value) -> serde_json::Value {
+    // A persisted SUCCESS envelope (the app-facing structured summary — see
+    // [`success_envelope`]) carries the original MCP result under `raw`.
+    // Unwrap through it so every reader of the persisted rails (`output`
+    // column + `ai_result`) keeps seeing the TOOL's payload.
+    if result.get("summary_fields").is_some()
+        && let Some(raw) = result.get("raw")
+    {
+        return unwrap_tool_payload(raw);
+    }
     if let Some(sc) = result.get("structuredContent")
         && (sc.is_object() || sc.is_array())
     {
@@ -1664,6 +1723,74 @@ fn friendly_tool_error(error_class: &str, message: &str, plugin_id: &str, tool: 
     }
 }
 
+/// The app-facing STRUCTURED success summary — the polish twin of the error
+/// envelope (`{friendly, error_class, …, raw}`). Deterministic on purpose (no
+/// LLM): project the unwrapped tool payload's known keys into labeled fields;
+/// the full MCP envelope stays under `raw` for the "copy/expand" affordance.
+/// Every persisted-rail reader unwraps through this via [`unwrap_tool_payload`].
+fn success_envelope(plugin_id: &str, tool: &str, result: &serde_json::Value) -> serde_json::Value {
+    let payload = unwrap_tool_payload(result);
+    let mut fields: Vec<serde_json::Value> = Vec::new();
+    fn push(fields: &mut Vec<serde_json::Value>, label: &str, value: String) {
+        if !value.is_empty() {
+            fields.push(json!({"label": label, "value": value}));
+        }
+    }
+    let scalar = |v: &serde_json::Value| -> Option<String> {
+        match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            serde_json::Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        }
+    };
+    if let Some(obj) = payload.as_object() {
+        // The keys real tools return, in display order: frameio upload/comment
+        // (file_id/id/status/timestamp/text), cyan-media probe/proxy/conform
+        // (output_path/input_bytes/duration/new_proxy_hash/applied_ops).
+        const KNOWN: &[(&str, &str)] = &[
+            ("file_id", "File ID"),
+            ("id", "ID"),
+            ("status", "Status"),
+            ("output_path", "Output"),
+            ("input_bytes", "Input bytes"),
+            ("duration", "Duration"),
+            ("duration_seconds", "Duration (s)"),
+            ("timestamp", "Anchor"),
+            ("text", "Comment"),
+            ("new_proxy_hash", "Proxy hash"),
+            ("applied_ops", "Applied ops"),
+        ];
+        for (key, label) in KNOWN {
+            if let Some(v) = obj.get(*key).and_then(&scalar) {
+                push(&mut fields, label, v);
+            }
+        }
+        // A list result (frameio list_comments: {"data":[…]}) summarizes as a count.
+        if let Some(arr) = obj.get("data").and_then(|d| d.as_array()) {
+            push(&mut fields, "Items", arr.len().to_string());
+        }
+        // Nothing recognized: fall back to the payload's own scalar keys so the
+        // card still reads human (capped — the raw JSON is one tap away).
+        if fields.is_empty() {
+            for (k, v) in obj.iter().take(6) {
+                if let Some(s) = scalar(v) {
+                    push(&mut fields, k, s);
+                }
+            }
+        }
+    } else if let Some(arr) = payload.as_array() {
+        push(&mut fields, "Items", arr.len().to_string());
+    } else if let Some(s) = payload.as_str() {
+        push(&mut fields, "Result", s.chars().take(240).collect());
+    }
+    json!({
+        "summary_fields": fields,
+        "tool": format!("{plugin_id}.{tool}"),
+        "raw": result,
+    })
+}
+
 /// The board's playable video, resolved through the SAME rails the tools use —
 /// the ONE answer for the app's Video face (fix: "No video asset linked" after
 /// a successful proxy run). Returns:
@@ -1702,7 +1829,11 @@ pub fn board_video_media(board_id: &str) -> serde_json::Value {
         }
     }
 
-    let master = find_video_uri(board_id);
+    // CONTRACT: the app's player receives ONLY an absolute on-disk path or a real
+    // URI — never a bare filename. A bare name reads as neither local nor remote
+    // upstairs, falls into the S3 presign branch, and plays black (ROUND-2 bug).
+    let master = find_video_uri(board_id)
+        .filter(|m| m.starts_with('/') || m.contains("://"));
     json!({
         "proxy_path": proxy.map(|(_, p)| p),
         "master_uri": master,
@@ -1739,10 +1870,17 @@ fn resolve_media_uri(name: &str) -> Option<String> {
         // into the confined media root so cyan-media can actually read it.
         return Some(crate::media_staging::stage_local_media(name));
     }
-    let root = std::env::var("CYAN_MEDIA_ROOT").ok().filter(|r| !r.trim().is_empty())?;
-    let root = root.trim_end_matches('/');
-    // Works for both a local dir ("/opt/cyan/media") and an http base ("http://host/media").
-    Some(format!("{root}/{name}"))
+    if let Some(root) = std::env::var("CYAN_MEDIA_ROOT").ok().filter(|r| !r.trim().is_empty()) {
+        let root = root.trim_end_matches('/');
+        // Works for both a local dir ("/opt/cyan/media") and an http base ("http://host/media").
+        return Some(format!("{root}/{name}"));
+    }
+    // No env override: fall back to the engine's DEFAULT confined root — the same
+    // root cyan-media is spawned with. A bare clip name resolves to an absolute
+    // on-disk path or to nothing: a bare name handed up to the app reads as
+    // neither local nor remote, falls into the S3 presign branch, and plays black.
+    let joined = crate::media_staging::effective_media_root().join(name);
+    joined.is_file().then(|| joined.display().to_string())
 }
 
 /// The board's bound primary clip filename: the seed inserts one file row named after the
@@ -1938,9 +2076,65 @@ mod video_uri_tests {
             resolve_media_uri("sintel-clip.mp4").as_deref(),
             Some("http://lens:9080/media/sintel-clip.mp4")
         );
-        // no media root + bare name → None (caller surfaces a clear error, not garbage)
+        // no env root: the DEFAULT confined root (~/.cyan-phase3/media) answers,
+        // but only for a file that actually exists — a missing clip is None
+        // (caller surfaces a clear error), NEVER a bare/fabricated name.
         unsafe { std::env::remove_var("CYAN_MEDIA_ROOT"); }
+        let home = tempfile::tempdir().expect("scratch home");
+        let old_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", home.path()); }
         assert_eq!(resolve_media_uri("sintel-clip.mp4"), None);
+        let root = home.path().join(".cyan-phase3").join("media");
+        std::fs::create_dir_all(&root).expect("mk default root");
+        std::fs::write(root.join("sintel-clip.mp4"), b"x").expect("write clip");
+        let resolved = resolve_media_uri("sintel-clip.mp4").expect("resolves in default root");
+        assert!(
+            resolved.starts_with('/') && resolved.ends_with("/sintel-clip.mp4"),
+            "default-root resolution must be absolute, got {resolved:?}"
+        );
+        match old_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    // ROUND-2 P2: a successful tool result persists as a STRUCTURED success
+    // envelope; every persisted-rail reader unwraps through it to the tool's
+    // own payload.
+    #[test]
+    fn success_envelope_projects_fields_and_unwraps_to_payload() {
+        let mcp = serde_json::json!({
+            "content": [{"type": "text", "text": "{\"file_id\":\"3d721cff\",\"status\":\"uploaded\"}"}],
+            "isError": false
+        });
+        let env = super::success_envelope("frameio", "upload_file", &mcp);
+        let fields = env["summary_fields"].as_array().expect("fields");
+        assert!(
+            fields.iter().any(|f| f["label"] == "File ID" && f["value"] == "3d721cff"),
+            "file_id must project, got {fields:?}"
+        );
+        assert!(
+            fields.iter().any(|f| f["label"] == "Status" && f["value"] == "uploaded"),
+            "status must project, got {fields:?}"
+        );
+        assert_eq!(env["tool"], "frameio.upload_file");
+        // The envelope unwraps to the TOOL's payload — board_step_payloads,
+        // fps ladder, and upstream arg-fill all keep working.
+        let unwrapped = super::unwrap_tool_payload(&env);
+        assert_eq!(unwrapped["file_id"], "3d721cff");
+    }
+
+    #[test]
+    fn success_envelope_summarizes_comment_lists_as_count() {
+        let mcp = serde_json::json!({
+            "structuredContent": {"data": [{"id": "c1"}, {"id": "c2"}]},
+        });
+        let env = super::success_envelope("frameio", "list_comments", &mcp);
+        let fields = env["summary_fields"].as_array().expect("fields");
+        assert!(
+            fields.iter().any(|f| f["label"] == "Items" && f["value"] == "2"),
+            "list results summarize as a count, got {fields:?}"
+        );
     }
 }
 

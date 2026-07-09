@@ -1372,9 +1372,11 @@ pub fn resolve_board_review(
     Ok((tenant, newest.asset_hash, newest.branch))
 }
 
-/// Build the app player envelope for one (tenant, asset, branch).
+/// Build the app player envelope for one (tenant, asset, branch), merging the
+/// board's SENSED reviewer notes that never reached the ledger.
 pub fn board_envelope(
     conn: &Connection,
+    board_id: &str,
     tenant: &str,
     asset: &str,
     branch: &str,
@@ -1382,13 +1384,103 @@ pub fn board_envelope(
     let view = changelist::get(conn, tenant, asset, branch)?;
     let state = review_state::get(conn, tenant, asset, branch).map_err(|e| anyhow!("{e}"))?;
     let version = view.head_version.as_ref().map(|v| v.version_no).unwrap_or(0);
+    let mut entries = view.entries;
+    merge_sensed_notes(conn, board_id, tenant, asset, &mut entries);
     Ok(serde_json::json!({
         "asset_hash": asset,
         "branch": branch,
         "version": version,
         "review_state": state.map(|s| serde_json::json!({ "state": s.state, "round": s.round })),
-        "entries": view.entries,
+        "entries": entries,
     }))
+}
+
+/// A2 (live 2026-07-08: rail shows "Nothing here." after a successful sense):
+/// sensed reviewer comments always land as board `timecode_note` cells, but the
+/// LEDGER leg only runs for a registered derived proxy — so the review rail,
+/// which reads the ledger, misses them. Merge those notes into the envelope as
+/// synthetic read-only `note` entries, deduped by comment id against real
+/// ledger entries (`source_ref`). Anchors convert seconds→frames with the same
+/// fps ladder ingest used; no fps ⇒ frame 0 (the note text carries the frame —
+/// surfaced, never guessed). Best-effort: any failure just yields no extras.
+fn merge_sensed_notes(
+    conn: &Connection,
+    board_id: &str,
+    tenant: &str,
+    asset: &str,
+    entries: &mut Vec<changelist::ChangeEntry>,
+) {
+    let known: std::collections::HashSet<String> =
+        entries.iter().filter_map(|e| e.source_ref.clone()).collect();
+    let fps = asset_registry::get(conn, tenant, asset)
+        .ok()
+        .and_then(|a| a.fps)
+        .or_else(|| crate::pipeline_executor::board_probed_fps(board_id));
+    let mut stmt = match conn.prepare(
+        "SELECT id, cell_order, content, metadata_json FROM notebook_cells \
+         WHERE board_id = ?1 AND cell_type = 'timecode_note' ORDER BY cell_order",
+    ) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let rows = match stmt.query_map(rusqlite::params![board_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<String>>(3)?,
+        ))
+    }) {
+        Ok(rows) => rows.flatten().collect::<Vec<_>>(),
+        Err(_) => return,
+    };
+    let base_seq = entries.iter().map(|e| e.seq).max().unwrap_or(0);
+    let mut extra = 0i64;
+    for (id, order_ms, content, meta_json) in rows {
+        // Only SENSED reviewer comments (stable ids `frameio-comment-<id>`).
+        let Some(comment_id) = id.strip_prefix("frameio-comment-") else { continue };
+        if known.contains(comment_id) {
+            continue; // the ledger already carries this comment
+        }
+        let meta: serde_json::Value =
+            serde_json::from_str(meta_json.as_deref().unwrap_or("{}")).unwrap_or_default();
+        let author = meta.get("author").and_then(|v| v.as_str()).map(str::to_string);
+        let seconds = order_ms as f64 / 1000.0;
+        let tc_in = fps.map(|f| (seconds * f).round() as i64).unwrap_or(0);
+        extra += 1;
+        entries.push(changelist::ChangeEntry {
+            id: id.clone(),
+            entry_hash: format!("sensed-note:{comment_id}"),
+            asset_hash: asset.to_string(),
+            tenant_id: tenant.to_string(),
+            branch: None,
+            track: None,
+            tc_in,
+            tc_out: None,
+            kind: "note".to_string(),
+            op: None,
+            params: serde_json::json!({ "sensed": true }),
+            intent: content.unwrap_or_default(),
+            source: Some("frameio".to_string()),
+            source_ref: Some(comment_id.to_string()),
+            author,
+            role: Some("reviewer".to_string()),
+            proposed_by: Some("human".to_string()),
+            created_at: 0,
+            state: "proposed".to_string(),
+            active: true,
+            approved_by: None,
+            approved_at: None,
+            supersedes: None,
+            superseded_by: None,
+            seq: base_seq + extra,
+            depends_on: None,
+            version_ref: None,
+            outcome: None,
+            updated_at: 0,
+            updated_by: None,
+        });
+    }
 }
 
 /// What the app needs to OPEN the review player on real local media: the

@@ -1831,7 +1831,7 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
                 &board,
                 cmd.get("asset_hash").and_then(|v| v.as_str()),
             )?;
-            Ok(crate::review_loop::board_envelope(conn, &tenant_r, &asset, &br)?)
+            Ok(crate::review_loop::board_envelope(conn, &board, &tenant_r, &asset, &br)?)
         }
         "append" => {
             let asset = s(&cmd, "asset_hash")?;

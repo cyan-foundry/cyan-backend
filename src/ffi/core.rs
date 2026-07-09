@@ -4527,23 +4527,11 @@ pub extern "C" fn cyan_pipeline_run_step_local(
             if let Some(res) = meta["pipeline"]["state"]["ai_result"].as_str()
                 && let Ok(v) = serde_json::from_str::<serde_json::Value>(res)
             {
-                // A local plugin step stores the raw MCP tools/call result — the
-                // tool's own JSON may ride `structuredContent` or as a JSON
-                // string inside `content[0].text`. Unwrap so key lookup sees
-                // the TOOL's object (e.g. {"file_id": …}), not the envelope.
-                let unwrapped = v
-                    .get("structuredContent")
-                    .filter(|s| s.is_object())
-                    .cloned()
-                    .or_else(|| {
-                        v.get("content")
-                            .and_then(|c| c.get(0))
-                            .and_then(|c| c.get("text"))
-                            .and_then(serde_json::Value::as_str)
-                            .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
-                            .filter(|p| p.is_object())
-                    })
-                    .unwrap_or(v);
+                // A local plugin step stores its result as a success envelope
+                // over the raw MCP tools/call result. Unwrap through BOTH (the
+                // one shared helper) so key lookup sees the TOOL's object
+                // (e.g. {"file_id": …}), never a wrapper.
+                let unwrapped = crate::pipeline_executor::unwrap_tool_payload(&v);
                 if unwrapped.is_object() {
                     upstream.push(unwrapped);
                 }

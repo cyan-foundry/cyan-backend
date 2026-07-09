@@ -988,7 +988,7 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value, ReviewError> {
                         )))
                     }
                 }
-                crate::review_loop::board_envelope(conn, &tenant, &asset, &br)
+                crate::review_loop::board_envelope(conn, &board, &tenant, &asset, &br)
                     .map_err(|e| ReviewError::Other(e.to_string()))?
             }
         }
@@ -1054,7 +1054,7 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value, ReviewError> {
                 )
                 .map_err(|e| ReviewError::Other(e.to_string()))?;
                 finish(conn, &tenant, &asset, &br, Actor::Human)?;
-                crate::review_loop::board_envelope(conn, &tenant, &asset, &br)
+                crate::review_loop::board_envelope(conn, &board, &tenant, &asset, &br)
                     .map_err(|e| ReviewError::Other(e.to_string()))?
             }
         }
@@ -1294,7 +1294,7 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value, ReviewError> {
             {
                 confirm_notes(conn, &tenant, &asset, &br, Actor::Human)?;
             }
-            crate::review_loop::board_envelope(conn, &tenant, &asset, &br)
+            crate::review_loop::board_envelope(conn, &board, &tenant, &asset, &br)
                 .map_err(|e| ReviewError::Other(e.to_string()))?
         }
         other => return Err(ReviewError::Other(format!("unknown op '{}'", other))),
