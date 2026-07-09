@@ -4618,6 +4618,41 @@ pub extern "C" fn cyan_pipeline_run_step_local(
                 }
             }
         }
+
+        // Still-unfilled media prop: the LATEST upstream media output
+        // (cyan-media's `output_path`, media-root-relative → absolutized) is
+        // the media this step consumes — the review proxy an upload publishes,
+        // the conform input, etc. Found live on the C2C MATERIALIZED run
+        // (FABLE_FULL_AUDIT hard gate): no conform-registered media exists on
+        // a fresh materialized run, so this deterministic rung was missing and
+        // the upload died plugin-side on missing_argument.
+        for key in ["input", "file_path"] {
+            if pending.iter().any(|p| p == key)
+                && metadata["mcp_tool"]["args"].get(key).is_none()
+                && let Some(rel) =
+                    crate::pipeline_executor::latest_upstream_media_path(&upstream)
+            {
+                let abs = crate::media_staging::effective_media_root().join(&rel);
+                metadata["mcp_tool"]["args"][key] =
+                    serde_json::json!(abs.to_string_lossy());
+            }
+        }
+        // An unfilled `name` rides the resolved media prop: the artifact's real
+        // basename, never a guess.
+        if pending.iter().any(|p| p == "name")
+            && metadata["mcp_tool"]["args"].get("name").is_none()
+        {
+            let media = metadata["mcp_tool"]["args"]
+                .get("file_path")
+                .or_else(|| metadata["mcp_tool"]["args"].get("input"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            if let Some(media) = media {
+                metadata["mcp_tool"]["args"]["name"] = serde_json::json!(
+                    crate::pipeline_executor::media_name_default(&media)
+                );
+            }
+        }
     }
 
     let executor_type = metadata["pipeline"]["executor"].as_str().unwrap_or("local").to_string();

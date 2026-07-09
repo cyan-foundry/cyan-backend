@@ -1621,6 +1621,30 @@ pub fn unwrap_tool_payload(result: &serde_json::Value) -> serde_json::Value {
     result.clone()
 }
 
+/// The LATEST upstream media output — cyan-media's produced-media convention
+/// (`output_path`, media-root-relative). This is the deterministic source for
+/// an unfilled media prop (`input`/`file_path`) on a following step: the media
+/// a review workflow uploads/conforms IS the newest thing the pipeline
+/// produced. Found live on the C2C materialized run (FABLE_FULL_AUDIT hard
+/// gate, 2026-07-09): the upload step's pending `file_path` matched no
+/// upstream KEY and no conform-registered media existed yet, so dispatch died
+/// plugin-side on missing_argument. Zero-LLM, like every mechanical fill.
+pub fn latest_upstream_media_path(upstream: &[serde_json::Value]) -> Option<String> {
+    upstream
+        .iter()
+        .rev()
+        .find_map(|o| o.get("output_path").and_then(|v| v.as_str()).map(str::to_string))
+}
+
+/// The default `name` for a media prop fill: the file's basename. (An upload
+/// step's display name should be the artifact's real filename, never a guess.)
+pub fn media_name_default(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string())
+}
+
 /// Did the tool report failure? Checked on the MCP envelope (`isError`) AND
 /// the unwrapped payload. Recognized payload shapes:
 ///
@@ -2333,5 +2357,55 @@ mod tool_result_error_tests {
         assert!(f.contains("destination folder"), "folder_id → folder guidance: {f}");
         let f = friendly_tool_error("engine_error", &"x".repeat(500), "cyan-media", "proxy");
         assert!(f.len() < 400, "long raw messages are truncated for the card");
+    }
+}
+
+#[cfg(test)]
+mod media_arg_fill_tests {
+    use super::{latest_upstream_media_path, media_name_default};
+    use serde_json::json;
+
+    // THE LIVE C2C GAP (FABLE_FULL_AUDIT hard gate, 2026-07-09): on a
+    // MATERIALIZED run the upload step's pending `file_path`/`name` found no
+    // upstream key match (`output_path` ≠ `file_path`) and no conform-registered
+    // media, so the dispatch died plugin-side on missing_argument. The
+    // deterministic convention: the LATEST upstream media output (cyan-media's
+    // `output_path`) IS the media a following media-prop step consumes, and an
+    // unfilled `name` is that file's basename. Zero LLM, zero guessing.
+    #[test]
+    fn latest_upstream_output_path_fills_a_media_prop() {
+        let upstream = vec![
+            json!({ "container": "mov,mp4", "duration_s": 10.0 }),
+            json!({ "output_path": ".cyan-derived/proxy/1094216ab9165cb0.mp4", "height": 540 }),
+        ];
+        assert_eq!(
+            latest_upstream_media_path(&upstream).as_deref(),
+            Some(".cyan-derived/proxy/1094216ab9165cb0.mp4"),
+            "the newest upstream media output wins"
+        );
+
+        // Two producers: the LATER one is the current media.
+        let upstream = vec![
+            json!({ "output_path": "proxy/v1.mp4" }),
+            json!({ "file_id": "abc" }),
+            json!({ "output_path": "conform/v2.mp4" }),
+        ];
+        assert_eq!(
+            latest_upstream_media_path(&upstream).as_deref(),
+            Some("conform/v2.mp4")
+        );
+
+        // No upstream media ⇒ None (the plugin's own validation reports it —
+        // never a guess).
+        assert!(latest_upstream_media_path(&[json!({ "file_id": "x" })]).is_none());
+    }
+
+    #[test]
+    fn media_name_defaults_to_the_basename() {
+        assert_eq!(
+            media_name_default("/media/.cyan-derived/proxy/1094216ab9165cb0.mp4"),
+            "1094216ab9165cb0.mp4"
+        );
+        assert_eq!(media_name_default("clip.mov"), "clip.mov");
     }
 }
