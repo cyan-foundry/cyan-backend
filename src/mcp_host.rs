@@ -304,10 +304,25 @@ pub fn bundle_spawn_config(
     let manifest = cyan_mcp::Manifest::from_bundle(bundle_dir)
         .map_err(|e| anyhow!("bundle manifest {}: {e}", bundle_dir.display()))?;
 
-    let mut creds = vec![(
-        "CYAN_TENANT_ID".to_string(),
-        cyan_mcp::SecretString::new(tenant_id.to_string()),
-    )];
+    let mut creds = vec![
+        (
+            "CYAN_TENANT_ID".to_string(),
+            cyan_mcp::SecretString::new(tenant_id.to_string()),
+        ),
+        // The plugin must confine paths to the SAME root the host stages
+        // attachments into (media_staging). Injected explicitly so a plugin
+        // never falls back to its own cwd-relative default when the app
+        // process env lacks CYAN_MEDIA_ROOT — that mismatch is unfixable
+        // from inside the plugin. (Not a secret; rides the env-inject rail.)
+        (
+            "CYAN_MEDIA_ROOT".to_string(),
+            cyan_mcp::SecretString::new(
+                crate::media_staging::effective_media_root()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ),
+    ];
     for c in manifest
         .credentials
         .iter()

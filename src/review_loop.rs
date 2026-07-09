@@ -1071,6 +1071,13 @@ pub fn register_review_media(
     branch: &str,
     actor: review_state::Actor,
 ) -> Result<RegisteredMedia> {
+    // Stage the master into the confined media root FIRST: registration is the
+    // moment "a file the user picked" becomes "a review asset", and every
+    // downstream consumer (conform input derivation, the player's
+    // review_media_info) reads the registered path expecting it inside the
+    // root. Same-bytes idempotent, so re-registration is safe.
+    let staged = crate::media_staging::stage_local_media(master_path);
+    let master_path: &str = &staged;
     let path = std::path::Path::new(master_path);
     let bytes =
         std::fs::read(path).map_err(|e| anyhow!("read master {}: {e}", path.display()))?;
@@ -1257,9 +1264,10 @@ pub fn conform_via_env(
     tenant_id: &str,
     proxy_ref: &str,
 ) -> Result<(ConformOutcome, std::path::PathBuf)> {
-    let media_root = std::path::PathBuf::from(std::env::var("CYAN_MEDIA_ROOT").map_err(|_| {
-        anyhow!("CYAN_MEDIA_ROOT not set — the conform sandbox root is required")
-    })?);
+    // ONE root definition for the whole host (env override or the canonical
+    // per-user default) — see media_staging. This retires the "conform only
+    // works when CYAN_MEDIA_ROOT is exported" foot-gun.
+    let media_root = crate::media_staging::effective_media_root();
 
     // proxy_ref → proxy asset → master asset → its registered local path.
     let proxy = asset_registry::find_by_remote_ref(conn, tenant_id, "frameio", proxy_ref)?
@@ -1274,12 +1282,15 @@ pub fn conform_via_env(
         .get("path")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("master {master_hash} has no registered local path"))?;
-    let input_rel = std::path::Path::new(master_path)
+    // A master registered before staging existed may still point outside the
+    // root — stage it now (idempotent) instead of refusing the conform.
+    let master_abs = crate::media_staging::stage_local_media(master_path);
+    let input_rel = std::path::Path::new(&master_abs)
         .strip_prefix(&media_root)
         .map_err(|_| {
             anyhow!(
-                "master {} is outside CYAN_MEDIA_ROOT {} — cyan-media confines inputs to its root",
-                master_path,
+                "master {} is outside the media root {} and could not be staged into it",
+                master_abs,
                 media_root.display()
             )
         })?
@@ -1404,7 +1415,11 @@ pub fn review_media_info(
         .ok_or_else(|| anyhow!("master {master_hash} has no registered local path"))?;
 
     // The newest conform-derived proxy (it carries profile_json.output_path).
-    let media_root = std::env::var("CYAN_MEDIA_ROOT").ok();
+    let media_root = Some(
+        crate::media_staging::effective_media_root()
+            .to_string_lossy()
+            .into_owned(),
+    );
     let mut stmt = conn.prepare(
         "SELECT hash, profile_json FROM asset \
          WHERE tenant_id=?1 AND derived_from_asset=?2 AND kind='proxy' \

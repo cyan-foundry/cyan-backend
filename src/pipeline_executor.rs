@@ -850,6 +850,44 @@ pub(crate) async fn execute_local_mcp_tool_step(
         .map_err(|e| anyhow!("local plugin dispatch failed: {}", e))?
     {
         McpDispatch::Ran(result) => {
+            // FAILURE IS FAILURE: a successful transport round-trip is NOT tool
+            // success. cyan-media reports failures IN-PAYLOAD as
+            // `{"error":{"error_class","message"}}` (its dispatch contract);
+            // other tools may use `{"ok": false, ...}`. Either shape must turn
+            // the step red — no plugin_result finding, no "complete" note, no
+            // step_completed event, and (via the Err) no approval-gate pass, no
+            // downstream advance, no produced-file count. The Err carries a
+            // structured envelope: a plain-language `friendly` line for the
+            // step card plus the full raw payload for "Copy error / report".
+            if let Some((error_class, message)) = tool_result_error(&result.result) {
+                let friendly =
+                    friendly_tool_error(&error_class, &message, &step.plugin_id, &step.tool);
+                let envelope = json!({
+                    "friendly": friendly,
+                    "error_class": error_class,
+                    "message": message,
+                    "plugin": format!("{}.{}", step.plugin_id, step.tool),
+                    "raw": result.result,
+                });
+                let _ = event_tx.send(SwiftEvent::StatusUpdate {
+                    message: format!("❌ Step '{}' failed: {}", step_id, friendly),
+                });
+                publish_pipeline_event(event_tx, PipelineEvent {
+                    event_type: "step_failed".into(),
+                    board_id: board_id.into(),
+                    step_id: step_id.into(),
+                    run_id: run_id.clone(),
+                    timestamp: chrono::Utc::now().timestamp(),
+                    data: json!({
+                        "error": friendly,
+                        "error_class": envelope["error_class"],
+                        "plugin_id": step.plugin_id,
+                        "tool": step.tool,
+                    }),
+                });
+                return Err(anyhow!("{}", envelope));
+            }
+
             let summary = serde_json::to_string(&result.result)
                 .unwrap_or_else(|_| result.result.to_string());
 
@@ -1215,11 +1253,14 @@ fn find_video_uri(board_id: &str) -> Option<String> {
         }
     }
 
-    // (2) a bound asset with a real local file → probe it directly.
+    // (2) a bound asset with a real local file → STAGE it into the media root
+    //     (content-addressed, idempotent) so the confined cyan-media plugin can
+    //     read it. A raw attachment path (e.g. ~/sig_source.mp4) handed through
+    //     unstaged is exactly the live `path_denied` / `input_bytes:0` bug.
     for (_name, local_path) in &bound_files {
         if let Some(p) = local_path
             && !p.is_empty() && std::path::Path::new(p).exists() {
-                return Some(p.clone());
+                return Some(crate::media_staging::stage_local_media(p));
             }
     }
 
@@ -1249,14 +1290,27 @@ fn resolve_media_args(board_id: &str, step: &mut McpTool) {
     if step.plugin_id != "cyan-media" {
         return;
     }
-    // Already has an input path? Respect it.
-    if let Some(obj) = step.args.as_object() {
-        let has_input = MEDIA_INPUT_KEYS.iter().any(|k| {
-            obj.get(*k)
-                .and_then(|v| v.as_str())
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-        });
+    // Already has an input path? Respect the author's CONTENT choice — but if it
+    // names a local file OUTSIDE the confined media root (a `#`-bound attachment
+    // path fills args at bind time), stage it in place: same bytes, readable
+    // location. Passing the raw path through is the live `path_denied` bug.
+    if let Some(obj) = step.args.as_object_mut() {
+        let mut has_input = false;
+        for k in MEDIA_INPUT_KEYS {
+            let Some(v) = obj.get(*k).and_then(|v| v.as_str()).map(str::to_string) else {
+                continue;
+            };
+            if v.trim().is_empty() {
+                continue;
+            }
+            has_input = true;
+            if v.starts_with('/') && std::path::Path::new(&v).is_file() {
+                let staged = crate::media_staging::stage_local_media(&v);
+                if staged != v {
+                    obj.insert((*k).to_string(), json!(staged));
+                }
+            }
+        }
         if has_input {
             return;
         }
@@ -1275,6 +1329,168 @@ fn resolve_media_args(board_id: &str, step: &mut McpTool) {
         obj.insert("input".to_string(), json!(uri));
         obj.insert("uri".to_string(), json!(uri));
     }
+}
+
+/// Did the tool report failure IN its result payload? Two recognized shapes:
+///
+/// - cyan-media's dispatch contract: `{"error": {"error_class", "message"}}`
+///   (also tolerating a bare-string `"error"`), and
+/// - the generic `{"ok": false, ...}` envelope some tools use.
+///
+/// Returns `(error_class, message)` when the payload is a failure.
+fn tool_result_error(result: &serde_json::Value) -> Option<(String, String)> {
+    if let Some(e) = result.get("error") {
+        if let Some(obj) = e.as_object() {
+            let class = obj
+                .get("error_class")
+                .and_then(|v| v.as_str())
+                .unwrap_or("tool_error")
+                .to_string();
+            let message = obj
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("tool reported an error")
+                .to_string();
+            return Some((class, message));
+        }
+        if let Some(s) = e.as_str()
+            && !s.trim().is_empty()
+        {
+            return Some(("tool_error".to_string(), s.to_string()));
+        }
+    }
+    if result.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        let class = result
+            .get("error_class")
+            .and_then(|v| v.as_str())
+            .unwrap_or("tool_error")
+            .to_string();
+        let message = result
+            .get("message")
+            .and_then(|v| v.as_str())
+            .or_else(|| result.get("detail").and_then(|v| v.as_str()))
+            .unwrap_or("tool reported ok:false")
+            .to_string();
+        return Some((class, message));
+    }
+    None
+}
+
+/// Deterministic plain-language translation of a tool error — what the step
+/// card shows a HUMAN (the raw payload stays available behind "Copy error").
+/// Deterministic on purpose: the mechanical spine must explain itself with the
+/// GPU/Lens off, so this never calls out to an LLM.
+fn friendly_tool_error(error_class: &str, message: &str, plugin_id: &str, tool: &str) -> String {
+    let short = |s: &str| {
+        let t = s.trim();
+        if t.chars().count() > 160 {
+            format!("{}…", t.chars().take(160).collect::<String>())
+        } else {
+            t.to_string()
+        }
+    };
+    match error_class {
+        "path_denied" => "The file for this step is outside Cyan's media workspace. \
+             Re-attach the file to the board (Cyan stages attachments into the workspace \
+             automatically) and run the step again."
+            .to_string(),
+        "missing_argument" => {
+            if message.contains("folder_id") {
+                "Upload needs a destination folder — set the Frame.io folder for this \
+                 workflow (plugin settings), then Retry."
+                    .to_string()
+            } else if message.contains("account_id") {
+                "This step needs a Frame.io account — connect the Frame.io plugin for \
+                 this workflow, then Retry."
+                    .to_string()
+            } else {
+                format!(
+                    "The step is missing a required setting ({}). Fill it in the step \
+                     or plugin configuration, then Retry.",
+                    short(message)
+                )
+            }
+        }
+        "validation" => format!(
+            "The step's inputs don't match what {plugin_id}.{tool} expects: {}.",
+            short(message)
+        ),
+        "input_too_large" => "The attached file is larger than this tool allows. Use a \
+             smaller proxy of the media, or raise the tool's input cap."
+            .to_string(),
+        "timeout" => format!(
+            "{plugin_id}.{tool} ran out of time. Retry; if it keeps timing out, the \
+             media may be too large for this step."
+        ),
+        "auth" | "unauthorized" | "token_expired" => format!(
+            "The connection to {plugin_id} has expired. Reconnect the plugin (its \
+             sign-in), then Retry."
+        ),
+        "unsupported" => format!(
+            "{plugin_id}.{tool} can't process this input: {}.",
+            short(message)
+        ),
+        _ => format!(
+            "The {plugin_id}.{tool} step failed ({error_class}): {}. Retry, or copy \
+             the error report if it persists.",
+            short(message)
+        ),
+    }
+}
+
+/// The board's playable video, resolved through the SAME rails the tools use —
+/// the ONE answer for the app's Video face (fix: "No video asset linked" after
+/// a successful proxy run). Returns:
+///
+/// - `proxy_path`: the newest on-disk cyan-media derived output (proxy/
+///   transcode/conform) recorded in this board's persisted step outputs —
+///   the file a run REALLY produced, surviving app reboot + re-login because
+///   it is read back from the notebook cells, not from in-memory run state;
+/// - `master_uri`: the staged attached master (or explicit URL), via
+///   `find_video_uri` — identical to what probe/proxy receive as input;
+/// - `media_root`: the effective confined root, for diagnostics.
+pub fn board_video_media(board_id: &str) -> serde_json::Value {
+    let root = crate::media_staging::effective_media_root();
+
+    // Newest derived output among the board's persisted step outputs. Scope the
+    // DB lock tightly — find_video_uri below locks independently.
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(conn) = crate::storage::db().lock()
+        && let Ok(mut stmt) = conn.prepare(
+            "SELECT output FROM notebook_cells WHERE board_id=?1 AND output IS NOT NULL AND output != ''",
+        )
+        && let Ok(rows) = stmt.query_map(rusqlite::params![board_id], |row| row.get::<_, String>(0))
+    {
+        candidates = rows.flatten().collect();
+    }
+    let mut proxy: Option<(std::time::SystemTime, String)> = None;
+    for out in &candidates {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(out) else { continue };
+        let Some(rel) = v.get("output_path").and_then(|p| p.as_str()) else { continue };
+        if !is_media_filename(rel) {
+            continue;
+        }
+        let abs = if rel.starts_with('/') {
+            std::path::PathBuf::from(rel)
+        } else {
+            root.join(rel)
+        };
+        if let Ok(meta) = abs.metadata()
+            && meta.is_file()
+        {
+            let m = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            if proxy.as_ref().map(|(pm, _)| m > *pm).unwrap_or(true) {
+                proxy = Some((m, abs.display().to_string()));
+            }
+        }
+    }
+
+    let master = find_video_uri(board_id);
+    json!({
+        "proxy_path": proxy.map(|(_, p)| p),
+        "master_uri": master,
+        "media_root": root.display().to_string(),
+    })
 }
 
 /// True if `s` ends with a recognized video container extension (case-insensitive).
@@ -1302,7 +1518,9 @@ fn resolve_media_uri(name: &str) -> Option<String> {
         return Some(name.to_string());
     }
     if name.starts_with('/') && std::path::Path::new(name).exists() {
-        return Some(name.to_string());
+        // A concrete local path may live ANYWHERE (user attachment) — stage it
+        // into the confined media root so cyan-media can actually read it.
+        return Some(crate::media_staging::stage_local_media(name));
     }
     let root = std::env::var("CYAN_MEDIA_ROOT").ok().filter(|r| !r.trim().is_empty())?;
     let root = root.trim_end_matches('/');
@@ -1484,6 +1702,9 @@ mod video_uri_tests {
 
     #[test]
     fn resolves_bare_name_against_media_root_and_passes_urls_through() {
+        let _g = crate::media_staging::MEDIA_ROOT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // URL pass-through regardless of env
         assert_eq!(
             resolve_media_uri("https://x/y.mp4").as_deref(),
@@ -1549,5 +1770,86 @@ mod media_args_tests {
         assert_eq!(step.args["input"], json!("/opt/cyan/media/clip.mp4"));
         // No `src` was fabricated over the existing `input`.
         assert!(step.args.get("src").is_none());
+    }
+
+    // THE live path_denied bug: an author/bind-supplied input naming a REAL file
+    // OUTSIDE the media root is staged in place (content preserved, confined
+    // location) instead of being handed raw to the confined plugin.
+    #[test]
+    fn out_of_root_local_input_is_staged_into_media_root() {
+        let _g = crate::media_staging::MEDIA_ROOT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let src = outside.path().join("sig_source.mp4");
+        std::fs::write(&src, b"master bytes").unwrap();
+        unsafe { std::env::set_var("CYAN_MEDIA_ROOT", root.path()) };
+
+        let mut step = McpTool {
+            plugin_id: "cyan-media".into(),
+            tool: "probe".into(),
+            args: json!({ "input": src.display().to_string() }),
+        };
+        resolve_media_args("board-x", &mut step);
+        unsafe { std::env::remove_var("CYAN_MEDIA_ROOT") };
+
+        let staged = step.args["input"].as_str().unwrap().to_string();
+        assert_ne!(staged, src.display().to_string(), "raw outside path must not pass through");
+        assert!(
+            std::path::Path::new(&staged).starts_with(root.path()),
+            "staged into the media root, got {staged}"
+        );
+        assert_eq!(std::fs::read(&staged).unwrap(), b"master bytes");
+    }
+}
+
+#[cfg(test)]
+mod tool_result_error_tests {
+    use super::{friendly_tool_error, tool_result_error};
+    use serde_json::json;
+
+    // The exact live failure: cyan-media's in-payload error envelope must be
+    // recognized as FAILURE (it was sailing through as step success).
+    #[test]
+    fn cyan_media_error_envelope_is_a_failure() {
+        let payload = json!({
+            "error": { "error_class": "path_denied",
+                       "message": "input path escapes the media root: '/Users/rick/sig_source.mp4'" }
+        });
+        let (class, msg) = tool_result_error(&payload).expect("failure detected");
+        assert_eq!(class, "path_denied");
+        assert!(msg.contains("escapes the media root"));
+    }
+
+    #[test]
+    fn ok_false_and_bare_string_error_are_failures_success_is_not() {
+        let (class, _) = tool_result_error(&json!({ "ok": false, "error_class": "timeout" })).unwrap();
+        assert_eq!(class, "timeout");
+        let (class, msg) = tool_result_error(&json!({ "error": "boom" })).unwrap();
+        assert_eq!(class, "tool_error");
+        assert_eq!(msg, "boom");
+        // Genuine successes pass: no error key, ok:true, or ok absent.
+        assert!(tool_result_error(&json!({ "output_path": "p/x.mp4", "_meta": {} })).is_none());
+        assert!(tool_result_error(&json!({ "ok": true, "file_id": "f1" })).is_none());
+        // An empty error object is still a failure (unknown class).
+        assert!(tool_result_error(&json!({ "error": {} })).is_some());
+    }
+
+    // The friendly line is deterministic (works with the GPU/Lens OFF) and
+    // actionable for the known classes.
+    #[test]
+    fn friendly_lines_are_actionable() {
+        let f = friendly_tool_error("path_denied", "input path escapes…", "cyan-media", "probe");
+        assert!(f.contains("Re-attach"), "path_denied must tell the user what to do: {f}");
+        let f = friendly_tool_error(
+            "missing_argument",
+            "1 validation error for call[upload_file] folder_id missing",
+            "frameio",
+            "upload_file",
+        );
+        assert!(f.contains("destination folder"), "folder_id → folder guidance: {f}");
+        let f = friendly_tool_error("engine_error", &"x".repeat(500), "cyan-media", "proxy");
+        assert!(f.len() < 400, "long raw messages are truncated for the card");
     }
 }

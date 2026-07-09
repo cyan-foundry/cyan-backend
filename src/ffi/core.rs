@@ -4894,6 +4894,21 @@ pub extern "C" fn cyan_export_notes_markdown(board_id: *const c_char) -> *mut c_
         }
     }
 }
+/// The board's playable video, resolved through the SAME path-resolution rails
+/// the cyan-media tools use (staged master + newest derived proxy). Returns
+/// `{"proxy_path": string|null, "master_uri": string|null, "media_root": string}`
+/// as JSON, or null on an invalid board id. Additive — new verb for the app's
+/// Video face so the player and the tool inputs can never disagree.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_board_video_media(board_id: *const c_char) -> *mut c_char {
+    let board_id_str = match unsafe { CStr::from_ptr(board_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let info = crate::pipeline_executor::board_video_media(board_id_str);
+    json_cstring(&info.to_string())
+}
+
 // Add to ffi/core.rs — path autocomplete for g\ prefix
 
 /// Autocomplete a partial path like "g\", "g\Sales\", "g\Sales\Work"

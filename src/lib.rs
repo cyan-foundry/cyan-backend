@@ -1991,5 +1991,6 @@ pub mod asset_registry;
 pub mod ingest;
 pub mod skills;
 pub mod pipeline_executor;
+pub mod media_staging;
 pub mod dashboard;
 pub mod exec_plan;
