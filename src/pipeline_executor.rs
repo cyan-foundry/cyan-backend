@@ -1359,6 +1359,9 @@ pub fn ingest_sensed_comments(
     if step.plugin_id != "frameio" || !step.tool.contains("comments") || step.tool.starts_with("post") {
         return;
     }
+    // Tool results arrive as MCP envelopes; the comments payload (`{"data":[…]}`)
+    // is inside structuredContent / content[].text.
+    let result = &unwrap_tool_payload(result);
     let file_ref = step
         .args
         .get("file_id")
@@ -1449,7 +1452,8 @@ fn board_probed_fps(board_id: &str) -> Option<f64> {
         rows.flatten().collect()
     };
     for out in &outputs {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(out) else { continue };
+        let Ok(env) = serde_json::from_str::<serde_json::Value>(out) else { continue };
+        let v = unwrap_tool_payload(&env); // persisted outputs are MCP envelopes
         let rate = v
             .get("video")
             .and_then(|s| s.get("frame_rate"))
@@ -1477,14 +1481,57 @@ fn parse_rational_fps(rate: &str) -> Option<f64> {
     (fps.is_finite() && fps > 0.0).then_some(fps)
 }
 
-/// Did the tool report failure IN its result payload? Two recognized shapes:
+/// Unwrap an MCP tool-result ENVELOPE to the tool's actual payload. Plugins
+/// answer over MCP as `{"content":[{"text":"<json-string>"}],
+/// "structuredContent":{…},"isError":bool}` — the domain payload (cyan-media's
+/// `{"error":…}` / `{"output_path":…}`, frameio's `{"data":[…]}`) lives in
+/// `structuredContent`, else JSON-encoded inside the first `content[].text`.
+/// Found live 2026-07-08: matching on the envelope instead of the payload made
+/// the failure check and the sense glue silently miss. Non-envelope values
+/// pass through unchanged.
+pub fn unwrap_tool_payload(result: &serde_json::Value) -> serde_json::Value {
+    if let Some(sc) = result.get("structuredContent")
+        && (sc.is_object() || sc.is_array())
+    {
+        return sc.clone();
+    }
+    if let Some(text) = result
+        .get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.iter().find_map(|i| i.get("text").and_then(|t| t.as_str())))
+    {
+        // Non-JSON text is a plain-text tool answer — return it AS the payload.
+        return serde_json::from_str::<serde_json::Value>(text)
+            .unwrap_or_else(|_| serde_json::Value::String(text.to_string()));
+    }
+    result.clone()
+}
+
+/// Did the tool report failure? Checked on the MCP envelope (`isError`) AND
+/// the unwrapped payload. Recognized payload shapes:
 ///
 /// - cyan-media's dispatch contract: `{"error": {"error_class", "message"}}`
 ///   (also tolerating a bare-string `"error"`), and
 /// - the generic `{"ok": false, ...}` envelope some tools use.
 ///
-/// Returns `(error_class, message)` when the payload is a failure.
+/// Returns `(error_class, message)` when the result is a failure.
 fn tool_result_error(result: &serde_json::Value) -> Option<(String, String)> {
+    let payload = unwrap_tool_payload(result);
+    if result.get("isError").and_then(|v| v.as_bool()) == Some(true) {
+        if let Some(found) = payload_error(&payload) {
+            return Some(found);
+        }
+        let msg = payload
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| payload.to_string());
+        return Some(("tool_error".to_string(), msg));
+    }
+    payload_error(&payload)
+}
+
+/// The in-payload failure shapes (see [`tool_result_error`]).
+fn payload_error(result: &serde_json::Value) -> Option<(String, String)> {
     if let Some(e) = result.get("error") {
         if let Some(obj) = e.as_object() {
             let class = obj
@@ -1611,7 +1658,8 @@ pub fn board_video_media(board_id: &str) -> serde_json::Value {
     }
     let mut proxy: Option<(std::time::SystemTime, String)> = None;
     for out in &candidates {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(out) else { continue };
+        let Ok(env) = serde_json::from_str::<serde_json::Value>(out) else { continue };
+        let v = unwrap_tool_payload(&env); // persisted outputs are MCP envelopes
         let Some(rel) = v.get("output_path").and_then(|p| p.as_str()) else { continue };
         if !is_media_filename(rel) {
             continue;
@@ -1980,6 +2028,37 @@ mod tool_result_error_tests {
         assert!(tool_result_error(&json!({ "ok": true, "file_id": "f1" })).is_none());
         // An empty error object is still a failure (unknown class).
         assert!(tool_result_error(&json!({ "error": {} })).is_some());
+    }
+
+    // THE LIVE SHAPE (island DB, 2026-07-08): plugins answer over MCP as an
+    // ENVELOPE — the domain payload is in structuredContent / content[].text.
+    // Matching on the envelope made the failure check silently miss.
+    #[test]
+    fn mcp_envelopes_unwrap_and_fail_correctly() {
+        use super::unwrap_tool_payload;
+        // cyan-media path_denied INSIDE the envelope text → still a failure.
+        let env = json!({
+            "content": [{ "type": "text",
+                "text": "{\"error\":{\"error_class\":\"path_denied\",\"message\":\"input path escapes the media root\"}}" }],
+            "isError": false
+        });
+        let (class, _) = tool_result_error(&env).expect("in-envelope error detected");
+        assert_eq!(class, "path_denied");
+
+        // structuredContent wins when present.
+        let env = json!({
+            "content": [{ "type": "text", "text": "{\"file_id\":\"f1\"}" }],
+            "structuredContent": { "file_id": "f1", "status": "created" },
+            "isError": false
+        });
+        assert!(tool_result_error(&env).is_none(), "a real success stays success");
+        assert_eq!(unwrap_tool_payload(&env)["file_id"], "f1");
+
+        // MCP-level isError:true fails even without a recognizable payload.
+        let env = json!({ "content": [{ "type": "text", "text": "boom" }], "isError": true });
+        let (class, msg) = tool_result_error(&env).unwrap();
+        assert_eq!(class, "tool_error");
+        assert_eq!(msg, "boom");
     }
 
     // The friendly line is deterministic (works with the GPU/Lens OFF) and

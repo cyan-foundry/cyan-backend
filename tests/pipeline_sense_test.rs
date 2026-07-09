@@ -77,12 +77,17 @@ fn sensed_comments_become_per_comment_timecoded_notes() {
         tool: "list_comments".into(),
         args: json!({ "account_id": "a", "file_id": "file-xyz" }),
     };
-    // The live V4 envelope shape: {"data":[ …comments ]}.
-    let result = json!({ "data": [
+    // THE LIVE SHAPE: the MCP tool-result ENVELOPE with the V4 comments payload
+    // ({"data":[…]}) JSON-encoded inside content[].text (island DB, 2026-07-08).
+    let payload = json!({ "data": [
         { "id": "c-60", "text": "trim the logo here", "timestamp": 60,
           "owner": { "name": "Rick the Reviewer" } },
         { "id": "c-gen", "text": "love the pacing overall" },
     ]});
+    let result = json!({
+        "content": [{ "type": "text", "text": payload.to_string() }],
+        "isError": false
+    });
     let (tx, _rx) = mpsc::unbounded_channel::<CommandMsg>();
 
     pipeline_executor::ingest_sensed_comments(board, "step-sense", &step, &result, &tx);
