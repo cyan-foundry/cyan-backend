@@ -97,7 +97,11 @@ pub fn save_note(
     
     // Direct INSERT into DB (UpdateNotebookCell only updates existing rows)
     {
-        let conn = crate::storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
+        // try_db: same FFI-reachable rail as load_notes — error, never panic.
+        let conn = crate::storage::try_db()
+            .ok_or_else(|| anyhow!("DB not initialized"))?
+            .lock()
+            .map_err(|e| anyhow!("DB lock: {}", e))?;
         let now = chrono::Utc::now().timestamp();
         conn.execute(
             "INSERT OR REPLACE INTO notebook_cells (id, board_id, cell_type, cell_order, content, output, collapsed, height, metadata_json, created_at, updated_at) \
@@ -139,7 +143,13 @@ pub fn save_note(
 
 /// Load all timecoded notes for a board
 pub fn load_notes(board_id: &str) -> Result<Vec<TimecodeNote>> {
-    let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
+    // try_db: this crosses the FFI (`cyan_load_timecode_notes`) — a call
+    // before init must surface as an error the wrapper turns into nil, never
+    // a panic crashing the app (found by the app's Tier-1 harness 2026-07-09).
+    let conn = storage::try_db()
+        .ok_or_else(|| anyhow!("DB not initialized"))?
+        .lock()
+        .map_err(|e| anyhow!("DB lock: {}", e))?;
     
     let mut stmt = conn.prepare(
         "SELECT id, board_id, cell_order, content, metadata_json \
