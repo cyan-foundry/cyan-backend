@@ -1278,11 +1278,16 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
         return Err(anyhow!("No cells found in board"));
     }
 
-    // Filter out cells that are just URLs (asset references)
+    // Filter out cells that are just URLs (asset references), and — defense in depth
+    // for boards an old build already polluted — cells whose content IS a raw result
+    // blob: those are run output, never an authored step, and materializing one mints
+    // a garbage `rawcontent…` step id from the serialized JSON (authored_ledger_test).
     let step_cells: Vec<_> = cells.iter()
         .filter(|c| {
             let trimmed = c.content.trim();
-            !trimmed.starts_with("http://") && !trimmed.starts_with("https://") && !trimmed.is_empty()
+            !trimmed.starts_with("http://") && !trimmed.starts_with("https://")
+                && !trimmed.is_empty()
+                && !is_run_result_blob(trimmed)
         })
         .collect();
 
@@ -1798,7 +1803,9 @@ pub fn reset_pipeline(
 
     // Reset each step
     for cell in &cells {
-        if cell.pipeline_config.is_none() { continue; }
+        // RECOVERY runs on EVERY authored-kind cell (before the config guard — a
+        // scrambled cell's metadata may not even parse as a config any more).
+        if cell.pipeline_config.is_none() && !is_run_result_blob(&cell.content) { continue; }
 
         let (content, cell_order, current_metadata_json): (String, i32, Option<String>) = conn.query_row(
             "SELECT content, cell_order, metadata_json FROM notebook_cells WHERE id = ?1",
@@ -1813,6 +1820,27 @@ pub fn reset_pipeline(
         let mut metadata: serde_json::Value = current_metadata_json.as_ref()
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or(json!({}));
+
+        // RECOVERY (authored_ledger_test): a cell whose content is a raw result blob
+        // is run output an OLD build wrote into the authored ledger — Reset restores
+        // the clean authored set by ARCHIVING it (kept, reversible, no data loss),
+        // exactly like the §W1 migration parks non-authorable kinds.
+        if is_run_result_blob(&content) {
+            metadata["original_cell_type"] = json!("step");
+            metadata["archived_reason"] = json!("run_result_pollution");
+            let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
+                id: cell.cell_id.clone(),
+                board_id: board_id.to_string(),
+                cell_type: "archived".to_string(),
+                cell_order,
+                content: Some(content),
+                output: None,
+                collapsed: false,
+                height: None,
+                metadata_json: Some(metadata.to_string()),
+            });
+            continue;
+        }
 
         metadata["pipeline"]["state"]["status"] = json!("pending");
         metadata["pipeline"]["state"]["error"] = json!(null);
@@ -1986,11 +2014,17 @@ fn gather_dependency_outputs(board_id: &str, depends_on: &[String]) -> Vec<serde
 fn load_pipeline_cells(board_id: &str) -> Result<Vec<PipelineCell>> {
     let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
 
-    // Archived cells (legacy non-text kinds collapsed by the §W1 migration) are kept
-    // for no-data-loss but are NOT authorable steps — exclude them from the plan.
+    // THE AUTHORED-LEDGER READ (authored_ledger_test.rs): every pipeline verb —
+    // compile, run, approve, reset, export — operates on the AUTHORED cells only,
+    // selected by an explicit kind WHITELIST. Run outputs live in system-kind cells
+    // (`timecode_note`) on the same board; a blacklist here is how a run's result
+    // JSON got swept into the plan, rewritten as a step, and destroyed the authored
+    // workflow (SEV-HIGH, 2026-07-09). `step` is the one authorable kind (§W1);
+    // `markdown` is grandfathered for pre-migration rows.
     let mut stmt = conn.prepare(
         "SELECT id, board_id, cell_order, content, metadata_json \
-         FROM notebook_cells WHERE board_id = ?1 AND cell_type != 'archived' ORDER BY cell_order"
+         FROM notebook_cells WHERE board_id = ?1 AND cell_type IN ('step','markdown') \
+         ORDER BY cell_order"
     )?;
 
     let cells = stmt.query_map(rusqlite::params![board_id], |row| {
@@ -2253,6 +2287,21 @@ fn fire_notifications(
             }
         }
     }
+}
+
+/// True iff `content` is a serialized run-result blob (a JSON object/array), never
+/// authored English. An authored step can not parse as a JSON container, so this is
+/// the discriminator the compile filter and Reset recovery share: run output must
+/// never be materialized as a step nor mint a step id (`rawcontent…` was the tell).
+fn is_run_result_blob(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with(['{', '[']) {
+        return false;
+    }
+    matches!(
+        serde_json::from_str::<serde_json::Value>(content),
+        Ok(serde_json::Value::Object(_)) | Ok(serde_json::Value::Array(_))
+    )
 }
 
 /// Generate a step_id from cell content
