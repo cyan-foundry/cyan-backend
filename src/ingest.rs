@@ -820,6 +820,22 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
             source_remove(conn, &s("tenant_id")?, &s("id")?)?;
             Ok(serde_json::json!({ "removed": true }))
         }
+        // C1 — register a SEQUENCE (timeline referencing many clips, in order).
+        "sequence_register" => {
+            let clips: Vec<String> = cmd
+                .get("clips")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let name = cmd.get("name").and_then(|v| v.as_str()).unwrap_or("sequence");
+            let out = crate::asset_registry::register_sequence(
+                conn,
+                &s("tenant_id")?,
+                name,
+                &clips,
+            )?;
+            Ok(serde_json::to_value(out)?)
+        }
         "runs_for_board" => {
             let out = runs_for_board(conn, &s("board_id")?)?;
             Ok(serde_json::to_value(out)?)
@@ -837,6 +853,20 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
                 .map(|(asset, location)| serde_json::json!({ "asset": asset, "location": location }))
                 .collect();
             Ok(serde_json::json!({ "masters": out }))
+        }
+        // "Produce master" leg 2 (C3): selective retrieve-then-conform — the
+        // used masters retrieve by LOCATION, the anchor conforms with the
+        // frozen plan (frame-accurate), the delivery output registers.
+        // Retrieval + render can be slow (network, ffmpeg) but run on the
+        // caller's thread with the dispatch-wide lock we already hold — the
+        // op is explicitly human-triggered ("Produce master"), not a tick.
+        "produce_master" => {
+            let out = crate::review_loop::produce_master_via_env(
+                conn,
+                &s("tenant_id")?,
+                &s("version_id")?,
+            )?;
+            Ok(out)
         }
         other => Err(anyhow!("unknown op '{}'", other)),
     }

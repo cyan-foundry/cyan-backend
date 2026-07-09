@@ -309,6 +309,54 @@ pub fn set_derivation(
     get(conn, tenant_id, hash)
 }
 
+/// C1 — register a SEQUENCE: the timeline asset class, an edit referencing
+/// many clips in order. Identity is content-derived (Blake3 over the ordered
+/// clip hashes), so the same timeline registers once. Every referenced clip
+/// must already be registered — a sequence never points at ghosts.
+pub fn register_sequence(
+    conn: &Connection,
+    tenant_id: &str,
+    name: &str,
+    clip_hashes: &[String],
+) -> Result<Asset> {
+    if clip_hashes.is_empty() {
+        return Err(anyhow!("a sequence references at least one clip"));
+    }
+    for clip in clip_hashes {
+        let asset = get(conn, tenant_id, clip)
+            .map_err(|_| anyhow!("sequence references unregistered clip '{clip}'"))?;
+        let (class, _) = class_location(conn, tenant_id, &asset.hash)?;
+        if class.as_deref() == Some("sequence") {
+            return Err(anyhow!("sequences reference clips, not other sequences ('{clip}')"));
+        }
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cyan-sequence:");
+    for clip in clip_hashes {
+        hasher.update(clip.as_bytes());
+        hasher.update(b"\n");
+    }
+    let hash = hasher.finalize().to_hex().to_string();
+    let seq = upsert(
+        conn,
+        &Asset {
+            hash,
+            tenant_id: tenant_id.to_string(),
+            kind: Some("sequence".to_string()),
+            fps: None,
+            duration_ms: None,
+            derived_from_asset: None,
+            derived_from_version: None,
+            remote_refs: serde_json::json!({}),
+            profile_json: serde_json::json!({ "name": name, "clips": clip_hashes }),
+            render_profile: None,
+            created_at: 0,
+        },
+    )?;
+    set_class_location(conn, tenant_id, &seq.hash, Some("sequence"), None)?;
+    get(conn, tenant_id, &seq.hash)
+}
+
 /// set_class_location(hash, class, location) → stamp the STAGE-4 columns.
 /// `class` is validated against [`ASSET_CLASS_VOCAB`]; a `None` for either field
 /// keeps the stored value (accrete, never clobber — the `set_remote_ref` rule).

@@ -1320,6 +1320,207 @@ pub fn conform_via_env(
     Ok((outcome, out_abs))
 }
 
+// ── C3 leg 2 — "Produce master": SELECTIVE retrieve-then-conform ────────────
+
+/// Produce the DELIVERY master for a FROZEN version. Leg 1
+/// (`asset_registry::resolve_final_cut_masters`) names exactly the masters the
+/// cut uses — never a bulk pull; this leg:
+///
+/// 1. RETRIEVES each used master to local disk by its canonical LOCATION
+///    (`retrieve`: file:// verified in place; s3:// / frameio:// downloaded —
+///    prod wires `ingest_connectors::retrieve_by_location`);
+/// 2. CONFORMS the version's anchor MASTER with the version's FROZEN op list
+///    (`changelist::conform_plan` — master-frame coordinates, frame-accurate
+///    per the changelist contract) through cyan-media;
+/// 3. registers the output as a `delivery` asset derived from the anchor at
+///    this version (content-hashed — same bytes, same identity).
+///
+/// No review-state transition: producing a master is a delivery-side act on a
+/// frozen version, not a review round.
+pub fn produce_master(
+    conn: &Connection,
+    tenant_id: &str,
+    version_id: &str,
+    retrieve: &dyn Fn(&str, &std::path::Path) -> Result<std::path::PathBuf>,
+    dispatch: &dyn ConformDispatch,
+) -> Result<serde_json::Value> {
+    let media_root = crate::media_staging::effective_media_root();
+    let version = changelist::get_version(conn, tenant_id, version_id)?;
+    let anchor_hash = version.asset_hash.clone();
+
+    // 1 — selective retrieval: exactly the used masters.
+    let plan = asset_registry::resolve_final_cut_masters(conn, tenant_id, version_id)?;
+    let mut retrieved: Vec<serde_json::Value> = Vec::new();
+    let mut anchor_local: Option<std::path::PathBuf> = None;
+    for (asset, location) in &plan {
+        // Already held locally? (profile_json.path is the holding record.)
+        let held = asset
+            .profile_json
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_file());
+        let local = match held {
+            Some(p) => p,
+            None => {
+                let short: String = asset.hash.chars().take(12).collect();
+                let name = location.rsplit('/').next().unwrap_or("master").to_string();
+                let dest = media_root.join("masters").join(short).join(&name);
+                retrieve(location, &dest)
+                    .map_err(|e| anyhow!("retrieve master {} from {location}: {e}", asset.hash))?
+            }
+        };
+        if asset.hash == anchor_hash {
+            anchor_local = Some(local.clone());
+        }
+        retrieved.push(serde_json::json!({
+            "asset": asset.hash,
+            "location": location,
+            "path": local.display().to_string(),
+        }));
+    }
+    let anchor_local = anchor_local.ok_or_else(|| {
+        anyhow!("version {version_id}'s anchor master {anchor_hash} is not in its own retrieve plan")
+    })?;
+
+    // 2 — conform the anchor with the FROZEN plan (master frames).
+    let ops = changelist::conform_plan(conn, tenant_id, version_id)?;
+    let anchor_asset = asset_registry::get(conn, tenant_id, &anchor_hash)?;
+    let staged = crate::media_staging::stage_local_media(&anchor_local.display().to_string());
+    let input_rel = std::path::Path::new(&staged)
+        .strip_prefix(&media_root)
+        .map_err(|_| anyhow!("anchor master {staged} could not be staged into the media root"))?
+        .to_string_lossy()
+        .to_string();
+    let op_args: Vec<serde_json::Value> = ops
+        .iter()
+        .map(|o| {
+            let mut m = serde_json::json!({ "op": o.op, "tc_in": o.tc_in });
+            if let Some(out) = o.tc_out {
+                m["tc_out"] = serde_json::json!(out);
+            }
+            if o.params.is_object() {
+                m["params"] = o.params.clone();
+            }
+            m
+        })
+        .collect();
+    let mut args = serde_json::json!({ "ops": op_args, "input": input_rel });
+    if let Some(f) = anchor_asset.fps {
+        args["fps"] = serde_json::json!(f);
+    }
+    let result = dispatch
+        .conform(args)
+        .map_err(|e| anyhow!("produce-master conform dispatch failed: {e}"))?;
+    let output_path = result
+        .get("output_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("conform result missing 'output_path'"))?
+        .to_string();
+    let out_abs = media_root.join(&output_path);
+    if !out_abs.is_file() {
+        return Err(anyhow!(
+            "conform reported {output_path} but no file exists at {}",
+            out_abs.display()
+        ));
+    }
+
+    // 3 — register the delivery output (content identity).
+    let delivery_hash = blake3_file_hex(&out_abs)?;
+    asset_registry::upsert(
+        conn,
+        &asset_registry::Asset {
+            hash: delivery_hash.clone(),
+            tenant_id: tenant_id.to_string(),
+            kind: Some("delivery".to_string()),
+            fps: anchor_asset.fps,
+            duration_ms: None,
+            derived_from_asset: None,
+            derived_from_version: None,
+            remote_refs: serde_json::json!({}),
+            profile_json: serde_json::json!({
+                "path": out_abs.display().to_string(),
+                "output_path": output_path,
+            }),
+            render_profile: None,
+            created_at: 0,
+        },
+    )?;
+    asset_registry::set_derivation(conn, tenant_id, &delivery_hash, &anchor_hash, version_id)?;
+
+    Ok(serde_json::json!({
+        "version_id": version_id,
+        "masters": retrieved,
+        "ops_applied": ops.len(),
+        "delivery_hash": delivery_hash,
+        "output_path": out_abs.display().to_string(),
+    }))
+}
+
+/// Prod wiring for [`produce_master`]: location retrieval via the ingest
+/// connectors; conform via the env-configured cyan-media host.
+pub fn produce_master_via_env(
+    conn: &Connection,
+    tenant_id: &str,
+    version_id: &str,
+) -> Result<serde_json::Value> {
+    let media_root = crate::media_staging::effective_media_root();
+    // The dispatch needs the anchor's root-relative input up front — resolve
+    // it the same way produce_master will (held path, else retrieve).
+    let version = changelist::get_version(conn, tenant_id, version_id)?;
+    let anchor = asset_registry::get(conn, tenant_id, &version.asset_hash)?;
+    let held = anchor
+        .profile_json
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file());
+    let anchor_local = match held {
+        Some(p) => p,
+        None => {
+            let (_, location) = asset_registry::class_location(conn, tenant_id, &anchor.hash)?;
+            let location =
+                location.ok_or_else(|| anyhow!("anchor master {} has no location", anchor.hash))?;
+            let short: String = anchor.hash.chars().take(12).collect();
+            let name = location.rsplit('/').next().unwrap_or("master").to_string();
+            let dest = media_root.join("masters").join(short).join(&name);
+            crate::ingest_connectors::retrieve_by_location(&location, &dest)?
+        }
+    };
+    let staged = crate::media_staging::stage_local_media(&anchor_local.display().to_string());
+    let input_rel = std::path::Path::new(&staged)
+        .strip_prefix(&media_root)
+        .map_err(|_| anyhow!("anchor master {staged} could not be staged into the media root"))?
+        .to_string_lossy()
+        .to_string();
+    let command: Vec<String> = match std::env::var("CYAN_MEDIA_MCP_CMD") {
+        Ok(cmd) => cmd.split_whitespace().map(str::to_string).collect(),
+        Err(_) => vec!["cyan-media-mcp".to_string()],
+    };
+    let dispatch = crate::conform_dispatch::StdioConformDispatch {
+        command,
+        media_root,
+        input_rel,
+        timeout: std::time::Duration::from_secs(600),
+    };
+    produce_master(
+        conn,
+        tenant_id,
+        version_id,
+        &|location, dest| crate::ingest_connectors::retrieve_by_location(location, dest),
+        &dispatch,
+    )
+}
+
+/// Streamed Blake3 of a file (hex) — content identity for delivery outputs.
+fn blake3_file_hex(path: &std::path::Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| anyhow!("open {} for hashing: {e}", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher).map_err(|e| anyhow!("hash {}: {e}", path.display()))?;
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 // ── Board-keyed app dialect ─────────────────────────────────────────────────
 //
 // The macOS review player (`ReviewPlayerViewModel`) speaks a BOARD-keyed JSON

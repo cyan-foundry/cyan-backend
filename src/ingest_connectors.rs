@@ -63,6 +63,72 @@ fn download(client: &reqwest::blocking::Client, url: &str, bearer: Option<&str>,
     Ok(())
 }
 
+/// C3 — retrieve a master by its canonical LOCATION into `dest` (or verify it
+/// where it already lives). The "produce master" leg-2 retrieval:
+///
+/// - `file://<path>` / a bare absolute path → verified in place, no copy;
+/// - `s3://bucket/key` → presigned GetObject download;
+/// - `frameio://<account>/file/<file_id>` → media_links.original download.
+///
+/// Returns the local path holding the master's bytes.
+pub fn retrieve_by_location(location: &str, dest: &Path) -> Result<std::path::PathBuf> {
+    let loc = location.trim();
+    if let Some(path) = loc.strip_prefix("file://").or(loc.starts_with('/').then_some(loc)) {
+        let p = std::path::PathBuf::from(path);
+        if !p.is_file() {
+            return Err(anyhow!("master location {loc} does not exist on disk"));
+        }
+        return Ok(p);
+    }
+    if loc.starts_with("s3://") {
+        let s3 = S3Connector::from_creds()?;
+        let (bucket, key) = S3Connector::parse_uri(loc)?;
+        if key.is_empty() {
+            return Err(anyhow!("s3 master location names no object key: {loc}"));
+        }
+        let item = RemoteItem {
+            name: key.rsplit('/').next().unwrap_or(&key).to_string(),
+            provider: "s3",
+            ref_id: format!("{bucket}/{key}@"),
+            size: 0,
+        };
+        let src = placeholder_source(loc);
+        s3.fetch(&src, &item, dest)?;
+        return Ok(dest.to_path_buf());
+    }
+    if loc.starts_with("frameio://") {
+        // frameio://<account>/file/<file_id>
+        let rest = loc.strip_prefix("frameio://").unwrap_or_default();
+        let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
+        let (account, file_id) = match parts.as_slice() {
+            [account, "file", file_id] => (account.to_string(), file_id.to_string()),
+            _ => return Err(anyhow!("unrecognized frameio master location: {loc}")),
+        };
+        let c2c = FrameioC2cConnector::from_creds()?;
+        let item = RemoteItem { name: String::new(), provider: "frameio", ref_id: file_id, size: 0 };
+        // fetch() resolves the account from the source URI — hand it one.
+        let src = placeholder_source(&format!("frameio://{account}/x"));
+        c2c.fetch(&src, &item, dest)?;
+        return Ok(dest.to_path_buf());
+    }
+    Err(anyhow!("no retrieval transport for master location '{loc}'"))
+}
+
+/// A synthetic source row for location-based retrieval (the connectors only
+/// read `uri` from it).
+fn placeholder_source(uri: &str) -> IngestSource {
+    IngestSource {
+        id: String::new(),
+        tenant_id: String::new(),
+        board_id: String::new(),
+        kind: String::new(),
+        uri: uri.to_string(),
+        schedule_secs: None,
+        last_scan_at: None,
+        created_at: 0,
+    }
+}
+
 /// The prod connector for a source kind. Errors name the missing credential —
 /// honestly and without leaking values.
 pub fn connector_for(kind: &str) -> Result<Box<dyn RemoteConnector>> {
