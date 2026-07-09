@@ -891,6 +891,14 @@ pub(crate) async fn execute_local_mcp_tool_step(
             let summary = serde_json::to_string(&result.result)
                 .unwrap_or_else(|_| result.result.to_string());
 
+            // TWO-WAY REVIEW (sense → player): a frameio list_comments result
+            // materializes PER-COMMENT timecoded notes on the board — the Video
+            // face renders each at its frame — and, when the listed file is a
+            // registered review proxy, the comments also ingest into the review
+            // ledger (echo-suppressed, proxy→master remapped). Best-effort: a
+            // sense that listed comments successfully never fails on the glue.
+            ingest_sensed_comments(board_id, step_id, &step, &result.result, command_tx);
+
             // The plugin's JSON result becomes a finding so the step produces a
             // reviewable result (and a timecoded note, like every other step).
             let finding = Finding {
@@ -1329,6 +1337,144 @@ fn resolve_media_args(board_id: &str, step: &mut McpTool) {
         obj.insert("input".to_string(), json!(uri));
         obj.insert("uri".to_string(), json!(uri));
     }
+}
+
+/// TWO-WAY REVIEW glue (sense → player): when a `frameio` comment-listing step
+/// succeeds, each sensed comment becomes ONE timecoded note on the board —
+/// `timecode_seconds = frame / fps` — so the Video face shows the reviewer's
+/// note AT its frame (a note "at frame 60" appears at frame 60). When the
+/// listed file id is also a registered review proxy, the same result ingests
+/// into the review ledger via `review_loop::ingest_sense_result` (echo
+/// suppression + proxy→master remap). fps ladder: the registered proxy's fps,
+/// else the board's persisted probe output (`video.frame_rate`), else the
+/// anchored seconds are unknowable and the notes land un-anchored (frame kept
+/// in the note text — surfaced, never guessed).
+pub fn ingest_sensed_comments(
+    board_id: &str,
+    step_id: &str,
+    step: &McpTool,
+    result: &serde_json::Value,
+    command_tx: &UnboundedSender<CommandMsg>,
+) {
+    if step.plugin_id != "frameio" || !step.tool.contains("comments") || step.tool.starts_with("post") {
+        return;
+    }
+    let file_ref = step
+        .args
+        .get("file_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    // Under ONE scoped lock: registry fps + optional ledger ingest.
+    let mut fps: Option<f64> = None;
+    {
+        let Ok(conn) = crate::storage::db().lock() else { return };
+        let tenant = crate::review_loop::board_tenant(&conn, board_id);
+        if !file_ref.is_empty()
+            && let Ok(Some(proxy)) =
+                crate::asset_registry::find_by_remote_ref(&conn, &tenant, "frameio", &file_ref)
+        {
+            fps = proxy.fps;
+            if proxy.derived_from_version.is_some() {
+                match crate::review_loop::ingest_sense_result(&conn, &tenant, &file_ref, result) {
+                    Ok(ingest) => tracing::info!(
+                        "sense→ledger: appended={} deduped={} own_refs={} unmappable={} malformed={}",
+                        ingest.appended.len(), ingest.deduped, ingest.own_refs_skipped,
+                        ingest.unmappable, ingest.malformed
+                    ),
+                    Err(e) => tracing::warn!("sense→ledger ingest failed (non-fatal): {e:#}"),
+                }
+            }
+        }
+    }
+    if fps.is_none() {
+        fps = board_probed_fps(board_id);
+    }
+
+    let (comments, malformed) = crate::review_loop::parse_sense_comments(result, fps);
+    if malformed > 0 {
+        tracing::warn!("sense→notes: {malformed} malformed/unresolvable comment(s) skipped");
+    }
+    for c in &comments {
+        let seconds = fps.map(|f| c.frame as f64 / f).unwrap_or(0.0);
+        let content = if fps.is_none() && c.frame > 0 {
+            format!("{} (frame {})", c.text, c.frame) // anchor surfaced, not guessed
+        } else {
+            c.text.clone()
+        };
+        let note = crate::timecode_notes::TimecodeNote {
+            id: format!("frameio-comment-{}", c.id), // stable ⇒ re-sense upserts, no dupes
+            board_id: board_id.to_string(),
+            timecode_seconds: seconds,
+            content,
+            note_type: "review_comment".to_string(),
+            author: c.author.clone().unwrap_or_else(|| "frameio reviewer".to_string()),
+            created_at: chrono::Utc::now().timestamp() as f64,
+            pipeline_step_id: Some(step_id.to_string()),
+            pipeline_phase: Some("during".to_string()),
+            ai_reviewed: false,
+            human_approved: false,
+            action_skill: None,
+            action_status: None,
+            action_result: None,
+            action_model: None,
+            ai_flags_nearby: vec![],
+            reply_to: None,
+            thread_count: 0,
+        };
+        if let Err(e) = crate::timecode_notes::save_note(&note, command_tx) {
+            tracing::warn!("sense→notes: save failed for comment {}: {e:#}", c.id);
+        }
+    }
+    if !comments.is_empty() {
+        tracing::info!("sense→notes: {} reviewer comment(s) on board {board_id}", comments.len());
+    }
+}
+
+/// The board's probed frame rate, read back from persisted step outputs (the
+/// promo workflow probes before it senses): cyan-media probe reports
+/// `video.frame_rate` as an ffprobe rational ("30000/1001") — parsed to f64.
+fn board_probed_fps(board_id: &str) -> Option<f64> {
+    let outputs: Vec<String> = {
+        let conn = crate::storage::db().lock().ok()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT output FROM notebook_cells WHERE board_id=?1 AND output IS NOT NULL AND output != ''",
+            )
+            .ok()?;
+        let rows = stmt
+            .query_map(rusqlite::params![board_id], |row| row.get::<_, String>(0))
+            .ok()?;
+        rows.flatten().collect()
+    };
+    for out in &outputs {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(out) else { continue };
+        let rate = v
+            .get("video")
+            .and_then(|s| s.get("frame_rate"))
+            .and_then(|r| r.as_str());
+        if let Some(rate) = rate
+            && let Some(fps) = parse_rational_fps(rate)
+        {
+            return Some(fps);
+        }
+    }
+    None
+}
+
+/// "30000/1001" → 29.97…, "25/1" → 25.0, "24" → 24.0. None for junk/zero.
+fn parse_rational_fps(rate: &str) -> Option<f64> {
+    let fps = match rate.split_once('/') {
+        Some((n, d)) => {
+            let n: f64 = n.trim().parse().ok()?;
+            let d: f64 = d.trim().parse().ok()?;
+            if d == 0.0 { return None; }
+            n / d
+        }
+        None => rate.trim().parse().ok()?,
+    };
+    (fps.is_finite() && fps > 0.0).then_some(fps)
 }
 
 /// Did the tool report failure IN its result payload? Two recognized shapes:
