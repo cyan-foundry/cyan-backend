@@ -342,6 +342,63 @@ fn autocomplete_index_query_returns_tools_artifacts_actions() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Run-output pollution (fix #3): `#` must reference stable AUTHORED artifacts —
+// persisted run results (timecode_note cells) and raw-JSON blobs must NEVER be
+// offered as step_output artifacts. Live, a run + Review turned the prior run's
+// probe error / upload result / comment JSON into `#` chips like
+// `contenttextfile_id…`.
+// ════════════════════════════════════════════════════════════════════════════
+#[test]
+fn autocomplete_index_excludes_run_result_cells() {
+    ensure_db();
+    let now = 1_700_000_100i64;
+    let (group, board) = ("wf-pollution-grp", "wf-pollution-board");
+    seed_board(group, board);
+
+    // A real authored step with output — MUST surface.
+    storage::cell_insert_simple(
+        &format!("{board}-s0"), board, "step", 0,
+        Some("Probe the master"), Some("duration=01:32:00"), false, None, None, now, now,
+    )
+    .expect("authored step with output");
+    // A persisted run RESULT (the executor's timecode_note cell): content is the
+    // serialized tool payload, metadata carries pipeline_step_id. MUST NOT surface.
+    storage::cell_insert_simple(
+        &format!("{board}-note"), board, "timecode_note", 1,
+        Some(r#"{"content":[{"text":"ok","file_id":"ba0b656a"}]}"#),
+        Some(r#"{"file_id":"ba0b656a","status":"uploaded"}"#),
+        false, None,
+        Some(r#"{"pipeline_step_id":"s4","pipeline_phase":"during"}"#),
+        now, now,
+    )
+    .expect("run-result note cell");
+    // A cell whose text IS raw JSON (a result blob that leaked into a step cell
+    // pre-fix). MUST NOT surface either — a JSON blob is not an authorable name.
+    storage::cell_insert_simple(
+        &format!("{board}-blob"), board, "step", 2,
+        Some(r#"{"error":{"error_class":"path_denied"}}"#), Some("x"),
+        false, None, None, now, now,
+    )
+    .expect("json-blob step cell");
+
+    let idx = workflow::autocomplete_index(board);
+    let outputs: Vec<&str> = idx
+        .artifacts
+        .iter()
+        .filter(|e| e.kind == "step_output")
+        .map(|e| e.label.as_str())
+        .collect();
+    assert!(
+        outputs.iter().any(|l| l.contains("Probe the master")),
+        "authored step output stays offered, got {outputs:?}"
+    );
+    assert!(
+        !outputs.iter().any(|l| l.contains("file_id") || l.trim_start().starts_with('{')),
+        "run results / JSON blobs must never be # artifacts, got {outputs:?}"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // S5 — compile MUST preserve executor="manual" (the human-approval gate).
 // The LLM/deterministic recompile (compile_via_llm) used to hardcode executor="lens",
 // dropping the manual gate so the package/human step EXECUTED forever instead of pausing.

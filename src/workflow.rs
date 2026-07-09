@@ -189,6 +189,13 @@ pub fn autocomplete_index(board_id: &str) -> AutocompleteIndex {
     }
 
     for c in storage::cell_list_by_boards(&[board_id.to_string()]).unwrap_or_default() {
+        // Run-output pollution guard: `#` must reference a stable AUTHORED artifact,
+        // never serialized tool output. Persisted run results (`timecode_note` cells)
+        // and any cell whose text IS raw JSON are not authorable references — offering
+        // them produced `#` chips like `contenttextfile_id…` (a mangled result blob).
+        if c.cell_type == "timecode_note" {
+            continue;
+        }
         if c.output.as_deref().map(|o| !o.is_empty()).unwrap_or(false) {
             let label = c
                 .content
@@ -196,6 +203,9 @@ pub fn autocomplete_index(board_id: &str) -> AutocompleteIndex {
                 .map(first_line)
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| c.id.clone());
+            if label.trim_start().starts_with(['{', '[']) {
+                continue; // a JSON blob is a run result, not an authored step name
+            }
             artifacts.push(AutocompleteEntry {
                 trigger: '#',
                 kind: "step_output".to_string(),
