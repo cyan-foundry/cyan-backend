@@ -429,12 +429,62 @@ fn synthesize_args(
         }
     }
 
+    // TIMECODE ANCHORING (create_comment): a step that SAYS where the note goes
+    // must anchor it there. An unfilled `timestamp` prop is parsed from the
+    // authored text — "frame 60" → 60 (int frames), "at 00:00:02:12" → the
+    // non-drop timecode string (both pass through untransformed, per the tool
+    // contract). Without this the live run posted `timestamp:null`: "frame 60"
+    // was only prose, so the note landed as a GENERAL comment instead of at
+    // frame 60 (and the sense-back had no frame to render it at).
+    if properties.contains_key("timestamp")
+        && !args.contains_key("timestamp")
+        && let Some(ts) = timestamp_from_intent(content)
+    {
+        args.insert("timestamp".to_string(), ts);
+    }
+
     let pending: Vec<String> = required
         .iter()
         .filter(|r| !args.contains_key(**r))
         .map(|r| r.to_string())
         .collect();
     (Value::Object(args), pending)
+}
+
+/// The frame/timecode the authored text anchors a note at, if it states one.
+/// Deterministic, tiny vocabulary (never fuzzy):
+///
+/// - `frame <N>` (case-insensitive; also `frame=<N>` handled upstream by the
+///   inline kv grammar as a prop only if the schema names it) → integer frames;
+/// - a non-drop `HH:MM:SS:FF` timecode token → the string, untransformed.
+///
+/// Returns the JSON value to place in a `timestamp` arg.
+pub fn timestamp_from_intent(content: &str) -> Option<Value> {
+    let toks: Vec<&str> = content.split_whitespace().collect();
+    for (i, tok) in toks.iter().enumerate() {
+        // "frame 60" / "Frame 60," — the next token is the frame number.
+        if tok.to_lowercase().trim_matches(|c: char| !c.is_ascii_alphanumeric()) == "frame"
+            && let Some(next) = toks.get(i + 1)
+        {
+            let num = next.trim_matches(|c: char| !c.is_ascii_digit());
+            if !num.is_empty()
+                && let Ok(n) = num.parse::<i64>()
+            {
+                return Some(Value::from(n));
+            }
+        }
+        // A bare non-drop timecode token: HH:MM:SS:FF (4 numeric segments).
+        let t = tok.trim_matches(|c: char| !(c.is_ascii_digit() || c == ':'));
+        let segs: Vec<&str> = t.split(':').collect();
+        if segs.len() == 4
+            && segs
+                .iter()
+                .all(|s| !s.is_empty() && s.len() <= 2 && s.chars().all(|c| c.is_ascii_digit()))
+        {
+            return Some(Value::String(t.to_string()));
+        }
+    }
+    None
 }
 
 /// `key=value` tokens in the step text (single-token values; quotes trimmed) —
@@ -518,5 +568,61 @@ mod tests {
         assert_eq!(coerce("7", &serde_json::json!({"type":"integer"})), 7);
         assert_eq!(coerce("x", &serde_json::json!({"type":"integer"})), "x");
         assert_eq!(coerce("true", &serde_json::json!({"type":"boolean"})), true);
+    }
+
+    // create_comment ANCHORING (fix #7): the stated frame/timecode in the step
+    // text becomes the `timestamp` arg — the live run posted timestamp:null and
+    // "frame 60" stayed prose, landing the note as a general comment.
+    #[test]
+    fn timestamp_from_intent_parses_frames_and_timecode() {
+        use super::timestamp_from_intent;
+        // "frame N" in any casing/punctuation → integer frames.
+        assert_eq!(timestamp_from_intent("leave a note at frame 60 please"), Some(60.into()));
+        assert_eq!(timestamp_from_intent("Frame 12, tighten the cut"), Some(12.into()));
+        // A non-drop HH:MM:SS:FF token passes through as the string.
+        assert_eq!(
+            timestamp_from_intent("note the flash at 00:00:02:12 in the intro"),
+            Some(serde_json::Value::String("00:00:02:12".to_string()))
+        );
+        // No stated anchor → None (the comment stays general on purpose).
+        assert_eq!(timestamp_from_intent("leave a summary note on the cut"), None);
+        // mm:ss (2 segments) is NOT a frame anchor — never guess.
+        assert_eq!(timestamp_from_intent("around 01:30 somewhere"), None);
+    }
+
+    // End-to-end through the arg synthesizer: a schema with a `timestamp` prop
+    // gets the anchor filled from the authored text; an explicit inline
+    // `timestamp=…` still wins (author intent first).
+    #[test]
+    fn synthesize_args_fills_timestamp_from_step_text() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string"},
+                "file_id": {"type": "string"},
+                "text": {"type": "string"},
+                "timestamp": {},
+                "duration": {"type": "integer"}
+            },
+            "required": ["account_id", "file_id", "text"]
+        });
+        let (args, _pending) = synthesize_args(
+            "board-anchor-test", "grp-anchor-test", "frameio", &schema,
+            "@frameio.create_comment reviewer note: trim the logo at frame 60",
+            None,
+        );
+        assert_eq!(args["timestamp"], serde_json::json!(60));
+        assert!(
+            args["text"].as_str().unwrap_or_default().contains("trim the logo"),
+            "text keeps the authored intent"
+        );
+
+        // Inline kv wins over the parsed intent.
+        let (args, _pending) = synthesize_args(
+            "board-anchor-test", "grp-anchor-test", "frameio", &schema,
+            "@frameio.create_comment timestamp=90 note at frame 60",
+            None,
+        );
+        assert_eq!(args["timestamp"], serde_json::json!("90"));
     }
 }
