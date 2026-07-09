@@ -1992,5 +1992,6 @@ pub mod ingest;
 pub mod skills;
 pub mod pipeline_executor;
 pub mod media_staging;
+pub mod plugin_config;
 pub mod dashboard;
 pub mod exec_plan;

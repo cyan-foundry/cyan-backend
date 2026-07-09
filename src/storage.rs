@@ -2905,6 +2905,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         tracing::warn!("Migration: ingest tables failed: {e}");
     }
 
+    // Per-install / per-workflow plugin CONFIG (PLUGIN_CREDENTIAL_ONBOARDING
+    // §A): non-secret plugin targets (account_id/folder_id/…) scoped board →
+    // tenant, replacing the global env stopgap. Creates `plugin_config`.
+    // Idempotent (CREATE TABLE IF NOT EXISTS); additive.
+    if let Err(e) = crate::plugin_config::migrate(conn) {
+        tracing::warn!("Migration: plugin_config table failed: {e}");
+    }
+
     Ok(())
 }
 

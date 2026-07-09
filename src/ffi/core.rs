@@ -4580,16 +4580,25 @@ pub extern "C" fn cyan_pipeline_run_step_local(
                 metadata["mcp_tool"]["args"][key] = v.clone();
             }
         }
-        // ENV-CONTEXT fallback at dispatch too (heals a bind compiled before
-        // the env existed): the plugin's ambient identity, e.g. frameio's
-        // FRAMEIO_ACCOUNT_ID — the same context its token is injected from.
+        // CONFIG-CONTEXT fallback at dispatch too (heals a bind compiled before
+        // the config existed): per-WORKFLOW plugin_config row → per-TENANT row →
+        // the plugin's ambient env (demo stopgap) — the same ladder the bind
+        // uses (PLUGIN_CREDENTIAL_ONBOARDING §B).
         let plugin_id = metadata["mcp_tool"]["plugin_id"]
             .as_str()
             .unwrap_or_default()
             .to_string();
+        let cfg_tenant = crate::storage::board_get_group_id(&board_id_str)
+            .filter(|g| !g.is_empty())
+            .unwrap_or_else(|| "device".to_string());
         for key in &pending {
             if metadata["mcp_tool"]["args"].get(key).is_none()
-                && let Some(v) = crate::workflow_bind::env_context_value(&plugin_id, key)
+                && let Some(v) = crate::plugin_config::context_value(
+                    &cfg_tenant,
+                    Some(&board_id_str),
+                    &plugin_id,
+                    key,
+                )
             {
                 metadata["mcp_tool"]["args"][key] = serde_json::json!(v);
             }
@@ -4907,6 +4916,103 @@ pub extern "C" fn cyan_board_video_media(board_id: *const c_char) -> *mut c_char
     };
     let info = crate::pipeline_executor::board_video_media(board_id_str);
     json_cstring(&info.to_string())
+}
+
+/// Set one per-install / per-workflow plugin CONFIG value
+/// (PLUGIN_CREDENTIAL_ONBOARDING §A). Input JSON:
+/// `{"plugin_id","key","value","board_id"?,"tenant_id"?}` — with a `board_id`
+/// the row is WORKFLOW-scoped (tenant derived from the board's group unless
+/// given); without one it is the tenant-wide default. Returns
+/// `{"ok":bool,"error"?}`. Secret-looking keys are refused (vault material).
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_plugin_config_set(cmd_json: *const c_char) -> *mut c_char {
+    let cmd = match unsafe { CStr::from_ptr(cmd_json) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let v: serde_json::Value = match serde_json::from_str(cmd) {
+        Ok(v) => v,
+        Err(e) => return json_cstring(&serde_json::json!({"ok": false, "error": format!("bad json: {e}")}).to_string()),
+    };
+    let (Some(plugin_id), Some(key), Some(value)) = (
+        v["plugin_id"].as_str(),
+        v["key"].as_str(),
+        v["value"].as_str(),
+    ) else {
+        return json_cstring(
+            &serde_json::json!({"ok": false, "error": "plugin_id, key, value are required"})
+                .to_string(),
+        );
+    };
+    let board_id = v["board_id"].as_str().filter(|b| !b.is_empty());
+    let tenant = v["tenant_id"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| board_id.and_then(crate::storage::board_get_group_id))
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "device".to_string());
+    let out = {
+        let conn = crate::storage::db().lock_safe();
+        crate::plugin_config::set(
+            &conn,
+            &tenant,
+            board_id,
+            plugin_id,
+            key,
+            value,
+            chrono::Utc::now().timestamp(),
+        )
+    };
+    match out {
+        Ok(()) => json_cstring(&serde_json::json!({"ok": true}).to_string()),
+        Err(e) => json_cstring(&serde_json::json!({"ok": false, "error": e.to_string()}).to_string()),
+    }
+}
+
+/// Read plugin CONFIG. Input JSON `{"plugin_id","board_id"?,"tenant_id"?,"key"?}`:
+/// with `key` returns `{"ok":true,"value":string|null}` (workflow row wins over
+/// tenant row); without it returns `{"ok":true,"values":{key:value,…}}` (tenant
+/// defaults merged under workflow overrides — what a settings sheet lists).
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_plugin_config_get(cmd_json: *const c_char) -> *mut c_char {
+    let cmd = match unsafe { CStr::from_ptr(cmd_json) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let v: serde_json::Value = match serde_json::from_str(cmd) {
+        Ok(v) => v,
+        Err(e) => return json_cstring(&serde_json::json!({"ok": false, "error": format!("bad json: {e}")}).to_string()),
+    };
+    let Some(plugin_id) = v["plugin_id"].as_str() else {
+        return json_cstring(
+            &serde_json::json!({"ok": false, "error": "plugin_id is required"}).to_string(),
+        );
+    };
+    let board_id = v["board_id"].as_str().filter(|b| !b.is_empty());
+    let tenant = v["tenant_id"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| board_id.and_then(crate::storage::board_get_group_id))
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "device".to_string());
+    let conn = crate::storage::db().lock_safe();
+    if let Some(key) = v["key"].as_str() {
+        match crate::plugin_config::get(&conn, &tenant, board_id, plugin_id, key) {
+            Ok(val) => json_cstring(&serde_json::json!({"ok": true, "value": val}).to_string()),
+            Err(e) => json_cstring(&serde_json::json!({"ok": false, "error": e.to_string()}).to_string()),
+        }
+    } else {
+        match crate::plugin_config::list(&conn, &tenant, board_id, plugin_id) {
+            Ok(rows) => {
+                let map: serde_json::Map<String, serde_json::Value> = rows
+                    .into_iter()
+                    .map(|(k, val)| (k, serde_json::Value::String(val)))
+                    .collect();
+                json_cstring(&serde_json::json!({"ok": true, "values": map}).to_string())
+            }
+            Err(e) => json_cstring(&serde_json::json!({"ok": false, "error": e.to_string()}).to_string()),
+        }
+    }
 }
 
 // Add to ffi/core.rs — path autocomplete for g\ prefix

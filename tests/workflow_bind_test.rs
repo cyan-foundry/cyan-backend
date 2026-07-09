@@ -462,6 +462,122 @@ fn spawn_config_maps_python_uv_and_injects_creds() {
     }
 }
 
+/// PLUGIN_CREDENTIAL_ONBOARDING §C — the credential is resolved FRESH at every
+/// spawn from the cred dotenv file, so a token the loader refreshed ON DISK is
+/// what the next plugin spawn injects (the 401-mid-session bug: the app process
+/// env is a launch-time snapshot and never sees the refresh).
+#[test]
+fn spawn_config_reads_the_cred_file_fresh_per_spawn() {
+    ensure_db();
+    let group = "bind-group-cred-file";
+    create_fresh_group(group, "Bind Group CredFile");
+    let tar = make_bundle_tar("credio2");
+    storage::install_plugin_bundle(group, "credio2", &tar).expect("install");
+    let dir = storage::ensure_bundle_unpacked("credio2").expect("unpacked");
+
+    let cred_file = tempfile::NamedTempFile::new().expect("cred file");
+    std::fs::write(cred_file.path(), "export CREDIO2_IMS_TOKEN=\"launch-token\"\n").unwrap();
+    unsafe {
+        std::env::set_var("CYAN_VAULT", "mem"); // never prompt a Keychain in tests
+        std::env::set_var("CYAN_CRED_ENV_FILE", cred_file.path());
+        std::env::remove_var("CREDIO2_IMS_TOKEN"); // NO process-env fallback in play
+    }
+
+    let cfg = cyan_backend::mcp_host::bundle_spawn_config("credio2", &dir, "tenant-x")
+        .expect("spawn config");
+    let tok = cfg.creds.iter().find(|(k, _)| k == "CREDIO2_IMS_TOKEN").expect("token injected");
+    assert_eq!(tok.1.expose(), "launch-token");
+
+    // The loader refreshes the file mid-session → the NEXT spawn sees the new
+    // token, with no app restart and no plugin change.
+    std::fs::write(cred_file.path(), "CREDIO2_IMS_TOKEN=refreshed-token\n").unwrap();
+    let cfg2 = cyan_backend::mcp_host::bundle_spawn_config("credio2", &dir, "tenant-x")
+        .expect("spawn config after refresh");
+    let tok2 = cfg2.creds.iter().find(|(k, _)| k == "CREDIO2_IMS_TOKEN").expect("token injected");
+    assert_eq!(tok2.1.expose(), "refreshed-token", "fresh-per-spawn, not a launch snapshot");
+
+    unsafe {
+        std::env::remove_var("CYAN_CRED_ENV_FILE");
+        std::env::remove_var("CYAN_VAULT");
+    }
+}
+
+/// PLUGIN_CREDENTIAL_ONBOARDING §B — required tool props resolve from the
+/// per-WORKFLOW / per-TENANT `plugin_config` store BEFORE the ambient env
+/// stopgap: two producers on one device get their own Frame.io folder.
+#[test]
+fn bind_fills_required_props_from_plugin_config_store() {
+    ensure_db();
+    let group = "bind-group-cfg";
+    let (default_ws, _) = create_fresh_group(group, "Bind Group Cfg");
+    let board = "bind-board-cfg";
+    storage::board_insert(board, &default_ws, "Cfg Board", chrono::Utc::now().timestamp())
+        .expect("board insert");
+
+    // Tenant default + a workflow override for folder_id; env holds a decoy.
+    {
+        let conn = storage::db().lock_safe();
+        cyan_backend::plugin_config::set(&conn, group, None, "cfgio", "account_id", "acct-store", 1)
+            .expect("tenant account");
+        cyan_backend::plugin_config::set(&conn, group, None, "cfgio", "folder_id", "tenant-folder", 1)
+            .expect("tenant folder");
+        cyan_backend::plugin_config::set(&conn, group, Some(board), "cfgio", "folder_id", "board-folder", 2)
+            .expect("board folder");
+    }
+    unsafe { std::env::set_var("CFGIO_FOLDER_ID", "env-decoy") };
+
+    let manifest_json = serde_json::json!({
+        "name": "cfgio",
+        "version": "0.1.0",
+        "description": "plugin_config test plugin",
+        "runtime": "python-uv",
+        "credentials": null,
+        "extra_credentials": [],
+        "events_emitted": [],
+        "tools": [{
+            "name": "upload_file",
+            "when_to_use": "Push a finished cut to review.",
+            "aliases": [],
+            "io_types": { "input": ["video"], "output": ["json"] },
+            "stage": "review",
+            "side_effects": ["external_send"],
+            "locality": "local",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "account_id": {"type": "string"},
+                    "folder_id": {"type": "string"},
+                    "name": {"type": "string"},
+                    "file_path": {"type": "string"}
+                },
+                "required": ["account_id", "folder_id", "name", "file_path"]
+            },
+            "output_schema": {"type": "object"}
+        }]
+    });
+    let manifest: cyan_mcp::Manifest =
+        serde_json::from_value(manifest_json).expect("strict manifest");
+    let mention = workflow_bind::parse_mention("@cfgio.upload_file").expect("mention");
+    match workflow_bind::bind_with_manifest(
+        board,
+        group,
+        "@cfgio.upload_file name=cut.mp4 file_path=/tmp/cut.mp4",
+        &mention,
+        &manifest,
+    ) {
+        workflow_bind::BindOutcome::Bound(b) => {
+            assert_eq!(b.args["account_id"], "acct-store", "tenant config row fills");
+            assert_eq!(
+                b.args["folder_id"], "board-folder",
+                "the WORKFLOW row wins over tenant row AND the env stopgap"
+            );
+            assert!(b.pending.is_empty(), "nothing left pending: {:?}", b.pending);
+        }
+        other => panic!("expected Bound, got {other:?}"),
+    }
+    unsafe { std::env::remove_var("CFGIO_FOLDER_ID") };
+}
+
 /// TIER 2 — the IMPLICIT "attached master": a step with NO `#reference` binds
 /// the board's REAL attachment when it is the only content-distinct board file
 /// with local bytes; two DIFFERENT clips stay pending (never a guess), and a

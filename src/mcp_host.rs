@@ -329,15 +329,16 @@ pub fn bundle_spawn_config(
         .chain(manifest.extra_credentials.iter())
     {
         let env_var = cred_env_var(&manifest.name, &c.provider);
-        let val = std::env::var(&env_var)
-            .ok()
-            .filter(|v| !v.trim().is_empty())
+        let val = resolve_credential(&manifest.name, &c.provider, tenant_id, &env_var)
             .ok_or_else(|| {
                 anyhow!(
-                    "plugin '{plugin_id}' requires credential env var '{env_var}' which is not set: spawn refused"
+                    "plugin '{plugin_id}' requires credential '{env_var}' and none is available \
+                     (vault key '{}', cred file {}, process env all empty): spawn refused",
+                    crate::device_vault::plugin_cred_key(&manifest.name, &c.provider, tenant_id),
+                    cred_env_file().display(),
                 )
             })?;
-        creds.push((env_var, cyan_mcp::SecretString::new(val)));
+        creds.push((env_var, val));
     }
 
     let run_entry = bundle_dir.join("run");
@@ -365,6 +366,71 @@ pub fn bundle_spawn_config(
         args,
         creds,
     })
+}
+
+/// Resolve one declared plugin credential FRESH at spawn time
+/// (PLUGIN_CREDENTIAL_ONBOARDING §C), most-authoritative first:
+///
+/// 1. the device PLUGIN VAULT (`plugin_cred_key(plugin, provider, tenant)`) —
+///    the real per-install custody once connect-time capture writes it;
+/// 2. the credential dotenv file (`CYAN_CRED_ENV_FILE`, default
+///    `~/.frameio.env`) read FRESH — the auto-refreshing loader rewrites that
+///    file hourly, and re-reading per spawn (instead of trusting the app
+///    process env, a launch-time SNAPSHOT) is what fixes the 401-mid-session
+///    bug without touching any plugin;
+/// 3. the process env — the demo stopgap, last.
+fn resolve_credential(
+    plugin: &str,
+    provider: &str,
+    tenant_id: &str,
+    env_var: &str,
+) -> Option<cyan_mcp::SecretString> {
+    let key = crate::device_vault::plugin_cred_key(plugin, provider, tenant_id);
+    if let Ok(Some(secret)) = crate::device_vault::plugin_cred_vault().load(&key) {
+        use secrecy::ExposeSecret;
+        return Some(cyan_mcp::SecretString::new(secret.expose_secret().to_string()));
+    }
+    if let Some(v) = dotenv_lookup(&cred_env_file(), env_var) {
+        return Some(cyan_mcp::SecretString::new(v));
+    }
+    std::env::var(env_var)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(cyan_mcp::SecretString::new)
+}
+
+/// The credential dotenv file consulted at spawn (fresh read). Overridable for
+/// tests/deploys via `CYAN_CRED_ENV_FILE`; defaults to the auto-refreshed
+/// `~/.frameio.env` the demo loader maintains.
+fn cred_env_file() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("CYAN_CRED_ENV_FILE")
+        && !p.trim().is_empty()
+    {
+        return std::path::PathBuf::from(p.trim());
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    std::path::Path::new(&home).join(".frameio.env")
+}
+
+/// Minimal dotenv lookup: `KEY=VALUE` lines, tolerating a leading `export `,
+/// surrounding quotes, and comment/blank lines. Returns the LAST match (the
+/// refresher appends/rewrites; last write wins).
+fn dotenv_lookup(path: &std::path::Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        if let Some((k, v)) = line.split_once('=')
+            && k.trim() == key
+        {
+            let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
+            if !v.is_empty() {
+                found = Some(v.to_string());
+            }
+        }
+    }
+    found
 }
 
 /// Side effect that requires the human-approval gate before a tool runs.

@@ -407,13 +407,15 @@ fn synthesize_args(
         }
     }
 
-    // ENV-CONTEXT fallback for required props the author didn't inline — the
-    // plugin's ambient identity (e.g. frameio's FRAMEIO_ACCOUNT_ID, the same
-    // context its token is injected from at spawn). Required-only: an optional
-    // prop from env would surprise; a required one unblocks the bind.
+    // CONFIG-CONTEXT fallback for required props the author didn't inline
+    // (PLUGIN_CREDENTIAL_ONBOARDING §B): per-WORKFLOW plugin_config row →
+    // per-TENANT row → the plugin's ambient `<PLUGIN>_<PROP>` env (the demo
+    // stopgap, kept only for the transition). Required-only: an optional prop
+    // from context would surprise; a required one unblocks the bind.
     for r in &required {
         if !args.contains_key(*r)
-            && let Some(v) = env_context_value(plugin_id, r)
+            && let Some(v) =
+                crate::plugin_config::context_value(tenant_id, Some(board_id), plugin_id, r)
         {
             args.insert((*r).to_string(), json!(v));
         }
