@@ -1265,10 +1265,15 @@ fn find_video_uri(board_id: &str) -> Option<String> {
     //     (content-addressed, idempotent) so the confined cyan-media plugin can
     //     read it. A raw attachment path (e.g. ~/sig_source.mp4) handed through
     //     unstaged is exactly the live `path_denied` / `input_bytes:0` bug.
-    for (_name, local_path) in &bound_files {
+    //     Staged under the attachment's DISPLAY name: the upload store keeps
+    //     board files by bare hash (no extension), and an extension-less
+    //     staged path breaks every extension-sniffing consumer downstream
+    //     (found live: the Video face rendered its poster instead of media).
+    for (name, local_path) in &bound_files {
         if let Some(p) = local_path
             && !p.is_empty() && std::path::Path::new(p).exists() {
-                return Some(crate::media_staging::stage_local_media(p));
+                let display = (!name.trim().is_empty()).then_some(name.as_str());
+                return Some(crate::media_staging::stage_local_media_named(p, display));
             }
     }
 
@@ -1435,25 +1440,53 @@ pub fn ingest_sensed_comments(
     }
 }
 
+/// The board's persisted step-result payloads, UNWRAPPED. Results persist on
+/// two rails depending on the executor path (both found live):
+/// the cell's `output` column, and — for the FFI single-step dispatch the app
+/// drives, whose state the app re-saves — `metadata_json.pipeline.state.ai_result`.
+/// Reads BOTH per cell, parses, and unwraps the MCP envelope.
+fn board_step_payloads(board_id: &str) -> Vec<serde_json::Value> {
+    let raw: Vec<(Option<String>, Option<String>)> = {
+        let Ok(conn) = crate::storage::db().lock() else { return Vec::new() };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT output, metadata_json FROM notebook_cells WHERE board_id=?1",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map(rusqlite::params![board_id], |row| {
+            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?))
+        }) else {
+            return Vec::new();
+        };
+        rows.flatten().collect()
+    };
+    let mut payloads = Vec::new();
+    for (output, metadata) in &raw {
+        if let Some(out) = output.as_deref().filter(|o| !o.is_empty())
+            && let Ok(env) = serde_json::from_str::<serde_json::Value>(out)
+        {
+            payloads.push(unwrap_tool_payload(&env));
+        }
+        if let Some(meta) = metadata.as_deref().filter(|m| !m.is_empty())
+            && let Ok(m) = serde_json::from_str::<serde_json::Value>(meta)
+            && let Some(ai) = m
+                .get("pipeline")
+                .and_then(|p| p.get("state"))
+                .and_then(|s| s.get("ai_result"))
+                .and_then(|a| a.as_str())
+            && let Ok(env) = serde_json::from_str::<serde_json::Value>(ai)
+        {
+            payloads.push(unwrap_tool_payload(&env));
+        }
+    }
+    payloads
+}
+
 /// The board's probed frame rate, read back from persisted step outputs (the
 /// promo workflow probes before it senses): cyan-media probe reports
 /// `video.frame_rate` as an ffprobe rational ("30000/1001") — parsed to f64.
 fn board_probed_fps(board_id: &str) -> Option<f64> {
-    let outputs: Vec<String> = {
-        let conn = crate::storage::db().lock().ok()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT output FROM notebook_cells WHERE board_id=?1 AND output IS NOT NULL AND output != ''",
-            )
-            .ok()?;
-        let rows = stmt
-            .query_map(rusqlite::params![board_id], |row| row.get::<_, String>(0))
-            .ok()?;
-        rows.flatten().collect()
-    };
-    for out in &outputs {
-        let Ok(env) = serde_json::from_str::<serde_json::Value>(out) else { continue };
-        let v = unwrap_tool_payload(&env); // persisted outputs are MCP envelopes
+    for v in board_step_payloads(board_id) {
         let rate = v
             .get("video")
             .and_then(|s| s.get("frame_rate"))
@@ -1645,21 +1678,11 @@ fn friendly_tool_error(error_class: &str, message: &str, plugin_id: &str, tool: 
 pub fn board_video_media(board_id: &str) -> serde_json::Value {
     let root = crate::media_staging::effective_media_root();
 
-    // Newest derived output among the board's persisted step outputs. Scope the
-    // DB lock tightly — find_video_uri below locks independently.
-    let mut candidates: Vec<String> = Vec::new();
-    if let Ok(conn) = crate::storage::db().lock()
-        && let Ok(mut stmt) = conn.prepare(
-            "SELECT output FROM notebook_cells WHERE board_id=?1 AND output IS NOT NULL AND output != ''",
-        )
-        && let Ok(rows) = stmt.query_map(rusqlite::params![board_id], |row| row.get::<_, String>(0))
-    {
-        candidates = rows.flatten().collect();
-    }
+    // Newest derived output among the board's persisted step results — read
+    // from BOTH persistence rails (`output` column + metadata `ai_result`),
+    // already unwrapped from their MCP envelopes.
     let mut proxy: Option<(std::time::SystemTime, String)> = None;
-    for out in &candidates {
-        let Ok(env) = serde_json::from_str::<serde_json::Value>(out) else { continue };
-        let v = unwrap_tool_payload(&env); // persisted outputs are MCP envelopes
+    for v in board_step_payloads(board_id) {
         let Some(rel) = v.get("output_path").and_then(|p| p.as_str()) else { continue };
         if !is_media_filename(rel) {
             continue;

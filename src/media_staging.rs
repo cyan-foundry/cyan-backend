@@ -51,10 +51,17 @@ pub fn is_within_root(path: &Path, root: &Path) -> bool {
 /// - else copied to `<root>/attached/<blake3-16>/<filename>`; a re-attach of
 ///   the same bytes lands on the SAME path (dedup by content, not by origin).
 ///
+/// `display_name` names the staged file when given (final path component only —
+/// sanitized). The app's upload store keeps board files by BARE HASH with no
+/// extension; staging under the human name ("sig_source.mp4") keeps the
+/// extension end-to-end, which the player and any extension-sniffing consumer
+/// need (found live 2026-07-08: an extension-less staged master rendered the
+/// Video face poster instead of media).
+///
 /// Errors (unreadable source, copy failure) surface as `Err` — the caller
 /// decides whether to fall back to the raw path (letting the plugin produce
 /// its own clear denial) or to fail the step.
-pub fn stage_into_media_root(src: &Path) -> Result<PathBuf> {
+pub fn stage_into_media_root(src: &Path, display_name: Option<&str>) -> Result<PathBuf> {
     let root = effective_media_root();
     if !src.is_file() {
         return Err(anyhow!("not a readable file: {}", src.display()));
@@ -64,9 +71,17 @@ pub fn stage_into_media_root(src: &Path) -> Result<PathBuf> {
     }
 
     let digest = hash_file_blake3(src)?;
-    let name = src
-        .file_name()
-        .ok_or_else(|| anyhow!("path has no filename: {}", src.display()))?;
+    let sanitized = display_name
+        .map(|n| Path::new(n).file_name().map(|f| f.to_os_string()))
+        .unwrap_or_default();
+    let name = match &sanitized {
+        Some(n) if !n.is_empty() => n.clone(),
+        _ => src
+            .file_name()
+            .ok_or_else(|| anyhow!("path has no filename: {}", src.display()))?
+            .to_os_string(),
+    };
+    let name = name.as_os_str();
     let dest_dir = root.join(STAGED_DIR).join(&digest[..16]);
     std::fs::create_dir_all(&dest_dir)
         .with_context(|| format!("create staging dir {}", dest_dir.display()))?;
@@ -94,7 +109,13 @@ pub fn stage_into_media_root(src: &Path) -> Result<PathBuf> {
 /// string; on any staging error, log and fall back to the ORIGINAL path so
 /// the plugin surfaces its own clear denial rather than us inventing one.
 pub fn stage_local_media(path: &str) -> String {
-    match stage_into_media_root(Path::new(path)) {
+    stage_local_media_named(path, None)
+}
+
+/// [`stage_local_media`] with the attachment's DISPLAY name (see
+/// [`stage_into_media_root`] — keeps the human filename + extension).
+pub fn stage_local_media_named(path: &str, display_name: Option<&str>) -> String {
+    match stage_into_media_root(Path::new(path), display_name) {
         Ok(staged) => staged.display().to_string(),
         Err(e) => {
             tracing::warn!("media staging failed for {path}: {e:#} — passing through");
@@ -153,7 +174,7 @@ mod tests {
         std::fs::write(&src, b"not really a video, but bytes are bytes").unwrap();
 
         with_root(root.path(), || {
-            let staged = stage_into_media_root(&src).unwrap();
+            let staged = stage_into_media_root(&src, None).unwrap();
             assert!(is_within_root(&staged, root.path()), "staged into the root");
             assert_eq!(staged.file_name().unwrap(), "sig_source.mp4");
             assert_eq!(
@@ -161,13 +182,13 @@ mod tests {
                 std::fs::read(&src).unwrap()
             );
             // Idempotent: same bytes → same path, no duplicate entries.
-            let again = stage_into_media_root(&src).unwrap();
+            let again = stage_into_media_root(&src, None).unwrap();
             assert_eq!(staged, again);
 
             // Same bytes from a DIFFERENT origin dedup to the same staged file.
             let copy = outside.path().join("renamed-elsewhere.mp4");
             std::fs::copy(&src, &copy).unwrap();
-            let staged_copy = stage_into_media_root(&copy).unwrap();
+            let staged_copy = stage_into_media_root(&copy, None).unwrap();
             assert_eq!(staged.parent(), staged_copy.parent(), "same content dir");
         });
     }
@@ -180,7 +201,7 @@ mod tests {
         std::fs::write(&inside, b"already confined").unwrap();
 
         with_root(root.path(), || {
-            let staged = stage_into_media_root(&inside).unwrap();
+            let staged = stage_into_media_root(&inside, None).unwrap();
             assert_eq!(staged, inside, "no copy for an already-confined file");
         });
     }
@@ -189,7 +210,7 @@ mod tests {
     fn missing_file_is_an_error_and_stage_local_media_falls_back() {
         let root = tempfile::tempdir().unwrap();
         with_root(root.path(), || {
-            assert!(stage_into_media_root(Path::new("/definitely/not/here.mp4")).is_err());
+            assert!(stage_into_media_root(Path::new("/definitely/not/here.mp4"), None).is_err());
             // The string helper never panics the pipeline — it passes through.
             assert_eq!(
                 stage_local_media("/definitely/not/here.mp4"),
