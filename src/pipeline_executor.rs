@@ -1115,8 +1115,11 @@ impl crate::review_loop::ConformDispatch for HostConformDispatch {
         };
 
         // conform is side_effects:none, so `approved=false` still runs (never gated).
+        // The host returns the raw MCP envelope ({content:[{text}],structuredContent})
+        // — conform_proxy reads the TOOL payload (`output_path`, `applied`, …), so
+        // unwrap here (the load-bearing envelope contract; found live, E2E run 4).
         match host.dispatch_mcp_tool(&scope, &step, &side_effects, false, &ledger, connect)? {
-            McpDispatch::Ran(result) => Ok(result.result),
+            McpDispatch::Ran(result) => Ok(unwrap_tool_payload(&result.result)),
             McpDispatch::Gated { side_effects } => Err(anyhow!(
                 "conform unexpectedly gated (side effects: {}) — conform must be side_effects:none",
                 side_effects.join(", ")
