@@ -200,11 +200,20 @@ pub enum CommandMsg {
     /// Author or edit a note. `note_id = None` creates a new note (id generated);
     /// `Some(id)` edits that note (LWW bump of `updated_at`). `tenant_id = None`
     /// derives the tenant from the board's group.
+    ///
+    /// feat/notes-constitution (additive): `scope` (`tenant`|`group`|`board`) and
+    /// `kind` (`constitution`|`preference`|`editor-note`) — `None` keeps the exact
+    /// pre-scope behavior (`board`/`editor-note`). For `group`/`tenant` scope,
+    /// `board_id` carries the ANCHOR id (the group / tenant id).
     PutNote {
         board_id: String,
         note_id: Option<String>,
         tenant_id: Option<String>,
         text: String,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        kind: Option<String>,
     },
     DeleteNote {
         id: String,

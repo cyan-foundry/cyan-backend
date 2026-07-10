@@ -860,7 +860,21 @@ impl CommandActor {
                 }
 
                 // ── Note commands (ROUND8 §W2) — board-level authored LWW ledger ──
-                CommandMsg::PutNote { board_id, note_id, tenant_id, text } => {
+                CommandMsg::PutNote { board_id, note_id, tenant_id, text, scope, kind } => {
+                    // feat/notes-constitution: scope/kind are additive; absent ⇒ the exact
+                    // pre-scope behavior (a board editor-note). Invalid values REJECT the
+                    // command (never silently misfile a constitution/preference note).
+                    let scope = scope.unwrap_or_else(crate::models::dto::default_note_scope);
+                    let kind = kind.unwrap_or_else(crate::models::dto::default_note_kind);
+                    if !crate::models::dto::note_scope_valid(&scope)
+                        || !crate::models::dto::note_kind_valid(&kind)
+                    {
+                        tracing::error!(
+                            "PutNote rejected: invalid scope={scope:?} kind={kind:?} board={board_id}"
+                        );
+                        continue;
+                    }
+
                     let now = chrono::Utc::now().timestamp();
                     let author_id = self.node_id.clone();
                     // author_name resolves from the author's XaeroID profile (same path
@@ -870,8 +884,14 @@ impl CommandActor {
                         .filter(|n| !n.is_empty())
                         .unwrap_or_else(|| author_id.clone());
 
-                    // Tenant: explicit, else the board's group (group == tenant).
-                    let group_id = self.get_group_id_for_board(&board_id);
+                    // Tenant: explicit, else the board's group (group == tenant). For
+                    // group/tenant scope, `board_id` IS the anchor (the group/tenant id),
+                    // so it is also the broadcast group.
+                    let group_id = if scope == "board" {
+                        self.get_group_id_for_board(&board_id)
+                    } else {
+                        Some(board_id.clone())
+                    };
                     let tenant = tenant_id
                         .or_else(|| group_id.clone())
                         .unwrap_or_else(|| author_id.clone());
@@ -897,21 +917,23 @@ impl CommandActor {
                         text: text.clone(),
                         created_at,
                         updated_at: now,
+                        scope: scope.clone(),
+                        kind: kind.clone(),
                     };
                     match storage::note_upsert(&note) {
-                        Ok(_) => tracing::info!(tenant_id = %tenant, "obs note_put board={board_id} id={id}"),
+                        Ok(_) => tracing::info!(tenant_id = %tenant, "obs note_put board={board_id} id={id} scope={scope} kind={kind}"),
                         Err(e) => eprintln!("📝 [NOTE] 🔴 note_upsert failed: {e}"),
                     }
 
                     let event = if is_new {
                         NetworkEvent::NoteAdded {
                             id, board_id, tenant_id: tenant, author_id, author_name,
-                            text, created_at, updated_at: now,
+                            text, created_at, updated_at: now, scope, kind,
                         }
                     } else {
                         NetworkEvent::NoteUpdated {
                             id, board_id, tenant_id: tenant, author_id, author_name,
-                            text, created_at, updated_at: now,
+                            text, created_at, updated_at: now, scope, kind,
                         }
                     };
 
@@ -1987,6 +2009,10 @@ pub mod review_state;
 pub mod review_loop;
 pub mod note_inference;
 pub mod ops_proposer;
+pub mod constitution;
+pub mod llm;
+pub mod ops_eval;
+pub mod batch_confirm;
 pub mod xfer_policy;
 pub mod asset_registry;
 pub mod ingest;

@@ -771,19 +771,21 @@ fn migrate_chats_to_boards_conn(conn: &Connection) -> Result<usize> {
 pub fn note_upsert(n: &NoteDTO) -> Result<bool> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
     let changed = conn.execute(
-        "INSERT INTO notes (id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "INSERT INTO notes (id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(id) DO UPDATE SET
             board_id    = excluded.board_id,
             tenant_id   = excluded.tenant_id,
             author_id   = excluded.author_id,
             author_name = excluded.author_name,
             text        = excluded.text,
-            updated_at  = excluded.updated_at
+            updated_at  = excluded.updated_at,
+            scope       = excluded.scope,
+            kind        = excluded.kind
          WHERE excluded.updated_at > notes.updated_at",
         params![
             n.id, n.board_id, n.tenant_id, n.author_id, n.author_name, n.text,
-            n.created_at, n.updated_at
+            n.created_at, n.updated_at, n.scope, n.kind
         ],
     )?;
     Ok(changed > 0)
@@ -794,10 +796,31 @@ pub fn note_upsert(n: &NoteDTO) -> Result<bool> {
 pub fn note_list_by_board(board_id: &str, tenant_id: &str) -> Result<Vec<NoteDTO>> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
     let mut stmt = conn.prepare(
-        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind
          FROM notes WHERE board_id = ?1 AND tenant_id = ?2 ORDER BY created_at",
     )?;
     let rows = stmt.query_map(params![board_id, tenant_id], note_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// List notes by (tenant, scope, anchor, kind) — the merge-resolver query
+/// (feat/notes-constitution). `anchor_id` is what `board_id` holds for the scope:
+/// the board id (`board`), the group id (`group`), or the tenant id (`tenant`).
+/// Tenant-enforced like every note query; deterministic order (created_at, id).
+pub fn note_list_scoped(
+    tenant_id: &str,
+    scope: &str,
+    anchor_id: &str,
+    kind: &str,
+) -> Result<Vec<NoteDTO>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    let mut stmt = conn.prepare(
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind
+         FROM notes
+         WHERE tenant_id = ?1 AND scope = ?2 AND board_id = ?3 AND kind = ?4
+         ORDER BY created_at, id",
+    )?;
+    let rows = stmt.query_map(params![tenant_id, scope, anchor_id, kind], note_from_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
@@ -810,7 +833,7 @@ pub fn note_list_by_boards(board_ids: &[String]) -> Result<Vec<NoteDTO>> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
     let placeholders: String = board_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind
          FROM notes WHERE board_id IN ({}) ORDER BY created_at",
         placeholders
     );
@@ -826,7 +849,7 @@ pub fn note_list_by_boards(board_ids: &[String]) -> Result<Vec<NoteDTO>> {
 pub fn note_get(id: &str) -> Result<Option<NoteDTO>> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
     let mut stmt = conn.prepare(
-        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind
          FROM notes WHERE id = ?1",
     )?;
     stmt.query_row(params![id], note_from_row)
@@ -851,6 +874,8 @@ fn note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteDTO> {
         text: r.get(5)?,
         created_at: r.get(6)?,
         updated_at: r.get(7)?,
+        scope: r.get(8)?,
+        kind: r.get(9)?,
     })
 }
 
@@ -2788,12 +2813,34 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                 author_name TEXT NOT NULL,
                 text TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                scope TEXT NOT NULL DEFAULT 'board',
+                kind TEXT NOT NULL DEFAULT 'editor-note'
             )",
             [],
         );
         let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_board ON notes(board_id)", []);
     }
+    // feat/notes-constitution: notes gain SCOPE (tenant/group/board — `board_id` is the
+    // scope anchor) + KIND (constitution/preference/editor-note), ADDITIVE — legacy rows
+    // default to 'board'/'editor-note', i.e. exactly the pre-scope behavior.
+    if conn.prepare("SELECT scope FROM notes LIMIT 1").is_err() {
+        tracing::info!("Migration: adding scope column to notes");
+        let _ = conn
+            .execute("ALTER TABLE notes ADD COLUMN scope TEXT NOT NULL DEFAULT 'board'", []);
+    }
+    if conn.prepare("SELECT kind FROM notes LIMIT 1").is_err() {
+        tracing::info!("Migration: adding kind column to notes");
+        let _ = conn.execute(
+            "ALTER TABLE notes ADD COLUMN kind TEXT NOT NULL DEFAULT 'editor-note'",
+            [],
+        );
+    }
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_notes_tenant_scope_kind
+         ON notes(tenant_id, scope, board_id, kind)",
+        [],
+    );
 
     // ROUND8 §W4: templates — a pre-written English workflow (steps + bound plugins)
     // cloned into a board. Own store; user templates are tenant-scoped (built-in seeds
@@ -2924,6 +2971,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     // behavior changes.
     if let Err(e) = crate::review_state::migrate(conn) {
         tracing::warn!("Migration: review_state table failed: {e}");
+    }
+
+    // Batch-confirm gate (feat/notes-constitution): per-editor trust tiers over
+    // the changelist confirm surface. Creates `editor_trust`. Idempotent
+    // (CREATE TABLE IF NOT EXISTS); additive — no existing table or behavior
+    // changes.
+    if let Err(e) = crate::batch_confirm::migrate(conn) {
+        tracing::warn!("Migration: editor_trust table failed: {e}");
     }
 
     // Asset registry (CYAN_FORMAT_SPEC / CYAN_FORMAT_QA): one row per

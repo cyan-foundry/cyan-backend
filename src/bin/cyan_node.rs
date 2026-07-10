@@ -812,6 +812,8 @@ async fn handle_verb(
                     text: format!("note {i} by {tag}"),
                     created_at: now,
                     updated_at: now,
+                    scope: cyan_backend::models::dto::default_note_scope(),
+                    kind: cyan_backend::models::dto::default_note_kind(),
                 };
                 storage::note_upsert(&note).map_err(|e| anyhow!("note_upsert: {e}"))?;
             }
