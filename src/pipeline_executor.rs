@@ -21,6 +21,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::models::commands::CommandMsg;
 use crate::models::events::SwiftEvent;
+use crate::util::MutexExt;
 
 // ============================================================================
 // Lens API Types
@@ -692,6 +693,32 @@ pub(crate) fn parse_mcp_tool_step(metadata: &serde_json::Value) -> Option<McpToo
     })
 }
 
+/// PART 1-C (TONIGHT_RUN): the park decision for a step whose REQUIRED props
+/// are STILL unfilled after the whole deterministic dispatch ladder (upstream
+/// outputs → config context → env → conformed v2 → upstream media → confirmed
+/// changelist). Such a step PARKS — amber, human-actionable — it never
+/// dispatches into a red plugin validation error ("ops Field required", live
+/// 2026-07-09). Optional props never land in `pending`, so a fully-resolved
+/// step (empty `still_pending`) always dispatches.
+pub fn dispatch_park_reason(tool: &str, still_pending: &[String]) -> Option<String> {
+    if still_pending.is_empty() {
+        return None;
+    }
+    if tool == "conform" && still_pending.iter().any(|p| p == "ops") {
+        return Some(
+            "no confirmed edits yet — review a proposed edit and confirm it, then re-run"
+                .to_string(),
+        );
+    }
+    let props = still_pending.join(", ");
+    let plural = if still_pending.len() > 1 { "s" } else { "" };
+    Some(format!(
+        "required input{plural} '{props}' not yet available — an upstream step's output \
+         (or a confirmed edit) fills {} once that step has run",
+        if still_pending.len() > 1 { "them" } else { "it" }
+    ))
+}
+
 /// The device's installed-plugins root: one subdir per plugin (the unpacked
 /// `.cyanplugin` bundles the file-swarm fetched). Overridable for tests/ops.
 fn plugins_root() -> std::path::PathBuf {
@@ -1150,6 +1177,38 @@ fn run_review_loop_conform_step(
     event_tx: &UnboundedSender<SwiftEvent>,
 ) -> Result<(String, Vec<Finding>)> {
     let tenant = device_tenant();
+
+    // PART 1-C (TONIGHT_RUN): a conform round with NOTHING confirmed PARKS —
+    // amber, human-actionable — instead of dispatching into the loop engine's
+    // "not CONFORMING" red (the audit's conform-on-empty failure). The
+    // `awaiting:` prefix is the park contract the FFI reply + app rail decode.
+    let nothing_confirmed = {
+        let conn = crate::storage::db().lock_safe();
+        let board_tenant = crate::review_loop::board_tenant(&conn, board_id);
+        crate::review_loop::confirmed_ops_for_board(&conn, &board_tenant, board_id)
+            .ok()
+            .flatten()
+            .is_some_and(|ops| ops.is_empty())
+    };
+    if nothing_confirmed {
+        let _ = event_tx.send(SwiftEvent::StatusUpdate {
+            message: format!(
+                "⏳ Step '{step_id}' awaiting confirmed edits — review a proposed edit and confirm it, then re-run"
+            ),
+        });
+        publish_pipeline_event(event_tx, PipelineEvent {
+            event_type: "step_parked".into(),
+            board_id: board_id.into(),
+            step_id: step_id.into(),
+            run_id: step_id.into(),
+            timestamp: chrono::Utc::now().timestamp(),
+            data: json!({ "awaiting": "no confirmed edits yet" }),
+        });
+        return Err(anyhow!(
+            "awaiting: no confirmed edits yet — review a proposed edit and confirm it, then re-run"
+        ));
+    }
+
     let _ = event_tx.send(SwiftEvent::StatusUpdate {
         message: format!("🎬 Step '{step_id}' → conform proxy (apply approved edits)"),
     });
@@ -2362,7 +2421,7 @@ mod tool_result_error_tests {
 
 #[cfg(test)]
 mod media_arg_fill_tests {
-    use super::{latest_upstream_media_path, media_name_default};
+    use super::{dispatch_park_reason, latest_upstream_media_path, media_name_default};
     use serde_json::json;
 
     // THE LIVE C2C GAP (FABLE_FULL_AUDIT hard gate, 2026-07-09): on a
@@ -2407,5 +2466,37 @@ mod media_arg_fill_tests {
             "1094216ab9165cb0.mp4"
         );
         assert_eq!(media_name_default("clip.mov"), "clip.mov");
+    }
+
+    // PART 1-C (TONIGHT_RUN): a REQUIRED prop still unfilled after the whole
+    // deterministic fill ladder PARKS the step — amber, human-actionable —
+    // never a red dispatch ("ops Field required", live 2026-07-09).
+    #[test]
+    fn park_reason_names_the_conform_confirm_gate() {
+        let r = dispatch_park_reason("conform", &["ops".to_string()])
+            .expect("an unfilled required `ops` must park");
+        assert!(
+            r.contains("no confirmed edits yet"),
+            "the park is the confirm-gate ask, got: {r}"
+        );
+    }
+
+    #[test]
+    fn park_reason_names_the_missing_props_generically() {
+        let r = dispatch_park_reason(
+            "upload_file",
+            &["file_id".to_string(), "account_id".to_string()],
+        )
+        .expect("unfilled required props must park");
+        assert!(r.contains("file_id") && r.contains("account_id"), "names each prop: {r}");
+    }
+
+    #[test]
+    fn no_still_pending_props_means_no_park() {
+        // Optional props never land in `pending`, so an empty still-pending set
+        // (all required props filled) dispatches — parking here would deadlock
+        // every healthy step.
+        assert!(dispatch_park_reason("conform", &[]).is_none());
+        assert!(dispatch_park_reason("upload_file", &[]).is_none());
     }
 }

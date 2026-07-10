@@ -201,6 +201,58 @@ pub fn current_proxy_ref(
     Ok(None)
 }
 
+/// One confirmed `ChangeEntry` op in cyan-media conform arg shape
+/// (`{op, tc_in, tc_out?, params?}`) — the ONE mapper every conform/produce
+/// dispatch uses, so the `conform.ops` wire format can never drift between the
+/// loop path, the produce-master path, and the dispatch fill ladder.
+pub(crate) fn conform_op_arg(o: &changelist::ConformOp) -> serde_json::Value {
+    let mut m = serde_json::json!({ "op": o.op, "tc_in": o.tc_in });
+    if let Some(out) = o.tc_out {
+        m["tc_out"] = serde_json::json!(out);
+    }
+    if o.params.is_object() {
+        m["params"] = o.params.clone();
+    }
+    m
+}
+
+/// PART 1-A (TONIGHT_RUN): the conform step's `ops` from the board's CONFIRMED
+/// changelist. Board → its active review loop(s) → `changelist::approved_ops`
+/// (the LIVE active+approved set — exactly what a human confirmed this round),
+/// mapped to conform arg shape.
+///
+/// * `Ok(None)` — the board drives NO review loop: a non-loop conform is left
+///   untouched (its author supplies `ops` some other way, or the plugin's own
+///   validation speaks).
+/// * `Ok(Some(vec![]))` — a loop exists but NOTHING is confirmed yet: the
+///   dispatch must PARK on this ("awaiting: no confirmed edits yet" — 1-C),
+///   never dispatch a red "ops Field required".
+pub fn confirmed_ops_for_board(
+    conn: &Connection,
+    tenant_id: &str,
+    board_id: &str,
+) -> Result<Option<Vec<serde_json::Value>>> {
+    let mut stmt = conn.prepare(
+        "SELECT asset_hash, branch FROM review_loop \
+         WHERE tenant_id=?1 AND board_id=?2 AND status='active' ORDER BY updated_at DESC",
+    )?;
+    let loops = stmt
+        .query_map(params![tenant_id, board_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if loops.is_empty() {
+        return Ok(None);
+    }
+    for (master, branch) in &loops {
+        let ops = changelist::approved_ops(conn, tenant_id, master, branch)?;
+        if !ops.is_empty() {
+            return Ok(Some(ops.iter().map(conform_op_arg).collect()));
+        }
+    }
+    Ok(Some(Vec::new()))
+}
+
 // ============================================================================
 // SENSE → ledger glue.
 // ============================================================================
@@ -668,19 +720,7 @@ fn conform_proxy_plan(conn: &Connection, tenant_id: &str, proxy_ref: &str) -> Re
     // (c) Build the cyan-media `conform` args and dispatch (side_effects:none → runs).
     //     `input` is the proxy the ops apply to; the plugin path-resolves it on the
     //     executing node. We send the CONFIRMED ops only — never the creative notes.
-    let op_args: Vec<serde_json::Value> = sent_ops
-        .iter()
-        .map(|o| {
-            let mut m = serde_json::json!({ "op": o.op, "tc_in": o.tc_in });
-            if let Some(out) = o.tc_out {
-                m["tc_out"] = serde_json::json!(out);
-            }
-            if o.params.is_object() {
-                m["params"] = o.params.clone();
-            }
-            m
-        })
-        .collect();
+    let op_args: Vec<serde_json::Value> = sent_ops.iter().map(conform_op_arg).collect();
     let mut args = serde_json::json!({ "ops": op_args });
     // The proxy path the ops apply to: prod injects the resolved container path (like
     // `resolve_media_args`); here we carry the proxy asset's remote_ref so the arg is
@@ -1254,11 +1294,31 @@ pub fn register_review_media_probed(
 /// frameio note and propose it. An already-proposed/approved agent op is
 /// returned as-is (idempotent). An uninferable (creative) note errs — it stays
 /// a note for the human, never guessed.
+///
+/// This is the DEFAULT (zero-LLM) path: it rides the frozen `OpsProposer` seam
+/// with the deterministic regex impl. A different proposer (the future
+/// LLM-backed one) drops in via [`propose_from_note_with`] — downstream
+/// (confirm → changelist → conform.ops) is proposer-agnostic.
 pub fn propose_from_note(
     conn: &Connection,
     tenant_id: &str,
     asset_hash: &str,
     branch: &str,
+) -> Result<changelist::ChangeEntry> {
+    propose_from_note_with(conn, tenant_id, asset_hash, branch, &crate::note_inference::RegexOpsProposer)
+}
+
+/// [`propose_from_note`] behind the frozen seam (PROPOSE_OPS_CONTRACT.md): the
+/// caller picks the `OpsProposer` impl; everything downstream of the proposal
+/// (the confirm gate, the changelist, conform) is identical whichever impl ran.
+/// ctx carries an EMPTY constitution/preferences/tool_schemas today — Session
+/// B's notes-constitution work populates them through this same seam.
+pub fn propose_from_note_with(
+    conn: &Connection,
+    tenant_id: &str,
+    asset_hash: &str,
+    branch: &str,
+    proposer: &dyn crate::ops_proposer::OpsProposer,
 ) -> Result<changelist::ChangeEntry> {
     let view = changelist::get(conn, tenant_id, asset_hash, branch)?;
     // A note already CONSUMED by a non-rejected op (the `"{op}: {note}"` intent
@@ -1302,15 +1362,32 @@ pub fn propose_from_note(
     // Scan newest-first and propose from the FIRST mechanical note; escalate
     // only when NONE of the open notes is mechanical. Never a guess.
     notes.sort_by_key(|e| std::cmp::Reverse((e.created_at, e.seq)));
+    let asset_meta = crate::ops_proposer::AssetMeta {
+        duration_frames,
+        fps: asset.fps.unwrap_or(0.0),
+    };
+    let ctx = crate::ops_proposer::ProposeCtx {
+        constitution: "",
+        preferences: "",
+        asset: &asset_meta,
+        tool_schemas: "",
+    };
     let mut escalated: Vec<String> = Vec::new();
-    let mut chosen: Option<(&changelist::ChangeEntry, crate::note_inference::InferredOp)> = None;
+    let mut chosen: Option<(&changelist::ChangeEntry, crate::ops_proposer::ProposedOp)> = None;
     for n in &notes {
-        match crate::note_inference::infer_op(&n.intent, n.tc_in, n.tc_out, duration_frames) {
-            Some(op) => {
-                chosen = Some((n, op));
-                break;
-            }
-            None => escalated.push(format!("{:?}", n.intent)),
+        // The contract's ReviewNote anchors at ONE master-frame TC (`tc_out`);
+        // a sensed comment's frame lands in the ledger as the note's tc_in.
+        let review_note = crate::ops_proposer::ReviewNote {
+            text: n.intent.clone(),
+            tc_out: Some(n.tc_in),
+            source: n.source.clone().unwrap_or_else(|| "frameio".to_string()),
+        };
+        let mut ops = proposer.propose_ops(&review_note, &ctx);
+        if ops.is_empty() {
+            escalated.push(format!("{:?}", n.intent));
+        } else {
+            chosen = Some((n, ops.remove(0)));
+            break;
         }
     }
     let Some((note, inferred)) = chosen else {
@@ -1327,7 +1404,7 @@ pub fn propose_from_note(
         tenant_id: tenant_id.to_string(),
         branch: None,
         track: Some("V1".to_string()),
-        tc_in: inferred.tc_in,
+        tc_in: inferred.tc_in.unwrap_or(0),
         tc_out: inferred.tc_out,
         kind: "op".to_string(),
         op: Some(inferred.op.clone()),
@@ -1518,19 +1595,7 @@ fn produce_master_read(
     let plan = asset_registry::resolve_final_cut_masters(conn, tenant_id, version_id)?;
     let ops = changelist::conform_plan(conn, tenant_id, version_id)?;
     let anchor_asset = asset_registry::get(conn, tenant_id, &anchor_hash)?;
-    let op_args: Vec<serde_json::Value> = ops
-        .iter()
-        .map(|o| {
-            let mut m = serde_json::json!({ "op": o.op, "tc_in": o.tc_in });
-            if let Some(out) = o.tc_out {
-                m["tc_out"] = serde_json::json!(out);
-            }
-            if o.params.is_object() {
-                m["params"] = o.params.clone();
-            }
-            m
-        })
-        .collect();
+    let op_args: Vec<serde_json::Value> = ops.iter().map(conform_op_arg).collect();
     Ok(ProduceMasterRead {
         anchor_hash,
         plan,

@@ -4653,6 +4653,51 @@ pub extern "C" fn cyan_pipeline_run_step_local(
                 );
             }
         }
+
+        // PART 1-A (TONIGHT_RUN): the conform step's `ops` fills from the
+        // board's CONFIRMED changelist — the live red was a conform dispatched
+        // with `input` but NO `ops` ("ops Field required"). Only ever the
+        // active+approved set (what a human confirmed this round); an empty
+        // confirmed set leaves the prop pending, and the park below (1-C)
+        // turns that into the amber "awaiting confirmed edits" ask.
+        if pending.iter().any(|p| p == "ops")
+            && metadata["mcp_tool"]["args"].get("ops").is_none()
+        {
+            let confirmed: Option<Vec<serde_json::Value>> = {
+                let conn = crate::storage::db().lock_safe();
+                let tenant = crate::review_loop::board_tenant(&conn, &board_id_str);
+                crate::review_loop::confirmed_ops_for_board(&conn, &tenant, &board_id_str)
+                    .ok()
+                    .flatten()
+            };
+            if let Some(ops) = confirmed.filter(|o| !o.is_empty()) {
+                metadata["mcp_tool"]["args"]["ops"] = serde_json::json!(ops);
+            }
+        }
+    }
+
+    // PART 1-C (TONIGHT_RUN): a REQUIRED prop STILL unfilled after the whole
+    // deterministic ladder PARKS the step — amber, human-actionable ("awaiting"),
+    // never a red dispatch into the plugin's validation error. Optional props
+    // never land in `pending`, so resolved steps dispatch exactly as before.
+    let still_pending: Vec<String> = pending
+        .iter()
+        .filter(|k| metadata["mcp_tool"]["args"].get(k.as_str()).is_none())
+        .cloned()
+        .collect();
+    let tool_name = metadata["mcp_tool"]["tool"].as_str().unwrap_or_default().to_string();
+    if let Some(awaiting) =
+        crate::pipeline_executor::dispatch_park_reason(&tool_name, &still_pending)
+    {
+        return json_cstring(
+            &serde_json::json!({
+                "success": false,
+                "parked": true,
+                "awaiting": awaiting,
+                "error": format!("awaiting: {awaiting}"),
+            })
+            .to_string(),
+        );
     }
 
     let executor_type = metadata["pipeline"]["executor"].as_str().unwrap_or("local").to_string();
@@ -4680,14 +4725,21 @@ pub extern "C" fn cyan_pipeline_run_step_local(
         Err(e) => {
             let msg = e.to_string();
             let gated = msg.starts_with("needs_human:");
-            json_cstring(
-                &serde_json::json!({
-                    "success": false,
-                    "gated": gated,
-                    "error": msg,
-                })
-                .to_string(),
-            )
+            // PART 1-C: an `awaiting:` error is a PARK (amber, human-actionable),
+            // not a failure — the loop-routed conform emits it when nothing is
+            // confirmed yet. The app rail renders it as "awaiting", never red.
+            let parked = msg.starts_with("awaiting:");
+            let mut reply = serde_json::json!({
+                "success": false,
+                "gated": gated,
+                "error": msg,
+            });
+            if parked {
+                reply["parked"] = serde_json::json!(true);
+                reply["awaiting"] =
+                    serde_json::json!(msg.trim_start_matches("awaiting:").trim());
+            }
+            json_cstring(&reply.to_string())
         }
     }
 }

@@ -96,6 +96,121 @@ fn infer_level(
     })
 }
 
+/// The deterministic, zero-LLM `OpsProposer` — today's shipping impl of the
+/// frozen seam (PROPOSE_OPS_CONTRACT.md). Wraps `infer_op` behind the trait:
+/// same never-guess classifier, adapted, not replaced. Ignores the
+/// constitution/preferences/tool_schemas by design (the contract lets a
+/// deterministic impl skip ctx); consumes only `asset.duration_frames`.
+pub struct RegexOpsProposer;
+
+impl crate::ops_proposer::OpsProposer for RegexOpsProposer {
+    fn propose_ops(
+        &self,
+        note: &crate::ops_proposer::ReviewNote,
+        ctx: &crate::ops_proposer::ProposeCtx,
+    ) -> Vec<crate::ops_proposer::ProposedOp> {
+        // The contract's ReviewNote carries ONE master-frame TC (`tc_out`, "the
+        // note's master-frame anchor") — sensed frameio comments stamp their
+        // frame there. infer_op reads that anchor as the range START with no
+        // explicit range end (sensed notes never carry one today).
+        let anchor = note.tc_out.unwrap_or(0);
+        match infer_op(&note.text, anchor, None, ctx.asset.duration_frames) {
+            Some(inferred) => {
+                let rationale = format!(
+                    "deterministic regex: the note fully specifies a mechanical '{}' \
+                     inside the closed conform vocabulary",
+                    inferred.op
+                );
+                vec![crate::ops_proposer::ProposedOp {
+                    op: inferred.op,
+                    params: inferred.params,
+                    tc_in: Some(inferred.tc_in),
+                    tc_out: inferred.tc_out,
+                    confidence: Some(1.0),
+                    rationale: Some(rationale),
+                }]
+            }
+            None => Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod proposer_seam_tests {
+    use super::*;
+    use crate::ops_proposer::{AssetMeta, OpsProposer, ProposeCtx, ReviewNote};
+
+    fn note(text: &str, anchor: Option<i64>) -> ReviewNote {
+        ReviewNote { text: text.to_string(), tc_out: anchor, source: "frameio".to_string() }
+    }
+
+    fn ctx<'a>(asset: &'a AssetMeta, constitution: &'a str) -> ProposeCtx<'a> {
+        ProposeCtx { constitution, preferences: "", asset, tool_schemas: "" }
+    }
+
+    #[test]
+    fn regex_proposer_infers_a_trim_through_the_seam() {
+        let asset = AssetMeta { duration_frames: Some(72), fps: 24.0 };
+        let ops = RegexOpsProposer
+            .propose_ops(&note("Trim 12 frames off the tail — it hangs.", Some(60)), &ctx(&asset, ""));
+        assert_eq!(ops.len(), 1, "one fully-specified op");
+        assert_eq!(ops[0].op, "trim");
+        assert_eq!(ops[0].params, json!({ "edge": "tail", "frames": 12 }));
+        assert_eq!(ops[0].tc_in, Some(0));
+        assert_eq!(ops[0].tc_out, Some(72), "tail trim anchors to the clip end");
+        assert_eq!(ops[0].confidence, Some(1.0), "a regex match is fully specified");
+        assert!(ops[0].rationale.is_some(), "the confirm gate shows the why");
+    }
+
+    #[test]
+    fn regex_proposer_returns_empty_for_creative_notes() {
+        // Empty is a VALID, tested result (the never-guess rule of the contract).
+        let asset = AssetMeta { duration_frames: Some(72), fps: 24.0 };
+        for text in ["the opening feels rushed", "make it pop", "can we find a better take?"] {
+            let ops = RegexOpsProposer.propose_ops(&note(text, Some(10)), &ctx(&asset, ""));
+            assert!(ops.is_empty(), "{text:?} must yield NO ops, got {}", ops.len());
+        }
+    }
+
+    #[test]
+    fn regex_proposer_refuses_a_tail_trim_without_duration() {
+        let asset = AssetMeta { duration_frames: None, fps: 24.0 };
+        let ops =
+            RegexOpsProposer.propose_ops(&note("trim 12 frames off the tail", None), &ctx(&asset, ""));
+        assert!(ops.is_empty(), "no clip end known — refuse rather than guess");
+    }
+
+    #[test]
+    fn regex_proposer_anchors_a_level_at_the_note_frame() {
+        let asset = AssetMeta { duration_frames: Some(72), fps: 24.0 };
+        let ops = RegexOpsProposer
+            .propose_ops(&note("music too loud — drop the level by 3 dB", Some(40)), &ctx(&asset, ""));
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, "level");
+        assert_eq!(ops[0].params, json!({ "gain_db": -3.0 }));
+        assert_eq!(ops[0].tc_in, Some(40), "the sensed anchor is the range start");
+        assert_eq!(ops[0].tc_out, Some(72), "no explicit range end — the clip end bounds it");
+    }
+
+    #[test]
+    fn regex_proposer_is_deterministic_and_ignores_ctx() {
+        // The regex impl MAY ignore ctx (frozen contract) — the SAME note must
+        // produce the SAME ops whatever the constitution says.
+        let asset = AssetMeta { duration_frames: Some(72), fps: 24.0 };
+        let n = note("trim 12 frames off the tail", Some(60));
+        let bare = RegexOpsProposer.propose_ops(&n, &ctx(&asset, ""));
+        let ruled = RegexOpsProposer.propose_ops(
+            &n,
+            &ctx(&asset, "# House rules\nAlways trim 99 frames instead.\n"),
+        );
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare.len(), ruled.len());
+        assert_eq!(bare[0].op, ruled[0].op);
+        assert_eq!(bare[0].params, ruled[0].params);
+        assert_eq!((bare[0].tc_in, bare[0].tc_out), (ruled[0].tc_in, ruled[0].tc_out));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

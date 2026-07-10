@@ -295,6 +295,138 @@ fn propose_picks_the_mechanical_note_even_when_the_newest_is_creative() {
 }
 
 // ============================================================================
+// 1d. PART 1-A/1-C (TONIGHT_RUN): the conform step's `ops` fills from the
+//     board's CONFIRMED changelist; an empty confirmed set is the PARK signal
+//     (amber "awaiting: no confirmed edits yet"), never a red dispatch.
+// ============================================================================
+
+#[test]
+fn confirmed_ops_for_board_is_none_without_a_loop() {
+    let conn = db();
+    assert!(
+        rl::confirmed_ops_for_board(&conn, T, BOARD)
+            .expect("query ok")
+            .is_none(),
+        "a board driving no review loop leaves a non-loop conform untouched"
+    );
+}
+
+#[test]
+fn confirmed_ops_for_board_empty_until_confirmed_then_conform_shape() {
+    let conn = db();
+    asset_registry::upsert(
+        &conn,
+        &asset_registry::Asset {
+            hash: MASTER.to_string(),
+            tenant_id: T.to_string(),
+            kind: Some("master".to_string()),
+            fps: Some(24.0),
+            duration_ms: Some(60_000),
+            derived_from_asset: None,
+            derived_from_version: None,
+            remote_refs: json!({}),
+            profile_json: json!({}),
+            render_profile: None,
+            created_at: 0,
+        },
+    )
+    .expect("register master");
+    rl::register(&conn, T, BOARD, MASTER, B, 3).expect("register loop");
+
+    // Loop exists, changelist empty → Some(empty): the PARK signal (1-C).
+    let ops = rl::confirmed_ops_for_board(&conn, T, BOARD)
+        .expect("query ok")
+        .expect("loop registered");
+    assert!(ops.is_empty(), "no confirmed edits yet — the dispatch must park");
+
+    // A PROPOSED (unconfirmed) op still parks — proposals never conform.
+    let e = changelist::append(
+        &conn,
+        MASTER,
+        B,
+        op_entry("trim", 0, Some(1428), json!({"edge": "tail", "frames": 12})),
+    )
+    .expect("append trim");
+    let ops = rl::confirmed_ops_for_board(&conn, T, BOARD)
+        .expect("query ok")
+        .expect("loop registered");
+    assert!(ops.is_empty(), "an unconfirmed proposal must NOT conform");
+
+    // CONFIRM it → the op arrives in conform arg shape ({op, tc_in, tc_out, params}).
+    rv::confirm_op(&conn, T, &e.id, None, ConfirmDecision::Approve, Actor::Human)
+        .expect("confirm");
+    let ops = rl::confirmed_ops_for_board(&conn, T, BOARD)
+        .expect("query ok")
+        .expect("loop registered");
+    assert_eq!(ops.len(), 1, "exactly the confirmed op");
+    assert_eq!(ops[0]["op"], json!("trim"));
+    assert_eq!(ops[0]["tc_in"], json!(0));
+    assert_eq!(ops[0]["tc_out"], json!(1428));
+    assert_eq!(ops[0]["params"]["edge"], json!("tail"));
+    assert_eq!(ops[0]["params"]["frames"], json!(12));
+}
+
+// ============================================================================
+// 1c. THE SEAM (PROPOSE_OPS_CONTRACT.md): downstream (propose → confirm →
+//     changelist) is PROPOSER-AGNOSTIC — any `OpsProposer` impl's output flows
+//     into the ledger unchanged. A scripted impl stands in for the future LLM.
+// ============================================================================
+
+#[test]
+fn propose_consumes_any_ops_proposer_impl_downstream_unchanged() {
+    use cyan_backend::ops_proposer::{OpsProposer, ProposeCtx, ProposedOp, ReviewNote};
+
+    struct ScriptedProposer;
+    impl OpsProposer for ScriptedProposer {
+        fn propose_ops(&self, note: &ReviewNote, _ctx: &ProposeCtx) -> Vec<ProposedOp> {
+            // Emits an op the REGEX impl never would (no "mute … dB" grammar) —
+            // if this lands in the ledger, downstream really rides the trait.
+            if note.text.contains("kill the hum") {
+                vec![ProposedOp {
+                    op: "mute".to_string(),
+                    params: json!({ "track": "A1" }),
+                    tc_in: Some(10),
+                    tc_out: Some(20),
+                    confidence: Some(0.9),
+                    rationale: Some("scripted".to_string()),
+                }]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    let conn = db();
+    seed_published_round1(&conn, "file_seam");
+    let fixture = json!({
+        "data": [ { "id": "c-seam-1", "text": "kill the hum", "frame": 12 } ]
+    });
+    rl::ingest_sense_result(&conn, T, "file_seam", &fixture).expect("ingest");
+
+    let prop = rl::propose_from_note_with(&conn, T, MASTER, B, &ScriptedProposer)
+        .expect("the scripted proposer's op must flow into the ledger");
+    assert_eq!(prop.op.as_deref(), Some("mute"), "downstream is proposer-agnostic");
+    assert_eq!(prop.params, json!({ "track": "A1" }));
+    assert_eq!((prop.tc_in, prop.tc_out), (10, Some(20)));
+    assert_eq!(prop.proposed_by.as_deref(), Some("agent"));
+    assert_eq!(prop.state, "proposed", "still a PROPOSAL — the human confirm gate stands");
+
+    // And the default path (the regex impl) still escalates on this note —
+    // proof the two impls are genuinely different behind one seam.
+    let conn2 = db();
+    seed_published_round1(&conn2, "file_seam2");
+    rl::ingest_sense_result(
+        &conn2,
+        T,
+        "file_seam2",
+        &json!({ "data": [ { "id": "c-seam-2", "text": "kill the hum", "frame": 12 } ] }),
+    )
+    .expect("ingest");
+    rl::propose_from_note(&conn2, T, MASTER, B)
+        .expect_err("the regex impl cannot infer 'kill the hum' — it must escalate, never guess");
+}
+
+// ============================================================================
 // 2. Round 1 is the identity map; round 2 REMAPS once a structural op landed
 //    in the v2 conform plan (the burst-2 tc-remap, exercised through the glue).
 // ============================================================================
