@@ -1466,13 +1466,16 @@ fn register_uploaded_review_media(board_id: &str, step: &McpTool, result: &serde
     match crate::asset_registry::find_by_remote_ref(&conn, &tenant, "frameio", file_id) {
         Ok(Some(_)) => {} // already registered — idempotent no-op
         _ => {
+            // Actor::Human: this registration's internal PUBLISH leg is
+            // human-gated (external_send), and the human DID approve it — the
+            // upload only dispatched because the operator cleared its gate.
             match crate::review_loop::register_review_media(
                 &conn,
                 &tenant,
                 master_path,
                 file_id,
                 "main",
-                crate::review_state::Actor::Agent,
+                crate::review_state::Actor::Human,
             ) {
                 Ok(reg) => tracing::info!(
                     "upload→review-ledger: registered master {} / proxy ref {} (v {})",
