@@ -449,6 +449,69 @@ impl TopicActor {
                             }
                         }
                     }
+                    let known_size = storage::file_get_for_transfer(&file_id, &hash)
+                        .map(|(_, _, size)| size)
+                        .unwrap_or(0);
+
+                    // Resume-from-offset (G10): when the caller didn't pin an offset,
+                    // derive it from OUR interrupted-transfer state — the transfers row
+                    // names the tmp file, and the bytes actually on disk are exactly the
+                    // stream prefix that landed before the interruption (the incremental
+                    // verify re-hashes that prefix, so a lying tmp is still caught at
+                    // the final hash gate). A stale tmp at/over the full size restarts
+                    // fresh instead of appending garbage.
+                    let mut resume_offset = resume_offset;
+                    if resume_offset == 0
+                        && let Some((_, tmp)) = storage::transfer_get_partial(&file_id, &hash)
+                        && let Ok(meta) = std::fs::metadata(&tmp)
+                    {
+                        if known_size > 0 && meta.len() >= known_size {
+                            let _ = std::fs::remove_file(&tmp);
+                        } else {
+                            resume_offset = meta.len();
+                            tracing::info!(
+                                "🔁 [TOPIC] resuming {} from verified prefix at {} bytes",
+                                &file_id[..16.min(file_id.len())],
+                                resume_offset
+                            );
+                        }
+                    }
+
+                    // Pipelined parallel streams (G8 hardening) for fresh large transfers
+                    // whose size is known from the synced file row. Any failure (including
+                    // a legacy peer rejecting `RequestStriped`) falls back to the
+                    // single-stream path below.
+                    if resume_offset == 0 && known_size >= PARALLEL_MIN_BYTES {
+                        match download_file_parallel(
+                            endpoint.clone(),
+                            &file_id,
+                            &hash,
+                            &source_peer,
+                            known_size,
+                            event_tx.clone(),
+                        )
+                        .await
+                        {
+                            Ok(()) => return,
+                            // A policy refusal is final — the single-stream path would
+                            // ride the same relay; don't fall back around the policy.
+                            Err(e) if e.downcast_ref::<crate::xfer_policy::RelayRefused>().is_some() => {
+                                tracing::warn!("⛔ [TOPIC] transfer refused by relay policy: {}", e);
+                                let _ = event_tx.send(SwiftEvent::FileDownloadFailed {
+                                    file_id,
+                                    error: e.to_string(),
+                                });
+                                return;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "⚠️ [TOPIC] parallel transfer for {} failed ({}); falling back to single-stream",
+                                    &file_id[..16.min(file_id.len())],
+                                    e
+                                );
+                            }
+                        }
+                    }
                     if let Err(e) = download_file(
                         endpoint,
                         &file_id,
@@ -456,9 +519,17 @@ impl TopicActor {
                         &source_peer,
                         resume_offset,
                         &group_id,
-                        event_tx,
+                        event_tx.clone(),
                     ).await {
                         tracing::error!("🔴 [TOPIC] File download failed: {}", e);
+                        // Terminal failure surface (disk-full gate incident 2026-07-05): a
+                        // download that ends in error must ALWAYS emit exactly one
+                        // `FileDownloadFailed` — a silent tracing line leaves callers (UI,
+                        // tests) staring at a stall they can only time out on.
+                        let _ = event_tx.send(SwiftEvent::FileDownloadFailed {
+                            file_id,
+                            error: e.to_string(),
+                        });
                     }
                 });
             }
@@ -1183,9 +1254,11 @@ impl TopicActor {
             // are handled identically (the split is informational for the UI).
             NetworkEvent::NoteAdded {
                 id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at,
+                scope, kind,
             }
             | NetworkEvent::NoteUpdated {
                 id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at,
+                scope, kind,
             } => {
                 let note = crate::models::dto::NoteDTO {
                     id: id.clone(),
@@ -1196,6 +1269,8 @@ impl TopicActor {
                     text: text.clone(),
                     created_at: *created_at,
                     updated_at: *updated_at,
+                    scope: scope.clone(),
+                    kind: kind.clone(),
                 };
                 let _ = storage::note_upsert(&note);
             }
@@ -1212,6 +1287,29 @@ impl TopicActor {
                     updated_at: *updated_at,
                 };
                 let _ = storage::pin_upsert(&pin);
+            }
+            // Ledger sync deltas (CYAN_FORMAT_SPEC §6.2) — apply through the SAME
+            // idempotent store fns the local FFI path uses: content unions by
+            // entry_hash, versions by version_id, audits by audit_hash; lifecycle
+            // and branch heads are ONE LWW lane on updated_at (ties: higher actor
+            // id). Replays/echoes are no-ops, so gossip at-least-once is safe.
+            NetworkEvent::ChangeEntryAppended { entry, .. } => {
+                let _ = storage::change_entry_apply(entry);
+            }
+            NetworkEvent::ChangeEntryLifecycle { tenant_id, delta } => {
+                let _ = storage::change_lifecycle_apply(tenant_id, delta);
+            }
+            NetworkEvent::ChangeVersionCreated { version, .. } => {
+                let _ = storage::change_version_apply(version);
+            }
+            NetworkEvent::ChangeBranchHead { tenant_id, asset_hash, branch, head_version, updated_at } => {
+                let _ = storage::change_branch_head_apply(
+                    tenant_id,
+                    asset_hash,
+                    branch,
+                    head_version.as_deref(),
+                    *updated_at,
+                );
             }
             NetworkEvent::WhiteboardElementAdded {
                 id, board_id, element_type, x, y, width, height, z_index,
@@ -1378,13 +1476,12 @@ async fn swarm_download_file(
 ) -> Result<()> {
     let parsed = Hash::from_str(hash).map_err(|e| anyhow!("bad blob hash {}: {}", hash, e))?;
 
-    let bytes = swarm.fetch(&parsed, holders).await?; // Blake3-verified on completion
-
-    // File name from the existing file row (registered via FileAvailable); fall back to the id.
-    let file_name = storage::file_get_for_transfer(file_id, hash)
-        .map(|(name, _, _)| name)
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| file_id.to_string());
+    // File name + advertised size from the existing file row (registered via FileAvailable);
+    // fall back to the id.
+    let (file_name, advertised_size) = storage::file_get_for_transfer(file_id, hash)
+        .map(|(name, _, size)| (name, size))
+        .filter(|(n, _)| !n.is_empty())
+        .unwrap_or_else(|| (file_id.to_string(), 0));
 
     let data_dir = crate::DATA_DIR
         .get()
@@ -1392,8 +1489,15 @@ async fn swarm_download_file(
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let downloads_dir = data_dir.join("downloads");
     tokio::fs::create_dir_all(&downloads_dir).await?;
+
+    // Disk preflight: refuse a transfer that cannot land (advertised size + margin vs free
+    // space) with a clean error instead of failing at 99% on a full disk.
+    preflight_disk_space(&downloads_dir, advertised_size, file_id)?;
+
+    // RAM-flat: fetch into the fs-backed store (chunks land on disk as they arrive), export
+    // file-to-file, stream-verify. Never the whole blob in memory.
     let final_path = downloads_dir.join(&file_name);
-    tokio::fs::write(&final_path, &bytes).await?;
+    let size = swarm.fetch_to_path(&parsed, holders, &final_path).await?;
 
     let _ = storage::file_set_local_path(file_id, &final_path.to_string_lossy());
     let _ = storage::transfer_set_status(file_id, "complete");
@@ -1401,9 +1505,294 @@ async fn swarm_download_file(
     tracing::info!(
         "✅ [FILE] Swarm download complete: {} ({} bytes from {} holders)",
         file_name,
-        bytes.len(),
+        size,
         holders.len()
     );
+    let _ = event_tx.send(SwiftEvent::FileDownloaded {
+        file_id: file_id.to_string(),
+        local_path: final_path.to_string_lossy().to_string(),
+    });
+    Ok(())
+}
+
+/// Disk-space margin kept free beyond the transfer itself, so a download can never run the
+/// device out of disk (dailies-grade preflight).
+const DISK_FREE_MARGIN: u64 = 512 * 1024 * 1024;
+
+/// Refuse a transfer whose `needed` bytes don't fit in the destination filesystem's free
+/// space plus [`DISK_FREE_MARGIN`]. `needed == 0` (size unknown) skips the check. The
+/// refusal error propagates to the `DownloadFile` task's terminal `FileDownloadFailed`
+/// emission (exactly once per failed download), so the app sees the reason instead of a
+/// mid-transfer stall.
+fn preflight_disk_space(dir: &std::path::Path, needed: u64, file_id: &str) -> Result<()> {
+    if needed == 0 {
+        return Ok(());
+    }
+    let free = match crate::util::free_disk_space(dir) {
+        Ok(f) => f,
+        Err(e) => {
+            // Preflight is a guard, not a gate: an unreadable statvfs must not break transfers.
+            tracing::warn!("⚠️ [FILE] disk preflight unavailable for {}: {}", dir.display(), e);
+            return Ok(());
+        }
+    };
+    if needed.saturating_add(DISK_FREE_MARGIN) > free {
+        let msg = format!(
+            "insufficient disk space: transfer needs {} bytes (+{} margin), only {} free",
+            needed, DISK_FREE_MARGIN, free
+        );
+        let _ = storage::transfer_set_status(file_id, "no_disk_space");
+        return Err(anyhow!(msg));
+    }
+    Ok(())
+}
+
+/// Stripe/chunk unit for the pipelined parallel transfer. The endpoint's stream
+/// receive window is sized as CYAN_XFER_WINDOW (default 32) of these, so ~32 chunks
+/// ride in flight per stream with no per-chunk lockstep.
+const XFER_CHUNK: u64 = 256 * 1024;
+
+/// Below this size the single-stream path is used — stream fan-out isn't worth it.
+const PARALLEL_MIN_BYTES: u64 = 8 * 1024 * 1024;
+
+/// True when the ONLY live path to `pk` is the relay — the media-plane refusal key
+/// (G8 fix 5). Direct and mixed paths (incl. mDNS-LAN) are never relay-only; an
+/// unknown peer (no address info) is not judged here — the dial itself decides.
+fn relay_only_path(endpoint: &Endpoint, pk: &PublicKey) -> bool {
+    use iroh::Watcher;
+    match endpoint.conn_type(*pk) {
+        Some(mut watcher) => matches!(watcher.get(), iroh::endpoint::ConnectionType::Relay(_)),
+        None => false,
+    }
+}
+
+/// Apply the relay policy to a transfer of `total_size` bytes toward `pk`: above the
+/// threshold, a relay-only path is refused with the typed error propagated to the
+/// `DownloadFile` task's terminal `FileDownloadFailed` emission (never a mid-transfer
+/// stall on a saturated relay).
+fn enforce_relay_policy(
+    endpoint: &Endpoint,
+    pk: &PublicKey,
+    total_size: u64,
+    file_id: &str,
+) -> Result<()> {
+    if let Err(e) = crate::xfer_policy::enforce(total_size, relay_only_path(endpoint, pk)) {
+        let _ = storage::transfer_set_status(file_id, "relay_refused");
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// Parallel QUIC streams per transfer — `CYAN_XFER_STREAMS`, default 4, clamped 1..=16.
+fn xfer_streams() -> u32 {
+    std::env::var("CYAN_XFER_STREAMS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| (1..=16).contains(n))
+        .unwrap_or(4)
+}
+
+/// Pipelined parallel-stream download (G8 hardening): M QUIC streams on ONE connection,
+/// each carrying an interleaved stripe of 256 KB chunks (`RequestStriped`), landing at
+/// their true offsets in a preallocated tmp file. A follower task hashes the contiguous
+/// chunk frontier from the page cache as stripes land, so verification is incremental
+/// (finalize at completion — no whole-file re-read, no dead pause) and RAM stays flat
+/// (M stream buffers + one hash buffer). Fresh downloads only — resume rides the
+/// single-stream path; on any error the striped tmp (which has holes) is deleted so a
+/// legacy resume can never append onto it.
+async fn download_file_parallel(
+    endpoint: Endpoint,
+    file_id: &str,
+    hash: &str,
+    source_peer: &str,
+    total_size: u64,
+    event_tx: UnboundedSender<SwiftEvent>,
+) -> Result<()> {
+    use std::sync::atomic::AtomicU64;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+    let pk = PublicKey::from_str(source_peer)?;
+    let streams = xfer_streams();
+
+    let data_dir = crate::DATA_DIR.get().cloned().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let downloads_dir = data_dir.join("downloads");
+    tokio::fs::create_dir_all(&downloads_dir).await?;
+    preflight_disk_space(&downloads_dir, total_size, file_id)?;
+    let temp_path = downloads_dir.join(format!("{}.tmp", file_id));
+
+    tracing::info!(
+        "📥 [FILE] Parallel download {} ({} bytes, {} streams)",
+        &file_id[..16.min(file_id.len())],
+        total_size,
+        streams
+    );
+    let _ = event_tx.send(SwiftEvent::FileDownloadProgress {
+        file_id: file_id.to_string(),
+        progress: 0.0,
+    });
+
+    let result = async {
+        let conn: Connection = tokio::time::timeout(
+            Duration::from_secs(30),
+            endpoint.connect(pk, FILE_TRANSFER_ALPN),
+        )
+        .await
+        .map_err(|_| anyhow!("File transfer connection timeout"))?
+        .map_err(|e| anyhow!("File transfer connect failed: {}", e))?;
+
+        // Relay policy (fix 5): the small relay is signaling, not a media plane.
+        enforce_relay_policy(&endpoint, &pk, total_size, file_id)?;
+
+        // Preallocate the tmp file so every stream writes at its true offsets.
+        {
+            let file = tokio::fs::File::create(&temp_path).await?;
+            file.set_len(total_size).await?;
+        }
+
+        // Same transfer-tracking row the single-stream path keeps (UI progress source).
+        let tracked_name = storage::file_get_for_transfer(file_id, hash)
+            .map(|(name, _, _)| name)
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| file_id.to_string());
+        let _ = storage::transfer_upsert(
+            file_id,
+            &tracked_name,
+            total_size,
+            hash,
+            0,
+            temp_path.to_string_lossy().as_ref(),
+            source_peer,
+            "in_progress",
+        );
+
+        let n_chunks = total_size.div_ceil(XFER_CHUNK);
+        // Per-stream count of stripe chunks fully written — the hash follower's frontier.
+        let chunks_done: Arc<Vec<AtomicU64>> =
+            Arc::new((0..streams).map(|_| AtomicU64::new(0)).collect());
+        let (prog_tx, mut prog_rx) = mpsc::unbounded_channel::<()>();
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..streams {
+            let (mut send, mut recv) = conn.open_bi().await?;
+            let req = FileTransferMsg::RequestStriped {
+                file_id: file_id.to_string(),
+                hash: hash.to_string(),
+                chunk_size: XFER_CHUNK,
+                stride: streams,
+                index,
+            };
+            let req_data = serde_json::to_vec(&req)?;
+            let len = (req_data.len() as u32).to_be_bytes();
+            send.write_chunk(Bytes::copy_from_slice(&len)).await?;
+            send.write_chunk(Bytes::from(req_data)).await?;
+
+            let temp_path = temp_path.clone();
+            let file_id = file_id.to_string();
+            let chunks_done = chunks_done.clone();
+            let prog_tx = prog_tx.clone();
+            tasks.spawn(async move {
+                // Per-stream response header (or NotFound/Error).
+                let mut len_buf = [0u8; 4];
+                recv.read_exact(&mut len_buf).await?;
+                let mut header = vec![0u8; u32::from_be_bytes(len_buf) as usize];
+                recv.read_exact(&mut header).await?;
+                match serde_json::from_slice::<FileTransferMsg>(&header)? {
+                    FileTransferMsg::Header { .. } => {}
+                    FileTransferMsg::NotFound { .. } => {
+                        return Err(anyhow!("file {} not found on peer", file_id));
+                    }
+                    other => return Err(anyhow!("unexpected stripe response: {:?}", other)),
+                }
+
+                let mut file = tokio::fs::OpenOptions::new().write(true).open(&temp_path).await?;
+                let mut buf = vec![0u8; XFER_CHUNK as usize];
+                let mut k = index as u64;
+                while k * XFER_CHUNK < total_size {
+                    let pos = k * XFER_CHUNK;
+                    let n = XFER_CHUNK.min(total_size - pos) as usize;
+                    recv.read_exact(&mut buf[..n])
+                        .await
+                        .map_err(|e| anyhow!("stripe {} ended early: {}", index, e))?;
+                    file.seek(std::io::SeekFrom::Start(pos)).await?;
+                    file.write_all(&buf[..n]).await?;
+                    chunks_done[index as usize].fetch_add(1, Ordering::Release);
+                    let _ = prog_tx.send(());
+                    k += streams as u64;
+                }
+                file.flush().await?;
+                Ok::<(), anyhow::Error>(())
+            });
+        }
+        drop(prog_tx);
+
+        // Hash follower: consume chunks IN ORDER as their stripes land — incremental
+        // verification straight off the page cache, finalize at completion.
+        let mut hasher = blake3::Hasher::new();
+        let mut read_file = tokio::fs::File::open(&temp_path).await?;
+        let mut buf = vec![0u8; XFER_CHUNK as usize];
+        let mut last_progress = 0u64;
+        for c in 0..n_chunks {
+            let stream = (c % streams as u64) as usize;
+            let need = c / (streams as u64) + 1;
+            while chunks_done[stream].load(Ordering::Acquire) < need {
+                if prog_rx.recv().await.is_none()
+                    && chunks_done[stream].load(Ordering::Acquire) < need
+                {
+                    // All writers exited without delivering this chunk — surface the
+                    // first task error (or a generic one).
+                    while let Some(res) = tasks.join_next().await {
+                        res.map_err(|e| anyhow!("stripe task panicked: {e}"))??;
+                    }
+                    return Err(anyhow!("stripe writers exited before chunk {}", c));
+                }
+            }
+            let pos = c * XFER_CHUNK;
+            let n = XFER_CHUNK.min(total_size - pos) as usize;
+            read_file.seek(std::io::SeekFrom::Start(pos)).await?;
+            read_file.read_exact(&mut buf[..n]).await?;
+            hasher.update(&buf[..n]);
+            crate::metrics::record_file_verify_streamed(n as u64);
+
+            let done = pos + n as u64;
+            if done - last_progress >= 4 * 1024 * 1024 || done == total_size {
+                last_progress = done;
+                let _ = storage::transfer_update_progress(file_id, done);
+                let _ = event_tx.send(SwiftEvent::FileDownloadProgress {
+                    file_id: file_id.to_string(),
+                    progress: done as f64 / total_size as f64,
+                });
+            }
+        }
+        while let Some(res) = tasks.join_next().await {
+            res.map_err(|e| anyhow!("stripe task panicked: {e}"))??;
+        }
+
+        let actual_hash = hasher.finalize().to_hex().to_string();
+        if actual_hash != hash {
+            let _ = storage::transfer_set_status(file_id, "hash_mismatch");
+            return Err(anyhow!("Hash mismatch: expected {}, got {}", hash, actual_hash));
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    if let Err(e) = result {
+        // A striped tmp has holes — never leave it where a legacy resume could append to it.
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(e);
+    }
+
+    // Land it exactly like the single-stream path: rename, record, notify.
+    let file_name = storage::file_get_for_transfer(file_id, hash)
+        .map(|(name, _, _)| name)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| file_id.to_string());
+    let final_path = downloads_dir.join(&file_name);
+    tokio::fs::rename(&temp_path, &final_path).await?;
+    let _ = storage::file_set_local_path(file_id, final_path.to_string_lossy().as_ref());
+    let _ = storage::transfer_set_status(file_id, "complete");
+
+    tracing::info!("✅ [FILE] Parallel download complete: {}", file_name);
     let _ = event_tx.send(SwiftEvent::FileDownloaded {
         file_id: file_id.to_string(),
         local_path: final_path.to_string_lossy().to_string(),
@@ -1476,13 +1865,48 @@ async fn download_file(
                 byte_offset
             );
 
+            // Relay policy (fix 5): the header names the media's true size — refuse a
+            // relay-only path for large media before a byte of payload moves.
+            enforce_relay_policy(&endpoint, &pk, total_size, &file_id)?;
+
             // Create temp file for download
             let data_dir = crate::DATA_DIR.get().cloned().unwrap_or_else(|| std::path::PathBuf::from("."));
             let downloads_dir = data_dir.join("downloads");
             std::fs::create_dir_all(&downloads_dir)?;
 
+            // Disk preflight: refuse up front what cannot land (clean error, not a 99% stall).
+            preflight_disk_space(&downloads_dir, byte_length, &file_id)?;
+
             let temp_path = downloads_dir.join(format!("{}.tmp", file_id));
             let final_path = downloads_dir.join(&file_name);
+
+            // Incremental Blake3 (dailies-grade): hash chunks AS THEY LAND, so completion
+            // needs no whole-file re-read (no RAM spike, no dead pause at 100%). On resume,
+            // the hasher's state is rebuilt by streaming the already-verified prefix from
+            // the tmp file — a bounded HEAD read before the transfer, never a tail read.
+            let mut hasher = blake3::Hasher::new();
+            if byte_offset > 0 {
+                use tokio::io::AsyncReadExt;
+                let mut prefix = tokio::fs::File::open(&temp_path).await.map_err(|e| {
+                    anyhow!("resume at {} but tmp file is unreadable: {}", byte_offset, e)
+                })?;
+                let mut remaining = byte_offset;
+                let mut buf = vec![0u8; 1024 * 1024];
+                while remaining > 0 {
+                    let want = remaining.min(buf.len() as u64) as usize;
+                    let n = prefix.read(&mut buf[..want]).await?;
+                    if n == 0 {
+                        return Err(anyhow!(
+                            "resume at {} but tmp file holds only {} bytes",
+                            byte_offset,
+                            byte_offset - remaining
+                        ));
+                    }
+                    hasher.update(&buf[..n]);
+                    crate::metrics::record_file_verify_prefix_read(n as u64);
+                    remaining -= n as u64;
+                }
+            }
 
             // Open file for writing (append if resuming)
             let mut file = if resume_offset > 0 && temp_path.exists() {
@@ -1519,6 +1943,8 @@ async fn download_file(
                 match recv.read_chunk(chunk_size, true).await? {
                     Some(chunk) => {
                         file.write_all(&chunk.bytes).await?;
+                        hasher.update(&chunk.bytes);
+                        crate::metrics::record_file_verify_streamed(chunk.bytes.len() as u64);
                         received += chunk.bytes.len() as u64;
 
                         // Update progress every 256KB
@@ -1540,9 +1966,10 @@ async fn download_file(
             file.flush().await?;
             drop(file);
 
-            // Verify hash
-            let file_data = tokio::fs::read(&temp_path).await?;
-            let actual_hash = blake3::hash(&file_data).to_hex().to_string();
+            // Verify: the incremental hasher already consumed every byte (prefix + chunks) —
+            // finalize and compare. NO read of the landed file happens after the last chunk
+            // (the `file_verify_tail_read` tripwire stays zero).
+            let actual_hash = hasher.finalize().to_hex().to_string();
 
             if actual_hash != hash {
                 let _ = storage::transfer_set_status(&file_id, "hash_mismatch");
@@ -1565,11 +1992,11 @@ async fn download_file(
         }
 
         FileTransferMsg::NotFound { file_id } => {
+            // Propagate as an error: the DownloadFile task's terminal handler emits the one
+            // `FileDownloadFailed` (previously this emitted here but returned Ok, so the
+            // caller could not tell "not found" from success).
             tracing::warn!("⚠️ [FILE] File not found on peer: {}", &file_id[..16.min(file_id.len())]);
-            let _ = event_tx.send(SwiftEvent::FileDownloadFailed {
-                file_id,
-                error: "File not found on peer".to_string(),
-            });
+            return Err(anyhow!("file {} not found on peer", file_id));
         }
 
         _ => {
@@ -1748,7 +2175,7 @@ async fn download_snapshot_since(
                 }
             }
 
-            SnapshotFrame::Metadata { chats, files, integrations, board_metadata, notes, pins, workflow_states } => {
+            SnapshotFrame::Metadata { chats, files, integrations, board_metadata, notes, pins, workflow_states, .. } => {
                 eprintln!(
                     "📥 [SNAP-DL-9] METADATA: chats={} files={} integ={} meta={} notes={} pins={} wf={}",
                     chats.len(), files.len(), integrations.len(),

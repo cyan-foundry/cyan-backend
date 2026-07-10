@@ -38,6 +38,10 @@ path = "tests/delta_sync_test.rs"
 name = "cyan_node"
 path = "src/bin/cyan_node.rs"
 
+[[bin]]
+name = "phase3_reverse_loop"
+path = "src/bin/phase3_reverse_loop.rs"
+
 
 [dependencies]
 regex = "1"
@@ -91,6 +95,10 @@ glob = "0.3"
 # Already in the tree transitively via iroh 0.95; we only enable its `seal` feature,
 # so this adds no new crate, just the anonymous sealed-box API.
 crypto_box = { version = "0.10.0-pre.0", features = ["seal"] }
+# Dailies-grade transfers (G8/G10 hardening): disk-space preflight (statvfs) and the
+# peak-RSS oracle (getrusage). Already in the tree transitively; std exposes neither.
+libc = "0.2"
+rusty-s3 = "0.8"
 
 [dev-dependencies]
 # The `testing` feature exposes the embedded RS256 keypair + entitlement

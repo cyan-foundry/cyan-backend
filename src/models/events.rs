@@ -95,6 +95,13 @@ pub enum NetworkEvent {
         text: String,
         created_at: i64,
         updated_at: i64,
+        /// Note SCOPE (feat/notes-constitution): `tenant` | `group` | `board`.
+        /// `#[serde(default)]` keeps the event wire-compatible with pre-scope peers.
+        #[serde(default = "crate::models::dto::default_note_scope")]
+        scope: String,
+        /// Note KIND: `constitution` | `preference` | `editor-note`. Same compat rule.
+        #[serde(default = "crate::models::dto::default_note_kind")]
+        kind: String,
     },
     /// A note was edited. Conflict resolution is LWW on `updated_at` (older edits drop).
     NoteUpdated {
@@ -106,6 +113,11 @@ pub enum NetworkEvent {
         text: String,
         created_at: i64,
         updated_at: i64,
+        /// Same scope/kind wire-compat contract as `NoteAdded`.
+        #[serde(default = "crate::models::dto::default_note_scope")]
+        scope: String,
+        #[serde(default = "crate::models::dto::default_note_kind")]
+        kind: String,
     },
     NoteDeleted {
         id: String,
@@ -117,6 +129,35 @@ pub enum NetworkEvent {
         board_id: String,
         tenant_id: String,
         pinned: bool,
+        updated_at: i64,
+    },
+    // ---- Ledger sync deltas (CYAN_FORMAT_SPEC §6.2 — additive) ----
+    // Live gossip for the review ledger, on the same group topic notes/pins ride.
+    // Receivers apply through the idempotent `changelist::` fns (content unions by
+    // `entry_hash`, versions by `version_id`, audits by `audit_hash`; lifecycle and
+    // branch heads are ONE LWW lane keyed `updated_at`, ties by higher actor id) —
+    // so replays, echoes, and delta-vs-snapshot races all converge identically.
+    /// A ChangeEntry was appended (content lane).
+    ChangeEntryAppended {
+        tenant_id: String,
+        entry: Box<crate::changelist::ChangeEntry>,
+    },
+    /// An entry's lifecycle moved (LWW; the carried audit row always unions).
+    ChangeEntryLifecycle {
+        tenant_id: String,
+        delta: Box<crate::changelist::LifecycleDelta>,
+    },
+    /// A version was snapshotted (immutable union — concurrent snapshots both survive).
+    ChangeVersionCreated {
+        tenant_id: String,
+        version: Box<crate::changelist::ChangeVersion>,
+    },
+    /// A branch head moved (LWW on `updated_at`).
+    ChangeBranchHead {
+        tenant_id: String,
+        asset_hash: String,
+        branch: String,
+        head_version: Option<String>,
         updated_at: i64,
     },
     // ---- Whiteboard element events ----

@@ -200,11 +200,20 @@ pub enum CommandMsg {
     /// Author or edit a note. `note_id = None` creates a new note (id generated);
     /// `Some(id)` edits that note (LWW bump of `updated_at`). `tenant_id = None`
     /// derives the tenant from the board's group.
+    ///
+    /// feat/notes-constitution (additive): `scope` (`tenant`|`group`|`board`) and
+    /// `kind` (`constitution`|`preference`|`editor-note`) — `None` keeps the exact
+    /// pre-scope behavior (`board`/`editor-note`). For `group`/`tenant` scope,
+    /// `board_id` carries the ANCHOR id (the group / tenant id).
     PutNote {
         board_id: String,
         note_id: Option<String>,
         tenant_id: Option<String>,
         text: String,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        kind: Option<String>,
     },
     DeleteNote {
         id: String,
@@ -363,6 +372,38 @@ pub enum CommandMsg {
     UpdateProfile {
         display_name: String,
         avatar_hash: Option<String>,
+    },
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // LEDGER SYNC COMMANDS (CYAN_FORMAT_SPEC §6.2 — additive, engine-internal)
+    // ═══════════════════════════════════════════════════════════════════════
+    // Queued by `changelist::dispatch` after a LOCAL ledger mutation; the command
+    // loop broadcasts the matching `NetworkEvent` on the tenant's group topic
+    // (tenant == group id — where notes/pins already gossip). NOT sent by the app;
+    // additive so the FFI command shape stays drop-in.
+    /// A ChangeEntry was appended locally (content lane — unions by `entry_hash`).
+    ChangeEntryAppended {
+        tenant_id: String,
+        entry: Box<crate::changelist::ChangeEntry>,
+    },
+    /// An entry's lifecycle moved locally (ONE LWW lane keyed `updated_at`,
+    /// ties by higher actor id; the carried audit row unions on every peer).
+    ChangeEntryLifecycle {
+        tenant_id: String,
+        delta: Box<crate::changelist::LifecycleDelta>,
+    },
+    /// A version was snapshotted locally (immutable union by `version_id`).
+    ChangeVersionCreated {
+        tenant_id: String,
+        version: Box<crate::changelist::ChangeVersion>,
+    },
+    /// A branch head moved locally (LWW on `updated_at`).
+    ChangeBranchHead {
+        tenant_id: String,
+        asset_hash: String,
+        branch: String,
+        head_version: Option<String>,
+        updated_at: i64,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

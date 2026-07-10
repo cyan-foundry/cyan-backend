@@ -12,6 +12,11 @@
 //! running→terminal transitions, wave ordering, and the structural concurrency
 //! degree (`peak_concurrency`). Every wait is bounded: the run is awaited, then the
 //! event channel is drained non-blockingly.
+//!
+//! FAILURE HALTS THE RUN (harden S, CYAN_REALITY_AND_FIX): a failed step stops the
+//! run at the next wave boundary and downstream steps get NO events — fixtures are
+//! structured so every asserted step resolves before a failure halts the chain
+//! (cache hits for earlier waves, same-wave batches for barrier checks).
 
 use std::path::Path;
 use std::sync::Once;
@@ -185,7 +190,9 @@ async fn run(board: &str, p: Option<PhysicalPlan>) -> (Value, Vec<SwiftEvent>) {
     (result, drain(&mut event_rx))
 }
 
-// ── A→{B,C}→D: B and C share one wave and run concurrently; D follows. ──────────
+// ── A→{B,C}→D: B and C share one wave and run concurrently. A is a cache hit so
+// wave 1 is reachable (a live A would fail offline and HALT the run — harden S);
+// B/C then fail, so D's wave never launches: the halt leaves D untouched. ────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn diamond_dag_runs_independent_branch_concurrently() {
     ensure_db();
@@ -198,8 +205,10 @@ async fn diamond_dag_runs_independent_branch_concurrently() {
         step_config("d", "local", vec!["b", "c"]),
     ]);
 
+    let mut a = pstep("a");
+    a.cache_hit = true; // optimizer: reuse A's prior artifact so wave 1 launches
     let p = plan(group, 8, vec![
-        wave(0, vec![pstep("a")], vec![vec!["a"]]),
+        wave(0, vec![a], vec![vec!["a"]]),
         wave(1, vec![pstep("b"), pstep("c")], vec![vec!["b", "c"]]), // B,C one batch
         wave(2, vec![pstep("d")], vec![vec!["d"]]),
     ]);
@@ -210,16 +219,18 @@ async fn diamond_dag_runs_independent_branch_concurrently() {
     // B and C were launched in the same batch ⇒ peak in-flight is 2.
     assert_eq!(result["peak_concurrency"], 2, "B and C run concurrently in one wave");
 
-    // Both B and C reach `running` before D does (D is gated behind the wave barrier).
+    // Both B and C reach `running` in wave 1, after A resolved (done) in wave 0.
     let b_run = pos(&events, |e| is_state(e, "b", "running")).expect("b running");
     let c_run = pos(&events, |e| is_state(e, "c", "running")).expect("c running");
-    let d_run = pos(&events, |e| is_state(e, "d", "running")).expect("d running");
-    assert!(b_run < d_run, "b runs before d (next wave)");
-    assert!(c_run < d_run, "c runs before d (next wave)");
+    let a_done = pos(&events, |e| is_state(e, "a", "done")).expect("a done (cache hit)");
+    assert!(a_done < b_run && a_done < c_run, "a (wave 0) resolves before b/c (wave 1)");
 
-    // A runs before both B and C (earlier wave).
-    let a_run = pos(&events, |e| is_state(e, "a", "running")).expect("a running");
-    assert!(a_run < b_run && a_run < c_run, "a (wave 0) runs before b/c (wave 1)");
+    // FAILURE HALTS THE RUN (harden S): B/C failed offline, so D's wave never
+    // launches — D emits NO state events at all (left pending for Retry).
+    assert!(
+        !events.iter().any(|e| matches!(e, SwiftEvent::StepStateChanged { step_id, .. } if step_id == "d")),
+        "d's wave never launches after b/c fail — the halt leaves d untouched"
+    );
 }
 
 // ── A gate stalls only its own branch; an independent branch proceeds. ──────────
@@ -239,9 +250,12 @@ async fn gate_barrier_stalls_only_its_branch() {
     b.gate_barrier = Some("g".to_string()); // b waits behind gate g
     let mut g = pstep("g");
     g.is_gate = true;
+    // b rides a LATER BATCH of the same wave: an open gate (and x's offline
+    // failure) pauses/halts the run at the WAVE boundary (harden S / per-step
+    // pause), so a next wave would never launch — the branch-barrier stall is
+    // observable within the wave the gate opened in.
     let p = plan(group, 8, vec![
-        wave(0, vec![g, pstep("x")], vec![vec!["g", "x"]]), // gate + independent branch
-        wave(1, vec![b], vec![vec!["b"]]),                   // gated dependent
+        wave(0, vec![g, pstep("x"), b], vec![vec!["g", "x"], vec!["b"]]),
     ]);
 
     let (_result, events) = run(board, Some(p)).await;
@@ -350,13 +364,17 @@ async fn no_plan_falls_back_to_sequential() {
     assert_eq!(result["mode"], "sequential", "no plan ⇒ sequential fallback");
     assert_eq!(result["peak_concurrency"], 1, "sequential runs one step at a time");
 
-    // The root step runs; with no plan the sequential toposort applies the prior
-    // dependency-gating, so the dependents (whose deps aren't approved) stay pending
-    // — never the wave path's concurrent dispatch.
+    // The root step runs and fails offline; FAILURE HALTS THE RUN (harden S), so
+    // the dependents are never dispatched — no running, and no state events at
+    // all (they are left pending in the DB for an explicit Retry).
     assert!(pos(&events, |e| is_state(e, "a", "running")).is_some(), "root step a runs");
+    assert!(pos(&events, |e| is_state(e, "a", "failed")).is_some(), "a fails offline");
     for s in ["b", "c", "d"] {
         assert!(pos(&events, |e| is_state(e, s, "running")).is_none(), "{s} does not run concurrently (sequential gating)");
-        assert!(pos(&events, |e| is_state(e, s, "pending")).is_some(), "{s} is pending (deps not met)");
+        assert!(
+            !events.iter().any(|e| matches!(e, SwiftEvent::StepStateChanged { step_id, .. } if step_id == s)),
+            "{s} gets no state events — a's failure halted the run before it"
+        );
     }
 }
 
@@ -366,14 +384,15 @@ async fn exec_events_emitted_from_concurrent_path() {
     ensure_db();
     let group = "wave-grp-events";
     let board = "wave-board-events";
+    // a and b are independent and share one batch: both execute (a live chain
+    // would halt at the first offline failure — harden S — and b would never run).
     seed_board(group, board, &[
         step_config("a", "local", vec![]),
-        step_config("b", "local", vec!["a"]),
+        step_config("b", "local", vec![]),
     ]);
 
     let p = plan(group, 8, vec![
-        wave(0, vec![pstep("a")], vec![vec!["a"]]),
-        wave(1, vec![pstep("b")], vec![vec!["b"]]),
+        wave(0, vec![pstep("a"), pstep("b")], vec![vec!["a", "b"]]),
     ]);
 
     let (_result, events) = run(board, Some(p)).await;
@@ -390,11 +409,17 @@ async fn exec_events_emitted_from_concurrent_path() {
         "terminal state emitted",
     );
 
-    // Exactly one stats snapshot, tenant-scoped, with both steps' stages present.
+    // Stats snapshots: one LIVE incremental push per completed step (the "$0.00
+    // stuck" fix — cost/progress increment step-by-step) plus the final rollup.
     let stats: Vec<_> = events.iter().filter(|e| matches!(e, SwiftEvent::WorkflowStatsUpdated { .. })).collect();
-    assert_eq!(stats.len(), 1, "exactly one WorkflowStatsUpdated");
-    if let SwiftEvent::WorkflowStatsUpdated { tenant_id, snapshot, .. } = stats[0] {
-        assert_eq!(tenant_id, group, "stats tenant-scoped to the run's group");
+    assert_eq!(stats.len(), 3, "one incremental snapshot per step + the final rollup");
+    for s in &stats {
+        if let SwiftEvent::WorkflowStatsUpdated { tenant_id, .. } = s {
+            assert_eq!(tenant_id, group, "stats tenant-scoped to the run's group");
+        }
+    }
+    // The final rollup carries both steps' stages.
+    if let SwiftEvent::WorkflowStatsUpdated { snapshot, .. } = stats[stats.len() - 1] {
         let stages: Vec<&str> = snapshot.per_stage.iter().map(|s| s.stage.as_str()).collect();
         assert!(stages.contains(&"a") && stages.contains(&"b"), "both stages in snapshot: {stages:?}");
     }

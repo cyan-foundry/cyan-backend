@@ -65,7 +65,11 @@ pub fn group_high_water(group_id: &str) -> i64 {
     for ch in storage::chat_list_by_workspaces(&ws_ids).unwrap_or_default() {
         bump(ch.timestamp);
     }
-    for nt in storage::note_list_by_boards(&board_ids).unwrap_or_default() {
+    // feat/notes-constitution: group/tenant-scoped notes anchor at the group id — include
+    // them in the watermark exactly as the digest and the serializer do.
+    let mut note_anchor_ids = board_ids.clone();
+    note_anchor_ids.push(group_id.to_string());
+    for nt in storage::note_list_by_boards(&note_anchor_ids).unwrap_or_default() {
         bump(nt.updated_at);
     }
     for p in storage::pin_list_by_boards(&board_ids).unwrap_or_default() {
@@ -83,6 +87,26 @@ pub fn group_high_water(group_id: &str) -> i64 {
     }
     for f in storage::file_list_by_group(group_id).unwrap_or_default() {
         bump(f.created_at);
+    }
+    // Review-ledger tables (§6.4) are sent in FULL like `board_metadata`, but their
+    // clocks still count toward the watermark so it stays the true max version
+    // across every row a peer holds.
+    for e in storage::change_entry_list_by_tenant(group_id).unwrap_or_default() {
+        bump(e.created_at);
+        bump(e.updated_at);
+    }
+    for v in storage::change_version_list_by_tenant(group_id).unwrap_or_default() {
+        bump(v.created_at);
+    }
+    for b in storage::change_branch_list_by_tenant(group_id).unwrap_or_default() {
+        bump(b.created_at);
+        bump(b.updated_at);
+    }
+    for a in storage::change_audit_list_by_tenant(group_id).unwrap_or_default() {
+        bump(a.ts);
+    }
+    for rs in storage::review_state_list_by_tenant(group_id).unwrap_or_default() {
+        bump(rs.updated_at);
     }
     hi
 }
@@ -152,8 +176,12 @@ pub fn build_snapshot_frames(group_id: &str, since: Option<i64>) -> Result<Vec<S
         |i| i.created_at,
     );
     let board_metadata = storage::board_metadata_list_by_boards(&board_ids)?;
+    // feat/notes-constitution: group/tenant-scoped notes anchor at the group id, so the
+    // group id joins the anchor set — a scoped note repairs/cold-joins like a board note.
+    let mut note_anchor_ids = board_ids.clone();
+    note_anchor_ids.push(group_id.to_string());
     let notes = newer_than(
-        storage::note_list_by_boards(&board_ids)?,
+        storage::note_list_by_boards(&note_anchor_ids)?,
         since,
         |n| n.updated_at,
     );
@@ -167,6 +195,14 @@ pub fn build_snapshot_frames(group_id: &str, since: Option<i64>) -> Result<Vec<S
     // catch-up still carries it regardless of `since` and a returning peer reconciles a deploy/lock
     // it missed while offline.
     let workflow_states = storage::workflow_state_list_by_boards(&board_ids)?;
+    // CYAN_FORMAT_SPEC §6.4 — the five review-ledger tables (tenant == group id), also sent in
+    // FULL like `board_metadata`: ledger rows are tiny text, and the union/LWW apply paths make
+    // a full re-send converge without churn, so no `since` filter can ever mask a lane.
+    let change_entries = storage::change_entry_list_by_tenant(group_id)?;
+    let change_versions = storage::change_version_list_by_tenant(group_id)?;
+    let change_branches = storage::change_branch_list_by_tenant(group_id)?;
+    let change_audits = storage::change_audit_list_by_tenant(group_id)?;
+    let review_states = storage::review_state_list_by_tenant(group_id)?;
     let metadata = SnapshotFrame::Metadata {
         chats,
         files,
@@ -175,6 +211,11 @@ pub fn build_snapshot_frames(group_id: &str, since: Option<i64>) -> Result<Vec<S
         notes,
         pins,
         workflow_states,
+        change_entries,
+        change_versions,
+        change_branches,
+        change_audits,
+        review_states,
     };
 
     Ok(vec![structure, content, metadata, SnapshotFrame::Complete])
@@ -197,6 +238,11 @@ pub fn frame_row_count(frame: &SnapshotFrame) -> u64 {
             notes,
             pins,
             workflow_states,
+            change_entries,
+            change_versions,
+            change_branches,
+            change_audits,
+            review_states,
         } => {
             (chats.len()
                 + files.len()
@@ -204,7 +250,12 @@ pub fn frame_row_count(frame: &SnapshotFrame) -> u64 {
                 + board_metadata.len()
                 + notes.len()
                 + pins.len()
-                + workflow_states.len()) as u64
+                + workflow_states.len()
+                + change_entries.len()
+                + change_versions.len()
+                + change_branches.len()
+                + change_audits.len()
+                + review_states.len()) as u64
         }
         SnapshotFrame::Complete => 0,
     }
@@ -271,6 +322,11 @@ pub fn apply_snapshot_frame(frame: &SnapshotFrame) -> Result<()> {
             notes,
             pins,
             workflow_states,
+            change_entries,
+            change_versions,
+            change_branches,
+            change_audits,
+            review_states,
         } => {
             for ch in chats {
                 // R11 §1: chat is board-scoped. A pre-R11 frame may omit board_id; fall back
@@ -332,6 +388,31 @@ pub fn apply_snapshot_frame(frame: &SnapshotFrame) -> Result<()> {
             }
             for ws in workflow_states {
                 storage::workflow_state_upsert(ws)?;
+            }
+            // Review-ledger tables (§6.4): the same union/LWW apply fns the live
+            // gossip deltas use, so a snapshot merge and a delta converge identically.
+            // Audits BEFORE entries is not required (both are unions), but entries
+            // before versions keeps `version_ref`/`entry_hashes` resolvable sooner.
+            for e in change_entries {
+                storage::change_entry_apply(e)?;
+            }
+            for v in change_versions {
+                storage::change_version_apply(v)?;
+            }
+            for b in change_branches {
+                storage::change_branch_head_apply(
+                    &b.tenant_id,
+                    &b.asset_hash,
+                    &b.branch,
+                    b.head_version.as_deref(),
+                    b.updated_at,
+                )?;
+            }
+            for a in change_audits {
+                storage::change_audit_apply(a)?;
+            }
+            for rs in review_states {
+                storage::review_state_apply(rs)?;
             }
         }
         SnapshotFrame::Complete => {}

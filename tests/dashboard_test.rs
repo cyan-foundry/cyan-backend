@@ -103,8 +103,11 @@ fn cell_metadata(config: &PipelineStepConfig, mcp_tool: Option<&str>) -> String 
     Value::Object(meta).to_string()
 }
 
-/// Seed a group → workspace → board with one offline-failing `local` plugin step
-/// ("ingest" stage) and one `manual` gate step ("review" stage). Returns the board id.
+/// Seed a group → workspace → board with one `manual` gate step ("review" stage)
+/// followed by one offline-failing `local` plugin step ("ingest" stage). Both are
+/// independent and the gate comes FIRST: a failed step HALTS the run (harden S —
+/// downstream dependents never surface), so the gate must be reached before the
+/// failing step for both stages to emit their events.
 fn seed_two_step_board(group: &str, board: &str) {
     let now = 1_700_000_000i64;
     let ws = format!("{group}-ws");
@@ -120,8 +123,10 @@ fn seed_two_step_board(group: &str, board: &str) {
     let probe_meta = cell_metadata(&probe, Some(r#"{"plugin_id":"nope","tool":"nope","args":{}}"#));
     storage::cell_insert_simple(&format!("{board}-c1"), board, "markdown", 1, Some("Probe the asset"), None, false, None, Some(&probe_meta), now, now).expect("probe cell");
 
-    // review: a manual gate (awaiting approval).
-    let review = step_config("review", "review", "manual", vec!["probe".to_string()]);
+    // review: a manual gate (awaiting approval), dep-free. petgraph's toposort
+    // reverses DFS finish order, so of two independent nodes the LATER-seeded one
+    // is visited FIRST — review therefore gates before probe runs and halts.
+    let review = step_config("review", "review", "manual", vec![]);
     let review_meta = cell_metadata(&review, None);
     storage::cell_insert_simple(&format!("{board}-c2"), board, "markdown", 2, Some("Human review"), None, false, None, Some(&review_meta), now, now).expect("review cell");
 }
@@ -188,13 +193,16 @@ async fn run_emits_dashboard_events_in_order_with_correct_snapshot() {
         assert_eq!(actor, "ai");
     }
 
-    // review: awaiting_approval + an ApprovalRequested gate, after probe.
+    // review: awaiting_approval + an ApprovalRequested gate. The gate surfaces
+    // BEFORE the probe runs (it is first in toposort order); the probe's failure
+    // then HALTS the run (harden S), so nothing may come after it but the rollup.
     let review_await = pos(&|e| matches!(e, SwiftEvent::StepStateChanged { step_id, state, .. } if step_id == "review" && state == "awaiting_approval")).expect("review awaiting");
     let review_gate = pos(&|e| matches!(e, SwiftEvent::ApprovalRequested { step_id, .. } if step_id == "review")).expect("review gate");
-    assert!(probe_term < review_await, "probe terminal before review gate");
+    assert!(review_await < probe_running, "the gate surfaces before the failing probe halts the run");
     assert!(review_await < review_gate || review_gate == review_await + 1);
 
-    // ── Exactly one WorkflowStatsUpdated, before finished, with a correct snapshot. ──
+    // ── A WorkflowStatsUpdated with a correct snapshot (the first is the live
+    // incremental push after the probe executed; a final rollup follows). ──
     let stats = events.iter().find_map(|e| match e {
         SwiftEvent::WorkflowStatsUpdated { snapshot, tenant_id, .. } => Some((snapshot.clone(), tenant_id.clone())),
         _ => None,

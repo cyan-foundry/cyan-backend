@@ -89,10 +89,17 @@ impl RemoteToolConnector for EchoConnector {
         let mut t = ScriptedTransport::new();
         // initialize reply (the Client's first request, id=1)
         t.push_reply(jval(r#"{ "jsonrpc": "2.0", "id": 1, "result": { "protocolVersion": "1.0" } }"#));
-        // tools/call reply (id=2) — the echo plugin's result.
+        // tools/list reply (id=2) — the advertised-vs-registered contract check:
+        // the process registers the tool the request names (`render`).
+        t.push_reply(jval(
+            r#"{ "jsonrpc": "2.0", "id": 2, "result": { "tools": [
+                 { "name": "render", "description": "echo", "inputSchema": { "type": "object" } }
+            ] } }"#,
+        ));
+        // tools/call reply (id=3) — the echo plugin's result.
         t.push_reply(serde_json::from_value(serde_json::json!({
             "jsonrpc": "2.0",
-            "id": 2,
+            "id": 3,
             "result": self.result.clone(),
         }))
         .expect("valid reply"));

@@ -51,6 +51,37 @@ pub fn default_device_vault() -> Arc<dyn Vault> {
     }
 }
 
+/// Keychain *service* name for PLUGIN credentials (PLUGIN_CREDENTIAL_ONBOARDING
+/// §C) — separate from the identity service so wiping one never touches the other.
+#[cfg(target_os = "macos")]
+const PLUGIN_KEYCHAIN_SERVICE: &str = "io.blockxaero.cyan.plugins";
+
+/// The device-local PLUGIN credential vault (the DeviceVault of the onboarding
+/// design). Same fallback rules as [`default_device_vault`]: `CYAN_VAULT=mem`
+/// (or a non-macOS target) uses the in-memory fake so tests never prompt.
+pub fn plugin_cred_vault() -> Arc<dyn Vault> {
+    if std::env::var("CYAN_VAULT")
+        .map(|v| v.eq_ignore_ascii_case("mem"))
+        .unwrap_or(false)
+    {
+        return Arc::new(MemVault::new());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(KeychainVault::new(PLUGIN_KEYCHAIN_SERVICE))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Arc::new(MemVault::new())
+    }
+}
+
+/// The vault key one plugin credential lives under — scoped plugin + provider +
+/// tenant, so one operator's many producers never share a credential.
+pub fn plugin_cred_key(plugin: &str, provider: &str, tenant: &str) -> String {
+    format!("cyan.plugin.{plugin}.{provider}.{tenant}")
+}
+
 /// Store the device XaeroID private key (overwriting any existing value).
 pub fn store_device_key(vault: &dyn Vault, key: &SecretString) -> Result<()> {
     vault.store(DEVICE_KEY_ID, key)

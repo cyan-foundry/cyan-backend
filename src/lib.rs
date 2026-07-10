@@ -130,6 +130,17 @@ pub fn bootstrap_node_id() -> &'static str {
         .unwrap_or(rendezvous::BUNDLED_BOOTSTRAP_NODE_ID)
 }
 
+/// Queue an engine-internal `CommandMsg` onto the running system's command loop —
+/// the ledger-sync broadcast bridge (`changelist::dispatch` → group-topic gossip,
+/// CYAN_FORMAT_SPEC §6.2). A no-op when the full system isn't up (unit tests, bare
+/// storage use, the substrate harness driving `NetworkActor` directly) — the sync
+/// stays engine-internal and never blocks or fails a local store operation.
+pub(crate) fn queue_command(cmd: CommandMsg) {
+    if let Some(sys) = SYSTEM.get() {
+        let _ = sys.command_tx.send(cmd);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // CYAN SYSTEM
 // ═══════════════════════════════════════════════════════════════════════════
@@ -162,7 +173,11 @@ pub struct CyanSystem {
     pub ai_bridge: Arc<AIBridge>,
 }
 
-fn ensure_schema(conn: &Connection) -> Result<()> {
+/// The engine's base DDL — the FK clauses on `workspaces.group_id` / `objects.*` are
+/// load-bearing (the bundled SQLite is compiled with `SQLITE_DEFAULT_FOREIGN_KEYS=1`,
+/// so they are ENFORCED in prod). Public so integration tests can run the exact
+/// schema the shipping app runs instead of a drifted FK-less copy.
+pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
         PRAGMA journal_mode=WAL;
@@ -448,10 +463,15 @@ impl CommandActor {
 
                     {
                         let db = self.db.lock_safe();
-                        let _ = db.execute(
+                        // A failed group INSERT cascades (workspaces/objects FK-reference
+                        // groups, and the bundled SQLite ENFORCES FKs) — log it loudly
+                        // instead of letting downstream provisioning fail mysteriously.
+                        if let Err(e) = db.execute(
                             "INSERT INTO groups (id, name, icon, color, created_at, owner_node_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                             params![g.id, g.name, g.icon, g.color, g.created_at, self.node_id],
-                        );
+                        ) {
+                            tracing::error!(tenant_id = %id, "CreateGroup: groups INSERT failed: {e}");
+                        }
                     }
 
                     // ROUND8 §W3: a group is never born empty — auto-seed the default
@@ -475,6 +495,7 @@ impl CommandActor {
 
                     match seeded {
                         Ok((default, plugins)) => {
+                            let default_ws_id = default.id.clone();
                             for ws in [default, plugins] {
                                 tracing::info!(
                                     tenant_id = %id,
@@ -488,6 +509,35 @@ impl CommandActor {
                                 let _ = self.event_tx.send(SwiftEvent::Network(
                                     NetworkEvent::WorkspaceCreated(ws),
                                 ));
+                            }
+
+                            // TIER 3.5 (AUTHORING_FIXES_ROUND2): a new group is never
+                            // born board-less either — auto-create a DEFAULT BOARD in
+                            // the landing workspace so the first click lands on an
+                            // authorable Workflow, not an empty grid. Deterministic id
+                            // (INSERT OR IGNORE) ⇒ idempotent on re-delivery; creator-
+                            // only (this handler never runs on sync receivers — the
+                            // board reaches them via the same broadcast/snapshot path
+                            // any board does). Seeding lives in storage so the real-
+                            // schema regression test drives the identical code path.
+                            match storage::provision_default_board(&default_ws_id, &self.node_id, now) {
+                                Ok((board_id, board_name)) => {
+                                    let board_event = NetworkEvent::BoardCreated {
+                                        id: board_id,
+                                        workspace_id: default_ws_id,
+                                        name: board_name,
+                                        created_at: now,
+                                    };
+                                    let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                                        group_id: id.clone(),
+                                        event: board_event.clone(),
+                                    });
+                                    let _ = self.event_tx.send(SwiftEvent::Network(board_event));
+                                }
+                                Err(e) => tracing::error!(
+                                    tenant_id = %id,
+                                    "CreateGroup: default-board seed failed: {e}"
+                                ),
                             }
                         }
                         Err(e) => tracing::error!(tenant_id = %id, "group provisioning failed: {e}"),
@@ -810,7 +860,21 @@ impl CommandActor {
                 }
 
                 // ── Note commands (ROUND8 §W2) — board-level authored LWW ledger ──
-                CommandMsg::PutNote { board_id, note_id, tenant_id, text } => {
+                CommandMsg::PutNote { board_id, note_id, tenant_id, text, scope, kind } => {
+                    // feat/notes-constitution: scope/kind are additive; absent ⇒ the exact
+                    // pre-scope behavior (a board editor-note). Invalid values REJECT the
+                    // command (never silently misfile a constitution/preference note).
+                    let scope = scope.unwrap_or_else(crate::models::dto::default_note_scope);
+                    let kind = kind.unwrap_or_else(crate::models::dto::default_note_kind);
+                    if !crate::models::dto::note_scope_valid(&scope)
+                        || !crate::models::dto::note_kind_valid(&kind)
+                    {
+                        tracing::error!(
+                            "PutNote rejected: invalid scope={scope:?} kind={kind:?} board={board_id}"
+                        );
+                        continue;
+                    }
+
                     let now = chrono::Utc::now().timestamp();
                     let author_id = self.node_id.clone();
                     // author_name resolves from the author's XaeroID profile (same path
@@ -820,8 +884,14 @@ impl CommandActor {
                         .filter(|n| !n.is_empty())
                         .unwrap_or_else(|| author_id.clone());
 
-                    // Tenant: explicit, else the board's group (group == tenant).
-                    let group_id = self.get_group_id_for_board(&board_id);
+                    // Tenant: explicit, else the board's group (group == tenant). For
+                    // group/tenant scope, `board_id` IS the anchor (the group/tenant id),
+                    // so it is also the broadcast group.
+                    let group_id = if scope == "board" {
+                        self.get_group_id_for_board(&board_id)
+                    } else {
+                        Some(board_id.clone())
+                    };
                     let tenant = tenant_id
                         .or_else(|| group_id.clone())
                         .unwrap_or_else(|| author_id.clone());
@@ -847,21 +917,23 @@ impl CommandActor {
                         text: text.clone(),
                         created_at,
                         updated_at: now,
+                        scope: scope.clone(),
+                        kind: kind.clone(),
                     };
                     match storage::note_upsert(&note) {
-                        Ok(_) => tracing::info!(tenant_id = %tenant, "obs note_put board={board_id} id={id}"),
+                        Ok(_) => tracing::info!(tenant_id = %tenant, "obs note_put board={board_id} id={id} scope={scope} kind={kind}"),
                         Err(e) => eprintln!("📝 [NOTE] 🔴 note_upsert failed: {e}"),
                     }
 
                     let event = if is_new {
                         NetworkEvent::NoteAdded {
                             id, board_id, tenant_id: tenant, author_id, author_name,
-                            text, created_at, updated_at: now,
+                            text, created_at, updated_at: now, scope, kind,
                         }
                     } else {
                         NetworkEvent::NoteUpdated {
                             id, board_id, tenant_id: tenant, author_id, author_name,
-                            text, created_at, updated_at: now,
+                            text, created_at, updated_at: now, scope, kind,
                         }
                     };
 
@@ -1424,6 +1496,39 @@ impl CommandActor {
                     tracing::debug!("SeedDemoIfEmpty is a no-op (demo seeding removed)");
                 }
 
+                // ── Ledger sync deltas (CYAN_FORMAT_SPEC §6.2) ─────────────────
+                // Engine-internal: queued by `changelist::dispatch` after a LOCAL
+                // ledger mutation (via `queue_command`); this loop's only job is to
+                // put the matching NetworkEvent on the group topic (tenant == group).
+                // The receiver applies through the same idempotent `changelist::`
+                // fns, so a re-broadcast or an echo is a no-op.
+                CommandMsg::ChangeEntryAppended { tenant_id, entry } => {
+                    let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                        group_id: tenant_id.clone(),
+                        event: NetworkEvent::ChangeEntryAppended { tenant_id, entry },
+                    });
+                }
+                CommandMsg::ChangeEntryLifecycle { tenant_id, delta } => {
+                    let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                        group_id: tenant_id.clone(),
+                        event: NetworkEvent::ChangeEntryLifecycle { tenant_id, delta },
+                    });
+                }
+                CommandMsg::ChangeVersionCreated { tenant_id, version } => {
+                    let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                        group_id: tenant_id.clone(),
+                        event: NetworkEvent::ChangeVersionCreated { tenant_id, version },
+                    });
+                }
+                CommandMsg::ChangeBranchHead { tenant_id, asset_hash, branch, head_version, updated_at } => {
+                    let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                        group_id: tenant_id.clone(),
+                        event: NetworkEvent::ChangeBranchHead {
+                            tenant_id, asset_hash, branch, head_version, updated_at,
+                        },
+                    });
+                }
+
                 CommandMsg::SeedDemo => {
                     // Fix A: seed the coherent demo set IN-PROCESS under THIS engine's
                     // identity, so the seeded groups are stamped with our node_id (owned +
@@ -1806,6 +1911,15 @@ fn route_event_to_buffers(
                 // by the app: there is no UI panel for a Lens-orchestrated tool call
                 // running locally. Pass-through here.
                 NetworkEvent::RemoteToolCall { .. } | NetworkEvent::RemoteToolResult { .. } => {}
+
+                // Ledger sync deltas (CYAN_FORMAT_SPEC §6.2) are engine-internal
+                // replication: the receiver's storage is the surface, and the app
+                // reads the ledger via cyan_changelist_command / cyan_review_command.
+                // No UI buffer consumes them — pass-through, like PluginRelay.
+                NetworkEvent::ChangeEntryAppended { .. }
+                | NetworkEvent::ChangeEntryLifecycle { .. }
+                | NetworkEvent::ChangeVersionCreated { .. }
+                | NetworkEvent::ChangeBranchHead { .. } => {}
             }
         }
 
@@ -1885,9 +1999,28 @@ pub mod tests {
 pub mod pipeline;
 pub mod seed;
 pub mod workflow;
+pub mod workflow_bind;
 pub mod templates;
 pub mod timecode_notes;
+pub mod changelist;
+pub mod conform_map;
+pub mod conform_dispatch;
+pub mod review_state;
+pub mod review_loop;
+pub mod note_inference;
+pub mod ops_proposer;
+pub mod constitution;
+pub mod llm;
+pub mod llm_proposer;
+pub mod ops_eval;
+pub mod batch_confirm;
+pub mod xfer_policy;
+pub mod asset_registry;
+pub mod ingest;
+pub mod ingest_connectors;
 pub mod skills;
 pub mod pipeline_executor;
+pub mod media_staging;
+pub mod plugin_config;
 pub mod dashboard;
 pub mod exec_plan;

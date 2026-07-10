@@ -73,6 +73,42 @@ pub fn db() -> &'static Mutex<Connection> {
     DB.get().expect("DB not initialized - call init_db first")
 }
 
+/// Non-panicking accessor for the JSON dispatch paths (`changelist::command`,
+/// `review_state::command`): a command arriving before `init_db` must surface as a
+/// clean `{"error": ...}` JSON string, never a panic across the FFI boundary.
+pub fn try_db() -> Option<&'static Mutex<Connection>> {
+    DB.get()
+}
+
+/// How long a READ/UI path may wait for the DB before giving up and returning
+/// its empty shape. Short enough that a click never feels hung; long enough
+/// that ordinary write contention (single statements) always wins.
+pub const READ_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Bounded acquire for READ paths that cross the FFI into the UI. NEVER parks
+/// the calling thread on the DB mutex: spins `try_lock` up to `budget`, then
+/// yields `None` (callers return their empty shape and the UI's own cadence
+/// retries). Poison recovers like `lock_safe`. Same-thread re-entrancy cannot
+/// deadlock through this door — it burns the budget and returns `None` — but
+/// the envelope read path also threads one `&Connection` down so re-entrant
+/// acquisition doesn't arise in the first place.
+pub fn try_db_read(budget: std::time::Duration) -> Option<std::sync::MutexGuard<'static, Connection>> {
+    let db = try_db()?;
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match db.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // GROUPS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -362,6 +398,32 @@ pub fn provision_group_workspaces(
     Ok((default, plugins))
 }
 
+/// TIER 3.5 (AUTHORING_FIXES_ROUND2): deterministic id of a workspace's default board
+/// ("Board 1"). Deterministic ⇒ `INSERT OR IGNORE` makes seeding idempotent on
+/// re-delivery.
+pub fn default_board_id(workspace_id: &str) -> String {
+    blake3::hash(format!("board:{workspace_id}-Board 1").as_bytes()).to_hex().to_string()
+}
+
+/// Seed the default board ("Board 1") in a group's landing workspace so a new group is
+/// never born board-less. Returns `(board_id, board_name)`. Errors surface (FK to the
+/// workspaces row is ENFORCED — the bundled SQLite defaults foreign_keys ON), so a
+/// failed seed is a loud log line in the CreateGroup handler, never a silent no-board.
+pub fn provision_default_board(
+    workspace_id: &str,
+    owner_node_id: &str,
+    now: i64,
+) -> Result<(String, String)> {
+    let board_name = "Board 1".to_string();
+    let board_id = default_board_id(workspace_id);
+    let conn = db().lock_safe();
+    conn.execute(
+        "INSERT OR IGNORE INTO objects (id, workspace_id, type, name, created_at, owner_node_id) VALUES (?1, ?2, 'whiteboard', ?3, ?4, ?5)",
+        params![board_id, workspace_id, board_name, now, owner_node_id],
+    )?;
+    Ok((board_id, board_name))
+}
+
 pub fn workspace_insert(ws: &Workspace) -> Result<()> {
     let conn = db().lock_safe();
     conn.execute(
@@ -459,6 +521,13 @@ pub fn workspace_get_group_id(workspace_id: &str) -> Option<String> {
 /// Get group_id for a board (via its workspace)
 pub fn board_get_group_id(board_id: &str) -> Option<String> {
     let conn = db().lock_safe();
+    board_get_group_id_with(&conn, board_id)
+}
+
+/// `board_get_group_id` against an ALREADY-HELD connection — for callers running
+/// inside a dispatch that owns the global DB mutex (re-locking self-deadlocks;
+/// the std Mutex is not reentrant).
+pub fn board_get_group_id_with(conn: &rusqlite::Connection, board_id: &str) -> Option<String> {
     // Board -> workspace_id -> group_id
     let mut stmt = conn.prepare(
         "SELECT w.group_id FROM workspaces w
@@ -702,19 +771,21 @@ fn migrate_chats_to_boards_conn(conn: &Connection) -> Result<usize> {
 pub fn note_upsert(n: &NoteDTO) -> Result<bool> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
     let changed = conn.execute(
-        "INSERT INTO notes (id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "INSERT INTO notes (id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(id) DO UPDATE SET
             board_id    = excluded.board_id,
             tenant_id   = excluded.tenant_id,
             author_id   = excluded.author_id,
             author_name = excluded.author_name,
             text        = excluded.text,
-            updated_at  = excluded.updated_at
+            updated_at  = excluded.updated_at,
+            scope       = excluded.scope,
+            kind        = excluded.kind
          WHERE excluded.updated_at > notes.updated_at",
         params![
             n.id, n.board_id, n.tenant_id, n.author_id, n.author_name, n.text,
-            n.created_at, n.updated_at
+            n.created_at, n.updated_at, n.scope, n.kind
         ],
     )?;
     Ok(changed > 0)
@@ -725,10 +796,44 @@ pub fn note_upsert(n: &NoteDTO) -> Result<bool> {
 pub fn note_list_by_board(board_id: &str, tenant_id: &str) -> Result<Vec<NoteDTO>> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
     let mut stmt = conn.prepare(
-        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind
          FROM notes WHERE board_id = ?1 AND tenant_id = ?2 ORDER BY created_at",
     )?;
     let rows = stmt.query_map(params![board_id, tenant_id], note_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// List notes by (tenant, scope, anchor, kind) — the merge-resolver query
+/// (feat/notes-constitution). `anchor_id` is what `board_id` holds for the scope:
+/// the board id (`board`), the group id (`group`), or the tenant id (`tenant`).
+/// Tenant-enforced like every note query; deterministic order (created_at, id).
+pub fn note_list_scoped(
+    tenant_id: &str,
+    scope: &str,
+    anchor_id: &str,
+    kind: &str,
+) -> Result<Vec<NoteDTO>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    note_list_scoped_with(&conn, tenant_id, scope, anchor_id, kind)
+}
+
+/// `note_list_scoped` against an ALREADY-HELD connection — for callers running
+/// inside a dispatch that owns the global DB mutex (re-locking self-deadlocks;
+/// the std Mutex is not reentrant). Same pattern as `board_get_group_id_with`.
+pub fn note_list_scoped_with(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    scope: &str,
+    anchor_id: &str,
+    kind: &str,
+) -> Result<Vec<NoteDTO>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind
+         FROM notes
+         WHERE tenant_id = ?1 AND scope = ?2 AND board_id = ?3 AND kind = ?4
+         ORDER BY created_at, id",
+    )?;
+    let rows = stmt.query_map(params![tenant_id, scope, anchor_id, kind], note_from_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
@@ -741,7 +846,7 @@ pub fn note_list_by_boards(board_ids: &[String]) -> Result<Vec<NoteDTO>> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
     let placeholders: String = board_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind
          FROM notes WHERE board_id IN ({}) ORDER BY created_at",
         placeholders
     );
@@ -757,7 +862,7 @@ pub fn note_list_by_boards(board_ids: &[String]) -> Result<Vec<NoteDTO>> {
 pub fn note_get(id: &str) -> Result<Option<NoteDTO>> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
     let mut stmt = conn.prepare(
-        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind
          FROM notes WHERE id = ?1",
     )?;
     stmt.query_row(params![id], note_from_row)
@@ -782,6 +887,8 @@ fn note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteDTO> {
         text: r.get(5)?,
         created_at: r.get(6)?,
         updated_at: r.get(7)?,
+        scope: r.get(8)?,
+        kind: r.get(9)?,
     })
 }
 
@@ -1043,6 +1150,90 @@ pub fn workflow_state_upsert(s: &WorkflowStateDTO) -> Result<bool> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// LEDGER SYNC (CYAN_FORMAT_SPEC §6) — process-global wrappers over the explicit-
+// connection `changelist::` / `review_state::` fns, so the gossip apply path
+// (`topic_actor::persist_event`), the snapshot build/apply, and the anti-entropy
+// digest all read/write the ledger the same way they do notes/pins. Tenant == the
+// group id.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Apply an inbound `ChangeEntryAppended` (or one snapshot entry row) — union by
+/// `entry_hash` + lifecycle LWW, via `changelist::apply_entry`.
+pub fn change_entry_apply(e: &crate::changelist::ChangeEntry) -> Result<()> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::changelist::apply_entry(&conn, e).map(|_| ())
+}
+
+/// Apply an inbound `ChangeEntryLifecycle` — audit unions, lifecycle LWW.
+pub fn change_lifecycle_apply(tenant_id: &str, d: &crate::changelist::LifecycleDelta) -> Result<bool> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::changelist::apply_lifecycle(&conn, tenant_id, d)
+}
+
+/// Apply an inbound `ChangeVersionCreated` (or one snapshot version row) —
+/// immutable union by `version_id`.
+pub fn change_version_apply(v: &crate::changelist::ChangeVersion) -> Result<bool> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::changelist::apply_version(&conn, v)
+}
+
+/// Apply an inbound `ChangeBranchHead` (or one snapshot branch row) — LWW upsert.
+pub fn change_branch_head_apply(
+    tenant_id: &str,
+    asset_hash: &str,
+    branch: &str,
+    head_version: Option<&str>,
+    updated_at: i64,
+) -> Result<bool> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::changelist::apply_branch_head(&conn, tenant_id, asset_hash, branch, head_version, updated_at)
+}
+
+/// Apply one snapshot audit row — union by `audit_hash`.
+pub fn change_audit_apply(a: &crate::changelist::ChangeAudit) -> Result<bool> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::changelist::apply_audit(&conn, a)
+}
+
+/// Every ledger entry the tenant (group) holds — the snapshot/digest read.
+pub fn change_entry_list_by_tenant(tenant_id: &str) -> Result<Vec<crate::changelist::ChangeEntry>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::changelist::list_entries_by_tenant(&conn, tenant_id)
+}
+
+/// Every version the tenant holds.
+pub fn change_version_list_by_tenant(tenant_id: &str) -> Result<Vec<crate::changelist::ChangeVersion>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::changelist::list_versions_by_tenant(&conn, tenant_id)
+}
+
+/// Every branch head-pointer the tenant holds.
+pub fn change_branch_list_by_tenant(tenant_id: &str) -> Result<Vec<crate::changelist::ChangeBranch>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::changelist::list_branches_by_tenant(&conn, tenant_id)
+}
+
+/// Every audit row the tenant holds.
+pub fn change_audit_list_by_tenant(tenant_id: &str) -> Result<Vec<crate::changelist::ChangeAudit>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::changelist::list_audits_by_tenant(&conn, tenant_id)
+}
+
+/// Every review-loop state row the tenant holds (the `rs` lane).
+pub fn review_state_list_by_tenant(tenant_id: &str) -> Result<Vec<crate::review_state::ReviewState>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::review_state::list_by_tenant(&conn, tenant_id)
+        .map_err(|e| anyhow::anyhow!("review_state list: {}", e))
+}
+
+/// Apply one snapshot review-state row — LWW on `updated_at`.
+pub fn review_state_apply(rs: &crate::review_state::ReviewState) -> Result<bool> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    crate::review_state::apply_remote(&conn, rs)
+        .map_err(|e| anyhow::anyhow!("review_state apply: {}", e))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // FILES
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1061,17 +1252,33 @@ pub fn file_insert(
     name: &str, hash: &str, size: u64, source_peer: &str, created_at: i64,
 ) -> Result<()> {
     let conn = db().lock_safe();
-    conn.execute(
-        "INSERT OR IGNORE INTO objects (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, created_at)
-         SELECT ?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7, ?8, ?9
+    file_insert_conn(&conn, id, group_id, workspace_id, board_id, name, hash, size, source_peer, None, created_at)?;
+    Ok(())
+}
+
+/// `file_insert` against an ALREADY-HELD connection (the `board_get_group_id_with`
+/// pattern) — same two idempotency layers — plus an optional `local_path` stamped
+/// at insert time (the ingest leg knows the file's real on-disk path up front).
+/// Returns whether a row was actually inserted (`false` = the content-dedup guard
+/// collapsed it onto an existing row in that board scope).
+#[allow(clippy::too_many_arguments)]
+pub fn file_insert_conn(
+    conn: &Connection,
+    id: &str, group_id: Option<&str>, workspace_id: Option<&str>, board_id: Option<&str>,
+    name: &str, hash: &str, size: u64, source_peer: &str, local_path: Option<&str>,
+    created_at: i64,
+) -> Result<bool> {
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO objects (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, local_path, created_at)
+         SELECT ?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7, ?8, ?9, ?10
          WHERE NOT EXISTS (
              SELECT 1 FROM objects
              WHERE type = 'file' AND hash = ?6 AND COALESCE(deleted, 0) = 0
                AND COALESCE(board_id, '') = COALESCE(?4, '')
          )",
-        params![id, group_id, workspace_id, board_id, name, hash, size as i64, source_peer, created_at],
+        params![id, group_id, workspace_id, board_id, name, hash, size as i64, source_peer, local_path, created_at],
     )?;
-    Ok(())
+    Ok(n > 0)
 }
 
 pub fn file_set_local_path(id: &str, local_path: &str) -> Result<()> {
@@ -1498,6 +1705,232 @@ pub fn plugin_bundles_in_group(
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+/// Where installed `.cyanplugin` bundle files are written on disk. Mirrors the
+/// pipeline executor's `plugins_root` (env `CYAN_PLUGINS_ROOT`, else
+/// `$HOME/.cyan/plugins`) so a bundle written here is the same file the on-device
+/// MCP host later reads. Kept in storage so the install receiver and the reader
+/// agree on one path.
+pub fn plugin_bundles_dir() -> PathBuf {
+    if let Ok(root) = std::env::var("CYAN_PLUGINS_ROOT") {
+        return PathBuf::from(root);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home).join(".cyan").join("plugins")
+}
+
+/// Marker file stamped inside an unpacked bundle dir: the blake3 of the EXACT
+/// `.cyanplugin` bytes it was extracted from. Content-addressed freshness — the
+/// only trustworthy oracle here, because tar RESTORES the archive's stored (old)
+/// mtimes on extraction, so the installed bundle file is "newer" than its own
+/// unpack forever and an mtime comparison re-extracts on every call.
+const BUNDLE_HASH_MARKER: &str = ".cyan_bundle_hash";
+
+/// Serializes unpack work process-wide. `ensure_bundle_unpacked` is called from
+/// every `@` autocomplete keystroke, every Review-time bind, and every spawn —
+/// concurrently. Unserialized, two tar extractions into the same dir collide
+/// ("Can't create …: File exists") and a reader sees a HALF-EXTRACTED manifest
+/// (found live 2026-07-07: installed plugins intermittently failed to bind).
+static UNPACK_LOCK: Mutex<()> = Mutex::new(());
+
+/// Ensure the installed bundle for `plugin_id` is UNPACKED at
+/// `plugin_bundles_dir()/<plugin_id>/` so the on-device MCP host (registry index,
+/// tool autocomplete, rung-1 binding, spawn) can read its manifest. Best-effort
+/// by design: a bundle that fails to unpack/parse degrades to "not locally
+/// dispatchable" (the step stays on the lens path) — it must never fail the
+/// install that recorded the file row.
+///
+/// Hardened (Tier 0, 2026-07-07):
+///   * SHORT-CIRCUIT is content-addressed: the unpack stands iff its
+///     `.cyan_bundle_hash` marker equals the bundle's current blake3 AND the
+///     manifest parses (a corrupt/partial unpack self-heals on the next call).
+///   * REFRESH is atomic: extract into a temp sibling, verify the manifest,
+///     stamp the marker, then swap into place — a concurrent reader never sees
+///     a half-written manifest, and spawn debris in the old dir (`.venv`) can
+///     never fail the extraction (tar-over-existing-dir did, found live).
+///   * All unpack work is serialized process-wide (`UNPACK_LOCK`).
+pub fn ensure_bundle_unpacked(plugin_id: &str) -> Option<PathBuf> {
+    let root = plugin_bundles_dir();
+    let dest = root.join(plugin_id);
+    let bundle = root.join(format!("{plugin_id}{}", crate::mcp_host::PLUGIN_BUNDLE_SUFFIX));
+
+    let _guard = UNPACK_LOCK.lock_safe();
+
+    // No bundle file: a pre-placed dir with a valid manifest is still usable
+    // (dev drop-ins); otherwise there is nothing to unpack.
+    if !bundle.is_file() {
+        return cyan_mcp::Manifest::from_bundle(&dest).ok().map(|_| dest);
+    }
+    let bundle_hash = match std::fs::read(&bundle) {
+        Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
+        Err(e) => {
+            tracing::warn!("ensure_bundle_unpacked({plugin_id}): read bundle: {e}");
+            return None;
+        }
+    };
+
+    // Fast path: same bytes already unpacked AND readable — nothing to do.
+    // (`.venv` and other spawn debris in the dir is expected and preserved.)
+    let marker = dest.join(BUNDLE_HASH_MARKER);
+    if std::fs::read_to_string(&marker).is_ok_and(|h| h.trim() == bundle_hash)
+        && cyan_mcp::Manifest::from_bundle(&dest).is_ok()
+    {
+        return Some(dest);
+    }
+
+    // Refresh: extract into a TEMP sibling under the same root (same volume ⇒
+    // rename is atomic), verify, stamp, swap. bsdtar without -P already refuses
+    // absolute and `..`-traversing member paths, so extraction cannot escape
+    // the plugins root. The served bundle is a POSIX tar whose single top-level
+    // dir is the plugin id (verified against the live forge artifact).
+    let staging = root.join(format!(".unpack-{plugin_id}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    if let Err(e) = std::fs::create_dir_all(&staging) {
+        tracing::warn!("ensure_bundle_unpacked({plugin_id}): staging dir: {e}");
+        return None;
+    }
+    let status = std::process::Command::new("/usr/bin/tar")
+        .arg("-xf")
+        .arg(&bundle)
+        .arg("-C")
+        .arg(&staging)
+        .status();
+    let cleanup = |reason: &str| {
+        tracing::warn!("ensure_bundle_unpacked({plugin_id}): {reason}");
+        let _ = std::fs::remove_dir_all(&staging);
+    };
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            cleanup(&format!("tar exited {s}"));
+            return None;
+        }
+        Err(e) => {
+            cleanup(&format!("spawn tar: {e}"));
+            return None;
+        }
+    }
+    let extracted = staging.join(plugin_id);
+    // Only swap in a bundle the registry can index — otherwise the previous
+    // (still-valid) unpack keeps serving.
+    match cyan_mcp::Manifest::from_bundle(&extracted) {
+        Err(e) => {
+            cleanup(&format!("manifest: {e}"));
+            return cyan_mcp::Manifest::from_bundle(&dest).ok().map(|_| dest);
+        }
+        Ok(manifest) => {
+            // INDEX-TIME CONTRACT FLAG (FABLE_FULL_AUDIT headline 2): an alias
+            // carried by more than one tool is the signature of a stale or
+            // mis-curated bundle — every `@plugin.<alias>` bind over it is
+            // ambiguous (the binder hard-fails those at Review). Flag it loudly
+            // the moment the bundle lands, so the operator learns at INSTALL
+            // time, not mid-run.
+            for (alias, carriers) in manifest.ambiguous_aliases() {
+                tracing::warn!(
+                    "plugin '{plugin_id}' manifest contract: alias '{alias}' is carried by \
+                     {} tools [{}] — @{plugin_id}.{alias} cannot bind; reinstall a curated \
+                     bundle (stale/mis-curated)",
+                    carriers.len(),
+                    carriers.join(", ")
+                );
+            }
+        }
+    }
+    if let Err(e) = std::fs::write(extracted.join(BUNDLE_HASH_MARKER), &bundle_hash) {
+        cleanup(&format!("write marker: {e}"));
+        return None;
+    }
+    if dest.exists()
+        && let Err(e) = std::fs::remove_dir_all(&dest)
+    {
+        cleanup(&format!("clear old unpack: {e}"));
+        return None;
+    }
+    if let Err(e) = std::fs::rename(&extracted, &dest) {
+        cleanup(&format!("swap unpack into place: {e}"));
+        return None;
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+    Some(dest)
+}
+
+/// Install a `.cyanplugin` bundle into a group's "Plugins" workspace as a real
+/// installed file — the receiver half of the Market install leg (BURST C2).
+///
+/// The already-decoded tar `bytes` are written to `plugin_bundles_dir()/<plugin_id>.cyanplugin`
+/// and an `objects` file row is inserted into the group's system "Plugins" workspace with its
+/// `local_path` set, so both `plugin_bundles_in_group` and `workflow::autocomplete_index` find
+/// it immediately (they key on: type='file', that workspace, a set `local_path`, name ending
+/// `.cyanplugin`).
+///
+/// Idempotent: the file id is deterministic (`blake3("plugin-bundle:{group}:{plugin_id}")`) so a
+/// re-install REPLACES the prior row and overwrites the bytes on disk instead of duplicating.
+///
+/// The bundle's own XaeroID signature (over its embedded `manifest.yaml`) is a cyan-forge
+/// artifact; this repo has no unpack-and-verify path for the `.cyanplugin` internal layout yet,
+/// so signature verification is a documented TODO (see the FFI wrapper) — the install still
+/// records the bundle so the authoring surface can reference it. Returns the file id used.
+pub fn install_plugin_bundle(group_id: &str, plugin_id: &str, bytes: &[u8]) -> Result<String> {
+    if group_id.trim().is_empty() {
+        return Err(anyhow!("install_plugin_bundle: empty group_id"));
+    }
+    if plugin_id.trim().is_empty() {
+        return Err(anyhow!("install_plugin_bundle: empty plugin_id"));
+    }
+
+    // The workspace/objects rows below reference the group by FK (enforced — the
+    // bundled SQLite defaults foreign_keys ON). A group id with no `groups` row
+    // (e.g. a stale or placeholder id from the caller) must fail as a clear
+    // precondition, not SQLite's cryptic "FOREIGN KEY constraint failed".
+    {
+        let conn = db().lock_safe();
+        let exists: Option<i64> = conn
+            .query_row("SELECT 1 FROM groups WHERE id = ?1", params![group_id], |r| r.get(0))
+            .optional()?;
+        if exists.is_none() {
+            return Err(anyhow!(
+                "install_plugin_bundle: unknown group '{group_id}' — select an existing group before installing a plugin"
+            ));
+        }
+    }
+
+    // Ensure the group's system "Plugins" workspace exists (deterministic id, INSERT OR IGNORE).
+    provision_group_workspaces(group_id, None)?;
+    let plugins_ws = plugins_workspace_id(group_id);
+
+    // Write the bundle bytes to the shared bundles dir (overwrite on re-install).
+    let dir = plugin_bundles_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| anyhow!("install_plugin_bundle: mkdir {}: {e}", dir.display()))?;
+    let file_name = format!("{plugin_id}{}", crate::mcp_host::PLUGIN_BUNDLE_SUFFIX);
+    let path = dir.join(&file_name);
+    std::fs::write(&path, bytes)
+        .map_err(|e| anyhow!("install_plugin_bundle: write {}: {e}", path.display()))?;
+    let local_path = path.to_string_lossy().to_string();
+
+    // Deterministic id ⇒ re-install replaces rather than duplicates.
+    let file_id = blake3::hash(format!("plugin-bundle:{group_id}:{plugin_id}").as_bytes())
+        .to_hex()
+        .to_string();
+    let hash = blake3::hash(bytes).to_hex().to_string();
+    let now = chrono::Utc::now().timestamp();
+
+    {
+        let conn = db().lock_safe();
+        conn.execute(
+            "INSERT OR REPLACE INTO objects
+               (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, local_path, created_at, deleted)
+             VALUES (?1, ?2, ?3, NULL, 'file', ?4, ?5, ?6, 'install', ?7, ?8, 0)",
+            params![
+                file_id, group_id, plugins_ws, file_name, hash, bytes.len() as i64, local_path, now
+            ],
+        )?;
+    }
+    // Unpack for the on-device MCP host (registry/autocomplete/binding/spawn).
+    // Best-effort: a bundle that won't unpack still installs as a file row.
+    let _ = ensure_bundle_unpacked(plugin_id);
+    Ok(file_id)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // FILE TRANSFERS (resumable download state)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1533,6 +1966,21 @@ pub fn transfer_set_status(file_id: &str, status: &str) -> Result<()> {
         params![status, now, file_id],
     )?;
     Ok(())
+}
+
+/// The interrupted-transfer row for `(file_id, hash)`, if one is still resumable:
+/// returns `(bytes_received, temp_path)`. Complete transfers and hash mismatches
+/// don't resume; a different hash means the file changed — start fresh.
+pub fn transfer_get_partial(file_id: &str, hash: &str) -> Option<(u64, String)> {
+    let conn = db().lock_safe();
+    conn.query_row(
+        "SELECT bytes_received, temp_path FROM file_transfers \
+         WHERE file_id=?1 AND hash=?2 AND status IN ('pending','in_progress','failed')",
+        params![file_id, hash],
+        |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)),
+    )
+    .optional()
+    .ok()?
 }
 
 pub fn transfer_list_pending() -> Result<Vec<(String, String, String, u64)>> {
@@ -2378,12 +2826,34 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                 author_name TEXT NOT NULL,
                 text TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                scope TEXT NOT NULL DEFAULT 'board',
+                kind TEXT NOT NULL DEFAULT 'editor-note'
             )",
             [],
         );
         let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_board ON notes(board_id)", []);
     }
+    // feat/notes-constitution: notes gain SCOPE (tenant/group/board — `board_id` is the
+    // scope anchor) + KIND (constitution/preference/editor-note), ADDITIVE — legacy rows
+    // default to 'board'/'editor-note', i.e. exactly the pre-scope behavior.
+    if conn.prepare("SELECT scope FROM notes LIMIT 1").is_err() {
+        tracing::info!("Migration: adding scope column to notes");
+        let _ = conn
+            .execute("ALTER TABLE notes ADD COLUMN scope TEXT NOT NULL DEFAULT 'board'", []);
+    }
+    if conn.prepare("SELECT kind FROM notes LIMIT 1").is_err() {
+        tracing::info!("Migration: adding kind column to notes");
+        let _ = conn.execute(
+            "ALTER TABLE notes ADD COLUMN kind TEXT NOT NULL DEFAULT 'editor-note'",
+            [],
+        );
+    }
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_notes_tenant_scope_kind
+         ON notes(tenant_id, scope, board_id, kind)",
+        [],
+    );
 
     // ROUND8 §W4: templates — a pre-written English workflow (steps + bound plugins)
     // cloned into a board. Own store; user templates are tenant-scoped (built-in seeds
@@ -2496,6 +2966,67 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         Ok(n) if n > 0 => tracing::info!("Migration: re-keyed {n} legacy chat rows to a board"),
         Ok(_) => {}
         Err(e) => tracing::warn!("Migration: chat re-key failed: {e}"),
+    }
+
+    // ChangeList store (CYAN_CHANGELIST_STORE_AND_REVIEW_LOOP §Part 1): the durable,
+    // content-addressed per-asset change-list artifact the Frame.io review-&-conform
+    // loop operates on. Creates change_entry / change_version / change_branch /
+    // change_audit. Idempotent (CREATE TABLE IF NOT EXISTS); additive — no existing
+    // table or behavior changes.
+    if let Err(e) = crate::changelist::migrate(conn) {
+        tracing::warn!("Migration: changelist tables failed: {e}");
+    }
+
+    // Review-loop state machine (CYAN_REVIEW_LOOP_TRANSITION_CONTRACT): the per
+    // (tenant, asset, branch) review_state row (DRAFT..DELIVERED + round counter)
+    // the editable-proposal review loop advances. Creates `review_state`.
+    // Idempotent (CREATE TABLE IF NOT EXISTS); additive — no existing table or
+    // behavior changes.
+    if let Err(e) = crate::review_state::migrate(conn) {
+        tracing::warn!("Migration: review_state table failed: {e}");
+    }
+
+    // Batch-confirm gate (feat/notes-constitution): per-editor trust tiers over
+    // the changelist confirm surface. Creates `editor_trust`. Idempotent
+    // (CREATE TABLE IF NOT EXISTS); additive — no existing table or behavior
+    // changes.
+    if let Err(e) = crate::batch_confirm::migrate(conn) {
+        tracing::warn!("Migration: editor_trust table failed: {e}");
+    }
+
+    // Asset registry (CYAN_FORMAT_SPEC / CYAN_FORMAT_QA): one row per
+    // content-addressed media asset — kind/fps/duration (frame math), derivation
+    // edges (proxy/deliverable → {parent master, version}), and remote refs
+    // (e.g. the Frame.io file id a proxy was published as). Creates `asset`.
+    // Idempotent (CREATE TABLE IF NOT EXISTS); additive — no existing table or
+    // behavior changes.
+    if let Err(e) = crate::asset_registry::migrate(conn) {
+        tracing::warn!("Migration: asset registry table failed: {e}");
+    }
+
+    // Review-loop controller (CYAN_CHANGELIST_STORE_AND_REVIEW_LOOP §Part 2,
+    // engine delta #3): the per (board, asset) loop registration + the rounds-as-
+    // sequential-runs stamp table. Creates `review_loop` / `review_loop_run`.
+    // Idempotent (CREATE TABLE IF NOT EXISTS); additive — no existing table or
+    // behavior changes.
+    if let Err(e) = crate::review_loop::migrate(conn) {
+        tracing::warn!("Migration: review_loop tables failed: {e}");
+    }
+
+    // STAGE 4 ingest (AUTHORING_FIXES_ROUND2 §STAGE 4): watched sources
+    // (folder / s3 / frameio_c2c) + per-asset workflow runs. Creates
+    // `ingest_source` / `workflow_run`. Idempotent (CREATE TABLE IF NOT
+    // EXISTS); additive — no existing table or behavior changes.
+    if let Err(e) = crate::ingest::migrate(conn) {
+        tracing::warn!("Migration: ingest tables failed: {e}");
+    }
+
+    // Per-install / per-workflow plugin CONFIG (PLUGIN_CREDENTIAL_ONBOARDING
+    // §A): non-secret plugin targets (account_id/folder_id/…) scoped board →
+    // tenant, replacing the global env stopgap. Creates `plugin_config`.
+    // Idempotent (CREATE TABLE IF NOT EXISTS); additive.
+    if let Err(e) = crate::plugin_config::migrate(conn) {
+        tracing::warn!("Migration: plugin_config table failed: {e}");
     }
 
     Ok(())

@@ -342,6 +342,63 @@ fn autocomplete_index_query_returns_tools_artifacts_actions() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Run-output pollution (fix #3): `#` must reference stable AUTHORED artifacts —
+// persisted run results (timecode_note cells) and raw-JSON blobs must NEVER be
+// offered as step_output artifacts. Live, a run + Review turned the prior run's
+// probe error / upload result / comment JSON into `#` chips like
+// `contenttextfile_id…`.
+// ════════════════════════════════════════════════════════════════════════════
+#[test]
+fn autocomplete_index_excludes_run_result_cells() {
+    ensure_db();
+    let now = 1_700_000_100i64;
+    let (group, board) = ("wf-pollution-grp", "wf-pollution-board");
+    seed_board(group, board);
+
+    // A real authored step with output — MUST surface.
+    storage::cell_insert_simple(
+        &format!("{board}-s0"), board, "step", 0,
+        Some("Probe the master"), Some("duration=01:32:00"), false, None, None, now, now,
+    )
+    .expect("authored step with output");
+    // A persisted run RESULT (the executor's timecode_note cell): content is the
+    // serialized tool payload, metadata carries pipeline_step_id. MUST NOT surface.
+    storage::cell_insert_simple(
+        &format!("{board}-note"), board, "timecode_note", 1,
+        Some(r#"{"content":[{"text":"ok","file_id":"ba0b656a"}]}"#),
+        Some(r#"{"file_id":"ba0b656a","status":"uploaded"}"#),
+        false, None,
+        Some(r#"{"pipeline_step_id":"s4","pipeline_phase":"during"}"#),
+        now, now,
+    )
+    .expect("run-result note cell");
+    // A cell whose text IS raw JSON (a result blob that leaked into a step cell
+    // pre-fix). MUST NOT surface either — a JSON blob is not an authorable name.
+    storage::cell_insert_simple(
+        &format!("{board}-blob"), board, "step", 2,
+        Some(r#"{"error":{"error_class":"path_denied"}}"#), Some("x"),
+        false, None, None, now, now,
+    )
+    .expect("json-blob step cell");
+
+    let idx = workflow::autocomplete_index(board);
+    let outputs: Vec<&str> = idx
+        .artifacts
+        .iter()
+        .filter(|e| e.kind == "step_output")
+        .map(|e| e.label.as_str())
+        .collect();
+    assert!(
+        outputs.iter().any(|l| l.contains("Probe the master")),
+        "authored step output stays offered, got {outputs:?}"
+    );
+    assert!(
+        !outputs.iter().any(|l| l.contains("file_id") || l.trim_start().starts_with('{')),
+        "run results / JSON blobs must never be # artifacts, got {outputs:?}"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // S5 — compile MUST preserve executor="manual" (the human-approval gate).
 // The LLM/deterministic recompile (compile_via_llm) used to hardcode executor="lens",
 // dropping the manual gate so the package/human step EXECUTED forever instead of pausing.
@@ -356,12 +413,16 @@ async fn compile_preserves_manual_executor() {
 
     let lens_meta = r#"{"pipeline":{"step_id":"ingest","depends_on":[],"executor":"lens","model":"cyan-lens","timeout_seconds":300,"retry_count":1,"auto_advance":false,"notifications":[],"state":{"status":"pending","attempt":0}}}"#;
     let manual_meta = r#"{"pipeline":{"step_id":"package","depends_on":["ingest"],"executor":"manual","model":"cyan-lens","timeout_seconds":300,"retry_count":1,"auto_advance":false,"notifications":[],"state":{"status":"pending","attempt":0}}}"#;
+    // Authored as "step" (the ONLY authorable kind per W1). Using a legacy kind
+    // here would also race the legacy-migration test above: both share the
+    // process-global DB, and the global legacy sweep would migrate these rows,
+    // breaking that test's second-run-is-a-no-op assertion.
     storage::cell_insert_simple(
-        &format!("{board}-ingest"), board, "markdown", 0,
+        &format!("{board}-ingest"), board, "step", 0,
         Some("Ingest the master big-buck-bunny.mp4"), None, false, None, Some(lens_meta), now, now,
     ).expect("ingest cell");
     storage::cell_insert_simple(
-        &format!("{board}-package"), board, "markdown", 1,
+        &format!("{board}-package"), board, "step", 1,
         Some("Package: deliver big-buck-bunny.mp4 at -14 LUFS and write the sidecar"),
         None, false, None, Some(manual_meta), now, now,
     ).expect("package cell");
@@ -380,4 +441,128 @@ async fn compile_preserves_manual_executor() {
         meta["pipeline"]["executor"].as_str().unwrap_or("?")
     );
     println!("S5-PROOF package executor after compile = {}", meta["pipeline"]["executor"]);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// C1 — workflow autocomplete FILTER (the @/# / grammar the notebook editor drives).
+// `parse_trigger` extracts the trailing trigger+query; `filter_autocomplete` narrows
+// the tenant-scoped index to just that trigger's matches. This is the logic the new
+// `cyan_workflow_autocomplete` FFI wraps.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn parse_trigger_reads_the_trailing_trigger_and_query() {
+    use cyan_backend::workflow::parse_trigger;
+    assert_eq!(parse_trigger("probe @sl"), Some(('@', "sl".to_string())));
+    assert_eq!(parse_trigger("use the #mas"), Some(('#', "mas".to_string())));
+    assert_eq!(parse_trigger("/ru"), Some(('/', "ru".to_string())));
+    // trigger with no query yet → list-all for that trigger
+    assert_eq!(parse_trigger("bind @"), Some(('@', String::new())));
+    // no active trigger at the cursor
+    assert_eq!(parse_trigger("just plain text"), None);
+    // an email-ish token is not an active @-completion (trigger not at token start)
+    assert_eq!(parse_trigger("me@host"), None);
+}
+
+#[test]
+fn filter_autocomplete_narrows_to_the_active_trigger() {
+    ensure_db();
+    let now = 1_700_000_000i64;
+    let (group, board) = ("wf-flt-grp", "wf-flt-board");
+    seed_board(group, board);
+
+    // Installed plugins in the Plugins workspace.
+    let plugins_ws = format!("{group}-plugins");
+    storage::workspace_insert_simple(&plugins_ws, group, "Plugins").expect("plugins ws");
+    for (id, name) in [("flt-slack", "slack.cyanplugin"), ("flt-media", "cyan-media.cyanplugin")] {
+        storage::file_insert(id, Some(group), Some(&plugins_ws), None, name, id, 10, "peer", now)
+            .expect("plugin file");
+        storage::file_set_local_path(id, &format!("/tmp/{name}")).expect("local path");
+    }
+    // A board artifact file.
+    storage::file_insert(
+        "flt-file", Some(group), Some(&format!("{group}-ws")), Some(board),
+        "master.mov", "flt-file", 99, "peer", now,
+    ).expect("artifact file");
+
+    use cyan_backend::workflow::filter_autocomplete;
+
+    // '@sl' → only the slack plugin, no artifacts/actions.
+    let at = filter_autocomplete(board, "probe @sl");
+    assert!(at.plugins.iter().any(|e| e.value.contains("slack")), "slack matched under @sl");
+    assert!(at.plugins.iter().all(|e| !e.value.contains("cyan-media")), "cyan-media filtered out by 'sl'");
+    assert!(at.artifacts.is_empty() && at.actions.is_empty(), "an @ trigger shows only plugins");
+
+    // '#' (empty query) → all artifacts, no plugins/actions.
+    let hash = filter_autocomplete(board, "use #");
+    assert!(hash.artifacts.iter().any(|e| e.label.contains("master.mov")), "artifact under #");
+    assert!(hash.plugins.is_empty() && hash.actions.is_empty(), "a # trigger shows only artifacts");
+
+    // '/ru' → the 'run' action, no plugins/artifacts.
+    let slash = filter_autocomplete(board, "/ru");
+    assert!(slash.actions.iter().any(|e| e.value == "run"), "run action under /ru");
+    assert!(slash.plugins.is_empty() && slash.artifacts.is_empty(), "a / trigger shows only actions");
+
+    // No active trigger → the full index (all three lists present).
+    let full = filter_autocomplete(board, "plain step text");
+    assert!(!full.plugins.is_empty() && !full.actions.is_empty(), "no-trigger returns the full index");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// C2 — plugin bundle install (the receiver half). `storage::install_plugin_bundle`
+// writes the bundle + inserts the objects row so `plugin_bundles_in_group` +
+// `autocomplete_index` find it under `@`; a re-install replaces, never duplicates.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn install_plugin_bundle_is_discoverable_and_idempotent() {
+    ensure_db();
+    // Isolate the on-disk bundle dir so the test never touches a real ~/.cyan/plugins.
+    let dir = tempfile::tempdir().expect("tmp plugins dir");
+    unsafe { std::env::set_var("CYAN_PLUGINS_ROOT", dir.path()); }
+
+    let (group, board) = ("wf-inst-grp", "wf-inst-board");
+    seed_board(group, board);
+
+    let bytes_v1 = b"cyanplugin-tar-bytes-v1";
+    let id1 = storage::install_plugin_bundle(group, "acme-tool", bytes_v1).expect("install v1");
+
+    // Discoverable via the registry read the MCP host + autocomplete both use.
+    let bundles = storage::plugin_bundles_in_group(
+        group,
+        cyan_backend::mcp_host::PLUGINS_WORKSPACE_NAME,
+        cyan_backend::mcp_host::PLUGIN_BUNDLE_SUFFIX,
+    )
+    .expect("list bundles");
+    assert!(
+        bundles.iter().any(|b| b.name == "acme-tool.cyanplugin"),
+        "installed bundle appears in plugin_bundles_in_group"
+    );
+    // Bytes landed on disk at the reader's path.
+    let installed = bundles.iter().find(|b| b.name == "acme-tool.cyanplugin").expect("bundle row");
+    assert_eq!(std::fs::read(&installed.local_path).expect("read bundle"), bytes_v1);
+
+    // Surfaces under @ in the board's autocomplete index.
+    let idx = workflow::autocomplete_index(board);
+    assert!(
+        idx.plugins.iter().any(|e| e.value == "acme-tool"),
+        "installed plugin surfaces under @ in autocomplete_index"
+    );
+
+    // Re-install with new bytes REPLACES (same file id, overwritten bytes, no dup row).
+    let bytes_v2 = b"cyanplugin-tar-bytes-v2-updated";
+    let id2 = storage::install_plugin_bundle(group, "acme-tool", bytes_v2).expect("install v2");
+    assert_eq!(id1, id2, "deterministic id ⇒ re-install replaces");
+    let bundles2 = storage::plugin_bundles_in_group(
+        group,
+        cyan_backend::mcp_host::PLUGINS_WORKSPACE_NAME,
+        cyan_backend::mcp_host::PLUGIN_BUNDLE_SUFFIX,
+    )
+    .expect("list bundles v2");
+    let count = bundles2.iter().filter(|b| b.name == "acme-tool.cyanplugin").count();
+    assert_eq!(count, 1, "re-install must not duplicate the bundle row");
+    let installed2 = bundles2.iter().find(|b| b.name == "acme-tool.cyanplugin").expect("bundle row v2");
+    assert_eq!(std::fs::read(&installed2.local_path).expect("read v2"), bytes_v2);
+
+    unsafe { std::env::remove_var("CYAN_PLUGINS_ROOT"); }
 }

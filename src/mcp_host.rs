@@ -239,6 +239,27 @@ impl PluginHost {
             .initialize()
             .map_err(|e| anyhow!("mcp initialize {}: {e}", step.plugin_id))?;
 
+        // THE ADVERTISED-vs-REGISTERED CONTRACT (mcp_tool_test.rs): the bound
+        // tool must be one the plugin PROCESS actually registers. A stale or
+        // mis-curated bundle can advertise a tool (e.g. the raw
+        // `post_…_files_local_upload` twin) the process never registers — that
+        // died as a bare "Unknown tool" mid-run (live 2026-07-09). Reconcile at
+        // spawn time and refuse LOUDLY, naming both sides, before any
+        // tools/call fires.
+        let registered = client
+            .list_tool_names()
+            .map_err(|e| anyhow!("mcp tools/list {}: {e}", step.plugin_id))?;
+        if !registered.iter().any(|n| n == &step.tool) {
+            return Err(anyhow!(
+                "plugin '{}' contract violation: the installed manifest advertises tool '{}' \
+                 but the plugin process registers [{}] — the bundle is stale or mis-curated; \
+                 reinstall the plugin (or pin an exact registered tool name)",
+                step.plugin_id,
+                step.tool,
+                registered.join(", ")
+            ));
+        }
+
         let start = self.clock.now();
         let result = client
             .call_tool(&step.tool, step.args.clone())
@@ -264,6 +285,173 @@ impl PluginHost {
             cost_usd,
         }))
     }
+}
+
+/// The env var a manifest credential resolves from, by convention (kept
+/// IDENTICAL to the lens host so a bundle behaves the same on device and
+/// cloud): `<PLUGIN>_<PROVIDER-LAST-SEGMENT>_TOKEN`, uppercased. The frameio
+/// manifest's `oauth2`/`adobe_ims` credential resolves `FRAMEIO_IMS_TOKEN`.
+pub fn cred_env_var(plugin_name: &str, provider: &str) -> String {
+    let segment = provider.rsplit(['_', '-']).next().unwrap_or(provider);
+    format!("{}_{}_TOKEN", env_token(plugin_name), env_token(segment))
+}
+
+/// Uppercase + squash non-alphanumerics to `_` (env-var-safe).
+pub(crate) fn env_token(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Build the `SpawnConfig` for an unpacked bundle dir: the manifest's declared
+/// runtime picks the launch command (a forge `python-uv` bundle ships
+/// `src/plugin.py` + `uv.lock`, so `uv run` inside the bundle dir is the whole
+/// launch — same recipe as the lens host), and its declared credentials resolve
+/// from the DEVICE process env at spawn ("inject at plugin spawn" — the value
+/// never lives in the bundle). A missing credential refuses the spawn with a
+/// clear error, never a half-started process. A bundle with a legacy `run`
+/// entrypoint keeps working.
+pub fn bundle_spawn_config(
+    plugin_id: &str,
+    bundle_dir: &Path,
+    tenant_id: &str,
+) -> anyhow::Result<cyan_mcp::SpawnConfig> {
+    let manifest = cyan_mcp::Manifest::from_bundle(bundle_dir)
+        .map_err(|e| anyhow!("bundle manifest {}: {e}", bundle_dir.display()))?;
+
+    let mut creds = vec![
+        (
+            "CYAN_TENANT_ID".to_string(),
+            cyan_mcp::SecretString::new(tenant_id.to_string()),
+        ),
+        // The plugin must confine paths to the SAME root the host stages
+        // attachments into (media_staging). Injected explicitly so a plugin
+        // never falls back to its own cwd-relative default when the app
+        // process env lacks CYAN_MEDIA_ROOT — that mismatch is unfixable
+        // from inside the plugin. (Not a secret; rides the env-inject rail.)
+        (
+            "CYAN_MEDIA_ROOT".to_string(),
+            cyan_mcp::SecretString::new(
+                crate::media_staging::effective_media_root()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ),
+    ];
+    for c in manifest
+        .credentials
+        .iter()
+        .chain(manifest.extra_credentials.iter())
+    {
+        let env_var = cred_env_var(&manifest.name, &c.provider);
+        let val = resolve_credential(&manifest.name, &c.provider, tenant_id, &env_var)
+            .ok_or_else(|| {
+                anyhow!(
+                    "plugin '{plugin_id}' requires credential '{env_var}' and none is available \
+                     (vault key '{}', cred file {}, process env all empty): spawn refused",
+                    crate::device_vault::plugin_cred_key(&manifest.name, &c.provider, tenant_id),
+                    cred_env_file().display(),
+                )
+            })?;
+        creds.push((env_var, val));
+    }
+
+    let run_entry = bundle_dir.join("run");
+    let (command, args) = match manifest.runtime.as_deref() {
+        Some("python-uv") => (
+            "uv".to_string(),
+            vec![
+                "run".to_string(),
+                "--directory".to_string(),
+                bundle_dir.to_string_lossy().into_owned(),
+                "src/plugin.py".to_string(),
+            ],
+        ),
+        _ if run_entry.is_file() => (run_entry.to_string_lossy().into_owned(), vec![]),
+        other => {
+            return Err(anyhow!(
+                "plugin '{plugin_id}' declares runtime {other:?}, which the device host cannot spawn (supported: python-uv, or a bundled `run` entrypoint)"
+            ))
+        }
+    };
+
+    Ok(cyan_mcp::SpawnConfig {
+        plugin_id: plugin_id.to_string(),
+        command,
+        args,
+        creds,
+    })
+}
+
+/// Resolve one declared plugin credential FRESH at spawn time
+/// (PLUGIN_CREDENTIAL_ONBOARDING §C), most-authoritative first:
+///
+/// 1. the device PLUGIN VAULT (`plugin_cred_key(plugin, provider, tenant)`) —
+///    the real per-install custody once connect-time capture writes it;
+/// 2. the credential dotenv file (`CYAN_CRED_ENV_FILE`, default
+///    `~/.frameio.env`) read FRESH — the auto-refreshing loader rewrites that
+///    file hourly, and re-reading per spawn (instead of trusting the app
+///    process env, a launch-time SNAPSHOT) is what fixes the 401-mid-session
+///    bug without touching any plugin;
+/// 3. the process env — the demo stopgap, last.
+fn resolve_credential(
+    plugin: &str,
+    provider: &str,
+    tenant_id: &str,
+    env_var: &str,
+) -> Option<cyan_mcp::SecretString> {
+    let key = crate::device_vault::plugin_cred_key(plugin, provider, tenant_id);
+    if let Ok(Some(secret)) = crate::device_vault::plugin_cred_vault().load(&key) {
+        use secrecy::ExposeSecret;
+        return Some(cyan_mcp::SecretString::new(secret.expose_secret().to_string()));
+    }
+    if let Some(v) = dotenv_lookup(&cred_env_file(), env_var) {
+        return Some(cyan_mcp::SecretString::new(v));
+    }
+    std::env::var(env_var)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(cyan_mcp::SecretString::new)
+}
+
+/// The credential dotenv file consulted at spawn (fresh read). Overridable for
+/// tests/deploys via `CYAN_CRED_ENV_FILE`; defaults to the auto-refreshed
+/// `~/.frameio.env` the demo loader maintains.
+pub(crate) fn cred_env_file() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("CYAN_CRED_ENV_FILE")
+        && !p.trim().is_empty()
+    {
+        return std::path::PathBuf::from(p.trim());
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    std::path::Path::new(&home).join(".frameio.env")
+}
+
+/// Minimal dotenv lookup: `KEY=VALUE` lines, tolerating a leading `export `,
+/// surrounding quotes, and comment/blank lines. Returns the LAST match (the
+/// refresher appends/rewrites; last write wins).
+pub(crate) fn dotenv_lookup(path: &std::path::Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        if let Some((k, v)) = line.split_once('=')
+            && k.trim() == key
+        {
+            let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
+            if !v.is_empty() {
+                found = Some(v.to_string());
+            }
+        }
+    }
+    found
 }
 
 /// Side effect that requires the human-approval gate before a tool runs.

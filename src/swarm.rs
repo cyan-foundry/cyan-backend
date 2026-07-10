@@ -22,6 +22,7 @@
 // behavior-preserving: the gossip/file/dm/snapshot paths are untouched.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +30,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use iroh::{Endpoint, PublicKey};
-use iroh_blobs::store::mem::MemStore;
+use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::BlobsProtocol;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -72,7 +73,7 @@ pub enum SwarmMessage {
 /// core (holder registry + message handling) and a multi-source fetcher. One symmetric type — a node
 /// can both serve held blobs and fetch missing ones.
 pub struct BlobSwarm {
-    store: MemStore,
+    store: FsStore,
     endpoint: Endpoint,
     node_id: String,
     /// hash (hex) -> set of node_ids that announced they hold it.
@@ -81,15 +82,22 @@ pub struct BlobSwarm {
 
 impl BlobSwarm {
     /// Build a blob swarm bound to `endpoint` (whose advertised ALPNs must include [`BLOB_ALPN`]).
-    /// Builds the in-memory content-addressed store; the caller mounts [`BlobSwarm::blobs_protocol`]
-    /// on its `Router` so this node serves held blobs.
-    pub fn new(endpoint: Endpoint, node_id: String) -> Self {
-        Self {
-            store: MemStore::new(),
+    /// The content-addressed store is FS-BACKED under `store_root` (RAM-flat, dailies-grade:
+    /// fetched chunks land on disk as they arrive and verified ranges persist across restarts —
+    /// never a whole blob in memory). Callers pass a per-node root (e.g. `<data>/blobs/<node>`)
+    /// so in-process multi-node tests keep honest per-node stores. The caller mounts
+    /// [`BlobSwarm::blobs_protocol`] on its `Router` so this node serves held blobs.
+    pub async fn new(endpoint: Endpoint, node_id: String, store_root: &Path) -> Result<Self> {
+        tokio::fs::create_dir_all(store_root).await?;
+        let store = FsStore::load(store_root)
+            .await
+            .map_err(|e| anyhow!("blob store at {} failed to load: {e}", store_root.display()))?;
+        Ok(Self {
+            store,
             endpoint,
             node_id,
             holders: Arc::new(RwLock::new(HashMap::new())),
-        }
+        })
     }
 
     /// The blobs protocol over this swarm's store, for the caller to `.accept(BLOB_ALPN, ..)` on its
@@ -210,6 +218,46 @@ impl BlobSwarm {
     /// On completion we recompute the Blake3 hash of the assembled bytes and reject any mismatch
     /// (defence-in-depth on top of verified streaming) before surfacing the blob.
     pub async fn fetch(&self, hash: &Hash, holders: &[String]) -> Result<Bytes> {
+        self.fetch_into_store(hash, holders).await?;
+
+        // Integrity gate: surface the blob only if the assembled content's Blake3 hash matches.
+        // This materializes the blob — use [`BlobSwarm::fetch_to_path`] for large media.
+        let bytes = self.get(hash).await?;
+        let computed = Hash::new(&bytes);
+        if &computed != hash {
+            return Err(anyhow!(
+                "integrity check failed: fetched content hashes to {computed}, expected {hash}"
+            ));
+        }
+        Ok(bytes)
+    }
+
+    /// RAM-flat fetch for LARGE media: fetch into the fs-backed store (verified chunks land on
+    /// disk as they arrive and persist, so this resumes across holder churn AND process restarts),
+    /// then export file-to-file to `dest` and stream-verify the exported file's Blake3 in bounded
+    /// buffers. No step holds the whole blob in memory. Returns the byte length.
+    pub async fn fetch_to_path(&self, hash: &Hash, holders: &[String], dest: &Path) -> Result<u64> {
+        self.fetch_into_store(hash, holders).await?;
+        let size = self
+            .store
+            .blobs()
+            .export(*hash, dest)
+            .await
+            .map_err(|e| anyhow!("blob export to {} failed: {e}", dest.display()))?;
+
+        // Integrity gate, RAM-flat: stream the exported file back through Blake3.
+        let computed = hash_file_streaming(dest).await?;
+        if &computed != hash {
+            return Err(anyhow!(
+                "integrity check failed: exported file hashes to {computed}, expected {hash}"
+            ));
+        }
+        Ok(size)
+    }
+
+    /// The multi-source transfer core shared by [`BlobSwarm::fetch`]/[`BlobSwarm::fetch_to_path`]:
+    /// try each holder in turn until the store holds the complete blob.
+    async fn fetch_into_store(&self, hash: &Hash, holders: &[String]) -> Result<()> {
         if holders.is_empty() {
             return Err(anyhow!("cannot fetch {hash}: no holders provided"));
         }
@@ -260,15 +308,24 @@ impl BlobSwarm {
                 last_err.unwrap_or_else(|| anyhow!("no holder in the set could serve {hash}"))
             );
         }
-
-        // Integrity gate: surface the blob only if the assembled content's Blake3 hash matches.
-        let bytes = self.get(hash).await?;
-        let computed = Hash::new(&bytes);
-        if &computed != hash {
-            return Err(anyhow!(
-                "integrity check failed: fetched content hashes to {computed}, expected {hash}"
-            ));
-        }
-        Ok(bytes)
+        Ok(())
     }
+}
+
+/// Blake3 of a file's contents streamed in bounded buffers (1 MiB) — the RAM-flat
+/// integrity check shared by the swarm export path and callers that must never
+/// materialize a whole file (dailies-grade media).
+pub async fn hash_file_streaming(path: &Path) -> Result<Hash> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(Hash::from(hasher.finalize()))
 }

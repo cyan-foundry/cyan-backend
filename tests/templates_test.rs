@@ -93,13 +93,14 @@ fn seed_templates_present() {
         templates::SEED_TRANSCODE_DELIVER_NAME,
         templates::SEED_TRANSCRIBE_QC_NAME,
         templates::SEED_CONFORM_APPROVE_MASTER_NAME,
+        templates::SEED_FRAMEIO_REVIEW_LOOP_NAME,
     ] {
         assert!(names.contains(&want), "seed template '{want}' must be present, got {names:?}");
     }
 
     // Every seed is flagged built-in and carries at least one pre-written step.
     let seeds: Vec<_> = list.iter().filter(|t| t.source == templates::SOURCE_BUILTIN).collect();
-    assert_eq!(seeds.len(), 3, "exactly three built-in seed templates");
+    assert_eq!(seeds.len(), 4, "exactly four built-in seed templates");
     for s in &seeds {
         assert!(!s.steps.is_empty(), "seed '{}' has pre-written steps", s.name);
     }

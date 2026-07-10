@@ -415,6 +415,26 @@ fn step_stage(config: &PipelineStepConfig) -> String {
 /// drives the lens ReAct at RUN time; this only materializes the DAG so Compile is
 /// instant and reliable (never "0 steps"). Returns the pipeline stage and, when a
 /// media verb is recognized, the cyan-media tool the step should bind to.
+/// Authored-executor convention (REVIEW_LOOP_ONE_BOARD Stage 3): placeholder /
+/// manual steps and the await-sense park are HUMAN gates; everything else
+/// defaults to the lens (creative) unless a deterministic bind claims it.
+fn infer_executor(content: &str) -> String {
+    let c = content.to_lowercase();
+    if c.contains("placeholder") || c.starts_with("manual:") || c.contains("(manual)")
+        || is_await_sense(content)
+    {
+        "manual".to_string()
+    } else {
+        "lens".to_string()
+    }
+}
+
+/// The await-sense park marker: "await … note(s)/review/feedback".
+fn is_await_sense(content: &str) -> bool {
+    let c = content.to_lowercase();
+    c.contains("await") && (c.contains("note") || c.contains("review") || c.contains("feedback"))
+}
+
 fn infer_step(content: &str) -> (String, Option<String>) {
     let c = content.to_lowercase();
     let has = |kws: &[&str]| kws.iter().any(|k| c.contains(k));
@@ -664,8 +684,8 @@ pub async fn run_pipeline_with_plan(
     // step-through (it grows, never resets). Already-run steps are skipped/paused-at by
     // the executor, so this is counted exactly ONCE (no double-charge).
     for (cell, config) in &steps {
-        if matches!(config.state.status.as_str(), "human_approved" | "ai_complete" | "skipped" | "done") {
-            if let Some(dur) = config.state.duration {
+        if matches!(config.state.status.as_str(), "human_approved" | "ai_complete" | "skipped" | "done")
+            && let Some(dur) = config.state.duration {
                 let gpu_ms = (dur * 1000.0) as u64;
                 acc.obs.record(StepObs {
                     step_id: config.step_id.clone(),
@@ -680,7 +700,6 @@ pub async fn run_pipeline_with_plan(
                 });
                 acc.processed += 1;
             }
-        }
     }
 
     let (mode, peak) = match plan {
@@ -1259,11 +1278,16 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
         return Err(anyhow!("No cells found in board"));
     }
 
-    // Filter out cells that are just URLs (asset references)
+    // Filter out cells that are just URLs (asset references), and — defense in depth
+    // for boards an old build already polluted — cells whose content IS a raw result
+    // blob: those are run output, never an authored step, and materializing one mints
+    // a garbage `rawcontent…` step id from the serialized JSON (authored_ledger_test).
     let step_cells: Vec<_> = cells.iter()
         .filter(|c| {
             let trimmed = c.content.trim();
-            !trimmed.starts_with("http://") && !trimmed.starts_with("https://") && !trimmed.is_empty()
+            !trimmed.starts_with("http://") && !trimmed.starts_with("https://")
+                && !trimmed.is_empty()
+                && !is_run_result_blob(trimmed)
         })
         .collect();
 
@@ -1302,14 +1326,31 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
         // S5 — PRESERVE the authored executor (esp. "manual", the human-approval gate) so a
         // Run/recompile never drops it to "lens" (which made the package/human step EXECUTE
         // forever instead of pausing as a gate). A cell with a bound config keeps its
-        // executor; a brand-new/unconfigured cell defaults to "lens". Stable across recompiles
-        // because compile writes this executor back into the cell's pipeline config below.
+        // executor; a brand-new/unconfigured cell defaults by AUTHORED CONVENTION
+        // (REVIEW_LOOP_ONE_BOARD Stage 3): a step that says "placeholder" /
+        // "manual:" / "(manual)" is a HUMAN step (the Pro Tools / Resolve "done"
+        // placeholders — parked for Complete, never dispatched anywhere), and an
+        // "await … notes/review" step is the AWAIT-SENSE PARK (a human-shaped
+        // gate the app auto-approves when the reviewer's note is SENSED).
         let executor = cell
             .pipeline_config
             .as_ref()
             .map(|c| c.executor.clone())
             .filter(|e| !e.is_empty())
-            .unwrap_or_else(|| "lens".to_string());
+            .unwrap_or_else(|| infer_executor(&cell.content));
+
+        // Rung-1 DETERMINISTIC BIND runs FIRST so the step's config carries the
+        // TRUTH of where it executes. `command` is the authoring surface's
+        // route label — for a bound step it must read `@plugin.tool`, never the
+        // "cyan-lens" placeholder (found live: every bound step displayed
+        // "unbound + send to AI (Lens)" because the view only had the
+        // placeholder to render).
+        let bind_outcome = crate::workflow_bind::bind_step(board_id, &cell.content);
+        let bound_command = match &bind_outcome {
+            crate::workflow_bind::BindOutcome::Bound(b) =>
+                Some(format!("@{}.{}", b.plugin_id, b.tool)),
+            _ => None,
+        };
 
         let config = PipelineStepConfig {
             step_id: step_id.clone(),
@@ -1320,7 +1361,7 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
             model_config: None,
             tools: media_tool.iter().cloned().collect(),
             output_format: "markdown".to_string(),
-            command: None,
+            command: bound_command,
             timeout_seconds: Some(300),
             retry_count: Some(1),
             auto_advance: false,
@@ -1334,8 +1375,42 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or(json!({}));
         metadata["pipeline"] = serde_json::to_value(&config)?;
+        if is_await_sense(&cell.content) {
+            // The AWAIT-SENSE PARK marker: the app's live loop senses Frame.io
+            // notes while this gate is open and fires the SAME approve/resume
+            // machinery when one lands — the loop is one continuous pass.
+            metadata["await_sense"] = json!(true);
+        }
         if let Some(tool) = &media_tool {
             metadata["mcp_tool"] = json!({ "plugin_id": "cyan-media", "tool": tool });
+        }
+        // Rung-1 DETERMINISTIC BIND (the load-bearing fix): an `@plugin.tool`
+        // step whose required args resolve from inline `key=value` + `#file`
+        // references binds at Review time — the run path dispatches it
+        // through the LOCAL cyan-mcp host with zero LLM turns, so the
+        // mechanical spine never needs the GPU. A miss is stamped for
+        // authoring feedback and the step stays on the lens path (creative).
+        match bind_outcome {
+            crate::workflow_bind::BindOutcome::Bound(b) => {
+                metadata["mcp_tool"] = json!({
+                    "plugin_id": b.plugin_id,
+                    "tool": b.tool,
+                    "args": b.args,
+                    "side_effects": b.side_effects,
+                    // Required props not resolvable at Review: the dispatch fills
+                    // them from UPSTREAM step outputs by key (e.g. list_comments'
+                    // file_id from the upload step's result) — still zero-LLM.
+                    "pending": b.pending,
+                    "bound": true,
+                });
+                if let Some(m) = metadata.as_object_mut() {
+                    m.remove("mcp_tool_miss");
+                }
+            }
+            crate::workflow_bind::BindOutcome::Miss { mention, reason } => {
+                metadata["mcp_tool_miss"] = json!({ "mention": mention, "reason": reason });
+            }
+            crate::workflow_bind::BindOutcome::None => {}
         }
 
         let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
@@ -1418,11 +1493,10 @@ pub fn pipeline_status(board_id: &str) -> Result<serde_json::Value> {
                 _ => pending += 1,
             }
             // The run-id stamped on any step that has run (the active run).
-            if run_id.is_none() {
-                if let Some(rid) = config.state.run_id.as_ref().filter(|s| !s.is_empty()) {
+            if run_id.is_none()
+                && let Some(rid) = config.state.run_id.as_ref().filter(|s| !s.is_empty()) {
                     run_id = Some(rid.clone());
                 }
-            }
             // The first step awaiting approval (the current gate) — drives the UI.
             if awaiting_step.is_none() && config.state.status == "ai_complete" {
                 awaiting_step = Some(config.step_id.clone());
@@ -1729,7 +1803,9 @@ pub fn reset_pipeline(
 
     // Reset each step
     for cell in &cells {
-        if cell.pipeline_config.is_none() { continue; }
+        // RECOVERY runs on EVERY authored-kind cell (before the config guard — a
+        // scrambled cell's metadata may not even parse as a config any more).
+        if cell.pipeline_config.is_none() && !is_run_result_blob(&cell.content) { continue; }
 
         let (content, cell_order, current_metadata_json): (String, i32, Option<String>) = conn.query_row(
             "SELECT content, cell_order, metadata_json FROM notebook_cells WHERE id = ?1",
@@ -1744,6 +1820,27 @@ pub fn reset_pipeline(
         let mut metadata: serde_json::Value = current_metadata_json.as_ref()
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or(json!({}));
+
+        // RECOVERY (authored_ledger_test): a cell whose content is a raw result blob
+        // is run output an OLD build wrote into the authored ledger — Reset restores
+        // the clean authored set by ARCHIVING it (kept, reversible, no data loss),
+        // exactly like the §W1 migration parks non-authorable kinds.
+        if is_run_result_blob(&content) {
+            metadata["original_cell_type"] = json!("step");
+            metadata["archived_reason"] = json!("run_result_pollution");
+            let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
+                id: cell.cell_id.clone(),
+                board_id: board_id.to_string(),
+                cell_type: "archived".to_string(),
+                cell_order,
+                content: Some(content),
+                output: None,
+                collapsed: false,
+                height: None,
+                metadata_json: Some(metadata.to_string()),
+            });
+            continue;
+        }
 
         metadata["pipeline"]["state"]["status"] = json!("pending");
         metadata["pipeline"]["state"]["error"] = json!(null);
@@ -1917,11 +2014,17 @@ fn gather_dependency_outputs(board_id: &str, depends_on: &[String]) -> Vec<serde
 fn load_pipeline_cells(board_id: &str) -> Result<Vec<PipelineCell>> {
     let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
 
-    // Archived cells (legacy non-text kinds collapsed by the §W1 migration) are kept
-    // for no-data-loss but are NOT authorable steps — exclude them from the plan.
+    // THE AUTHORED-LEDGER READ (authored_ledger_test.rs): every pipeline verb —
+    // compile, run, approve, reset, export — operates on the AUTHORED cells only,
+    // selected by an explicit kind WHITELIST. Run outputs live in system-kind cells
+    // (`timecode_note`) on the same board; a blacklist here is how a run's result
+    // JSON got swept into the plan, rewritten as a step, and destroyed the authored
+    // workflow (SEV-HIGH, 2026-07-09). `step` is the one authorable kind (§W1);
+    // `markdown` is grandfathered for pre-migration rows.
     let mut stmt = conn.prepare(
         "SELECT id, board_id, cell_order, content, metadata_json \
-         FROM notebook_cells WHERE board_id = ?1 AND cell_type != 'archived' ORDER BY cell_order"
+         FROM notebook_cells WHERE board_id = ?1 AND cell_type IN ('step','markdown') \
+         ORDER BY cell_order"
     )?;
 
     let cells = stmt.query_map(rusqlite::params![board_id], |row| {
@@ -1976,9 +2079,31 @@ fn update_step_state_full(
     duration: Option<f64>,
     command_tx: &UnboundedSender<CommandMsg>,
 ) -> Result<()> {
-    // CRITICAL: Re-read cell from DB to get latest metadata (avoids race condition)
-    let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
+    let cmd = {
+        // CRITICAL: Re-read cell from DB to get latest metadata (avoids race condition)
+        let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
+        update_step_state_full_on(&conn, board_id, cell_id, status, ai_result, error, run_id, duration)?
+    }; // Release lock before sending command
+    let _ = command_tx.send(cmd);
+    Ok(())
+}
 
+/// Conn-explicit core of `update_step_state_full` — the review-loop CONFIRM
+/// interlock calls this on a connection it already holds (`approve_review_gate_steps`).
+/// Reads the cell's latest metadata, folds the new step state in, persists it
+/// SYNCHRONOUSLY on `conn`, and returns the `UpdateNotebookCell` command for the
+/// caller to gossip AFTER its lock is released (sync-before-gossip).
+#[allow(clippy::too_many_arguments)]
+fn update_step_state_full_on(
+    conn: &rusqlite::Connection,
+    board_id: &str,
+    cell_id: &str,
+    status: &str,
+    ai_result: Option<&str>,
+    error: Option<&str>,
+    run_id: &str,
+    duration: Option<f64>,
+) -> Result<CommandMsg> {
     let (content, cell_order, current_metadata_json): (String, i32, Option<String>) = conn.query_row(
         "SELECT content, cell_order, metadata_json FROM notebook_cells WHERE id = ?1",
         rusqlite::params![cell_id],
@@ -1988,8 +2113,6 @@ fn update_step_state_full(
             row.get(2)?,
         )),
     ).map_err(|e| anyhow!("Cell not found: {}", e))?;
-
-    drop(conn); // Release lock before sending command
 
     let mut metadata: serde_json::Value = current_metadata_json.as_ref()
         .and_then(|s| serde_json::from_str(s).ok())
@@ -2015,23 +2138,28 @@ fn update_step_state_full(
     }
 
     // SYNCHRONOUS persist (N/L/M): write the new state to storage NOW so the resume-run
-    // and the Dashboard reconstruct read the latest status immediately (the command_tx
-    // path below still gossips it to peers). Without this, a resume raced the async
+    // and the Dashboard reconstruct read the latest status immediately (the returned
+    // command still gossips it to peers). Without this, a resume raced the async
     // command and re-paused at the just-finished step, and reconstruct showed stale cost.
-    let _ = storage::cell_update(&crate::models::dto::NotebookCellDTO {
-        id: cell_id.to_string(),
-        board_id: board_id.to_string(),
-        cell_type: "markdown".to_string(),
-        cell_order,
-        content: Some(content.clone()),
-        output: ai_result.map(|s| s.to_string()),
-        collapsed: false,
-        height: None,
-        metadata_json: Some(metadata.to_string()),
-        created_at: now,
-        updated_at: now,
-    });
-    let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
+    let _ = conn.execute(
+        "UPDATE notebook_cells SET cell_type=?2, cell_order=?3, content=?4, output=?5, \
+            collapsed=?6, height=?7, metadata_json=?8, updated_at=?9 WHERE id=?1",
+        rusqlite::params![
+            cell_id,
+            "markdown",
+            cell_order,
+            Some(content.clone()),
+            ai_result,
+            0i32,
+            Option::<f64>::None,
+            metadata.to_string(),
+            now,
+        ],
+    );
+
+    tracing::info!("📝 Pipeline step {} → {} (metadata: {}B)", cell_id.get(..8).unwrap_or(cell_id), status, metadata.to_string().len());
+
+    Ok(CommandMsg::UpdateNotebookCell {
         id: cell_id.to_string(),
         board_id: board_id.to_string(),
         cell_type: "markdown".to_string(),
@@ -2041,11 +2169,73 @@ fn update_step_state_full(
         collapsed: false,
         height: None,
         metadata_json: Some(metadata.to_string()),
-    });
+    })
+}
 
-    tracing::info!("📝 Pipeline step {} → {} (metadata: {}B)", cell_id.get(..8).unwrap_or(cell_id), status, metadata.to_string().len());
+/// CONFIRM-step ↔ review-loop interlock (CYAN_FORMAT_QA gap 6). When the review
+/// machine advances NOTES_IN → CONFORMING (every proposal resolved through the
+/// human confirm gate), the tenant's parked manual CONFIRM steps — cells marked
+/// with a top-level `"review_gate": true` in `metadata_json` — flip to
+/// `human_approved`: the workflow was parked on the SAME human decision the review
+/// gate just recorded, so it un-parks without a second approval tap.
+///
+/// Writes through the `update_step_state_full` core on the CALLER's connection
+/// (synchronous persist first), then gossips via `queue_command`
+/// (sync-before-gossip; a no-op without a running system). Only parked steps move:
+/// already-approved, skipped, or failed (explicitly rejected) gates are left
+/// alone. A DB without the workflow tables (bare ledger-only stores) has zero
+/// boards — never an error.
+pub fn approve_review_gate_steps(conn: &rusqlite::Connection, tenant_id: &str) -> Result<usize> {
+    let Ok(mut board_stmt) = conn.prepare(
+        "SELECT id FROM objects WHERE type='whiteboard' AND (group_id=?1 \
+            OR workspace_id IN (SELECT id FROM workspaces WHERE group_id=?1))",
+    ) else {
+        return Ok(0); // no workflow tables on this DB
+    };
+    let board_ids: Vec<String> = board_stmt
+        .query_map(rusqlite::params![tenant_id], |r| r.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(board_stmt);
 
-    Ok(())
+    let mut approved = 0usize;
+    for board_id in &board_ids {
+        let mut cell_stmt = conn.prepare(
+            "SELECT id, metadata_json FROM notebook_cells \
+             WHERE board_id=?1 AND cell_type != 'archived'",
+        )?;
+        let cells: Vec<(String, Option<String>)> = cell_stmt
+            .query_map(rusqlite::params![board_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(cell_stmt);
+
+        for (cell_id, meta_json) in cells {
+            let Some(meta) = meta_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            else {
+                continue;
+            };
+            if meta.get("review_gate").and_then(|v| v.as_bool()) != Some(true) {
+                continue;
+            }
+            // Only a manual (human-approval) pipeline step can be a review gate.
+            let executor = meta["pipeline"]["executor"].as_str().unwrap_or("");
+            if executor != "manual" {
+                continue;
+            }
+            let status = meta["pipeline"]["state"]["status"].as_str().unwrap_or("pending");
+            if matches!(status, "human_approved" | "skipped" | "failed") {
+                continue; // resolved gates never move (idempotent; a rejection stands)
+            }
+            let run_id = meta["pipeline"]["state"]["run_id"].as_str().unwrap_or("").to_string();
+            let cmd = update_step_state_full_on(
+                conn, board_id, &cell_id, "human_approved", None, None, &run_id, None,
+            )?;
+            crate::queue_command(cmd);
+            approved += 1;
+        }
+    }
+    Ok(approved)
 }
 
 /// Fire notifications for a step event
@@ -2097,6 +2287,21 @@ fn fire_notifications(
             }
         }
     }
+}
+
+/// True iff `content` is a serialized run-result blob (a JSON object/array), never
+/// authored English. An authored step can not parse as a JSON container, so this is
+/// the discriminator the compile filter and Reset recovery share: run output must
+/// never be materialized as a step nor mint a step id (`rawcontent…` was the tell).
+fn is_run_result_blob(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with(['{', '[']) {
+        return false;
+    }
+    matches!(
+        serde_json::from_str::<serde_json::Value>(content),
+        Ok(serde_json::Value::Object(_)) | Ok(serde_json::Value::Array(_))
+    )
 }
 
 /// Generate a step_id from cell content

@@ -40,10 +40,27 @@ pub extern "C" fn cyan_set_discovery_key(key: *const c_char) -> bool {
     DISCOVERY_KEY.set(s).is_ok()
 }
 
+/// The git commit this engine was compiled from ("abc123def" / "abc123def-dirty" /
+/// "unknown"), embedded by build.rs. The `cyan-build-commit:` prefix makes the stamp
+/// greppable in the raw .a / app binary (`strings … | grep cyan-build-commit:`) — how
+/// build_static_lib.sh proves the copied xcframework really carries HEAD's bits.
+pub const BUILD_STAMP: &str = concat!("cyan-build-commit:", env!("CYAN_BUILD_COMMIT"));
+
+/// FFI: the engine's build commit ("abc123def" or "abc123def-dirty"). Static storage —
+/// the caller must NOT free the returned pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_build_commit() -> *const c_char {
+    static COMMIT: OnceLock<CString> = OnceLock::new();
+    COMMIT
+        .get_or_init(|| CString::new(env!("CYAN_BUILD_COMMIT")).unwrap_or_default())
+        .as_ptr()
+}
+
 /// Initialize Cyan with ephemeral identity (for testing).
 /// Different NodeID each launch - use for P2P mesh testing.
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_init(db_path: *const c_char) -> bool {
+    eprintln!("🏗 {BUILD_STAMP}");
     if SYSTEM.get().is_some() {
         return true;
     }
@@ -90,7 +107,7 @@ use std::ffi::{c_char, CStr, CString};
 use std::path::{Path, PathBuf};
 // Initialize tracing (only once)
 // Initialize tracing (only once)
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 
 static TRACING_INIT: Once = Once::new();
 
@@ -144,6 +161,10 @@ pub extern "C" fn cyan_init_with_identity(
         tracing::info!("🔵 Tracing initialized - log file: {:?}", log_path);
     });
     eprintln!("🔥 cyan_init_with_identity");
+    // Phase-0 fingerprint guardrail: the FIRST thing a booting engine states is which
+    // source it was built from, so a stale binary can never be tested against silently.
+    eprintln!("🏗 {BUILD_STAMP}");
+    tracing::info!("{BUILD_STAMP}");
     if SYSTEM.get().is_some() {
         return true;
     }
@@ -683,6 +704,47 @@ pub extern "C" fn cyan_note_put(
         note_id,
         tenant_id,
         text,
+        scope: None,
+        kind: None,
+    });
+}
+
+/// Author or edit a SCOPED note (feat/notes-constitution). Same contract as
+/// `cyan_note_put`, plus `scope` (`tenant`|`group`|`board`) and `kind`
+/// (`constitution`|`preference`|`editor-note`); null ⇒ `board`/`editor-note`. For
+/// `group`/`tenant` scope, `board_id` carries the ANCHOR id (the group/tenant id).
+/// Additive verb — never replaces any existing FFI.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_note_put_scoped(
+    board_id: *const c_char,
+    note_id: *const c_char,
+    tenant_id: *const c_char,
+    text: *const c_char,
+    scope: *const c_char,
+    kind: *const c_char,
+) {
+    let Some(board) = (unsafe { cstr_arg(board_id) }) else {
+        return;
+    };
+    let Some(text) = (unsafe { cstr_arg(text) }) else {
+        return;
+    };
+    let note_id = unsafe { cstr_arg(note_id) }; // null ⇒ new note
+    let tenant_id = unsafe { cstr_arg(tenant_id) }; // null ⇒ derive from anchor group
+    let scope = unsafe { cstr_arg(scope) }; // null ⇒ "board"
+    let kind = unsafe { cstr_arg(kind) }; // null ⇒ "editor-note"
+
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let _ = sys.command_tx.send(CommandMsg::PutNote {
+        board_id: board,
+        note_id,
+        tenant_id,
+        text,
+        scope,
+        kind,
     });
 }
 
@@ -899,6 +961,74 @@ pub extern "C" fn cyan_upload_file_to_workspace(workspace_id: *const c_char, pat
         workspace_id: wid,
         path: p,
     });
+}
+
+/// Install a signed `.cyanplugin` bundle into a group's local "Plugins" workspace
+/// (BURST C2 — the cyan-backend receiver half of the Market install leg).
+///
+/// The app fetches the bundle bytes from the Lens marketplace endpoint, base64-encodes
+/// them, and calls this. We base64-decode, hand the tar bytes to
+/// `storage::install_plugin_bundle`, and — on success — emit a fresh `TreeLoaded` (via the
+/// command actor's `Snapshot`) so the Explorer/authoring surface refreshes and
+/// `workflow::autocomplete_index` finds the plugin under `@`.
+///
+/// Idempotent: a re-install replaces the prior bundle (deterministic file id + overwrite).
+///
+/// Returns a JSON string the caller frees with `cyan_free_string`:
+///   `{"success":true,"plugin_id":"<id>","file_id":"<id>"}` on success, else
+///   `{"success":false,"error":"<why>"}`. Never null unless the JSON encode itself fails.
+///
+/// TODO(C2 signature): the bundle carries an XaeroID signature over its embedded
+/// `manifest.yaml`; this repo has no `.cyanplugin` unpack path yet, so signature
+/// verification is deferred (documented) — the bytes come from the authenticated Lens
+/// endpoint (same auth as `/browse`). Wire verification here once the unpack lands.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_install_plugin_bundle(
+    group_id: *const c_char,
+    plugin_id: *const c_char,
+    bundle_bytes_b64: *const c_char,
+) -> *mut c_char {
+    use base64::Engine as _;
+
+    let err = |msg: String| -> *mut c_char {
+        json_cstring(&serde_json::json!({ "success": false, "error": msg }).to_string())
+    };
+
+    let Some(gid) = (unsafe { cstr_arg(group_id) }) else {
+        return err("missing group_id".to_string());
+    };
+    let Some(pid) = (unsafe { cstr_arg(plugin_id) }) else {
+        return err("missing plugin_id".to_string());
+    };
+    let Some(b64) = (unsafe { cstr_arg(bundle_bytes_b64) }) else {
+        return err("missing bundle_bytes_b64".to_string());
+    };
+
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+        Ok(b) => b,
+        Err(e) => return err(format!("base64 decode failed: {e}")),
+    };
+    if bytes.is_empty() {
+        return err("empty bundle bytes".to_string());
+    }
+
+    match storage::install_plugin_bundle(&gid, &pid, &bytes) {
+        Ok(file_id) => {
+            // Refresh the tree so the app sees the new plugin (emits TreeLoaded).
+            if let Some(sys) = SYSTEM.get() {
+                let _ = sys.command_tx.send(CommandMsg::Snapshot {});
+            }
+            json_cstring(
+                &serde_json::json!({
+                    "success": true,
+                    "plugin_id": pid,
+                    "file_id": file_id,
+                })
+                .to_string(),
+            )
+        }
+        Err(e) => err(format!("install failed: {e}")),
+    }
 }
 
 /// R10FB §D: demo seeding has been REMOVED. This symbol is kept (inert) only so the C ABI
@@ -1726,30 +1856,62 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
         }
     };
 
-    // Generate file ID
-    let file_id = blake3::hash(format!("file:{}:{}:{}", gid, file_name, now).as_bytes())
-        .to_hex()
-        .to_string();
+    // CONTENT-ADDRESSED DEDUP: the same bytes in the same group are ONE file row.
+    // Re-uploading identical content re-scopes/renames the existing row instead of
+    // minting a second id (the old `blake3("file:{gid}:{name}:{now}")` id folded in
+    // the timestamp, so every re-upload duplicated the file in `#` autocomplete).
+    let existing_id: Option<String> = {
+        let db = sys.db.lock_safe();
+        db.query_row(
+            "SELECT id FROM objects
+             WHERE group_id = ?1 AND hash = ?2 AND type = 'file' AND COALESCE(deleted,0) = 0",
+            params![gid, hash],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    };
+    let file_id = existing_id.clone().unwrap_or_else(|| {
+        blake3::hash(format!("file:{}:{}:{}", gid, file_name, now).as_bytes())
+            .to_hex()
+            .to_string()
+    });
 
-    // Insert into database
+    // Insert into database (or re-scope the deduped row).
     {
         let db = sys.db.lock_safe();
-        let result = db.execute(
-            "INSERT OR REPLACE INTO objects (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, local_path, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                file_id,
-                group_id,
-                workspace_id,
-                board_id,
-                file_name,
-                hash,
-                size as i64,
-                sys.node_id,
-                local_path.to_string_lossy().to_string(),
-                now
-            ],
-        );
+        let result = if existing_id.is_some() {
+            db.execute(
+                "UPDATE objects SET name = ?2, workspace_id = ?3, board_id = ?4,
+                        local_path = ?5, size = ?6 WHERE id = ?1",
+                params![
+                    file_id,
+                    file_name,
+                    workspace_id,
+                    board_id,
+                    local_path.to_string_lossy().to_string(),
+                    size as i64
+                ],
+            )
+        } else {
+            db.execute(
+                "INSERT OR REPLACE INTO objects (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, local_path, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    file_id,
+                    group_id,
+                    workspace_id,
+                    board_id,
+                    file_name,
+                    hash,
+                    size as i64,
+                    sys.node_id,
+                    local_path.to_string_lossy().to_string(),
+                    now
+                ],
+            )
+        };
 
         if let Err(e) = result {
             return CString::new(format!(r#"{{"success":false,"error":"DB error: {}"}}"#, e))
@@ -4328,7 +4490,15 @@ pub extern "C" fn cyan_pipeline_approve(
     // pipeline (approved/skipped steps are skipped) to execute the next step, which
     // then runs → awaits its own approval. This is what lets Rick step THROUGH the
     // workflow one approval at a time, with cost incrementing across steps.
-    if approved {
+    //
+    // REVIEW_LOOP_ONE_BOARD: OPT-IN ONLY. The app's LensRunCoordinator owns the
+    // step chain and resumes it itself after an approve — this engine-side
+    // auto-resume was a SECOND copy of the step-loop racing it (double-execution
+    // on multi-step boards). Kept behind CYAN_ENGINE_AUTORESUME=1 for headless/
+    // engine-driven rigs.
+    let engine_autoresume =
+        std::env::var("CYAN_ENGINE_AUTORESUME").map(|v| v == "1") == Ok(true);
+    if approved && engine_autoresume {
         let command_tx = system.command_tx.clone();
         let event_tx = system.event_tx.clone();
         let bid = board_id_str.to_string();
@@ -4344,6 +4514,276 @@ pub extern "C" fn cyan_pipeline_approve(
     approved
 }
 
+
+/// Run ONE locally-bound pipeline step through the on-device cyan-mcp host —
+/// the MECHANICAL SPINE verb (additive). The step's compiled metadata must
+/// carry `mcp_tool` (a rung-1 deterministic bind stamped at Review, or the
+/// cyan-media hint); dispatch goes straight through `PluginHost` with the
+/// side-effect approval gate — ZERO Lens/LLM involvement, GPU not required.
+///
+/// Returns JSON:
+///   `{"success":true,"summary":...,"findings":N}`
+///   `{"success":false,"gated":true,"error":"needs_human: …"}`  (approve → re-run)
+///   `{"success":false,"error":…}`
+/// A step with no local bind returns `{"success":false,"error":"not_locally_bound"}` —
+/// the caller sends it to the lens instead.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_pipeline_run_step_local(
+    board_id: *const c_char,
+    step_id: *const c_char,
+) -> *mut c_char {
+    let board_id_str = match unsafe { CStr::from_ptr(board_id) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let step_id_str = match unsafe { CStr::from_ptr(step_id) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let system = match SYSTEM.get() {
+        Some(s) => s,
+        None => return json_cstring(r#"{"success":false,"error":"System not initialized"}"#),
+    };
+    let rt = match crate::RUNTIME.get() {
+        Some(rt) => rt,
+        None => return json_cstring(r#"{"success":false,"error":"Runtime not available"}"#),
+    };
+
+    // Locate the compiled cell for this step and its metadata, plus every PRIOR
+    // step's persisted result (`pipeline.state.ai_result`) — the deterministic
+    // source for `pending` arg completion below.
+    let (content, mut metadata, upstream): (String, serde_json::Value, Vec<serde_json::Value>) = {
+        let cells = crate::storage::cell_list_by_boards(std::slice::from_ref(&board_id_str))
+            .unwrap_or_default();
+        let mut found: Option<(String, serde_json::Value)> = None;
+        let mut upstream: Vec<serde_json::Value> = Vec::new();
+        for c in cells {
+            let meta: serde_json::Value =
+                serde_json::from_str(c.metadata_json.as_deref().unwrap_or("{}"))
+                    .unwrap_or(serde_json::Value::Null);
+            if meta["pipeline"]["step_id"].as_str() == Some(step_id_str.as_str()) {
+                found = Some((c.content.unwrap_or_default(), meta));
+                break; // cells arrive in cell_order — everything before is upstream
+            }
+            if let Some(res) = meta["pipeline"]["state"]["ai_result"].as_str()
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(res)
+            {
+                // A local plugin step stores its result as a success envelope
+                // over the raw MCP tools/call result. Unwrap through BOTH (the
+                // one shared helper) so key lookup sees the TOOL's object
+                // (e.g. {"file_id": …}), never a wrapper.
+                let unwrapped = crate::pipeline_executor::unwrap_tool_payload(&v);
+                if unwrapped.is_object() {
+                    upstream.push(unwrapped);
+                }
+            }
+        }
+        match found {
+            Some((content, meta)) => (content, meta, upstream),
+            None => {
+                return json_cstring(
+                    r#"{"success":false,"error":"step not found (compile first)"}"#,
+                )
+            }
+        }
+    };
+    if metadata.get("mcp_tool").is_none() {
+        return json_cstring(r#"{"success":false,"error":"not_locally_bound"}"#);
+    }
+
+    // PENDING ARG COMPLETION (deterministic, zero-LLM): required props Review
+    // couldn't resolve fill from the LATEST upstream output carrying the key —
+    // e.g. `list_comments.file_id` from the upload step's `{"file_id": …}`.
+    // A prop still missing dispatches anyway; the plugin's own validation
+    // reports it clearly (never guessed, never routed to a model).
+    let pending: Vec<String> = metadata["mcp_tool"]["pending"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if !pending.is_empty() {
+        for key in &pending {
+            if metadata["mcp_tool"]["args"].get(key).is_some() {
+                continue;
+            }
+            if let Some(v) = upstream.iter().rev().find_map(|o| o.get(key)) {
+                metadata["mcp_tool"]["args"][key] = v.clone();
+            }
+        }
+        // CONFIG-CONTEXT fallback at dispatch too (heals a bind compiled before
+        // the config existed): per-WORKFLOW plugin_config row → per-TENANT row →
+        // the plugin's ambient env (demo stopgap) — the same ladder the bind
+        // uses (PLUGIN_CREDENTIAL_ONBOARDING §B).
+        let plugin_id = metadata["mcp_tool"]["plugin_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let cfg_tenant = crate::storage::board_get_group_id(&board_id_str)
+            .filter(|g| !g.is_empty())
+            .unwrap_or_else(|| "device".to_string());
+        for key in &pending {
+            if metadata["mcp_tool"]["args"].get(key).is_none()
+                && let Some(v) = crate::plugin_config::context_value(
+                    &cfg_tenant,
+                    Some(&board_id_str),
+                    &plugin_id,
+                    key,
+                )
+            {
+                metadata["mcp_tool"]["args"][key] = serde_json::json!(v);
+            }
+        }
+
+        // A media INPUT still unfilled resolves to the board's CONFORMED v2
+        // when the review loop has produced one — the "produce master" step
+        // renders from the frame-accurate conform output, never a stale
+        // source, and still with zero LLM involvement.
+        for key in ["input", "file_path"] {
+            if pending.iter().any(|p| p == key)
+                && metadata["mcp_tool"]["args"].get(key).is_none()
+            {
+                let v2: Option<String> = {
+                    let conn = crate::storage::db().lock_safe();
+                    let tenant = crate::review_loop::board_tenant(&conn, &board_id_str);
+                    crate::review_loop::current_proxy_ref(&conn, &tenant, &board_id_str)
+                        .ok()
+                        .flatten()
+                        .and_then(|pref| {
+                            crate::review_loop::review_media_info(&conn, &tenant, &pref).ok()
+                        })
+                        .and_then(|info| {
+                            info["derived_proxy_path"].as_str().map(str::to_string)
+                        })
+                };
+                if let Some(v2) = v2 {
+                    metadata["mcp_tool"]["args"][key] = serde_json::json!(v2);
+                }
+            }
+        }
+
+        // Still-unfilled media prop: the LATEST upstream media output
+        // (cyan-media's `output_path`, media-root-relative → absolutized) is
+        // the media this step consumes — the review proxy an upload publishes,
+        // the conform input, etc. Found live on the C2C MATERIALIZED run
+        // (FABLE_FULL_AUDIT hard gate): no conform-registered media exists on
+        // a fresh materialized run, so this deterministic rung was missing and
+        // the upload died plugin-side on missing_argument.
+        for key in ["input", "file_path"] {
+            if pending.iter().any(|p| p == key)
+                && metadata["mcp_tool"]["args"].get(key).is_none()
+                && let Some(rel) =
+                    crate::pipeline_executor::latest_upstream_media_path(&upstream)
+            {
+                let abs = crate::media_staging::effective_media_root().join(&rel);
+                metadata["mcp_tool"]["args"][key] =
+                    serde_json::json!(abs.to_string_lossy());
+            }
+        }
+        // An unfilled `name` rides the resolved media prop: the artifact's real
+        // basename, never a guess.
+        if pending.iter().any(|p| p == "name")
+            && metadata["mcp_tool"]["args"].get("name").is_none()
+        {
+            let media = metadata["mcp_tool"]["args"]
+                .get("file_path")
+                .or_else(|| metadata["mcp_tool"]["args"].get("input"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            if let Some(media) = media {
+                metadata["mcp_tool"]["args"]["name"] = serde_json::json!(
+                    crate::pipeline_executor::media_name_default(&media)
+                );
+            }
+        }
+
+        // PART 1-A (TONIGHT_RUN): the conform step's `ops` fills from the
+        // board's CONFIRMED changelist — the live red was a conform dispatched
+        // with `input` but NO `ops` ("ops Field required"). Only ever the
+        // active+approved set (what a human confirmed this round); an empty
+        // confirmed set leaves the prop pending, and the park below (1-C)
+        // turns that into the amber "awaiting confirmed edits" ask.
+        if pending.iter().any(|p| p == "ops")
+            && metadata["mcp_tool"]["args"].get("ops").is_none()
+        {
+            let confirmed: Option<Vec<serde_json::Value>> = {
+                let conn = crate::storage::db().lock_safe();
+                let tenant = crate::review_loop::board_tenant(&conn, &board_id_str);
+                crate::review_loop::confirmed_ops_for_board(&conn, &tenant, &board_id_str)
+                    .ok()
+                    .flatten()
+            };
+            if let Some(ops) = confirmed.filter(|o| !o.is_empty()) {
+                metadata["mcp_tool"]["args"]["ops"] = serde_json::json!(ops);
+            }
+        }
+    }
+
+    // PART 1-C (TONIGHT_RUN): a REQUIRED prop STILL unfilled after the whole
+    // deterministic ladder PARKS the step — amber, human-actionable ("awaiting"),
+    // never a red dispatch into the plugin's validation error. Optional props
+    // never land in `pending`, so resolved steps dispatch exactly as before.
+    let still_pending: Vec<String> = pending
+        .iter()
+        .filter(|k| metadata["mcp_tool"]["args"].get(k.as_str()).is_none())
+        .cloned()
+        .collect();
+    let tool_name = metadata["mcp_tool"]["tool"].as_str().unwrap_or_default().to_string();
+    if let Some(awaiting) =
+        crate::pipeline_executor::dispatch_park_reason(&tool_name, &still_pending)
+    {
+        return json_cstring(
+            &serde_json::json!({
+                "success": false,
+                "parked": true,
+                "awaiting": awaiting,
+                "error": format!("awaiting: {awaiting}"),
+            })
+            .to_string(),
+        );
+    }
+
+    let executor_type = metadata["pipeline"]["executor"].as_str().unwrap_or("local").to_string();
+    let command_tx = system.command_tx.clone();
+    let event_tx = system.event_tx.clone();
+    let result = rt.block_on(crate::pipeline_executor::execute_pipeline_step(
+        &board_id_str,
+        &step_id_str,
+        &content,
+        &executor_type,
+        Some(metadata),
+        Vec::new(),
+        &command_tx,
+        &event_tx,
+    ));
+    match result {
+        Ok((summary, findings)) => json_cstring(
+            &serde_json::json!({
+                "success": true,
+                "summary": summary,
+                "findings": findings.len(),
+            })
+            .to_string(),
+        ),
+        Err(e) => {
+            let msg = e.to_string();
+            let gated = msg.starts_with("needs_human:");
+            // PART 1-C: an `awaiting:` error is a PARK (amber, human-actionable),
+            // not a failure — the loop-routed conform emits it when nothing is
+            // confirmed yet. The app rail renders it as "awaiting", never red.
+            let parked = msg.starts_with("awaiting:");
+            let mut reply = serde_json::json!({
+                "success": false,
+                "gated": gated,
+                "error": msg,
+            });
+            if parked {
+                reply["parked"] = serde_json::json!(true);
+                reply["awaiting"] =
+                    serde_json::json!(msg.trim_start_matches("awaiting:").trim());
+            }
+            json_cstring(&reply.to_string())
+        }
+    }
+}
 
 /// Retry a pipeline step (reset to pending, preserve metadata)
 #[unsafe(no_mangle)]
@@ -4452,6 +4892,72 @@ pub extern "C" fn cyan_pipeline_status(
 }
 
 // ============================================================================
+// ChangeList store FFI (CYAN_CHANGELIST_STORE_AND_REVIEW_LOOP §Part 1)
+// ============================================================================
+
+/// Drive the content-addressed ChangeList store. Additive `cyan_*` surface for the
+/// Frame.io review-&-conform loop; both the iOS review rail and Cyan Lens call the
+/// same ops through this one JSON entrypoint.
+///
+/// `cmd_json` is `{ "op": <name>, ... }` where `op` is one of: append, set_state,
+/// set_active, supersede, snapshot, branch, diff, conform_plan, get, get_version,
+/// set_outcome. Returns a JSON string the caller owns and must free with
+/// `cyan_free_string`; errors surface as `{ "error": "<msg>" }` — never a panic
+/// across the boundary.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_changelist_command(cmd_json: *const c_char) -> *mut c_char {
+    let json_str = match unsafe { cstr_arg(cmd_json) } {
+        Some(s) => s,
+        None => return json_cstring(&serde_json::json!({ "error": "null command" }).to_string()),
+    };
+    json_cstring(&crate::changelist::command(&json_str))
+}
+
+// ============================================================================
+// STAGE-4 ingest FFI (AUTHORING_FIXES_ROUND2 §STAGE 4)
+// ============================================================================
+
+/// Drive watched ingest sources + per-asset workflow runs. Additive `cyan_*`
+/// surface mirroring `cyan_changelist_command`: `cmd_json` is
+/// `{ "op": <name>, ... }` where `op` is one of: source_add, source_list,
+/// source_remove, scan_now, scan_due, runs_for_board, produce_master_plan.
+/// Returns a JSON string the caller owns and must free with `cyan_free_string`;
+/// errors surface as `{ "error": "<msg>" }` — never a panic across the boundary.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_ingest_command(cmd_json: *const c_char) -> *mut c_char {
+    let json_str = match unsafe { cstr_arg(cmd_json) } {
+        Some(s) => s,
+        None => return json_cstring(&serde_json::json!({ "error": "null command" }).to_string()),
+    };
+    json_cstring(&crate::ingest::command(&json_str))
+}
+
+// ============================================================================
+// Review-loop state machine FFI (CYAN_REVIEW_LOOP_TRANSITION_CONTRACT)
+// ============================================================================
+
+/// Drive the review-loop state machine + editable-proposal lifecycle. Additive
+/// `cyan_*` surface layered on the ChangeList store; the iOS review rail and Cyan
+/// Lens fire transitions through this one JSON entrypoint.
+///
+/// `cmd_json` is `{ "op": <name>, "actor": "auto|agent|human", ... }`. Ops:
+/// get, start_draft, publish, notes_arrived, version_approved, confirm_notes,
+/// conform_run, conform_failed, publish_proxy, finish, delivered, reopen_branch,
+/// propose_op, confirm_op, escalate_note, nudges_for. The three-actor authority
+/// model is enforced inside: an AGENT may only PROPOSE, and every gated /
+/// external_send transition requires `actor=human`. Returns a JSON string the
+/// caller owns and must free with `cyan_free_string`; errors surface as
+/// `{ "error": "<msg>" }` — never a panic across the boundary.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_review_command(cmd_json: *const c_char) -> *mut c_char {
+    let json_str = match unsafe { cstr_arg(cmd_json) } {
+        Some(s) => s,
+        None => return json_cstring(&serde_json::json!({ "error": "null command" }).to_string()),
+    };
+    json_cstring(&crate::review_state::command(&json_str))
+}
+
+// ============================================================================
 // Timecoded Notes FFI
 // ============================================================================
 
@@ -4513,6 +5019,118 @@ pub extern "C" fn cyan_export_notes_markdown(board_id: *const c_char) -> *mut c_
         }
     }
 }
+/// The board's playable video, resolved through the SAME path-resolution rails
+/// the cyan-media tools use (staged master + newest derived proxy). Returns
+/// `{"proxy_path": string|null, "master_uri": string|null, "media_root": string}`
+/// as JSON, or null on an invalid board id. Additive — new verb for the app's
+/// Video face so the player and the tool inputs can never disagree.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_board_video_media(board_id: *const c_char) -> *mut c_char {
+    let board_id_str = match unsafe { CStr::from_ptr(board_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let info = crate::pipeline_executor::board_video_media(board_id_str);
+    json_cstring(&info.to_string())
+}
+
+/// Set one per-install / per-workflow plugin CONFIG value
+/// (PLUGIN_CREDENTIAL_ONBOARDING §A). Input JSON:
+/// `{"plugin_id","key","value","board_id"?,"tenant_id"?}` — with a `board_id`
+/// the row is WORKFLOW-scoped (tenant derived from the board's group unless
+/// given); without one it is the tenant-wide default. Returns
+/// `{"ok":bool,"error"?}`. Secret-looking keys are refused (vault material).
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_plugin_config_set(cmd_json: *const c_char) -> *mut c_char {
+    let cmd = match unsafe { CStr::from_ptr(cmd_json) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let v: serde_json::Value = match serde_json::from_str(cmd) {
+        Ok(v) => v,
+        Err(e) => return json_cstring(&serde_json::json!({"ok": false, "error": format!("bad json: {e}")}).to_string()),
+    };
+    let (Some(plugin_id), Some(key), Some(value)) = (
+        v["plugin_id"].as_str(),
+        v["key"].as_str(),
+        v["value"].as_str(),
+    ) else {
+        return json_cstring(
+            &serde_json::json!({"ok": false, "error": "plugin_id, key, value are required"})
+                .to_string(),
+        );
+    };
+    let board_id = v["board_id"].as_str().filter(|b| !b.is_empty());
+    let tenant = v["tenant_id"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| board_id.and_then(crate::storage::board_get_group_id))
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "device".to_string());
+    let out = {
+        let conn = crate::storage::db().lock_safe();
+        crate::plugin_config::set(
+            &conn,
+            &tenant,
+            board_id,
+            plugin_id,
+            key,
+            value,
+            chrono::Utc::now().timestamp(),
+        )
+    };
+    match out {
+        Ok(()) => json_cstring(&serde_json::json!({"ok": true}).to_string()),
+        Err(e) => json_cstring(&serde_json::json!({"ok": false, "error": e.to_string()}).to_string()),
+    }
+}
+
+/// Read plugin CONFIG. Input JSON `{"plugin_id","board_id"?,"tenant_id"?,"key"?}`:
+/// with `key` returns `{"ok":true,"value":string|null}` (workflow row wins over
+/// tenant row); without it returns `{"ok":true,"values":{key:value,…}}` (tenant
+/// defaults merged under workflow overrides — what a settings sheet lists).
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_plugin_config_get(cmd_json: *const c_char) -> *mut c_char {
+    let cmd = match unsafe { CStr::from_ptr(cmd_json) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let v: serde_json::Value = match serde_json::from_str(cmd) {
+        Ok(v) => v,
+        Err(e) => return json_cstring(&serde_json::json!({"ok": false, "error": format!("bad json: {e}")}).to_string()),
+    };
+    let Some(plugin_id) = v["plugin_id"].as_str() else {
+        return json_cstring(
+            &serde_json::json!({"ok": false, "error": "plugin_id is required"}).to_string(),
+        );
+    };
+    let board_id = v["board_id"].as_str().filter(|b| !b.is_empty());
+    let tenant = v["tenant_id"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| board_id.and_then(crate::storage::board_get_group_id))
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "device".to_string());
+    let conn = crate::storage::db().lock_safe();
+    if let Some(key) = v["key"].as_str() {
+        match crate::plugin_config::get(&conn, &tenant, board_id, plugin_id, key) {
+            Ok(val) => json_cstring(&serde_json::json!({"ok": true, "value": val}).to_string()),
+            Err(e) => json_cstring(&serde_json::json!({"ok": false, "error": e.to_string()}).to_string()),
+        }
+    } else {
+        match crate::plugin_config::list(&conn, &tenant, board_id, plugin_id) {
+            Ok(rows) => {
+                let map: serde_json::Map<String, serde_json::Value> = rows
+                    .into_iter()
+                    .map(|(k, val)| (k, serde_json::Value::String(val)))
+                    .collect();
+                json_cstring(&serde_json::json!({"ok": true, "values": map}).to_string())
+            }
+            Err(e) => json_cstring(&serde_json::json!({"ok": false, "error": e.to_string()}).to_string()),
+        }
+    }
+}
+
 // Add to ffi/core.rs — path autocomplete for g\ prefix
 
 /// Autocomplete a partial path like "g\", "g\Sales\", "g\Sales\Work"
@@ -4526,11 +5144,13 @@ pub extern "C" fn cyan_autocomplete_path(
         Err(_) => return std::ptr::null_mut(),
     };
     
-    let conn = match crate::storage::db().lock() {
-        Ok(c) => c,
-        Err(_) => return std::ptr::null_mut(),
+    // Bounded read acquire: autocomplete fires per keystroke — parking it
+    // behind a mesh sync hangs typing (the P0 hang family). Busy ⇒ no
+    // suggestions this keystroke; the next keystroke retries.
+    let Some(conn) = crate::storage::try_db_read(crate::storage::READ_LOCK_BUDGET) else {
+        return std::ptr::null_mut();
     };
-    
+
     // Strip g\ or g/ prefix
     let cleaned = partial_str
         .trim_start_matches("g\\")
@@ -4677,6 +5297,39 @@ pub extern "C" fn cyan_autocomplete_path(
     let json = serde_json::to_string(&result).unwrap_or_else(|_| "[]".to_string());
     match CString::new(json) {
         Ok(cs) => cs.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Workflow authoring autocomplete (BURST C1). ADDITIVE — the `g\` file-tree grammar
+/// `cyan_autocomplete_path` stays for the Explorer; this speaks the `@`/`#`/`/` workflow
+/// grammar the notebook step editor uses.
+///
+/// Delegates to `workflow::filter_autocomplete(board_id, partial)`: it builds the board's
+/// tenant-scoped index (`@` installed plugins · `#` group files + this board's prior-step
+/// outputs · `/` control actions) and filters it by the trailing trigger + query in
+/// `partial`. A `@sl` cursor returns only matching plugins; `#`/`​/` behave likewise; no
+/// active trigger returns the full index.
+///
+/// Returns JSON (caller frees with `cyan_free_string`):
+///   `{"tenant_id":"…","plugins":[{"trigger":"@","kind":"plugin","value":"…","label":"…"}],
+///     "artifacts":[…],"actions":[…]}`.
+/// Null only on a bad `board_id`/`partial` pointer or a JSON encode failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_workflow_autocomplete(
+    board_id: *const c_char,
+    partial: *const c_char,
+) -> *mut c_char {
+    let board_id_str = match unsafe { CStr::from_ptr(board_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    // A null/invalid `partial` degrades to the empty query (full index), not a failure.
+    let partial_str = unsafe { cstr_arg(partial) }.unwrap_or_default();
+
+    let idx = crate::workflow::filter_autocomplete(board_id_str, &partial_str);
+    match serde_json::to_string(&idx) {
+        Ok(json) => json_cstring(&json),
         Err(_) => std::ptr::null_mut(),
     }
 }
