@@ -915,6 +915,16 @@ pub(crate) async fn execute_local_mcp_tool_step(
             // never the raw MCP envelope. Same polish as the error path.
             let summary = success_envelope(&step.plugin_id, &step.tool, &result.result).to_string();
 
+            // REVIEW-LEDGER BOOTSTRAP (PART 1-B, the workflow path): a successful
+            // frameio upload registers the uploaded local file as the review
+            // MASTER with the returned file id as its published proxy ref — the
+            // same ledger bootstrap the dashboard coordinator does via
+            // register_review_media. Without it the later sense step's ledger
+            // ingest (and therefore the agent PROPOSAL) never ran on a pure
+            // workflow run (found live, run 10: note sensed to the rail, no
+            // proposal). Best-effort + idempotent.
+            register_uploaded_review_media(board_id, &step, &result.result);
+
             // TWO-WAY REVIEW (sense → player): a frameio list_comments result
             // materializes PER-COMMENT timecoded notes on the board — the Video
             // face renders each at its frame — and, when the listed file is a
@@ -1430,6 +1440,58 @@ fn resolve_media_args(board_id: &str, step: &mut McpTool) {
 /// else the board's persisted probe output (`video.frame_rate`), else the
 /// anchored seconds are unknowable and the notes land un-anchored (frame kept
 /// in the note text — surfaced, never guessed).
+/// PART 1-B (workflow path): after a successful `frameio.upload_file`, register
+/// the uploaded LOCAL file as the review master + the returned Frame.io file id
+/// as its published proxy ref (`review_loop::register_review_media`) — the
+/// ledger bootstrap the sense→propose leg requires. Best-effort and idempotent
+/// (an already-registered proxy ref is left untouched); a failure only logs.
+fn register_uploaded_review_media(board_id: &str, step: &McpTool, result: &serde_json::Value) {
+    if step.plugin_id != "frameio" || step.tool != "upload_file" {
+        return;
+    }
+    let payload = unwrap_tool_payload(result);
+    let Some(file_id) = payload.get("file_id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let Some(master_path) = step
+        .args
+        .get("file_path")
+        .or_else(|| step.args.get("input"))
+        .and_then(|v| v.as_str())
+    else {
+        return;
+    };
+    let Ok(conn) = crate::storage::db().lock() else { return };
+    let tenant = crate::review_loop::board_tenant(&conn, board_id);
+    match crate::asset_registry::find_by_remote_ref(&conn, &tenant, "frameio", file_id) {
+        Ok(Some(_)) => {} // already registered — idempotent no-op
+        _ => {
+            match crate::review_loop::register_review_media(
+                &conn,
+                &tenant,
+                master_path,
+                file_id,
+                "main",
+                crate::review_state::Actor::Agent,
+            ) {
+                Ok(reg) => tracing::info!(
+                    "upload→review-ledger: registered master {} / proxy ref {} (v {})",
+                    reg.master_hash, file_id, reg.version_id
+                ),
+                Err(e) => tracing::warn!("upload→review-ledger registration failed (non-fatal): {e:#}"),
+            }
+        }
+    }
+    // The loop row ties the board to the master so confirmed_ops_for_board and
+    // the conform park/fill see this asset (idempotent).
+    if let Ok(Some(proxy)) =
+        crate::asset_registry::find_by_remote_ref(&conn, &tenant, "frameio", file_id)
+        && let Some(master) = proxy.derived_from_asset.clone().or(Some(proxy.hash.clone()))
+    {
+        let _ = crate::review_loop::register(&conn, &tenant, board_id, &master, "main", 5);
+    }
+}
+
 pub fn ingest_sensed_comments(
     board_id: &str,
     step_id: &str,
