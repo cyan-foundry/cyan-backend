@@ -2009,6 +2009,7 @@ pub mod review_state;
 pub mod review_loop;
 pub mod note_inference;
 pub mod ops_proposer;
+pub mod constitution;
 pub mod xfer_policy;
 pub mod asset_registry;
 pub mod ingest;
