@@ -1159,9 +1159,13 @@ fn resolve_conform_proxy_ref(board_id: &str, args: &serde_json::Value) -> Option
     if let Some(r) = proxy_ref_from_args(args) {
         return Some(r);
     }
-    let tenant = device_tenant();
+    // The BOARD'S tenant (its group), never the device tenant: the loop rows
+    // live under the group id, and resolving under "device" found nothing —
+    // the conform silently fell to the PLAIN bind (no fps in the args, no
+    // loop bookkeeping) and the "applied" trim cut NOTHING (E2E run 3: the
+    // 25fps schema default put the tail bound past the media end).
     let conn = crate::storage::db().lock().ok()?;
-    crate::review_loop::current_proxy_ref(&conn, &tenant, board_id)
+    crate::review_loop::current_proxy_ref_for_board(&conn, board_id)
         .ok()
         .flatten()
 }
@@ -1196,7 +1200,13 @@ fn run_review_loop_conform_step(
     proxy_ref: &str,
     event_tx: &UnboundedSender<SwiftEvent>,
 ) -> Result<(String, Vec<Finding>)> {
-    let tenant = device_tenant();
+    // The BOARD'S tenant — the loop, its assets, and the changelist all live
+    // under the board's group id, not the device tenant (same run-3 finding
+    // as resolve_conform_proxy_ref).
+    let tenant = {
+        let conn = crate::storage::db().lock_safe();
+        crate::review_loop::board_tenant(&conn, board_id)
+    };
 
     // PART 1-C (TONIGHT_RUN): a conform round with NOTHING confirmed PARKS —
     // amber, human-actionable — instead of dispatching into the loop engine's

@@ -400,6 +400,81 @@ fn board_constitution_markdown_none_when_no_rules() {
 }
 
 // ============================================================================
+// 3b. The conform step's LOOP ROUTING resolves the BOARD'S tenant (E2E run-3
+//     finding): the loop rows live under the board's GROUP tenant, but the
+//     dispatch resolved under the device tenant — `current_proxy_ref` found
+//     nothing, the conform fell to the PLAIN bind (no fps, no loop
+//     bookkeeping), and the "applied" trim silently cut NOTHING (the 25fps
+//     schema default put the tail bound past the media end).
+// ============================================================================
+
+#[test]
+fn current_proxy_ref_for_board_resolves_the_group_tenant() {
+    let conn = db();
+    // The loop + assets live under the GROUP tenant (tenant == group id in
+    // this engine); the board anchors in that group.
+    let g = "group-join-conform";
+    anchor_board_in_group(&conn, g);
+
+    asset_registry::upsert(
+        &conn,
+        &asset_registry::Asset {
+            hash: MASTER.to_string(),
+            tenant_id: g.to_string(),
+            kind: Some("master".to_string()),
+            fps: Some(30.0),
+            duration_ms: Some(10_000),
+            derived_from_asset: None,
+            derived_from_version: None,
+            remote_refs: json!({}),
+            profile_json: json!({}),
+            render_profile: None,
+            created_at: 0,
+        },
+    )
+    .expect("register master");
+    asset_registry::upsert(
+        &conn,
+        &asset_registry::Asset {
+            hash: "proxy-conform-1".to_string(),
+            tenant_id: g.to_string(),
+            kind: Some("proxy".to_string()),
+            fps: Some(30.0),
+            duration_ms: None,
+            derived_from_asset: None,
+            derived_from_version: None,
+            remote_refs: json!({}),
+            profile_json: json!({}),
+            render_profile: Some("proxy-540p".to_string()),
+            created_at: 0,
+        },
+    )
+    .expect("register proxy");
+    asset_registry::set_derivation(&conn, g, "proxy-conform-1", MASTER, "v-1")
+        .expect("derivation");
+    asset_registry::set_remote_ref(&conn, g, "proxy-conform-1", "frameio", "file_conform_1")
+        .expect("remote ref");
+    rl::register(&conn, g, BOARD, MASTER, B, 3).expect("register loop");
+
+    // The board-keyed resolver finds the loop's published proxy under the
+    // board's OWN tenant — the routing the conform dispatch rides.
+    let got = rl::current_proxy_ref_for_board(&conn, BOARD)
+        .expect("query ok")
+        .expect("the board's active loop resolves its published proxy");
+    assert_eq!(got, "file_conform_1");
+
+    // Under the WRONG tenant (the old device-tenant bug) the same query finds
+    // nothing — the regression this test pins.
+    assert!(
+        rl::current_proxy_ref(&conn, "device", BOARD)
+            .expect("query ok")
+            .is_none(),
+        "the loop is invisible under the device tenant — resolving there routed \
+         the conform to the plain bind (the run-3 silent no-op trim)"
+    );
+}
+
+// ============================================================================
 // 4. The conn-passing resolver variant (the deadlock-safe JOIN seam) agrees
 //    with the tenant⊕group⊕board contract on an isolated connection.
 // ============================================================================

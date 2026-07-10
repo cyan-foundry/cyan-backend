@@ -198,6 +198,19 @@ pub fn get_loop(
 /// published proxy; `None` if the board drives no loop yet or nothing is published.
 /// This is the board-state fallback the run-loop conform wire uses when the step does
 /// not already carry an explicit `proxy_ref`.
+/// [`current_proxy_ref`] under the BOARD'S OWN tenant (its group; "device" for
+/// an un-grouped board — `board_tenant`). The conform dispatch ROUTES on this:
+/// the loop rows live under the board's tenant, and resolving under any other
+/// tenant silently sends the conform down the PLAIN bind (no fps, no loop
+/// bookkeeping — the E2E run-3 silent no-op trim).
+pub fn current_proxy_ref_for_board(
+    conn: &Connection,
+    board_id: &str,
+) -> Result<Option<String>> {
+    let tenant = board_tenant(conn, board_id);
+    current_proxy_ref(conn, &tenant, board_id)
+}
+
 pub fn current_proxy_ref(
     conn: &Connection,
     tenant_id: &str,
