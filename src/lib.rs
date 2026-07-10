@@ -2011,6 +2011,7 @@ pub mod note_inference;
 pub mod ops_proposer;
 pub mod constitution;
 pub mod llm;
+pub mod llm_proposer;
 pub mod ops_eval;
 pub mod batch_confirm;
 pub mod xfer_policy;

@@ -1362,7 +1362,20 @@ pub fn propose_from_note(
     asset_hash: &str,
     branch: &str,
 ) -> Result<changelist::ChangeEntry> {
-    propose_from_note_with(conn, tenant_id, asset_hash, branch, &crate::note_inference::RegexOpsProposer)
+    // Config selects the impl (JOIN §3): CYAN_OPS_PROPOSER=llm (+ provider) opts
+    // into the Llm-backed proposer; the deterministic regex impl is the zero-LLM
+    // default and the fall-back for any unusable LLM config. Downstream
+    // (confirm → changelist → conform.ops) is identical whichever ran.
+    match crate::llm_proposer::configured_llm_proposer() {
+        Some(llm) => propose_from_note_with(conn, tenant_id, asset_hash, branch, &llm),
+        None => propose_from_note_with(
+            conn,
+            tenant_id,
+            asset_hash,
+            branch,
+            &crate::note_inference::RegexOpsProposer,
+        ),
+    }
 }
 
 /// The board whose ACTIVE loop drives this asset branch (newest first) — the

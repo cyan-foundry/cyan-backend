@@ -443,7 +443,11 @@ fn propose_consumes_any_ops_proposer_impl_downstream_unchanged() {
     let prop = rl::propose_from_note_with(&conn, T, MASTER, B, &ScriptedProposer)
         .expect("the scripted proposer's op must flow into the ledger");
     assert_eq!(prop.op.as_deref(), Some("mute"), "downstream is proposer-agnostic");
-    assert_eq!(prop.params, json!({ "track": "A1" }));
+    assert_eq!(prop.params["track"], json!("A1"), "op params flow through unchanged");
+    // THE JOIN's adapter: proposer confidence rides params["confidence"] — the
+    // batch-confirm gate's read location (SESSION_JOIN §2, propose_ctx_join_test).
+    let c = prop.params["confidence"].as_f64().expect("confidence in params");
+    assert!((c - 0.9).abs() < 1e-6, "the scripted 0.9 landed, got {c}");
     assert_eq!((prop.tc_in, prop.tc_out), (10, Some(20)));
     assert_eq!(prop.proposed_by.as_deref(), Some("agent"));
     assert_eq!(prop.state, "proposed", "still a PROPOSAL — the human confirm gate stands");
