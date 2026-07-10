@@ -35,8 +35,24 @@ pub fn effective_notes(
     group_id: Option<&str>,
     board_id: &str,
 ) -> anyhow::Result<EffectiveNotes> {
-    let constitution = merge_kind(tenant_id, group_id, board_id, "constitution")?;
-    let preferences = merge_kind(tenant_id, group_id, board_id, "preference")?;
+    let conn = storage::db()
+        .lock()
+        .map_err(|e| anyhow::anyhow!("DB lock: {e}"))?;
+    effective_notes_with(&conn, tenant_id, group_id, board_id)
+}
+
+/// [`effective_notes`] against an ALREADY-HELD connection — the JOIN's seam for
+/// callers running inside a dispatch that owns the global DB mutex (the spine's
+/// `propose_from_note*` receives `&Connection`; re-locking self-deadlocks, the
+/// std Mutex is not reentrant). Same resolution, same obs line.
+pub fn effective_notes_with(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    group_id: Option<&str>,
+    board_id: &str,
+) -> anyhow::Result<EffectiveNotes> {
+    let constitution = merge_kind(conn, tenant_id, group_id, board_id, "constitution")?;
+    let preferences = merge_kind(conn, tenant_id, group_id, board_id, "preference")?;
     tracing::info!(
         tenant_id = %tenant_id,
         "obs constitution_resolved board={board_id} constitution_bytes={} preference_bytes={}",
@@ -48,8 +64,9 @@ pub fn effective_notes(
 
 /// Merge one kind across the three scopes into labeled markdown. Deterministic:
 /// scope order is fixed (tenant → group → board), rows order by (created_at, id)
-/// via `note_list_scoped`.
+/// via `note_list_scoped_with`.
 fn merge_kind(
+    conn: &rusqlite::Connection,
     tenant_id: &str,
     group_id: Option<&str>,
     board_id: &str,
@@ -57,11 +74,11 @@ fn merge_kind(
 ) -> anyhow::Result<String> {
     let mut sections: Vec<String> = Vec::new();
 
-    push_section(&mut sections, "Tenant", storage::note_list_scoped(tenant_id, "tenant", tenant_id, kind)?);
+    push_section(&mut sections, "Tenant", storage::note_list_scoped_with(conn, tenant_id, "tenant", tenant_id, kind)?);
     if let Some(gid) = group_id {
-        push_section(&mut sections, "Group", storage::note_list_scoped(tenant_id, "group", gid, kind)?);
+        push_section(&mut sections, "Group", storage::note_list_scoped_with(conn, tenant_id, "group", gid, kind)?);
     }
-    push_section(&mut sections, "Board", storage::note_list_scoped(tenant_id, "board", board_id, kind)?);
+    push_section(&mut sections, "Board", storage::note_list_scoped_with(conn, tenant_id, "board", board_id, kind)?);
 
     if sections.is_empty() {
         return Ok(String::new());

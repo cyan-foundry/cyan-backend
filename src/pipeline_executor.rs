@@ -38,6 +38,12 @@ pub struct LensExecuteRequest {
     pub human_input: Option<String>,
     pub tools_markdown: Option<String>,     // client-defined tools
     pub skills_markdown: Option<String>,    // client-defined skills
+    /// The board's EFFECTIVE constitution (merged tenant ⊕ group ⊕ board notes,
+    /// board wins) — read-only advisory context for the lens ReAct loop
+    /// (feat/notes-constitution widened the lens seam; this is the producer).
+    /// `None` when the board has no rules: the wire field stays absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constitution_markdown: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -161,6 +167,13 @@ pub async fn execute_step_via_lens(
         data: json!({ "executor_type": executor_type, "cell_content": &cell_content[..cell_content.len().min(100)] }),
     });
     
+    // THE JOIN (SESSION_JOIN §2): the board's merged constitution rides every
+    // lens execute as read-only context — the ReAct loop reasons over the house
+    // rules. Bounded read acquire (locks contract: never park on the DB mutex);
+    // a missed budget or uninitialized storage executes with no context.
+    let constitution_markdown = crate::storage::try_db_read(crate::storage::READ_LOCK_BUDGET)
+        .and_then(|conn| crate::review_loop::board_constitution_markdown(&conn, board_id));
+
     // Step 1: Send initial execute request
     let request = LensExecuteRequest {
         step_id: step_id.into(),
@@ -172,6 +185,7 @@ pub async fn execute_step_via_lens(
         human_input: None,
         tools_markdown: None,
         skills_markdown: None,
+        constitution_markdown,
     };
     
     eprintln!("📺 PIPELINE: Step {} → Lens API ({} executor)", step_id, executor_type);

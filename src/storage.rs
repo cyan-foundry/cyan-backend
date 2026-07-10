@@ -814,6 +814,19 @@ pub fn note_list_scoped(
     kind: &str,
 ) -> Result<Vec<NoteDTO>> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    note_list_scoped_with(&conn, tenant_id, scope, anchor_id, kind)
+}
+
+/// `note_list_scoped` against an ALREADY-HELD connection — for callers running
+/// inside a dispatch that owns the global DB mutex (re-locking self-deadlocks;
+/// the std Mutex is not reentrant). Same pattern as `board_get_group_id_with`.
+pub fn note_list_scoped_with(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    scope: &str,
+    anchor_id: &str,
+    kind: &str,
+) -> Result<Vec<NoteDTO>> {
     let mut stmt = conn.prepare(
         "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind
          FROM notes

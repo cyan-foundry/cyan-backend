@@ -46,6 +46,23 @@ fn now() -> i64 {
 /// a human ask), `exited` (approval or terminal state reached).
 pub const LOOP_STATUS_VOCAB: &[&str] = &["active", "escalated", "exited"];
 
+/// The closed-vocab op schemas handed to every proposer as `ProposeCtx.tool_schemas`
+/// (PROPOSE_OPS_CONTRACT.md: "the closed-vocab op vocabulary a proposer may emit").
+/// Shapes mirror `changelist::OP_VOCAB` + cyan-media conform's actual param reads —
+/// a proposer may emit ONLY these ops, with these params, or stay empty. The regex
+/// impl ignores this by design; the LLM impl embeds it in its prompt verbatim.
+pub const PROPOSER_TOOL_SCHEMAS: &str = r#"{
+  "trim":    { "params": { "edge": "head|tail", "frames": "int > 0" }, "note": "shorten an edge; a tail trim needs the clip duration" },
+  "delete":  { "params": {}, "note": "ripple-remove [tc_in, tc_out)" },
+  "lift":    { "params": {}, "note": "blank [tc_in, tc_out) in place, duration kept" },
+  "level":   { "params": { "gain_db": "float (signed)", "target_lufs": "float (alternative to gain_db)" }, "note": "audio gain over [tc_in, tc_out)" },
+  "mute":    { "params": {}, "note": "silence [tc_in, tc_out)" },
+  "fade":    { "params": { "dir": "in|out", "frames": "int > 0" }, "note": "audio+video fade anchored at tc_in (in) / tc_out (out)" },
+  "speed":   { "params": { "ratio": "float > 0" }, "note": "retime" },
+  "reframe": { "params": { "aspect": "e.g. 9:16", "mode": "crop|pan" }, "note": "aspect change" },
+  "color":   { "params": { "preset": "string" }, "note": "LUT preset only, not a grade. Loudness-normalize asks are level with target_lufs — 'loudnorm' is NOT an op the ledger accepts" }
+}"#;
+
 // ============================================================================
 // Migration — additive tables, idempotent.
 // ============================================================================
@@ -1348,11 +1365,68 @@ pub fn propose_from_note(
     propose_from_note_with(conn, tenant_id, asset_hash, branch, &crate::note_inference::RegexOpsProposer)
 }
 
+/// The board whose ACTIVE loop drives this asset branch (newest first) — the
+/// anchor the constitution resolver needs. `None` when no loop is registered:
+/// a loop-less propose runs with an EMPTY constitution, never a guess.
+fn loop_board_for_asset(
+    conn: &Connection,
+    tenant_id: &str,
+    asset_hash: &str,
+    branch: &str,
+) -> Option<String> {
+    conn.query_row(
+        "SELECT board_id FROM review_loop \
+         WHERE tenant_id=?1 AND asset_hash=?2 AND branch=?3 \
+         ORDER BY updated_at DESC LIMIT 1",
+        params![tenant_id, asset_hash, branch],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+}
+
+/// The board's EFFECTIVE notes for the proposer ctx — BEST-EFFORT: a DB that
+/// predates the notes table (or any resolver error) yields the empty strings,
+/// never a failed propose. The warn keeps the miss observable.
+fn effective_notes_for_board(
+    conn: &Connection,
+    tenant_id: &str,
+    board_id: &str,
+) -> crate::constitution::EffectiveNotes {
+    let group = crate::storage::board_get_group_id_with(conn, board_id);
+    crate::constitution::effective_notes_with(conn, tenant_id, group.as_deref(), board_id)
+        .unwrap_or_else(|e| {
+            tracing::warn!("constitution resolve failed for board {board_id} (non-fatal): {e:#}");
+            crate::constitution::EffectiveNotes {
+                constitution: String::new(),
+                preferences: String::new(),
+            }
+        })
+}
+
+/// The Lens `constitution_markdown` context for a board: the merged effective
+/// constitution, `None` when the board has no rules — the execute request field
+/// then stays absent (old-client wire shape). Preferences ride the constitution
+/// string here (one advisory context rail into the ReAct loop).
+pub fn board_constitution_markdown(conn: &Connection, board_id: &str) -> Option<String> {
+    let tenant = board_tenant(conn, board_id);
+    let eff = effective_notes_for_board(conn, &tenant, board_id);
+    let mut out = eff.constitution;
+    if !eff.preferences.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("## Preferences\n");
+        out.push_str(&eff.preferences);
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 /// [`propose_from_note`] behind the frozen seam (PROPOSE_OPS_CONTRACT.md): the
 /// caller picks the `OpsProposer` impl; everything downstream of the proposal
 /// (the confirm gate, the changelist, conform) is identical whichever impl ran.
-/// ctx carries an EMPTY constitution/preferences/tool_schemas today — Session
-/// B's notes-constitution work populates them through this same seam.
+/// THE JOIN: ctx now carries the board's EFFECTIVE constitution + preferences
+/// (resolved through the asset's active loop board) and the closed-vocab
+/// [`PROPOSER_TOOL_SCHEMAS`]. The regex impl still ignores them by contract.
 pub fn propose_from_note_with(
     conn: &Connection,
     tenant_id: &str,
@@ -1406,11 +1480,19 @@ pub fn propose_from_note_with(
         duration_frames,
         fps: asset.fps.unwrap_or(0.0),
     };
+    // THE JOIN (SESSION_JOIN §2): the board's effective constitution/preferences
+    // populate the ctx. No loop board ⇒ empty strings (a valid, tested result).
+    let effective = loop_board_for_asset(conn, tenant_id, asset_hash, branch)
+        .map(|board| effective_notes_for_board(conn, tenant_id, &board))
+        .unwrap_or_else(|| crate::constitution::EffectiveNotes {
+            constitution: String::new(),
+            preferences: String::new(),
+        });
     let ctx = crate::ops_proposer::ProposeCtx {
-        constitution: "",
-        preferences: "",
+        constitution: &effective.constitution,
+        preferences: &effective.preferences,
         asset: &asset_meta,
-        tool_schemas: "",
+        tool_schemas: PROPOSER_TOOL_SCHEMAS,
     };
     let mut escalated: Vec<String> = Vec::new();
     let mut chosen: Option<(&changelist::ChangeEntry, crate::ops_proposer::ProposedOp)> = None;
@@ -1437,6 +1519,17 @@ pub fn propose_from_note_with(
         ));
     };
     let note = (*note).clone();
+    // The JOIN's changelist adapter: proposer confidence rides
+    // `params["confidence"]` — exactly where the batch-confirm gate reads it
+    // (batch_confirm.rs). Absent = deterministic proposer, by contract.
+    // conform's op params schema is an OPEN object; conform reads only the
+    // keys it knows, so the extra key never breaks a dispatch.
+    let mut params = inferred.params.clone();
+    if let Some(c) = inferred.confidence
+        && let Some(obj) = params.as_object_mut()
+    {
+        obj.insert("confidence".to_string(), serde_json::json!(c));
+    }
     let entry = changelist::ChangeEntry {
         id: String::new(),
         entry_hash: String::new(),
@@ -1448,7 +1541,7 @@ pub fn propose_from_note_with(
         tc_out: inferred.tc_out,
         kind: "op".to_string(),
         op: Some(inferred.op.clone()),
-        params: inferred.params.clone(),
+        params,
         intent: format!("{}: {}", inferred.op, note.intent),
         source: Some("cyan".to_string()),
         source_ref: None,
