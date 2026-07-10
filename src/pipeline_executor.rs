@@ -693,30 +693,26 @@ pub(crate) fn parse_mcp_tool_step(metadata: &serde_json::Value) -> Option<McpToo
     })
 }
 
-/// PART 1-C (TONIGHT_RUN): the park decision for a step whose REQUIRED props
-/// are STILL unfilled after the whole deterministic dispatch ladder (upstream
-/// outputs → config context → env → conformed v2 → upstream media → confirmed
-/// changelist). Such a step PARKS — amber, human-actionable — it never
-/// dispatches into a red plugin validation error ("ops Field required", live
-/// 2026-07-09). Optional props never land in `pending`, so a fully-resolved
-/// step (empty `still_pending`) always dispatches.
+/// PART 1-C (TONIGHT_RUN): the park decision for a conform step whose REQUIRED
+/// `ops` prop is STILL unfilled after the whole deterministic dispatch ladder —
+/// the conform-with-no-confirmed-edits case ("ops Field required", red live
+/// 2026-07-09). Such a step PARKS: amber, human-actionable, never a red dispatch.
+///
+/// DELIBERATELY NARROW: only conform's `ops` parks. Media props
+/// (`input`/`file_path`/`name`) have LATER fill rungs inside
+/// `execute_local_mcp_tool_step` (`resolve_media_args` + the upstream-output
+/// fills), so parking on them pre-dispatch broke the WORKING C2C flow (found
+/// live: the materialized run's probe parked on an `input` the executor would
+/// have filled). Every other still-pending prop keeps the shipping behavior:
+/// dispatch, and the plugin's own validation reports it clearly.
 pub fn dispatch_park_reason(tool: &str, still_pending: &[String]) -> Option<String> {
-    if still_pending.is_empty() {
-        return None;
-    }
     if tool == "conform" && still_pending.iter().any(|p| p == "ops") {
         return Some(
             "no confirmed edits yet — review a proposed edit and confirm it, then re-run"
                 .to_string(),
         );
     }
-    let props = still_pending.join(", ");
-    let plural = if still_pending.len() > 1 { "s" } else { "" };
-    Some(format!(
-        "required input{plural} '{props}' not yet available — an upstream step's output \
-         (or a confirmed edit) fills {} once that step has run",
-        if still_pending.len() > 1 { "them" } else { "it" }
-    ))
+    None
 }
 
 /// The device's installed-plugins root: one subdir per plugin (the unpacked
@@ -2488,13 +2484,18 @@ mod media_arg_fill_tests {
     }
 
     #[test]
-    fn park_reason_names_the_missing_props_generically() {
-        let r = dispatch_park_reason(
+    fn non_ops_props_never_park() {
+        // DELIBERATE: media/id props have LATER fill rungs at dispatch
+        // (resolve_media_args, upstream outputs) — parking on them pre-dispatch
+        // broke the working C2C probe flow (found live 2026-07-09). They keep
+        // the shipping behavior: dispatch, plugin validation speaks.
+        assert!(dispatch_park_reason(
             "upload_file",
-            &["file_id".to_string(), "account_id".to_string()],
+            &["file_id".to_string(), "account_id".to_string()]
         )
-        .expect("unfilled required props must park");
-        assert!(r.contains("file_id") && r.contains("account_id"), "names each prop: {r}");
+        .is_none());
+        assert!(dispatch_park_reason("probe", &["input".to_string()]).is_none());
+        assert!(dispatch_park_reason("proxy", &["input".to_string()]).is_none());
     }
 
     #[test]
