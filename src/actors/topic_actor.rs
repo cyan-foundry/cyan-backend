@@ -1254,9 +1254,11 @@ impl TopicActor {
             // are handled identically (the split is informational for the UI).
             NetworkEvent::NoteAdded {
                 id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at,
+                scope, kind,
             }
             | NetworkEvent::NoteUpdated {
                 id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at,
+                scope, kind,
             } => {
                 let note = crate::models::dto::NoteDTO {
                     id: id.clone(),
@@ -1267,6 +1269,8 @@ impl TopicActor {
                     text: text.clone(),
                     created_at: *created_at,
                     updated_at: *updated_at,
+                    scope: scope.clone(),
+                    kind: kind.clone(),
                 };
                 let _ = storage::note_upsert(&note);
             }

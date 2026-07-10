@@ -132,6 +132,31 @@ pub struct ChatDTO {
 // NOTE (ROUND8 §W2 — board-level, authored, LWW ledger)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// The closed note SCOPE vocabulary (feat/notes-constitution). `board_id` doubles as
+/// the scope ANCHOR: the board id for `board`, the group id for `group`, the tenant id
+/// for `tenant` (tenant == group id in this engine).
+pub const NOTE_SCOPE_VOCAB: [&str; 3] = ["tenant", "group", "board"];
+/// The closed note KIND vocabulary. `constitution` + `preference` feed the merge
+/// resolver (→ `ProposeCtx.constitution` / `.preferences`); `editor-note` is the
+/// pre-existing board-note behavior.
+pub const NOTE_KIND_VOCAB: [&str; 3] = ["constitution", "preference", "editor-note"];
+
+pub fn note_scope_valid(s: &str) -> bool {
+    NOTE_SCOPE_VOCAB.contains(&s)
+}
+
+pub fn note_kind_valid(k: &str) -> bool {
+    NOTE_KIND_VOCAB.contains(&k)
+}
+
+pub fn default_note_scope() -> String {
+    "board".to_string()
+}
+
+pub fn default_note_kind() -> String {
+    "editor-note".to_string()
+}
+
 /// A board-level, authored note. Its own store + own sync stream — NOT a notebook
 /// cell. Editable; conflict resolution is LWW on `updated_at`; the store upserts by
 /// `id` (idempotent, so snapshot apply / anti-entropy repair converge without churn).
@@ -139,6 +164,7 @@ pub struct ChatDTO {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NoteDTO {
     pub id: String,
+    /// The scope ANCHOR (see `NOTE_SCOPE_VOCAB`): board id / group id / tenant id.
     pub board_id: String,
     pub tenant_id: String,
     pub author_id: String,
@@ -146,6 +172,13 @@ pub struct NoteDTO {
     pub text: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// `tenant` | `group` | `board`. Defaults keep pre-scope peers/rows wire- and
+    /// DB-compatible: a payload or row without it is a plain board note.
+    #[serde(default = "default_note_scope")]
+    pub scope: String,
+    /// `constitution` | `preference` | `editor-note`. Same compat contract as `scope`.
+    #[serde(default = "default_note_kind")]
+    pub kind: String,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

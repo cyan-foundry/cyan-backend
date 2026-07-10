@@ -95,6 +95,13 @@ pub enum NetworkEvent {
         text: String,
         created_at: i64,
         updated_at: i64,
+        /// Note SCOPE (feat/notes-constitution): `tenant` | `group` | `board`.
+        /// `#[serde(default)]` keeps the event wire-compatible with pre-scope peers.
+        #[serde(default = "crate::models::dto::default_note_scope")]
+        scope: String,
+        /// Note KIND: `constitution` | `preference` | `editor-note`. Same compat rule.
+        #[serde(default = "crate::models::dto::default_note_kind")]
+        kind: String,
     },
     /// A note was edited. Conflict resolution is LWW on `updated_at` (older edits drop).
     NoteUpdated {
@@ -106,6 +113,11 @@ pub enum NetworkEvent {
         text: String,
         created_at: i64,
         updated_at: i64,
+        /// Same scope/kind wire-compat contract as `NoteAdded`.
+        #[serde(default = "crate::models::dto::default_note_scope")]
+        scope: String,
+        #[serde(default = "crate::models::dto::default_note_kind")]
+        kind: String,
     },
     NoteDeleted {
         id: String,

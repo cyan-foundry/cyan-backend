@@ -65,7 +65,11 @@ pub fn group_high_water(group_id: &str) -> i64 {
     for ch in storage::chat_list_by_workspaces(&ws_ids).unwrap_or_default() {
         bump(ch.timestamp);
     }
-    for nt in storage::note_list_by_boards(&board_ids).unwrap_or_default() {
+    // feat/notes-constitution: group/tenant-scoped notes anchor at the group id — include
+    // them in the watermark exactly as the digest and the serializer do.
+    let mut note_anchor_ids = board_ids.clone();
+    note_anchor_ids.push(group_id.to_string());
+    for nt in storage::note_list_by_boards(&note_anchor_ids).unwrap_or_default() {
         bump(nt.updated_at);
     }
     for p in storage::pin_list_by_boards(&board_ids).unwrap_or_default() {
@@ -172,8 +176,12 @@ pub fn build_snapshot_frames(group_id: &str, since: Option<i64>) -> Result<Vec<S
         |i| i.created_at,
     );
     let board_metadata = storage::board_metadata_list_by_boards(&board_ids)?;
+    // feat/notes-constitution: group/tenant-scoped notes anchor at the group id, so the
+    // group id joins the anchor set — a scoped note repairs/cold-joins like a board note.
+    let mut note_anchor_ids = board_ids.clone();
+    note_anchor_ids.push(group_id.to_string());
     let notes = newer_than(
-        storage::note_list_by_boards(&board_ids)?,
+        storage::note_list_by_boards(&note_anchor_ids)?,
         since,
         |n| n.updated_at,
     );

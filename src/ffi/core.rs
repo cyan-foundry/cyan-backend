@@ -704,6 +704,47 @@ pub extern "C" fn cyan_note_put(
         note_id,
         tenant_id,
         text,
+        scope: None,
+        kind: None,
+    });
+}
+
+/// Author or edit a SCOPED note (feat/notes-constitution). Same contract as
+/// `cyan_note_put`, plus `scope` (`tenant`|`group`|`board`) and `kind`
+/// (`constitution`|`preference`|`editor-note`); null ⇒ `board`/`editor-note`. For
+/// `group`/`tenant` scope, `board_id` carries the ANCHOR id (the group/tenant id).
+/// Additive verb — never replaces any existing FFI.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_note_put_scoped(
+    board_id: *const c_char,
+    note_id: *const c_char,
+    tenant_id: *const c_char,
+    text: *const c_char,
+    scope: *const c_char,
+    kind: *const c_char,
+) {
+    let Some(board) = (unsafe { cstr_arg(board_id) }) else {
+        return;
+    };
+    let Some(text) = (unsafe { cstr_arg(text) }) else {
+        return;
+    };
+    let note_id = unsafe { cstr_arg(note_id) }; // null ⇒ new note
+    let tenant_id = unsafe { cstr_arg(tenant_id) }; // null ⇒ derive from anchor group
+    let scope = unsafe { cstr_arg(scope) }; // null ⇒ "board"
+    let kind = unsafe { cstr_arg(kind) }; // null ⇒ "editor-note"
+
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let _ = sys.command_tx.send(CommandMsg::PutNote {
+        board_id: board,
+        note_id,
+        tenant_id,
+        text,
+        scope,
+        kind,
     });
 }
 
