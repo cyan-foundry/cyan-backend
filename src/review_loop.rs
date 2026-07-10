@@ -253,6 +253,46 @@ pub fn confirmed_ops_for_board(
     Ok(Some(Vec::new()))
 }
 
+/// PART 1-B (TONIGHT_RUN): the WORKFLOW sense path's ingest + auto-propose in
+/// one verb. `ingest_sense_result` appends the sensed notes; when ≥1 landed,
+/// the agent immediately proposes from the open notes (`propose_from_note` —
+/// the regex seam; never a guess). A creative-only round proposes NOTHING and
+/// that is `Ok((ingest, None))`, not an error — the note stays with the human.
+/// The proposal (when any) is returned so callers can surface it.
+pub fn ingest_and_propose(
+    conn: &Connection,
+    tenant_id: &str,
+    proxy_ref: &str,
+    result: &serde_json::Value,
+) -> Result<(SenseIngest, Option<changelist::ChangeEntry>)> {
+    let ingest = ingest_sense_result(conn, tenant_id, proxy_ref, result)?;
+    if ingest.appended.is_empty() {
+        return Ok((ingest, None));
+    }
+    // proxy_ref → master: the ledger lives on the MASTER asset.
+    let Some(proxy) = asset_registry::find_by_remote_ref(conn, tenant_id, "frameio", proxy_ref)?
+    else {
+        return Ok((ingest, None));
+    };
+    let Some(master) = proxy.derived_from_asset.clone() else {
+        return Ok((ingest, None));
+    };
+    let branch = proxy
+        .derived_from_version
+        .as_deref()
+        .and_then(|v| changelist::get_version(conn, tenant_id, v).ok())
+        .map(|v| v.branch)
+        .unwrap_or_else(|| "main".to_string());
+    match propose_from_note(conn, tenant_id, &master, &branch) {
+        Ok(entry) => Ok((ingest, Some(entry))),
+        // "No mechanical note" is the escalate-to-human path — a valid outcome.
+        Err(e) => {
+            tracing::info!("sense→propose: no proposal this round ({e:#})");
+            Ok((ingest, None))
+        }
+    }
+}
+
 // ============================================================================
 // SENSE → ledger glue.
 // ============================================================================

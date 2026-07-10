@@ -367,6 +367,43 @@ fn confirmed_ops_for_board_empty_until_confirmed_then_conform_shape() {
 }
 
 // ============================================================================
+// 1e. PART 1-B (TONIGHT_RUN): the WORKFLOW sense step proposes — after a sense
+//     ingest appends a mechanical note, the agent proposal lands WITHOUT the
+//     dashboard review bar (the workflow path used to ingest and stop; the
+//     player then had nothing to confirm and conform parked forever).
+// ============================================================================
+
+#[test]
+fn workflow_sense_ingest_auto_proposes_mechanical_notes() {
+    let conn = db();
+    seed_published_round1(&conn, "file_auto");
+
+    let fixture = json!({
+        "data": [
+            { "id": "c-auto-1", "text": "Trim 12 frames off the tail — it hangs too long",
+              "frame": 60 }
+        ]
+    });
+    let (ingest, proposed) =
+        rl::ingest_and_propose(&conn, T, "file_auto", &fixture).expect("ingest+propose");
+    assert_eq!(ingest.appended.len(), 1, "the note lands in the ledger");
+    let prop = proposed.expect("a mechanical note must yield an agent proposal");
+    assert_eq!(prop.op.as_deref(), Some("trim"));
+    assert_eq!(prop.state, "proposed", "still gated on the human confirm");
+
+    // A CREATIVE-only ingest proposes nothing — and that is NOT an error.
+    let conn2 = db();
+    seed_published_round1(&conn2, "file_auto2");
+    let creative = json!({
+        "data": [ { "id": "c-auto-2", "text": "the vibe is off in the middle", "timestamp": 0 } ]
+    });
+    let (ingest2, proposed2) =
+        rl::ingest_and_propose(&conn2, T, "file_auto2", &creative).expect("ingest ok");
+    assert_eq!(ingest2.appended.len(), 1);
+    assert!(proposed2.is_none(), "creative notes escalate to the human, never guessed");
+}
+
+// ============================================================================
 // 1c. THE SEAM (PROPOSE_OPS_CONTRACT.md): downstream (propose → confirm →
 //     changelist) is PROPOSER-AGNOSTIC — any `OpsProposer` impl's output flows
 //     into the ledger unchanged. A scripted impl stands in for the future LLM.

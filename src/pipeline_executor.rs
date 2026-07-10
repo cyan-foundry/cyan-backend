@@ -1465,11 +1465,17 @@ pub fn ingest_sensed_comments(
         {
             fps = proxy.fps;
             if proxy.derived_from_version.is_some() {
-                match crate::review_loop::ingest_sense_result(&conn, &tenant, &file_ref, result) {
-                    Ok(ingest) => tracing::info!(
-                        "sense→ledger: appended={} deduped={} own_refs={} unmappable={} malformed={}",
+                // PART 1-B: ingest + AUTO-PROPOSE in one verb — the workflow
+                // sense step used to ingest and stop, so the player had no
+                // proposal to confirm and conform parked forever. A mechanical
+                // note now proposes immediately (regex seam, never a guess);
+                // a creative-only round proposes nothing and stays human.
+                match crate::review_loop::ingest_and_propose(&conn, &tenant, &file_ref, result) {
+                    Ok((ingest, proposed)) => tracing::info!(
+                        "sense→ledger: appended={} deduped={} own_refs={} unmappable={} malformed={} proposed={:?}",
                         ingest.appended.len(), ingest.deduped, ingest.own_refs_skipped,
-                        ingest.unmappable, ingest.malformed
+                        ingest.unmappable, ingest.malformed,
+                        proposed.as_ref().and_then(|p| p.op.clone())
                     ),
                     Err(e) => tracing::warn!("sense→ledger ingest failed (non-fatal): {e:#}"),
                 }
