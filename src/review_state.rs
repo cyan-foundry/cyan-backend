@@ -1200,6 +1200,31 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value, ReviewError> {
             let out = escalate_note(conn, &s("tenant_id")?, &s("entry_id")?, promote, actor()?)?;
             serde_json::to_value(out).map_err(|e| ReviewError::Other(e.to_string()))?
         }
+        // Batch-confirm gate (feat/notes-constitution) — additive verbs over the
+        // same confirm surface. `batch_confirm` = "approve all mechanical" for one
+        // (tenant, asset, branch) by one HUMAN tap, tier-gated per editor.
+        "set_trust" => {
+            let tier_str = s("tier")?;
+            let tier = crate::batch_confirm::TrustTier::parse(&tier_str).ok_or_else(|| {
+                ReviewError::Other(format!(
+                    "unknown trust tier '{tier_str}' (expected per-op|mechanical|senior)"
+                ))
+            })?;
+            let by = cmd.get("by").and_then(|v| v.as_str()).unwrap_or("human");
+            crate::batch_confirm::set_trust(conn, &s("tenant_id")?, &s("editor_id")?, tier, by)?;
+            serde_json::json!({ "ok": true, "tier": tier.as_str() })
+        }
+        "batch_confirm" => {
+            let out = crate::batch_confirm::approve_all_mechanical(
+                conn,
+                &s("tenant_id")?,
+                &s("asset_hash")?,
+                &branch(),
+                &s("editor_id")?,
+                actor()?,
+            )?;
+            serde_json::to_value(out).map_err(|e| ReviewError::Other(e.to_string()))?
+        }
         "nudges_for" => {
             let in_review_t = cmd.get("in_review_threshold_secs").and_then(|v| v.as_i64());
             let notes_in_t = cmd.get("notes_in_threshold_secs").and_then(|v| v.as_i64());

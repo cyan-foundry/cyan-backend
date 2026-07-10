@@ -2973,6 +2973,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         tracing::warn!("Migration: review_state table failed: {e}");
     }
 
+    // Batch-confirm gate (feat/notes-constitution): per-editor trust tiers over
+    // the changelist confirm surface. Creates `editor_trust`. Idempotent
+    // (CREATE TABLE IF NOT EXISTS); additive — no existing table or behavior
+    // changes.
+    if let Err(e) = crate::batch_confirm::migrate(conn) {
+        tracing::warn!("Migration: editor_trust table failed: {e}");
+    }
+
     // Asset registry (CYAN_FORMAT_SPEC / CYAN_FORMAT_QA): one row per
     // content-addressed media asset — kind/fps/duration (frame math), derivation
     // edges (proxy/deliverable → {parent master, version}), and remote refs

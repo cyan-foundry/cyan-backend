@@ -2012,6 +2012,7 @@ pub mod ops_proposer;
 pub mod constitution;
 pub mod llm;
 pub mod ops_eval;
+pub mod batch_confirm;
 pub mod xfer_policy;
 pub mod asset_registry;
 pub mod ingest;
