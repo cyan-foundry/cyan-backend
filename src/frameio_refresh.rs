@@ -91,8 +91,14 @@ pub fn refresh_cred_file() -> Result<bool> {
     Ok(true)
 }
 
-/// Is this error family the expired/invalid-credential class the refresh heals?
-pub fn is_auth_error(error_class: &str) -> bool {
-    matches!(error_class, "auth" | "unauthorized" | "token_expired")
-        || error_class.contains("401")
+/// Is this failure the expired/invalid-credential family the refresh heals?
+/// Checks the structured class first, then the message — a plugin that buckets
+/// a 401 under a generic class (with the status only in its message) still
+/// gets the refresh instead of a human bounce.
+pub fn is_auth_error(error_class: &str, message: &str) -> bool {
+    if matches!(error_class, "auth" | "unauthorized" | "token_expired") || error_class.contains("401") {
+        return true;
+    }
+    let m = message.to_ascii_lowercase();
+    m.contains("401") || m.contains("unauthorized") || m.contains("token expired")
 }

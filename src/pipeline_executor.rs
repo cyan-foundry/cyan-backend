@@ -903,8 +903,8 @@ pub(crate) async fn execute_local_mcp_tool_step(
     // spawn reads fresh) and retries the step ONCE. Anything else falls
     // through to the structured error path below.
     if let McpDispatch::Ran(result) = &dispatched {
-        if let Some((error_class, _)) = tool_result_error(&result.result) {
-            if crate::frameio_refresh::is_auth_error(&error_class)
+        if let Some((error_class, message)) = tool_result_error(&result.result) {
+            if crate::frameio_refresh::is_auth_error(&error_class, &message)
                 && crate::frameio_refresh::refresh_cred_file().unwrap_or(false)
             {
                 let _ = event_tx.send(SwiftEvent::StatusUpdate {
