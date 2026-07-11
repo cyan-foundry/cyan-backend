@@ -2300,6 +2300,26 @@ pub extern "C" fn cyan_save_notebook_cell(cell_json: *const c_char) -> bool {
             &id,
         );
 
+        // B4 — a changed STEP cell records its previous content for undo (the
+        // redo branch is invalidated inside record_edit). Best-effort: a
+        // history hiccup must never block the author's save.
+        if !is_new && cell_type == crate::workflow::STEP_KIND {
+            if let Some(new_content) = content.as_deref() {
+                let old: Option<String> = db.query_row(
+                    "SELECT content FROM notebook_cells WHERE id = ?1",
+                    params![&id],
+                    |row| row.get::<_, Option<String>>(0),
+                ).ok().flatten();
+                if let Some(old) = old {
+                    if let Err(e) =
+                        crate::step_history::record_edit(&db, &id, &old, new_content, now)
+                    {
+                        tracing::warn!("step edit history record failed: {e}");
+                    }
+                }
+            }
+        }
+
         // Get group_id via board -> workspace -> group
         group_id = db.query_row(
             "SELECT w.group_id FROM objects o
@@ -4887,13 +4907,140 @@ pub extern "C" fn cyan_pipeline_reset(
         Ok(s) => s,
         Err(_) => return false,
     };
-    
+
     let system = match SYSTEM.get() {
         Some(s) => s,
         None => return false,
     };
-    
+
     crate::pipeline::reset_pipeline(board_id_str, &system.command_tx).is_ok()
+}
+
+/// B4 — reset ONE step to pending: result cleared, attempt zeroed, any human
+/// decision cleared. State surgery only — never runs anything; the app decides
+/// whether (and when) to run. Additive FFI.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_pipeline_reset_step(
+    board_id: *const c_char,
+    step_id: *const c_char,
+) -> bool {
+    let board_id_str = match unsafe { CStr::from_ptr(board_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let step_id_str = match unsafe { CStr::from_ptr(step_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let system = match SYSTEM.get() {
+        Some(s) => s,
+        None => return false,
+    };
+    crate::pipeline::reset_step(board_id_str, step_id_str, &system.command_tx).is_ok()
+}
+
+/// B4 — undo (direction=0) / redo (direction=1) one edit of a STEP cell's
+/// content. Applies the restored content through the SAME persist path a
+/// normal save uses (storage + command loop → gossip + NotebookCellUpdated),
+/// so every surface refreshes. Returns owned JSON:
+///   {"content": "...", "undo_depth": N, "redo_depth": M}
+///   {"error": "nothing to undo"} — the cell is left untouched.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_step_edit_travel(
+    board_id: *const c_char,
+    cell_id: *const c_char,
+    direction: i32,
+) -> *mut c_char {
+    let err = |m: &str| json_cstring(&serde_json::json!({ "error": m }).to_string());
+    let Ok(board_id_str) = (unsafe { CStr::from_ptr(board_id) }).to_str() else {
+        return err("bad board_id");
+    };
+    let Ok(cell_id_str) = (unsafe { CStr::from_ptr(cell_id) }).to_str() else {
+        return err("bad cell_id");
+    };
+    let Some(system) = SYSTEM.get() else {
+        return err("engine not initialized");
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    // One lock: read the row, travel, write back.
+    let restored: Result<(String, i32, String, Option<String>, i64, i64), String> = {
+        let db = system.db.lock_safe();
+        let row: Result<(String, i32, Option<String>, Option<String>), _> = db.query_row(
+            "SELECT cell_type, cell_order, content, metadata_json \
+             FROM notebook_cells WHERE id = ?1 AND board_id = ?2",
+            params![cell_id_str, board_id_str],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        );
+        match row {
+            Err(_) => Err("cell not found on this board".to_string()),
+            Ok((cell_type, cell_order, content, metadata_json)) => {
+                let current = content.unwrap_or_default();
+                let travelled = if direction == 0 {
+                    crate::step_history::undo(&db, cell_id_str, &current, now)
+                } else {
+                    crate::step_history::redo(&db, cell_id_str, &current, now)
+                };
+                match travelled {
+                    Err(e) => Err(e.to_string()),
+                    Ok(None) => Err(if direction == 0 {
+                        "nothing to undo".to_string()
+                    } else {
+                        "nothing to redo".to_string()
+                    }),
+                    Ok(Some(restored)) => {
+                        let (u, r) = crate::step_history::depths(&db, cell_id_str)
+                            .unwrap_or((0, 0));
+                        Ok((cell_type, cell_order, restored, metadata_json, u, r))
+                    }
+                }
+            }
+        }
+    };
+
+    match restored {
+        Err(m) => err(&m),
+        Ok((cell_type, cell_order, restored, metadata_json, undo_depth, redo_depth)) => {
+            // Persist + broadcast through the normal update path (sync write so
+            // an immediate re-read sees it; command loop handles gossip/events).
+            let _ = crate::storage::cell_update(&crate::models::dto::NotebookCellDTO {
+                id: cell_id_str.to_string(),
+                board_id: board_id_str.to_string(),
+                cell_type: cell_type.clone(),
+                cell_order,
+                content: Some(restored.clone()),
+                output: None,
+                collapsed: false,
+                height: None,
+                metadata_json: metadata_json.clone(),
+                created_at: 0,
+                updated_at: now,
+            });
+            let _ = system.command_tx.send(crate::models::commands::CommandMsg::UpdateNotebookCell {
+                id: cell_id_str.to_string(),
+                board_id: board_id_str.to_string(),
+                cell_type,
+                cell_order,
+                content: Some(restored.clone()),
+                output: None,
+                collapsed: false,
+                height: None,
+                metadata_json,
+            });
+            json_cstring(
+                &serde_json::json!({
+                    "content": restored,
+                    "undo_depth": undo_depth,
+                    "redo_depth": redo_depth,
+                })
+                .to_string(),
+            )
+        }
+    }
 }
 
 

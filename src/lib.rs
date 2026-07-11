@@ -2582,6 +2582,7 @@ pub mod plugin_config;
 pub mod review_loop;
 pub mod review_state;
 pub mod seed;
+pub mod step_history;
 pub mod skills;
 pub mod templates;
 pub mod timecode_notes;

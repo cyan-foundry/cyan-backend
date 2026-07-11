@@ -1728,6 +1728,35 @@ pub fn retry_step(
     step_id: &str,
     command_tx: &UnboundedSender<CommandMsg>,
 ) -> Result<()> {
+    step_state_surgery(board_id, step_id, command_tx, StepSurgery::Retry)
+}
+
+/// B4 — per-step RESET: back to `pending`, result cleared, attempt counter
+/// ZEROED and any human decision cleared (a reset is a clean slate, not a
+/// retry — it never inflates the attempt/metering trail). The app decides
+/// whether to run afterwards; this is state surgery only.
+pub fn reset_step(
+    board_id: &str,
+    step_id: &str,
+    command_tx: &UnboundedSender<CommandMsg>,
+) -> Result<()> {
+    step_state_surgery(board_id, step_id, command_tx, StepSurgery::Reset)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum StepSurgery {
+    /// → pending, result cleared, attempt += 1 (an attempt is being spent).
+    Retry,
+    /// → pending, result cleared, attempt = 0, human decision cleared.
+    Reset,
+}
+
+fn step_state_surgery(
+    board_id: &str,
+    step_id: &str,
+    command_tx: &UnboundedSender<CommandMsg>,
+    surgery: StepSurgery,
+) -> Result<()> {
     let cells = load_pipeline_cells(board_id)?;
 
     let cell = cells.iter()
@@ -1757,10 +1786,20 @@ pub fn retry_step(
     metadata["pipeline"]["state"]["duration"] = json!(null);
     metadata["pipeline"]["state"]["started_at"] = json!(null);
     metadata["pipeline"]["state"]["ai_completed_at"] = json!(null);
-    
-    // Increment attempt counter
-    let attempt = metadata["pipeline"]["state"]["attempt"].as_u64().unwrap_or(0);
-    metadata["pipeline"]["state"]["attempt"] = json!(attempt + 1);
+
+    match surgery {
+        StepSurgery::Retry => {
+            // An attempt is being spent — the counter tells the truth.
+            let attempt = metadata["pipeline"]["state"]["attempt"].as_u64().unwrap_or(0);
+            metadata["pipeline"]["state"]["attempt"] = json!(attempt + 1);
+        }
+        StepSurgery::Reset => {
+            // Clean slate: no attempts spent, no lingering human decision.
+            metadata["pipeline"]["state"]["attempt"] = json!(0);
+            metadata["pipeline"]["state"]["approved_by"] = json!(null);
+            metadata["pipeline"]["state"]["approved_at"] = json!(null);
+        }
+    }
 
     // SYNCHRONOUS persist (C/S): the resume-run spawned right after Retry must read the
     // step as `pending` NOW so it re-executes it (resume from the failed step).
@@ -1789,7 +1828,11 @@ pub fn retry_step(
         metadata_json: Some(metadata.to_string()),
     });
 
-    tracing::info!("Step {} reset to pending (retry)", step_id);
+    tracing::info!(
+        "Step {} reset to pending ({})",
+        step_id,
+        if surgery == StepSurgery::Retry { "retry" } else { "reset" }
+    );
     Ok(())
 }
 

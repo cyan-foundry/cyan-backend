@@ -3061,6 +3061,12 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         tracing::warn!("Migration: plugin_config table failed: {e}");
     }
 
+    // B4 — per-step edit history (undo/redo stacks). Creates
+    // `cell_edit_history`. Idempotent; additive.
+    if let Err(e) = crate::step_history::migrate(conn) {
+        tracing::warn!("Migration: cell_edit_history table failed: {e}");
+    }
+
     Ok(())
 }
 
