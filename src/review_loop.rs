@@ -211,6 +211,26 @@ pub fn current_proxy_ref_for_board(
     current_proxy_ref(conn, &tenant, board_id)
 }
 
+/// BOARD-KEYED media info (B3): the app asks with just a `board_id`; the engine
+/// resolves the board's tenant and its current published proxy itself. An
+/// explicit `proxy_ref` (the coordinator's bound path) still wins. This drops
+/// the app's binding-token dependency — a board grid can open ANY board's
+/// player without holding that board's Frame.io binding.
+pub fn review_media_info_for_board(
+    conn: &Connection,
+    board_id: &str,
+    proxy_ref: Option<&str>,
+) -> Result<serde_json::Value> {
+    let tenant = board_tenant(conn, board_id);
+    let pref = match proxy_ref.filter(|p| !p.is_empty()) {
+        Some(p) => p.to_string(),
+        None => current_proxy_ref(conn, &tenant, board_id)?.ok_or_else(|| {
+            anyhow!("board '{board_id}' has no published review media (no active loop or no published proxy)")
+        })?,
+    };
+    review_media_info(conn, &tenant, &pref)
+}
+
 pub fn current_proxy_ref(
     conn: &Connection,
     tenant_id: &str,
