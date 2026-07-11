@@ -383,6 +383,14 @@ pub fn apply_snapshot_frame(frame: &SnapshotFrame) -> Result<()> {
                 )?;
             }
             for n in notes {
+                // LENS_AI_NOTES P1 — USER SCOPE IS SOVEREIGN: a holder never serializes
+                // user-scoped notes (`note_list_by_boards` excludes them), so one in a
+                // frame is foreign. Drop it — a snapshot must not write into this
+                // node's sovereign layer.
+                if n.scope == "user" {
+                    tracing::debug!("dropping inbound user-scoped note {} from snapshot", n.id);
+                    continue;
+                }
                 storage::note_upsert(n)?;
             }
             for p in pins {

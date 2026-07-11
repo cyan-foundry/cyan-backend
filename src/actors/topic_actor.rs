@@ -1264,22 +1264,29 @@ impl TopicActor {
                 id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at,
                 scope, kind, anchor_kind, anchor_id, origin_ref,
             } => {
-                let note = crate::models::dto::NoteDTO {
-                    id: id.clone(),
-                    board_id: board_id.clone(),
-                    tenant_id: tenant_id.clone(),
-                    author_id: author_id.clone(),
-                    author_name: author_name.clone(),
-                    text: text.clone(),
-                    created_at: *created_at,
-                    updated_at: *updated_at,
-                    scope: scope.clone(),
-                    kind: kind.clone(),
-                    anchor_kind: anchor_kind.clone(),
-                    anchor_id: anchor_id.clone(),
-                    origin_ref: origin_ref.clone(),
-                };
-                let _ = storage::note_upsert(&note);
+                // LENS_AI_NOTES P1 — USER SCOPE IS SOVEREIGN: our own user-scoped notes
+                // are never broadcast, so an inbound one is foreign (buggy or malicious).
+                // Drop it — nobody writes into another node's sovereign layer.
+                if scope == "user" {
+                    tracing::debug!("dropping inbound user-scoped note {id} (sovereign scope)");
+                } else {
+                    let note = crate::models::dto::NoteDTO {
+                        id: id.clone(),
+                        board_id: board_id.clone(),
+                        tenant_id: tenant_id.clone(),
+                        author_id: author_id.clone(),
+                        author_name: author_name.clone(),
+                        text: text.clone(),
+                        created_at: *created_at,
+                        updated_at: *updated_at,
+                        scope: scope.clone(),
+                        kind: kind.clone(),
+                        anchor_kind: anchor_kind.clone(),
+                        anchor_id: anchor_id.clone(),
+                        origin_ref: origin_ref.clone(),
+                    };
+                    let _ = storage::note_upsert(&note);
+                }
             }
             NetworkEvent::NoteDeleted { id } => {
                 let _ = storage::note_delete(id);

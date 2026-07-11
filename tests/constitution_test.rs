@@ -272,3 +272,194 @@ fn effective_notes_feed_propose_ctx() {
     assert!(ctx.constitution.contains("never trim the sponsor tag"));
     assert!(ctx.preferences.contains("music -20 LUFS under VO"));
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// 8. LENS_AI_NOTES P1 — the FULL scope chain: tenant ⊕ group ⊕ board ⊕ workflow
+//    ⊕ producer ⊕ user, most-specific LAST (user innermost, so user wins).
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn chain_merges_all_six_scopes_most_specific_last() {
+    ensure_db();
+    let tenant = "ch6-t";
+
+    put("ch6-1", tenant, tenant, "tenant", "constitution", "tenant chain rule", 1);
+    put("ch6-2", "ch6-g", tenant, "group", "constitution", "group chain rule", 2);
+    put("ch6-3", "ch6-b", tenant, "board", "constitution", "board chain rule", 3);
+    put("ch6-4", "ch6-w", tenant, "workflow", "constitution", "workflow chain rule", 4);
+    put("ch6-5", "ch6-p", tenant, "producer", "constitution", "producer chain rule", 5);
+    put("ch6-6", "ch6-u", tenant, "user", "constitution", "user chain rule", 6);
+
+    let chain = constitution::ScopeChain {
+        tenant_id: tenant.to_string(),
+        group_id: Some("ch6-g".to_string()),
+        board_id: "ch6-b".to_string(),
+        workflow_id: Some("ch6-w".to_string()),
+        producer_id: Some("ch6-p".to_string()),
+        user_id: Some("ch6-u".to_string()),
+    };
+    let eff = constitution::effective_notes_chain(&chain).expect("resolve chain");
+    let c = &eff.constitution;
+    let idx = |s: &str| c.find(s).unwrap_or_else(|| panic!("{s:?} missing:\n{c}"));
+
+    assert!(idx("tenant chain rule") < idx("group chain rule"), "tenant → group:\n{c}");
+    assert!(idx("group chain rule") < idx("board chain rule"), "group → board:\n{c}");
+    assert!(idx("board chain rule") < idx("workflow chain rule"), "board → workflow:\n{c}");
+    assert!(idx("workflow chain rule") < idx("producer chain rule"), "workflow → producer:\n{c}");
+    assert!(idx("producer chain rule") < idx("user chain rule"), "producer → user (user LAST, wins):\n{c}");
+
+    // The precedence contract is stated in the merged text, covering the FULL chain
+    // while preserving the 3-scope phrase existing consumers already assert on.
+    assert!(c.contains("user > producer > workflow"), "chain precedence stated:\n{c}");
+    assert!(c.contains("board > group > tenant"), "3-scope phrase preserved:\n{c}");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 9. User scope is the innermost link: even against only a board rule, the user
+//    section comes LAST — the sovereign, per-person override.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn chain_user_scope_is_innermost_and_wins() {
+    ensure_db();
+    let tenant = "chu-t";
+
+    put("chu-1", "chu-b", tenant, "board", "constitution", "board says -16 LUFS", 1);
+    put("chu-2", "chu-user", tenant, "user", "constitution", "user says -14 LUFS", 2);
+
+    let chain = constitution::ScopeChain {
+        tenant_id: tenant.to_string(),
+        group_id: None,
+        board_id: "chu-b".to_string(),
+        workflow_id: None,
+        producer_id: None,
+        user_id: Some("chu-user".to_string()),
+    };
+    let eff = constitution::effective_notes_chain(&chain).expect("resolve");
+    let c = &eff.constitution;
+    let b = c.find("board says -16 LUFS").expect("board rule present");
+    let u = c.find("user says -14 LUFS").expect("user rule present");
+    assert!(b < u, "user section is LAST (most specific wins):\n{c}");
+    assert!(c.contains("## User"), "user section labeled:\n{c}");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 10. Chain tenant isolation: a chain for tenant A NEVER picks tenant B rows,
+//     even with identical anchor ids at every link.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn chain_tenant_isolation_holds() {
+    ensure_db();
+    let (ta, tb) = ("chi-a", "chi-b");
+    // Identical anchors for both tenants at every scope link.
+    let (board, wf, prod, user) = ("chi-board", "chi-wf", "chi-prod", "chi-user");
+
+    put("chi-a1", wf, ta, "workflow", "constitution", "A workflow secret", 1);
+    put("chi-a2", prod, ta, "producer", "constitution", "A producer secret", 2);
+    put("chi-a3", user, ta, "user", "constitution", "A user secret", 3);
+    put("chi-b1", wf, tb, "workflow", "constitution", "B workflow secret", 1);
+    put("chi-b2", prod, tb, "producer", "constitution", "B producer secret", 2);
+    put("chi-b3", user, tb, "user", "constitution", "B user secret", 3);
+
+    let chain_a = constitution::ScopeChain {
+        tenant_id: ta.to_string(),
+        group_id: Some(ta.to_string()),
+        board_id: board.to_string(),
+        workflow_id: Some(wf.to_string()),
+        producer_id: Some(prod.to_string()),
+        user_id: Some(user.to_string()),
+    };
+    let a = constitution::effective_notes_chain(&chain_a).expect("a");
+    assert!(a.constitution.contains("A workflow secret"));
+    assert!(a.constitution.contains("A producer secret"));
+    assert!(a.constitution.contains("A user secret"));
+    for leak in ["B workflow secret", "B producer secret", "B user secret"] {
+        assert!(
+            !a.constitution.contains(leak),
+            "tenant A must never see {leak:?}:\n{}",
+            a.constitution
+        );
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 11. Creative DNA (kind = "creative-dna") rides the CONSTITUTION rail as its
+//     own labeled subsection per scope — never the preferences string.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn creative_dna_rides_constitution_as_labeled_subsections() {
+    ensure_db();
+    let tenant = "chd-t";
+
+    put("chd-1", tenant, tenant, "tenant", "constitution", "tenant base rule", 1);
+    put("chd-2", tenant, tenant, "tenant", "creative-dna", "house style: slow push-ins", 2);
+    put("chd-3", "chd-u", tenant, "user", "creative-dna", "my feel: cut on breath", 3);
+
+    let chain = constitution::ScopeChain {
+        tenant_id: tenant.to_string(),
+        group_id: None,
+        board_id: "chd-b".to_string(),
+        workflow_id: None,
+        producer_id: None,
+        user_id: Some("chd-u".to_string()),
+    };
+    let eff = constitution::effective_notes_chain(&chain).expect("resolve");
+    let c = &eff.constitution;
+
+    assert!(c.contains("## Creative DNA (Tenant)"), "tenant DNA subsection labeled:\n{c}");
+    assert!(c.contains("house style: slow push-ins"), "tenant DNA content present:\n{c}");
+    assert!(c.contains("## Creative DNA (User)"), "user DNA subsection labeled:\n{c}");
+    assert!(c.contains("my feel: cut on breath"), "user DNA content present:\n{c}");
+
+    // Per-scope placement: the tenant DNA rides with the tenant link (before the
+    // user link), so specificity ordering holds for DNA too.
+    let t_dna = c.find("house style: slow push-ins").expect("t dna");
+    let u_dna = c.find("my feel: cut on breath").expect("u dna");
+    assert!(t_dna < u_dna, "tenant DNA before user DNA:\n{c}");
+
+    assert!(
+        !eff.preferences.contains("slow push-ins") && !eff.preferences.contains("cut on breath"),
+        "creative-dna never leaks into preferences:\n{}",
+        eff.preferences
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 12. Absent chain links produce NO sections — and the legacy 3-arg resolver is
+//     exactly a chain with the new links None (the frozen seam holds).
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn absent_links_have_no_sections_and_three_arg_seam_is_a_none_chain() {
+    ensure_db();
+    let tenant = "chn-t";
+
+    put("chn-1", tenant, tenant, "tenant", "constitution", "tenant-only rule", 1);
+    put("chn-2", "chn-b", tenant, "board", "constitution", "board-only rule", 2);
+
+    let chain = constitution::ScopeChain {
+        tenant_id: tenant.to_string(),
+        group_id: Some(tenant.to_string()),
+        board_id: "chn-b".to_string(),
+        workflow_id: None,
+        producer_id: None,
+        user_id: None,
+    };
+    let chained = constitution::effective_notes_chain(&chain).expect("chain");
+    for absent in ["## Workflow", "## Producer", "## User"] {
+        assert!(
+            !chained.constitution.contains(absent),
+            "absent link must produce no {absent:?} section:\n{}",
+            chained.constitution
+        );
+    }
+
+    let three_arg =
+        constitution::effective_notes(tenant, Some(tenant), "chn-b").expect("3-arg");
+    assert_eq!(
+        three_arg, chained,
+        "the 3-arg resolver IS a chain with workflow/producer/user = None"
+    );
+}

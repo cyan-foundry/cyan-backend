@@ -139,15 +139,22 @@ pub struct ChatDTO {
 // NOTE (ROUND8 §W2 — board-level, authored, LWW ledger)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// The closed note SCOPE vocabulary (feat/notes-constitution). `board_id` doubles as
-/// the scope ANCHOR: the board id for `board`, the group id for `group`, the tenant id
-/// for `tenant` (tenant == group id in this engine).
-pub const NOTE_SCOPE_VOCAB: [&str; 3] = ["tenant", "group", "board"];
+/// The closed note SCOPE vocabulary (feat/notes-constitution + LENS_AI_NOTES P1).
+/// `board_id` doubles as the scope ANCHOR: the board id for `board`, the group id for
+/// `group`, the tenant id for `tenant` (tenant == group id in this engine), the
+/// workflow id for `workflow`, the producer id for `producer`, and the user id for
+/// `user`. The merge chain runs tenant → group → board → workflow → producer → user,
+/// most-specific LAST. `user` is SOVEREIGN: local-only, never gossiped or snapshot.
+pub const NOTE_SCOPE_VOCAB: [&str; 6] =
+    ["tenant", "group", "board", "workflow", "producer", "user"];
 /// The closed note KIND vocabulary. `constitution` + `preference` feed the merge
 /// resolver (→ `ProposeCtx.constitution` / `.preferences`); `editor-note` is the
 /// pre-existing board-note behavior; `decision` (CHAT C7) is a board decision
-/// promoted from the chat lane — a local ledger row, offline-capable.
-pub const NOTE_KIND_VOCAB: [&str; 4] = ["constitution", "preference", "editor-note", "decision"];
+/// promoted from the chat lane — a local ledger row, offline-capable; `creative-dna`
+/// (LENS_AI_NOTES P1) carries producer/house/director/studio/genre/feel/episodic
+/// material at any scope and rides the constitution rail as a labeled subsection.
+pub const NOTE_KIND_VOCAB: [&str; 5] =
+    ["constitution", "preference", "editor-note", "decision", "creative-dna"];
 
 pub fn note_scope_valid(s: &str) -> bool {
     NOTE_SCOPE_VOCAB.contains(&s)

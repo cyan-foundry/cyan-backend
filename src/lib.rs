@@ -438,6 +438,132 @@ impl CyanSystem {
 // COMMAND ACTOR
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// The `PutNote` dispatch (ROUND8 §W2 / feat/notes-constitution / LENS_AI_NOTES P1),
+/// extracted behavior-identically from `CommandActor::run` so tests can drive it
+/// with captured channels (the mcp_host pattern): validate scope/kind, persist via
+/// the LWW ledger, then gossip `NoteAdded`/`NoteUpdated` to the scope's group.
+///
+/// **USER SCOPE IS SOVEREIGN (local-first):** a `scope = "user"` note persists
+/// locally and surfaces to the local UI (`SwiftEvent`), but NO `NetworkCommand` is
+/// ever issued for it — it never gossips. (The other egress lanes, snapshot and
+/// anti-entropy, feed from `storage::note_list_by_boards`, which excludes user
+/// scope; inbound applies drop foreign user-scoped notes.)
+///
+/// `board_group` resolves a board id to its gossip group (the actor's DB lookup);
+/// it is only consulted for board scope.
+pub fn dispatch_put_note(
+    node_id: &str,
+    board_group: &dyn Fn(&str) -> Option<String>,
+    network_tx: &mpsc::UnboundedSender<NetworkCommand>,
+    event_tx: &mpsc::UnboundedSender<SwiftEvent>,
+    board_id: String,
+    note_id: Option<String>,
+    tenant_id: Option<String>,
+    text: String,
+    scope: Option<String>,
+    kind: Option<String>,
+    anchor_kind: Option<String>,
+    anchor_id: Option<String>,
+    origin_ref: Option<String>,
+) {
+    // feat/notes-constitution: scope/kind are additive; absent ⇒ the exact
+    // pre-scope behavior (a board editor-note). Invalid values REJECT the
+    // command (never silently misfile a constitution/preference note).
+    let scope = scope.unwrap_or_else(crate::models::dto::default_note_scope);
+    let kind = kind.unwrap_or_else(crate::models::dto::default_note_kind);
+    if !crate::models::dto::note_scope_valid(&scope)
+        || !crate::models::dto::note_kind_valid(&kind)
+    {
+        tracing::error!(
+            "PutNote rejected: invalid scope={scope:?} kind={kind:?} board={board_id}"
+        );
+        return;
+    }
+    // CHAT C7: an anchor is a matched pair — normalize half an anchor to
+    // unanchored rather than persist it.
+    let (anchor_kind, anchor_id) = match (anchor_kind, anchor_id) {
+        (Some(k), Some(a)) if !k.is_empty() && !a.is_empty() => (Some(k), Some(a)),
+        _ => (None, None),
+    };
+    let origin_ref = origin_ref.filter(|o| !o.is_empty());
+
+    let now = chrono::Utc::now().timestamp();
+    let author_id = node_id.to_string();
+    // author_name resolves from the author's XaeroID profile (same path
+    // presence/chat use); fall back to the raw id if no profile yet.
+    let author_name = storage::profile_get(&author_id)
+        .map(|(name, _)| name)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| author_id.clone());
+
+    // Tenant: explicit, else the board's group (group == tenant). For group/
+    // tenant scope, `board_id` IS the anchor (the group/tenant id), so it is
+    // also the broadcast group. USER SCOPE NEVER RESOLVES A BROADCAST GROUP —
+    // a sovereign note has nowhere to go by construction.
+    let group_id = match scope.as_str() {
+        "board" => board_group(&board_id),
+        "user" => None,
+        _ => Some(board_id.clone()),
+    };
+    let tenant = tenant_id
+        .or_else(|| group_id.clone())
+        .unwrap_or_else(|| author_id.clone());
+
+    // Editing an existing note preserves its original created_at; a new
+    // note gets a generated id + created_at = now. An id that resolves to
+    // an existing row is an edit (NoteUpdated); otherwise it's an add.
+    let id = note_id.unwrap_or_else(|| {
+        blake3::hash(format!("note:{board_id}-{text}-{now}").as_bytes())
+            .to_hex()
+            .to_string()
+    });
+    let existing = storage::note_get(&id).ok().flatten();
+    let is_new = existing.is_none();
+    let created_at = existing.map(|n| n.created_at).unwrap_or(now);
+
+    let note = crate::models::dto::NoteDTO {
+        id: id.clone(),
+        board_id: board_id.clone(),
+        tenant_id: tenant.clone(),
+        author_id: author_id.clone(),
+        author_name: author_name.clone(),
+        text: text.clone(),
+        created_at,
+        updated_at: now,
+        scope: scope.clone(),
+        kind: kind.clone(),
+        anchor_kind: anchor_kind.clone(),
+        anchor_id: anchor_id.clone(),
+        origin_ref: origin_ref.clone(),
+    };
+    match storage::note_upsert(&note) {
+        Ok(_) => tracing::info!(tenant_id = %tenant, "obs note_put board={board_id} id={id} scope={scope} kind={kind}"),
+        Err(e) => eprintln!("📝 [NOTE] 🔴 note_upsert failed: {e}"),
+    }
+
+    let event = if is_new {
+        NetworkEvent::NoteAdded {
+            id, board_id, tenant_id: tenant, author_id, author_name,
+            text, created_at, updated_at: now, scope, kind,
+            anchor_kind, anchor_id, origin_ref,
+        }
+    } else {
+        NetworkEvent::NoteUpdated {
+            id, board_id, tenant_id: tenant, author_id, author_name,
+            text, created_at, updated_at: now, scope, kind,
+            anchor_kind, anchor_id, origin_ref,
+        }
+    };
+
+    if let Some(gid) = group_id {
+        let _ = network_tx.send(NetworkCommand::Broadcast {
+            group_id: gid,
+            event: event.clone(),
+        });
+    }
+    let _ = event_tx.send(SwiftEvent::Network(event));
+}
+
 struct CommandActor {
     db: Arc<Mutex<Connection>>,
     rx: mpsc::UnboundedReceiver<CommandMsg>,
@@ -873,101 +999,17 @@ impl CommandActor {
 
                 // ── Note commands (ROUND8 §W2) — board-level authored LWW ledger ──
                 CommandMsg::PutNote { board_id, note_id, tenant_id, text, scope, kind, anchor_kind, anchor_id, origin_ref } => {
-                    // feat/notes-constitution: scope/kind are additive; absent ⇒ the exact
-                    // pre-scope behavior (a board editor-note). Invalid values REJECT the
-                    // command (never silently misfile a constitution/preference note).
-                    let scope = scope.unwrap_or_else(crate::models::dto::default_note_scope);
-                    let kind = kind.unwrap_or_else(crate::models::dto::default_note_kind);
-                    if !crate::models::dto::note_scope_valid(&scope)
-                        || !crate::models::dto::note_kind_valid(&kind)
-                    {
-                        tracing::error!(
-                            "PutNote rejected: invalid scope={scope:?} kind={kind:?} board={board_id}"
-                        );
-                        continue;
-                    }
-                    // CHAT C7: an anchor is a matched pair — normalize half an anchor to
-                    // unanchored rather than persist it.
-                    let (anchor_kind, anchor_id) = match (anchor_kind, anchor_id) {
-                        (Some(k), Some(a)) if !k.is_empty() && !a.is_empty() => (Some(k), Some(a)),
-                        _ => (None, None),
-                    };
-                    let origin_ref = origin_ref.filter(|o| !o.is_empty());
-
-                    let now = chrono::Utc::now().timestamp();
-                    let author_id = self.node_id.clone();
-                    // author_name resolves from the author's XaeroID profile (same path
-                    // presence/chat use); fall back to the raw id if no profile yet.
-                    let author_name = storage::profile_get(&author_id)
-                        .map(|(name, _)| name)
-                        .filter(|n| !n.is_empty())
-                        .unwrap_or_else(|| author_id.clone());
-
-                    // Tenant: explicit, else the board's group (group == tenant). For
-                    // group/tenant scope, `board_id` IS the anchor (the group/tenant id),
-                    // so it is also the broadcast group.
-                    let group_id = if scope == "board" {
-                        self.get_group_id_for_board(&board_id)
-                    } else {
-                        Some(board_id.clone())
-                    };
-                    let tenant = tenant_id
-                        .or_else(|| group_id.clone())
-                        .unwrap_or_else(|| author_id.clone());
-
-                    // Editing an existing note preserves its original created_at; a new
-                    // note gets a generated id + created_at = now. An id that resolves to
-                    // an existing row is an edit (NoteUpdated); otherwise it's an add.
-                    let id = note_id.unwrap_or_else(|| {
-                        blake3::hash(format!("note:{board_id}-{text}-{now}").as_bytes())
-                            .to_hex()
-                            .to_string()
-                    });
-                    let existing = storage::note_get(&id).ok().flatten();
-                    let is_new = existing.is_none();
-                    let created_at = existing.map(|n| n.created_at).unwrap_or(now);
-
-                    let note = crate::models::dto::NoteDTO {
-                        id: id.clone(),
-                        board_id: board_id.clone(),
-                        tenant_id: tenant.clone(),
-                        author_id: author_id.clone(),
-                        author_name: author_name.clone(),
-                        text: text.clone(),
-                        created_at,
-                        updated_at: now,
-                        scope: scope.clone(),
-                        kind: kind.clone(),
-                        anchor_kind: anchor_kind.clone(),
-                        anchor_id: anchor_id.clone(),
-                        origin_ref: origin_ref.clone(),
-                    };
-                    match storage::note_upsert(&note) {
-                        Ok(_) => tracing::info!(tenant_id = %tenant, "obs note_put board={board_id} id={id} scope={scope} kind={kind}"),
-                        Err(e) => eprintln!("📝 [NOTE] 🔴 note_upsert failed: {e}"),
-                    }
-
-                    let event = if is_new {
-                        NetworkEvent::NoteAdded {
-                            id, board_id, tenant_id: tenant, author_id, author_name,
-                            text, created_at, updated_at: now, scope, kind,
-                            anchor_kind, anchor_id, origin_ref,
-                        }
-                    } else {
-                        NetworkEvent::NoteUpdated {
-                            id, board_id, tenant_id: tenant, author_id, author_name,
-                            text, created_at, updated_at: now, scope, kind,
-                            anchor_kind, anchor_id, origin_ref,
-                        }
-                    };
-
-                    if let Some(gid) = group_id {
-                        let _ = self.network_tx.send(NetworkCommand::Broadcast {
-                            group_id: gid,
-                            event: event.clone(),
-                        });
-                    }
-                    let _ = self.event_tx.send(SwiftEvent::Network(event));
+                    // Extracted behavior-identically into `dispatch_put_note` (LENS_AI_NOTES
+                    // P1) so the sovereignty contract — a user-scoped note NEVER broadcasts —
+                    // is testable with captured channels.
+                    dispatch_put_note(
+                        &self.node_id,
+                        &|b: &str| self.get_group_id_for_board(b),
+                        &self.network_tx,
+                        &self.event_tx,
+                        board_id, note_id, tenant_id, text, scope, kind,
+                        anchor_kind, anchor_id, origin_ref,
+                    );
                 }
 
                 CommandMsg::DeleteNote { id } => {

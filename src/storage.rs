@@ -848,6 +848,11 @@ pub fn note_list_scoped_with(
 
 /// List all notes attached to the given boards (for the digest + snapshot serializer).
 /// A group is a single tenant, so this is naturally tenant-scoped by the board set.
+///
+/// LENS_AI_NOTES P1 — USER SCOPE IS SOVEREIGN: `scope = 'user'` rows are excluded
+/// OUTRIGHT. This is the single feed behind snapshot + anti-entropy, so filtering
+/// here guarantees a user-scoped note never leaves the device on either lane, even
+/// if its anchor id ever collided with a board/group id.
 pub fn note_list_by_boards(board_ids: &[String]) -> Result<Vec<NoteDTO>> {
     if board_ids.is_empty() {
         return Ok(vec![]);
@@ -856,7 +861,7 @@ pub fn note_list_by_boards(board_ids: &[String]) -> Result<Vec<NoteDTO>> {
     let placeholders: String = board_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
         "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref
-         FROM notes WHERE board_id IN ({}) ORDER BY created_at",
+         FROM notes WHERE board_id IN ({}) AND scope != 'user' ORDER BY created_at",
         placeholders
     );
     let mut stmt = conn.prepare(&sql)?;
