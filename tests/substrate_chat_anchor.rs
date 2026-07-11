@@ -8,11 +8,14 @@
 
 mod support;
 
-use cyan_backend::models::commands::CommandMsg;
-use cyan_backend::models::dto::{self, NoteDTO};
-use cyan_backend::models::events::NetworkEvent;
-use cyan_backend::storage;
-use cyan_backend::workflow;
+use cyan_backend::{
+    models::{
+        commands::CommandMsg,
+        dto::{self, NoteDTO},
+        events::NetworkEvent,
+    },
+    storage, workflow,
+};
 
 // ════════════════════════════════════════════════════════════════════════════
 // C1 — wire compatibility
@@ -25,7 +28,13 @@ fn c1_pre_anchor_send_chat_decodes() {
     let old_wire = r#"{"type":"SendChat","board_id":"b1","message":"hi","parent_id":null}"#;
     let cmd: CommandMsg = serde_json::from_str(old_wire).expect("old SendChat decodes");
     match cmd {
-        CommandMsg::SendChat { board_id, message, anchor_kind, anchor_id, .. } => {
+        CommandMsg::SendChat {
+            board_id,
+            message,
+            anchor_kind,
+            anchor_id,
+            ..
+        } => {
             assert_eq!(board_id, "b1");
             assert_eq!(message, "hi");
             assert!(anchor_kind.is_none(), "absent anchor_kind decodes as None");
@@ -42,7 +51,11 @@ fn c1_anchor_roundtrip_and_absent_when_unset() {
     let anchored = r#"{"type":"SendChat","board_id":"b1","message":"hi","parent_id":null,"anchor_kind":"step","anchor_id":"uid-42"}"#;
     let cmd: CommandMsg = serde_json::from_str(anchored).expect("anchored SendChat decodes");
     match &cmd {
-        CommandMsg::SendChat { anchor_kind, anchor_id, .. } => {
+        CommandMsg::SendChat {
+            anchor_kind,
+            anchor_id,
+            ..
+        } => {
             assert_eq!(anchor_kind.as_deref(), Some("step"));
             assert_eq!(anchor_id.as_deref(), Some("uid-42"));
         }
@@ -70,7 +83,11 @@ fn c1_chat_sent_event_wire_compat() {
     let old_wire = r#"{"type":"ChatSent","id":"m1","board_id":"b1","workspace_id":"w1","message":"hi","author":"a1","parent_id":null,"timestamp":7}"#;
     let evt: NetworkEvent = serde_json::from_str(old_wire).expect("old ChatSent decodes");
     match &evt {
-        NetworkEvent::ChatSent { anchor_kind, anchor_id, .. } => {
+        NetworkEvent::ChatSent {
+            anchor_kind,
+            anchor_id,
+            ..
+        } => {
             assert!(anchor_kind.is_none() && anchor_id.is_none());
         }
         other => panic!("decoded wrong variant: {other:?}"),
@@ -90,7 +107,11 @@ fn c1_chat_sent_event_wire_compat() {
     let json = serde_json::to_string(&anchored).expect("serializes");
     let back: NetworkEvent = serde_json::from_str(&json).expect("round-trips");
     match back {
-        NetworkEvent::ChatSent { anchor_kind, anchor_id, .. } => {
+        NetworkEvent::ChatSent {
+            anchor_kind,
+            anchor_id,
+            ..
+        } => {
             assert_eq!(anchor_kind.as_deref(), Some("step"));
             assert_eq!(anchor_id.as_deref(), Some("uid-42"));
         }
@@ -128,12 +149,27 @@ fn c1_chat_anchor_persists_and_lists() {
     let b = support::unique_group_id();
 
     storage::chat_insert(
-        &format!("{b}-m1"), &b, &w, "anchored msg", "author", None, 1,
-        Some("step"), Some("uid-42"),
+        &format!("{b}-m1"),
+        &b,
+        &w,
+        "anchored msg",
+        "author",
+        None,
+        1,
+        Some("step"),
+        Some("uid-42"),
     )
     .expect("insert anchored");
     storage::chat_insert(
-        &format!("{b}-m2"), &b, &w, "board msg", "author", None, 2, None, None,
+        &format!("{b}-m2"),
+        &b,
+        &w,
+        "board msg",
+        "author",
+        None,
+        2,
+        None,
+        None,
     )
     .expect("insert unanchored");
 
@@ -151,9 +187,18 @@ fn c1_chat_anchor_persists_and_lists() {
 /// `decision` joins the closed kind vocabulary; garbage is still rejected.
 #[test]
 fn c7_decision_kind_is_valid_garbage_is_not() {
-    assert!(dto::note_kind_valid("decision"), "decision is a valid kind (C7)");
-    assert!(dto::note_kind_valid("editor-note"), "pre-C7 kinds unchanged");
-    assert!(!dto::note_kind_valid("verdict"), "closed vocab still closed");
+    assert!(
+        dto::note_kind_valid("decision"),
+        "decision is a valid kind (C7)"
+    );
+    assert!(
+        dto::note_kind_valid("editor-note"),
+        "pre-C7 kinds unchanged"
+    );
+    assert!(
+        !dto::note_kind_valid("verdict"),
+        "closed vocab still closed"
+    );
 }
 
 /// A promoted note (anchor + origin_ref + decision kind) persists all three C7
@@ -180,7 +225,10 @@ fn c7_note_anchor_and_provenance_roundtrip() {
         anchor_id: Some("uid-42".into()),
         origin_ref: Some("chat:msg-abc".into()),
     };
-    assert!(storage::note_upsert(&note).expect("upsert"), "insert is a change");
+    assert!(
+        storage::note_upsert(&note).expect("upsert"),
+        "insert is a change"
+    );
 
     let got = storage::note_get(&id).expect("get").expect("exists");
     assert_eq!(got.kind, "decision");
@@ -205,7 +253,12 @@ fn c7_note_event_wire_compat() {
     let old_wire = r#"{"type":"NoteAdded","id":"n1","board_id":"b1","tenant_id":"t1","author_id":"a1","author_name":"Ana","text":"note","created_at":1,"updated_at":1,"scope":"board","kind":"editor-note"}"#;
     let evt: NetworkEvent = serde_json::from_str(old_wire).expect("old NoteAdded decodes");
     match evt {
-        NetworkEvent::NoteAdded { anchor_kind, anchor_id, origin_ref, .. } => {
+        NetworkEvent::NoteAdded {
+            anchor_kind,
+            anchor_id,
+            origin_ref,
+            ..
+        } => {
             assert!(anchor_kind.is_none() && anchor_id.is_none() && origin_ref.is_none());
         }
         other => panic!("decoded wrong variant: {other:?}"),
@@ -269,12 +322,293 @@ fn step_uid_preserves_client_metadata_keys() {
     let existing = r#"{"step_uid":"uid-original"}"#;
     let meta = workflow::ensure_step_uid(Some(incoming), Some(existing), "cell-1");
     let v: serde_json::Value = serde_json::from_str(&meta).expect("valid json");
-    assert_eq!(v["step_uid"].as_str(), Some("uid-original"), "inherited into client write");
-    assert_eq!(v["custom"].as_str(), Some("kept"), "client keys pass through");
+    assert_eq!(
+        v["step_uid"].as_str(),
+        Some("uid-original"),
+        "inherited into client write"
+    );
+    assert_eq!(
+        v["custom"].as_str(),
+        Some("kept"),
+        "client keys pass through"
+    );
     assert_eq!(v["pipeline"]["step_id"].as_str(), Some("conform"));
 
     let explicit = r#"{"step_uid":"uid-explicit"}"#;
     let meta2 = workflow::ensure_step_uid(Some(explicit), Some(existing), "cell-1");
     let v2: serde_json::Value = serde_json::from_str(&meta2).expect("valid json");
-    assert_eq!(v2["step_uid"].as_str(), Some("uid-explicit"), "explicit uid wins");
+    assert_eq!(
+        v2["step_uid"].as_str(),
+        Some("uid-explicit"),
+        "explicit uid wins"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// P4 (LENS_AI_NOTES) — unified anchor kinds: step | board | run | frame
+// ════════════════════════════════════════════════════════════════════════════
+
+/// The anchor-kind vocabulary is CLOSED and additive: `run` (a `workflow_run.run_id`)
+/// and `frame` (`"<asset>@<master_frame>"`, opaque engine-side) join `step`/`board`;
+/// garbage rejects.
+#[test]
+fn p4_anchor_kind_vocab_is_closed() {
+    for k in ["step", "board", "run", "frame"] {
+        assert!(dto::anchor_kind_valid(k), "{k} is a valid anchor kind");
+    }
+    for k in ["", "Step", "zzz", "asset", "frame "] {
+        assert!(!dto::anchor_kind_valid(k), "{k:?} must be rejected");
+    }
+}
+
+/// `SendChat` with a `run` / `frame` anchor round-trips the wire — anchors stay a
+/// free (kind, id) pair, so no command/event shape changes at all.
+#[test]
+fn p4_run_and_frame_anchored_send_chat_roundtrip() {
+    let run_wire = r#"{"type":"SendChat","board_id":"b1","message":"run went sideways","parent_id":null,"anchor_kind":"run","anchor_id":"run-2024-042"}"#;
+    let cmd: CommandMsg = serde_json::from_str(run_wire).expect("run-anchored SendChat decodes");
+    match &cmd {
+        CommandMsg::SendChat {
+            anchor_kind,
+            anchor_id,
+            ..
+        } => {
+            assert_eq!(anchor_kind.as_deref(), Some("run"));
+            assert_eq!(anchor_id.as_deref(), Some("run-2024-042"));
+        }
+        other => panic!("decoded wrong variant: {other:?}"),
+    }
+
+    let frame = CommandMsg::SendChat {
+        board_id: "b1".into(),
+        message: "this frame clips".into(),
+        parent_id: None,
+        anchor_kind: Some("frame".into()),
+        anchor_id: Some("asset-lut@0042".into()),
+    };
+    let json = serde_json::to_string(&frame).expect("serializes");
+    let back: CommandMsg = serde_json::from_str(&json).expect("round-trips");
+    match back {
+        CommandMsg::SendChat {
+            anchor_kind,
+            anchor_id,
+            ..
+        } => {
+            assert_eq!(anchor_kind.as_deref(), Some("frame"));
+            assert_eq!(anchor_id.as_deref(), Some("asset-lut@0042"));
+        }
+        other => panic!("round-tripped wrong variant: {other:?}"),
+    }
+}
+
+/// `run` / `frame` anchored chats persist and list back through storage exactly like
+/// `step` anchors — and a pre-anchor row still reads back `None`.
+#[test]
+fn p4_run_and_frame_chat_anchors_persist() {
+    support::ensure_db();
+    let w = support::unique_group_id();
+    let b = support::unique_group_id();
+
+    storage::chat_insert(
+        &format!("{b}-m-run"),
+        &b,
+        &w,
+        "run chatter",
+        "author",
+        None,
+        1,
+        Some("run"),
+        Some("run-2024-042"),
+    )
+    .expect("insert run-anchored");
+    storage::chat_insert(
+        &format!("{b}-m-frame"),
+        &b,
+        &w,
+        "frame chatter",
+        "author",
+        None,
+        2,
+        Some("frame"),
+        Some("asset-lut@0042"),
+    )
+    .expect("insert frame-anchored");
+    storage::chat_insert(
+        &format!("{b}-m-old"),
+        &b,
+        &w,
+        "plain",
+        "author",
+        None,
+        3,
+        None,
+        None,
+    )
+    .expect("insert pre-anchor shape");
+
+    let chats = storage::chat_list_by_board(&b).expect("list");
+    assert_eq!(chats.len(), 3);
+    assert_eq!(chats[0].anchor_kind.as_deref(), Some("run"));
+    assert_eq!(chats[0].anchor_id.as_deref(), Some("run-2024-042"));
+    assert_eq!(chats[1].anchor_kind.as_deref(), Some("frame"));
+    assert_eq!(chats[1].anchor_id.as_deref(), Some("asset-lut@0042"));
+    assert!(chats[2].anchor_kind.is_none() && chats[2].anchor_id.is_none());
+}
+
+/// A `NoteAdded` event with a `run` anchor round-trips the gossip wire, and a
+/// pre-anchor payload still decodes — the vocab is validation-only, not a wire change.
+#[test]
+fn p4_note_event_run_anchor_wire_roundtrip() {
+    let anchored = NetworkEvent::NoteAdded {
+        id: "n-run".into(),
+        board_id: "b1".into(),
+        tenant_id: "t1".into(),
+        author_id: "a1".into(),
+        author_name: "Ana".into(),
+        text: "decision about the run".into(),
+        created_at: 1,
+        updated_at: 1,
+        scope: "board".into(),
+        kind: "decision".into(),
+        anchor_kind: Some("run".into()),
+        anchor_id: Some("run-2024-042".into()),
+        origin_ref: Some("chat:m-run".into()),
+    };
+    let json = serde_json::to_string(&anchored).expect("serializes");
+    let back: NetworkEvent = serde_json::from_str(&json).expect("round-trips");
+    match back {
+        NetworkEvent::NoteAdded {
+            anchor_kind,
+            anchor_id,
+            ..
+        } => {
+            assert_eq!(anchor_kind.as_deref(), Some("run"));
+            assert_eq!(anchor_id.as_deref(), Some("run-2024-042"));
+        }
+        other => panic!("round-tripped wrong variant: {other:?}"),
+    }
+
+    let old_wire = r#"{"type":"NoteAdded","id":"n-old","board_id":"b1","tenant_id":"t1","author_id":"a1","author_name":"Ana","text":"note","created_at":1,"updated_at":1,"scope":"board","kind":"editor-note"}"#;
+    let evt: NetworkEvent = serde_json::from_str(old_wire).expect("pre-anchor payload decodes");
+    match evt {
+        NetworkEvent::NoteAdded {
+            anchor_kind,
+            anchor_id,
+            ..
+        } => {
+            assert!(anchor_kind.is_none() && anchor_id.is_none());
+        }
+        other => panic!("decoded wrong variant: {other:?}"),
+    }
+}
+
+/// PutNote validates the anchor kind: an unknown kind REJECTS the command outright
+/// (nothing persisted, nothing broadcast); `run`/`frame` are accepted and persist;
+/// absent anchors stay valid (every pre-anchor note).
+#[test]
+fn p4_put_note_validates_anchor_kind() {
+    support::ensure_db();
+    let board = support::unique_group_id();
+    let tenant = support::unique_group_id();
+    let (net_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel();
+    let group = format!("{board}-grp");
+    let board_group = |_: &str| Some(group.clone());
+
+    // Unknown anchor kind: rejected — no row, no broadcast, no local event.
+    cyan_backend::dispatch_put_note(
+        "node-p4",
+        &board_group,
+        &net_tx,
+        &evt_tx,
+        board.clone(),
+        Some("p4-note-bad".into()),
+        Some(tenant.clone()),
+        "anchored to nonsense".into(),
+        Some("board".into()),
+        Some("editor-note".into()),
+        Some("zzz".into()),
+        Some("whatever".into()),
+        None,
+    );
+    assert!(
+        storage::note_get("p4-note-bad").expect("get").is_none(),
+        "an invalid anchor kind must reject the whole PutNote"
+    );
+    assert!(
+        net_rx.try_recv().is_err(),
+        "no broadcast for a rejected note"
+    );
+    assert!(
+        evt_rx.try_recv().is_err(),
+        "no local event for a rejected note"
+    );
+
+    // `run` anchor: accepted, persisted, broadcast.
+    cyan_backend::dispatch_put_note(
+        "node-p4",
+        &board_group,
+        &net_tx,
+        &evt_tx,
+        board.clone(),
+        Some("p4-note-run".into()),
+        Some(tenant.clone()),
+        "note about a run".into(),
+        Some("board".into()),
+        Some("decision".into()),
+        Some("run".into()),
+        Some("run-2024-042".into()),
+        None,
+    );
+    let got = storage::note_get("p4-note-run")
+        .expect("get")
+        .expect("run-anchored note persists");
+    assert_eq!(got.anchor_kind.as_deref(), Some("run"));
+    assert_eq!(got.anchor_id.as_deref(), Some("run-2024-042"));
+    assert!(
+        net_rx.try_recv().is_ok(),
+        "valid anchored note still broadcasts"
+    );
+
+    // `frame` anchor: accepted; the id is an opaque "<asset>@<master_frame>" string.
+    cyan_backend::dispatch_put_note(
+        "node-p4",
+        &board_group,
+        &net_tx,
+        &evt_tx,
+        board.clone(),
+        Some("p4-note-frame".into()),
+        Some(tenant.clone()),
+        "note about a frame".into(),
+        Some("board".into()),
+        Some("editor-note".into()),
+        Some("frame".into()),
+        Some("asset-lut@0042".into()),
+        None,
+    );
+    let got = storage::note_get("p4-note-frame")
+        .expect("get")
+        .expect("frame-anchored note persists");
+    assert_eq!(got.anchor_id.as_deref(), Some("asset-lut@0042"));
+
+    // Absent anchor: still valid (the pre-anchor contract is untouched).
+    cyan_backend::dispatch_put_note(
+        "node-p4",
+        &board_group,
+        &net_tx,
+        &evt_tx,
+        board,
+        Some("p4-note-plain".into()),
+        Some(tenant),
+        "plain note".into(),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let got = storage::note_get("p4-note-plain")
+        .expect("get")
+        .expect("plain note persists");
+    assert!(got.anchor_kind.is_none() && got.anchor_id.is_none());
 }

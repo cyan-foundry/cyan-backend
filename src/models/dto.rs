@@ -2,8 +2,9 @@
 //
 // Data Transfer Objects for storage and network serialization
 
-use crate::models::core::{Group, Workspace};
 use serde::{Deserialize, Serialize};
+
+use crate::models::core::{Group, Workspace};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TREE SNAPSHOT DTO (for UI refresh)
@@ -153,8 +154,13 @@ pub const NOTE_SCOPE_VOCAB: [&str; 6] =
 /// promoted from the chat lane — a local ledger row, offline-capable; `creative-dna`
 /// (LENS_AI_NOTES P1) carries producer/house/director/studio/genre/feel/episodic
 /// material at any scope and rides the constitution rail as a labeled subsection.
-pub const NOTE_KIND_VOCAB: [&str; 5] =
-    ["constitution", "preference", "editor-note", "decision", "creative-dna"];
+pub const NOTE_KIND_VOCAB: [&str; 5] = [
+    "constitution",
+    "preference",
+    "editor-note",
+    "decision",
+    "creative-dna",
+];
 
 pub fn note_scope_valid(s: &str) -> bool {
     NOTE_SCOPE_VOCAB.contains(&s)
@@ -162,6 +168,18 @@ pub fn note_scope_valid(s: &str) -> bool {
 
 pub fn note_kind_valid(k: &str) -> bool {
     NOTE_KIND_VOCAB.contains(&k)
+}
+
+/// The closed ANCHOR-KIND vocabulary (LENS_AI_NOTES P4, unified): what a chat
+/// message or note anchors to WITHIN a board. `step` → a stable `step_uid`;
+/// `board` → the board's general slot; `run` → a `workflow_run.run_id`; `frame` →
+/// `"<asset>@<master_frame>"` (an opaque string — the engine never parses it).
+/// Anchors stay a free (kind, id) pair on the wire (pair-normalization in SendChat
+/// is unchanged); this vocab validates where notes are PUT.
+pub const ANCHOR_KIND_VOCAB: [&str; 4] = ["step", "board", "run", "frame"];
+
+pub fn anchor_kind_valid(k: &str) -> bool {
+    ANCHOR_KIND_VOCAB.contains(&k)
 }
 
 pub fn default_note_scope() -> String {
