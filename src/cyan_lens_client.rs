@@ -5,14 +5,15 @@
 //
 // Used by ai_bridge.rs to route:
 // - LensSearch → POST /api/v1/query
-// - Summarize → POST /api/v1/summarize  
+// - Summarize → POST /api/v1/summarize
 // - Nudges → GET /api/v1/nudges/:gid
 // - Graph ops → GET /api/v1/graph/*
 //
 // Events are forwarded via Iggy (separate path)
 
-use serde::{Deserialize, Serialize};
 use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 // ============================================================================
 // Configuration
@@ -42,8 +43,7 @@ impl CyanLensConfig {
         Self {
             base_url: std::env::var("CYAN_LENS_URL")
                 .unwrap_or_else(|_| "http://localhost:8080".to_string()),
-            group_id: std::env::var("CYAN_GROUP_ID")
-                .unwrap_or_else(|_| "default".to_string()),
+            group_id: std::env::var("CYAN_GROUP_ID").unwrap_or_else(|_| "default".to_string()),
             workspace_id: std::env::var("CYAN_WORKSPACE_ID").ok(),
             timeout_secs: std::env::var("CYAN_LENS_TIMEOUT")
                 .ok()
@@ -77,16 +77,36 @@ pub struct SummaryRequest {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SummaryQuery {
-    Topic { topic: String },
-    Entity { external_id: String, source: Option<String> },
-    Recent { hours: u64 },
-    Workspace { workspace_id: String },
+    Topic {
+        topic: String,
+    },
+    Entity {
+        external_id: String,
+        source: Option<String>,
+    },
+    Recent {
+        hours: u64,
+    },
+    Workspace {
+        workspace_id: String,
+    },
     StatusReport,
-    Board { board_id: String },
+    Board {
+        board_id: String,
+    },
     Group,
-    Files { scope_type: String, scope_id: Option<String> },
-    JiraEpic { epic_key: String },
-    PrActivity { hours: u64, repo: Option<String>, related_epic: Option<String> },
+    Files {
+        scope_type: String,
+        scope_id: Option<String>,
+    },
+    JiraEpic {
+        epic_key: String,
+    },
+    PrActivity {
+        hours: u64,
+        repo: Option<String>,
+        related_epic: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -401,6 +421,18 @@ impl CyanLensClient {
         Self::new(CyanLensConfig::from_env())
     }
 
+    /// Non-panicking [`Self::from_env`] for fire-and-forget legs (the P5 chat
+    /// relay): a reqwest builder failure yields `None` instead of crossing the
+    /// engine as a panic. Reads the same `CYAN_LENS_*` env as `from_env`.
+    pub fn try_from_env() -> Option<Self> {
+        let config = CyanLensConfig::from_env();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.timeout_secs))
+            .build()
+            .ok()?;
+        Some(Self { client, config })
+    }
+
     /// Update group_id for subsequent requests
     pub fn set_group_id(&mut self, group_id: String) {
         self.config.group_id = group_id;
@@ -424,7 +456,8 @@ impl CyanLensClient {
         let url = format!("{}/api/v1/health", self.config.base_url);
         let resp = self.client.get(&url).send().await?;
         let body: ApiResponse<HealthResponse> = resp.json().await?;
-        body.data.ok_or_else(|| CyanLensError::Api(body.error.unwrap_or_default()))
+        body.data
+            .ok_or_else(|| CyanLensError::Api(body.error.unwrap_or_default()))
     }
 
     pub async fn is_available(&self) -> bool {
@@ -446,7 +479,8 @@ impl CyanLensClient {
 
         let resp = self.client.post(&url).json(&request).send().await?;
         let body: ApiResponse<QueryResponse> = resp.json().await?;
-        body.data.ok_or_else(|| CyanLensError::Api(body.error.unwrap_or_default()))
+        body.data
+            .ok_or_else(|| CyanLensError::Api(body.error.unwrap_or_default()))
     }
 
     // ========================================================================
@@ -454,7 +488,10 @@ impl CyanLensClient {
     // ========================================================================
 
     pub async fn summarize_topic(&self, topic: &str) -> Result<SummaryResponse, CyanLensError> {
-        self.summarize(SummaryQuery::Topic { topic: topic.to_string() }).await
+        self.summarize(SummaryQuery::Topic {
+            topic: topic.to_string(),
+        })
+        .await
     }
 
     pub async fn summarize_recent(&self, hours: u64) -> Result<SummaryResponse, CyanLensError> {
@@ -465,18 +502,27 @@ impl CyanLensClient {
         self.summarize(SummaryQuery::StatusReport).await
     }
 
-    pub async fn summarize_entity(&self, external_id: &str, source: Option<&str>) -> Result<SummaryResponse, CyanLensError> {
+    pub async fn summarize_entity(
+        &self,
+        external_id: &str,
+        source: Option<&str>,
+    ) -> Result<SummaryResponse, CyanLensError> {
         self.summarize(SummaryQuery::Entity {
             external_id: external_id.to_string(),
             source: source.map(String::from),
-        }).await
+        })
+        .await
     }
 
     async fn summarize(&self, query: SummaryQuery) -> Result<SummaryResponse, CyanLensError> {
         self.summarize_filtered(query, None).await
     }
 
-    async fn summarize_filtered(&self, query: SummaryQuery, source_filter: Option<Vec<String>>) -> Result<SummaryResponse, CyanLensError> {
+    async fn summarize_filtered(
+        &self,
+        query: SummaryQuery,
+        source_filter: Option<Vec<String>>,
+    ) -> Result<SummaryResponse, CyanLensError> {
         let url = format!("{}/api/v1/summarize", self.config.base_url);
         let request = SummaryRequest {
             group_id: self.config.group_id.clone(),
@@ -487,42 +533,73 @@ impl CyanLensClient {
 
         let resp = self.client.post(&url).json(&request).send().await?;
         let body: ApiResponse<SummaryResponse> = resp.json().await?;
-        body.data.ok_or_else(|| CyanLensError::Api(body.error.unwrap_or_default()))
+        body.data
+            .ok_or_else(|| CyanLensError::Api(body.error.unwrap_or_default()))
     }
 
     pub async fn summarize_board(&self, board_id: &str) -> Result<SummaryResponse, CyanLensError> {
-        self.summarize(SummaryQuery::Board { board_id: board_id.to_string() }).await
+        self.summarize(SummaryQuery::Board {
+            board_id: board_id.to_string(),
+        })
+        .await
     }
 
     pub async fn summarize_group(&self) -> Result<SummaryResponse, CyanLensError> {
         self.summarize(SummaryQuery::Group).await
     }
 
-    pub async fn summarize_workspace(&self, workspace_id: &str) -> Result<SummaryResponse, CyanLensError> {
-        self.summarize(SummaryQuery::Workspace { workspace_id: workspace_id.to_string() }).await
+    pub async fn summarize_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<SummaryResponse, CyanLensError> {
+        self.summarize(SummaryQuery::Workspace {
+            workspace_id: workspace_id.to_string(),
+        })
+        .await
     }
 
-    pub async fn summarize_files(&self, scope_type: &str, scope_id: Option<&str>) -> Result<SummaryResponse, CyanLensError> {
+    pub async fn summarize_files(
+        &self,
+        scope_type: &str,
+        scope_id: Option<&str>,
+    ) -> Result<SummaryResponse, CyanLensError> {
         self.summarize(SummaryQuery::Files {
             scope_type: scope_type.to_string(),
             scope_id: scope_id.map(String::from),
-        }).await
+        })
+        .await
     }
 
-    pub async fn summarize_jira_epic(&self, epic_key: &str) -> Result<SummaryResponse, CyanLensError> {
-        self.summarize(SummaryQuery::JiraEpic { epic_key: epic_key.to_string() }).await
+    pub async fn summarize_jira_epic(
+        &self,
+        epic_key: &str,
+    ) -> Result<SummaryResponse, CyanLensError> {
+        self.summarize(SummaryQuery::JiraEpic {
+            epic_key: epic_key.to_string(),
+        })
+        .await
     }
 
-    pub async fn summarize_pr_activity(&self, hours: u64, repo: Option<&str>, epic: Option<&str>) -> Result<SummaryResponse, CyanLensError> {
+    pub async fn summarize_pr_activity(
+        &self,
+        hours: u64,
+        repo: Option<&str>,
+        epic: Option<&str>,
+    ) -> Result<SummaryResponse, CyanLensError> {
         self.summarize(SummaryQuery::PrActivity {
             hours,
             repo: repo.map(String::from),
             related_epic: epic.map(String::from),
-        }).await
+        })
+        .await
     }
 
     /// Summarize with source filter (e.g. only slack, only confluence)
-    pub async fn summarize_with_filter(&self, query: SummaryQuery, sources: Vec<String>) -> Result<SummaryResponse, CyanLensError> {
+    pub async fn summarize_with_filter(
+        &self,
+        query: SummaryQuery,
+        sources: Vec<String>,
+    ) -> Result<SummaryResponse, CyanLensError> {
         self.summarize_filtered(query, Some(sources)).await
     }
 
@@ -531,10 +608,14 @@ impl CyanLensClient {
     // ========================================================================
 
     pub async fn pulse(&self, days: u32) -> Result<SummaryResponse, CyanLensError> {
-        let url = format!("{}/api/v1/pulse/{}?days={}", self.config.base_url, self.config.group_id, days);
+        let url = format!(
+            "{}/api/v1/pulse/{}?days={}",
+            self.config.base_url, self.config.group_id, days
+        );
         let resp = self.client.get(&url).send().await?;
         let body: ApiResponse<SummaryResponse> = resp.json().await?;
-        body.data.ok_or_else(|| CyanLensError::Api(body.error.unwrap_or_default()))
+        body.data
+            .ok_or_else(|| CyanLensError::Api(body.error.unwrap_or_default()))
     }
 
     // ========================================================================
@@ -542,10 +623,14 @@ impl CyanLensClient {
     // ========================================================================
 
     pub async fn get_nudges(&self) -> Result<NudgeReport, CyanLensError> {
-        let url = format!("{}/api/v1/nudges/{}", self.config.base_url, self.config.group_id);
+        let url = format!(
+            "{}/api/v1/nudges/{}",
+            self.config.base_url, self.config.group_id
+        );
         let resp = self.client.get(&url).send().await?;
         let body: ApiResponse<NudgeReport> = resp.json().await?;
-        body.data.ok_or_else(|| CyanLensError::Api(body.error.unwrap_or_default()))
+        body.data
+            .ok_or_else(|| CyanLensError::Api(body.error.unwrap_or_default()))
     }
 
     // ========================================================================
@@ -553,14 +638,20 @@ impl CyanLensClient {
     // ========================================================================
 
     pub async fn get_asks(&self, limit: i32) -> Result<Vec<AskRow>, CyanLensError> {
-        let url = format!("{}/api/v1/asks/{}?limit={}", self.config.base_url, self.config.group_id, limit);
+        let url = format!(
+            "{}/api/v1/asks/{}?limit={}",
+            self.config.base_url, self.config.group_id, limit
+        );
         let resp = self.client.get(&url).send().await?;
         let body: ApiResponse<AsksResponse> = resp.json().await?;
         Ok(body.data.map(|r| r.asks).unwrap_or_default())
     }
 
     pub async fn get_decisions(&self, limit: i32) -> Result<Vec<DecisionRow>, CyanLensError> {
-        let url = format!("{}/api/v1/decisions/{}?limit={}", self.config.base_url, self.config.group_id, limit);
+        let url = format!(
+            "{}/api/v1/decisions/{}?limit={}",
+            self.config.base_url, self.config.group_id, limit
+        );
         let resp = self.client.get(&url).send().await?;
         let body: ApiResponse<DecisionsResponse> = resp.json().await?;
         Ok(body.data.map(|r| r.decisions).unwrap_or_default())
@@ -570,7 +661,11 @@ impl CyanLensClient {
     // Graph Operations
     // ========================================================================
 
-    pub async fn search_nodes(&self, query: &str, limit: i32) -> Result<Vec<GraphNode>, CyanLensError> {
+    pub async fn search_nodes(
+        &self,
+        query: &str,
+        limit: i32,
+    ) -> Result<Vec<GraphNode>, CyanLensError> {
         let url = format!(
             "{}/api/v1/graph/search?q={}&group_id={}&limit={}",
             self.config.base_url,
@@ -580,9 +675,10 @@ impl CyanLensClient {
         );
         let resp = self.client.get(&url).send().await?;
         let body: ApiResponse<serde_json::Value> = resp.json().await?;
-        
+
         if let Some(data) = body.data {
-            let nodes: Vec<GraphNode> = serde_json::from_value(data["nodes"].clone()).unwrap_or_default();
+            let nodes: Vec<GraphNode> =
+                serde_json::from_value(data["nodes"].clone()).unwrap_or_default();
             Ok(nodes)
         } else {
             Err(CyanLensError::Api(body.error.unwrap_or_default()))
@@ -593,7 +689,7 @@ impl CyanLensClient {
         let url = format!("{}/api/v1/graph/node/{}", self.config.base_url, id);
         let resp = self.client.get(&url).send().await?;
         let body: ApiResponse<serde_json::Value> = resp.json().await?;
-        
+
         if let Some(data) = body.data {
             let node: Option<GraphNode> = serde_json::from_value(data["node"].clone()).ok();
             Ok(node)
@@ -602,21 +698,31 @@ impl CyanLensClient {
         }
     }
 
-    pub async fn get_edges(&self, node_id: &str) -> Result<(Vec<GraphEdge>, Vec<GraphEdge>), CyanLensError> {
+    pub async fn get_edges(
+        &self,
+        node_id: &str,
+    ) -> Result<(Vec<GraphEdge>, Vec<GraphEdge>), CyanLensError> {
         let url = format!("{}/api/v1/graph/edges/{}", self.config.base_url, node_id);
         let resp = self.client.get(&url).send().await?;
         let body: ApiResponse<serde_json::Value> = resp.json().await?;
-        
+
         if let Some(data) = body.data {
-            let outgoing: Vec<GraphEdge> = serde_json::from_value(data["outgoing"].clone()).unwrap_or_default();
-            let incoming: Vec<GraphEdge> = serde_json::from_value(data["incoming"].clone()).unwrap_or_default();
+            let outgoing: Vec<GraphEdge> =
+                serde_json::from_value(data["outgoing"].clone()).unwrap_or_default();
+            let incoming: Vec<GraphEdge> =
+                serde_json::from_value(data["incoming"].clone()).unwrap_or_default();
             Ok((outgoing, incoming))
         } else {
             Err(CyanLensError::Api(body.error.unwrap_or_default()))
         }
     }
 
-    pub async fn traverse(&self, node_id: &str, relation: Option<&str>, direction: &str) -> Result<Vec<GraphNode>, CyanLensError> {
+    pub async fn traverse(
+        &self,
+        node_id: &str,
+        relation: Option<&str>,
+        direction: &str,
+    ) -> Result<Vec<GraphNode>, CyanLensError> {
         let mut url = format!(
             "{}/api/v1/graph/traverse/{}?direction={}",
             self.config.base_url, node_id, direction
@@ -627,9 +733,10 @@ impl CyanLensClient {
 
         let resp = self.client.get(&url).send().await?;
         let body: ApiResponse<serde_json::Value> = resp.json().await?;
-        
+
         if let Some(data) = body.data {
-            let nodes: Vec<GraphNode> = serde_json::from_value(data["nodes"].clone()).unwrap_or_default();
+            let nodes: Vec<GraphNode> =
+                serde_json::from_value(data["nodes"].clone()).unwrap_or_default();
             Ok(nodes)
         } else {
             Err(CyanLensError::Api(body.error.unwrap_or_default()))
@@ -644,7 +751,8 @@ impl CyanLensClient {
         let url = format!("{}/api/v1/events", self.config.base_url);
         let resp = self.client.post(&url).json(&event).send().await?;
         let body: ApiResponse<EventResponse> = resp.json().await?;
-        body.data.ok_or_else(|| CyanLensError::Api(body.error.unwrap_or_default()))
+        body.data
+            .ok_or_else(|| CyanLensError::Api(body.error.unwrap_or_default()))
     }
 }
 
@@ -656,10 +764,10 @@ impl CyanLensClient {
 pub enum CyanLensError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
-    
+
     #[error("API error: {0}")]
     Api(String),
-    
+
     #[error("Not available")]
     NotAvailable,
 }
@@ -703,7 +811,10 @@ mod tests {
         let r: ApiResponse<HealthResponse> = serde_json::from_str(live).unwrap();
         let h = r.data.expect("health data parsed");
         assert!(h.vllm && h.lens && h.postgres);
-        assert!(!h.iggy, "missing iggy defaults to false, never a parse error");
+        assert!(
+            !h.iggy,
+            "missing iggy defaults to false, never a parse error"
+        );
         assert_eq!(h.commit.as_deref(), Some("c3b809f"));
     }
 
@@ -722,9 +833,11 @@ mod tests {
         let n = r#"{"success":true,"data":{"tenant_id":"default","group_id":"default","generated_at":1,"nudges":[],"summary":{"stale_asks":0,"stale_blockers":0,"unanswered_mentions":0,"unimplemented_decisions":0,"total":0}}}"#;
         let nr: ApiResponse<NudgeReport> = serde_json::from_str(n).unwrap();
         assert_eq!(nr.data.unwrap().summary.total, 0);
-        let a: ApiResponse<AsksResponse> = serde_json::from_str(r#"{"success":true,"data":{"asks":[]}}"#).unwrap();
+        let a: ApiResponse<AsksResponse> =
+            serde_json::from_str(r#"{"success":true,"data":{"asks":[]}}"#).unwrap();
         assert!(a.data.unwrap().asks.is_empty());
-        let d: ApiResponse<DecisionsResponse> = serde_json::from_str(r#"{"success":true,"data":{"decisions":[]}}"#).unwrap();
+        let d: ApiResponse<DecisionsResponse> =
+            serde_json::from_str(r#"{"success":true,"data":{"decisions":[]}}"#).unwrap();
         assert!(d.data.unwrap().decisions.is_empty());
     }
 }
