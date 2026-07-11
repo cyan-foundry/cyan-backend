@@ -869,23 +869,64 @@ pub(crate) async fn execute_local_mcp_tool_step(
     // only runs when `dispatch_mcp_tool` decides to execute). The launch command
     // comes from the bundle manifest's runtime; credentials (e.g. the frameio
     // FRAMEIO_IMS_TOKEN) are injected at spawn from the device env — never stored.
+    // Built as a FACTORY so the B5 auto-refresh retry can spawn a SECOND process
+    // that re-reads the (freshly rewritten) credential file.
     let bundle_dir = root.join(&step.plugin_id);
-    let plugin_id = step.plugin_id.clone();
-    let spawn_tenant = tenant.clone();
-    let connect = move || -> Result<Box<dyn cyan_mcp::PluginTransport>> {
-        let config =
-            crate::mcp_host::bundle_spawn_config(&plugin_id, &bundle_dir, &spawn_tenant)?;
-        let mut transport = cyan_mcp::StdioTransport::new();
-        transport
-            .spawn(&config)
-            .map_err(|e| anyhow!("spawn plugin {}: {}", plugin_id, e))?;
-        Ok(Box::new(transport))
+    let make_connect = {
+        let plugin_id = step.plugin_id.clone();
+        let spawn_tenant = tenant.clone();
+        move || {
+            let plugin_id = plugin_id.clone();
+            let bundle_dir = bundle_dir.clone();
+            let spawn_tenant = spawn_tenant.clone();
+            move || -> Result<Box<dyn cyan_mcp::PluginTransport>> {
+                let config = crate::mcp_host::bundle_spawn_config(
+                    &plugin_id,
+                    &bundle_dir,
+                    &spawn_tenant,
+                )?;
+                let mut transport = cyan_mcp::StdioTransport::new();
+                transport
+                    .spawn(&config)
+                    .map_err(|e| anyhow!("spawn plugin {}: {}", plugin_id, e))?;
+                Ok(Box::new(transport))
+            }
+        }
     };
 
-    match host
-        .dispatch_mcp_tool(&scope, &step, &side_effects, approved, &ledger, connect)
-        .map_err(|e| anyhow!("local plugin dispatch failed: {}", e))?
-    {
+    let mut dispatched = host
+        .dispatch_mcp_tool(&scope, &step, &side_effects, approved, &ledger, make_connect())
+        .map_err(|e| anyhow!("local plugin dispatch failed: {}", e))?;
+
+    // B5 — ENVIRONMENTAL SELF-HEAL, no human: an auth-expired tool failure
+    // refreshes the Frame.io IMS token (rewriting the cred env file every
+    // spawn reads fresh) and retries the step ONCE. Anything else falls
+    // through to the structured error path below.
+    if let McpDispatch::Ran(result) = &dispatched {
+        if let Some((error_class, _)) = tool_result_error(&result.result) {
+            if crate::frameio_refresh::is_auth_error(&error_class)
+                && crate::frameio_refresh::refresh_cred_file().unwrap_or(false)
+            {
+                let _ = event_tx.send(SwiftEvent::StatusUpdate {
+                    message: format!(
+                        "🔁 Step '{step_id}': credential expired — token refreshed, retrying"
+                    ),
+                });
+                dispatched = host
+                    .dispatch_mcp_tool(
+                        &scope,
+                        &step,
+                        &side_effects,
+                        approved,
+                        &ledger,
+                        make_connect(),
+                    )
+                    .map_err(|e| anyhow!("local plugin dispatch failed (post-refresh): {}", e))?;
+            }
+        }
+    }
+
+    match dispatched {
         McpDispatch::Ran(result) => {
             // FAILURE IS FAILURE: a successful transport round-trip is NOT tool
             // success. cyan-media reports failures IN-PAYLOAD as

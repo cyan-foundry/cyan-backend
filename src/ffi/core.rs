@@ -4967,23 +4967,38 @@ pub extern "C" fn cyan_step_edit_travel(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    // One lock: read the row, travel, write back.
-    let restored: Result<(String, i32, String, Option<String>, i64, i64), String> = {
+    // One lock: resolve the cell (by cell id, or by the compiled step_id in its
+    // metadata — the Dashboard rows key by step_id), travel, write back. A
+    // single non-re-entrant acquire — never a nested engine call (P0 family).
+    let restored: Result<(String, String, i32, String, Option<String>, i64, i64), String> = {
         let db = system.db.lock_safe();
-        let row: Result<(String, i32, Option<String>, Option<String>), _> = db.query_row(
-            "SELECT cell_type, cell_order, content, metadata_json \
-             FROM notebook_cells WHERE id = ?1 AND board_id = ?2",
-            params![cell_id_str, board_id_str],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        );
+        let row: Result<(String, String, i32, Option<String>, Option<String>), _> = db
+            .query_row(
+                "SELECT id, cell_type, cell_order, content, metadata_json \
+                 FROM notebook_cells WHERE id = ?1 AND board_id = ?2",
+                params![cell_id_str, board_id_str],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .or_else(|_| {
+                db.query_row(
+                    "SELECT id, cell_type, cell_order, content, metadata_json \
+                     FROM notebook_cells WHERE board_id = ?2 \
+                     AND cell_type IN ('step','markdown') \
+                     AND metadata_json LIKE '%\"step_id\":\"' || ?1 || '\"%' LIMIT 1",
+                    params![cell_id_str, board_id_str],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+            });
         match row {
             Err(_) => Err("cell not found on this board".to_string()),
-            Ok((cell_type, cell_order, content, metadata_json)) => {
+            Ok((row_cell_id, cell_type, cell_order, content, metadata_json)) => {
                 let current = content.unwrap_or_default();
+                // History is keyed by the RESOLVED cell id (the save-path hook
+                // records under it), regardless of how the caller addressed us.
                 let travelled = if direction == 0 {
-                    crate::step_history::undo(&db, cell_id_str, &current, now)
+                    crate::step_history::undo(&db, &row_cell_id, &current, now)
                 } else {
-                    crate::step_history::redo(&db, cell_id_str, &current, now)
+                    crate::step_history::redo(&db, &row_cell_id, &current, now)
                 };
                 match travelled {
                     Err(e) => Err(e.to_string()),
@@ -4993,9 +5008,9 @@ pub extern "C" fn cyan_step_edit_travel(
                         "nothing to redo".to_string()
                     }),
                     Ok(Some(restored)) => {
-                        let (u, r) = crate::step_history::depths(&db, cell_id_str)
+                        let (u, r) = crate::step_history::depths(&db, &row_cell_id)
                             .unwrap_or((0, 0));
-                        Ok((cell_type, cell_order, restored, metadata_json, u, r))
+                        Ok((row_cell_id, cell_type, cell_order, restored, metadata_json, u, r))
                     }
                 }
             }
@@ -5004,11 +5019,11 @@ pub extern "C" fn cyan_step_edit_travel(
 
     match restored {
         Err(m) => err(&m),
-        Ok((cell_type, cell_order, restored, metadata_json, undo_depth, redo_depth)) => {
+        Ok((row_cell_id, cell_type, cell_order, restored, metadata_json, undo_depth, redo_depth)) => {
             // Persist + broadcast through the normal update path (sync write so
             // an immediate re-read sees it; command loop handles gossip/events).
             let _ = crate::storage::cell_update(&crate::models::dto::NotebookCellDTO {
-                id: cell_id_str.to_string(),
+                id: row_cell_id.clone(),
                 board_id: board_id_str.to_string(),
                 cell_type: cell_type.clone(),
                 cell_order,
@@ -5021,7 +5036,7 @@ pub extern "C" fn cyan_step_edit_travel(
                 updated_at: now,
             });
             let _ = system.command_tx.send(crate::models::commands::CommandMsg::UpdateNotebookCell {
-                id: cell_id_str.to_string(),
+                id: row_cell_id,
                 board_id: board_id_str.to_string(),
                 cell_type,
                 cell_order,
