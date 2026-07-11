@@ -78,6 +78,14 @@ pub enum NetworkEvent {
         author: String,
         parent_id: Option<String>,
         timestamp: i64,
+        /// CHAT C1 (Anchored Lane, additive): `"step"` | `"board"`. Absent ⇒ `#board`
+        /// (pre-C1 peers and messages). `skip_serializing_if` keeps the gossip wire
+        /// byte-identical when unset, so pre-C1 peers decode this event unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor_kind: Option<String>,
+        /// CHAT C1: the stable `step_uid` when `anchor_kind == "step"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor_id: Option<String>,
     },
     ChatDeleted {
         id: String,
@@ -99,9 +107,19 @@ pub enum NetworkEvent {
         /// `#[serde(default)]` keeps the event wire-compatible with pre-scope peers.
         #[serde(default = "crate::models::dto::default_note_scope")]
         scope: String,
-        /// Note KIND: `constitution` | `preference` | `editor-note`. Same compat rule.
+        /// Note KIND: `constitution` | `preference` | `editor-note` | `decision`.
+        /// Same compat rule.
         #[serde(default = "crate::models::dto::default_note_kind")]
         kind: String,
+        /// CHAT C7 (additive): note anchor — `"step"` | `"board"`; absent ⇒ unanchored.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor_kind: Option<String>,
+        /// CHAT C7: the stable `step_uid` when `anchor_kind == "step"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor_id: Option<String>,
+        /// CHAT C7: provenance for promoted notes — `chat:<message_id>`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_ref: Option<String>,
     },
     /// A note was edited. Conflict resolution is LWW on `updated_at` (older edits drop).
     NoteUpdated {
@@ -118,6 +136,13 @@ pub enum NetworkEvent {
         scope: String,
         #[serde(default = "crate::models::dto::default_note_kind")]
         kind: String,
+        /// Same C7 anchor/provenance contract as `NoteAdded`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor_kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_ref: Option<String>,
     },
     NoteDeleted {
         id: String,

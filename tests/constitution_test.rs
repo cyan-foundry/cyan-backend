@@ -77,6 +77,9 @@ fn put(id: &str, anchor: &str, tenant: &str, scope: &str, kind: &str, text: &str
         updated_at: at,
         scope: scope.to_string(),
         kind: kind.to_string(),
+        anchor_kind: None,
+        anchor_id: None,
+        origin_ref: None,
     })
     .expect("note upsert");
 }

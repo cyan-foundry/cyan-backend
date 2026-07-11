@@ -34,6 +34,8 @@ fn chat(id: &str, scope: &str, message: &str) -> NetworkEvent {
         author: "author-a".to_string(),
         parent_id: None,
         timestamp: 1,
+        anchor_kind: None,
+        anchor_id: None,
     }
 }
 
@@ -95,7 +97,7 @@ fn chat_is_board_scoped() {
     let b2 = unique_group_id();
     let id = format!("{b1}-c1");
 
-    storage::chat_insert(&id, &b1, &w, "hi board1", "author", None, 1).expect("insert");
+    storage::chat_insert(&id, &b1, &w, "hi board1", "author", None, 1, None, None).expect("insert");
 
     let on_b1 = storage::chat_list_by_board(&b1).expect("list b1");
     assert!(
@@ -119,8 +121,8 @@ fn two_boards_same_workspace_have_separate_chats() {
     let m1 = format!("{b1}-only");
     let m2 = format!("{b2}-only");
 
-    storage::chat_insert(&m1, &b1, &w, "for board 1", "author", None, 1).expect("insert b1");
-    storage::chat_insert(&m2, &b2, &w, "for board 2", "author", None, 2).expect("insert b2");
+    storage::chat_insert(&m1, &b1, &w, "for board 1", "author", None, 1, None, None).expect("insert b1");
+    storage::chat_insert(&m2, &b2, &w, "for board 2", "author", None, 2, None, None).expect("insert b2");
 
     let on_b1 = storage::chat_list_by_board(&b1).expect("list b1");
     assert!(on_b1.iter().any(|c| c.id == m1), "board 1 has its own message");

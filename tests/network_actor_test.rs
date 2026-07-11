@@ -527,6 +527,8 @@ fn create_test_data() -> Result<()> {
             "test-author",
             None,
             chrono::Utc::now().timestamp(),
+            None,
+            None,
         )?;
     }
 

@@ -51,6 +51,10 @@ pub const SNAPSHOT_ALPN: &[u8] = b"cyan-snapshot-v1";
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[derive(Debug)]
+// `Broadcast` carries the full `NetworkEvent` by value (the C1 anchor fields tipped it
+// over clippy's size threshold). Boxing it would touch every broadcast site for a
+// transient, short-lived command — not worth the churn.
+#[allow(clippy::large_enum_variant)]
 pub enum TopicCommand {
     /// Broadcast a NetworkEvent to this group
     Broadcast(NetworkEvent),
@@ -1234,7 +1238,7 @@ impl TopicActor {
                     Err(e) => eprintln!("💾 [PERSIST] 🔴 File insert FAILED: {}", e),
                 }
             }
-            NetworkEvent::ChatSent { id, board_id, workspace_id, message, author, parent_id, timestamp } => {
+            NetworkEvent::ChatSent { id, board_id, workspace_id, message, author, parent_id, timestamp, anchor_kind, anchor_id } => {
                 eprintln!("💾 [PERSIST] ChatSent:");
                 eprintln!("   chat_id: {}...", &id[..16.min(id.len())]);
                 eprintln!("   board_id: {}...", &board_id[..16.min(board_id.len())]);
@@ -1242,7 +1246,7 @@ impl TopicActor {
                 // R11 §1: chat is board-scoped. If a pre-R11 peer omits board_id, fall back to
                 // the message's workspace so the row is never dropped.
                 let board_key = if board_id.is_empty() { workspace_id.as_str() } else { board_id.as_str() };
-                match storage::chat_insert(id, board_key, workspace_id, message, author, parent_id.as_deref(), *timestamp) {
+                match storage::chat_insert(id, board_key, workspace_id, message, author, parent_id.as_deref(), *timestamp, anchor_kind.as_deref(), anchor_id.as_deref()) {
                     Ok(_) => eprintln!("💾 [PERSIST] ✓ Chat inserted to DB"),
                     Err(e) => eprintln!("💾 [PERSIST] 🔴 Chat insert FAILED: {}", e),
                 }
@@ -1254,11 +1258,11 @@ impl TopicActor {
             // are handled identically (the split is informational for the UI).
             NetworkEvent::NoteAdded {
                 id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at,
-                scope, kind,
+                scope, kind, anchor_kind, anchor_id, origin_ref,
             }
             | NetworkEvent::NoteUpdated {
                 id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at,
-                scope, kind,
+                scope, kind, anchor_kind, anchor_id, origin_ref,
             } => {
                 let note = crate::models::dto::NoteDTO {
                     id: id.clone(),
@@ -1271,6 +1275,9 @@ impl TopicActor {
                     updated_at: *updated_at,
                     scope: scope.clone(),
                     kind: kind.clone(),
+                    anchor_kind: anchor_kind.clone(),
+                    anchor_id: anchor_id.clone(),
+                    origin_ref: origin_ref.clone(),
                 };
                 let _ = storage::note_upsert(&note);
             }

@@ -340,6 +340,8 @@ pub fn apply_snapshot_frame(frame: &SnapshotFrame) -> Result<()> {
                     &ch.author,
                     ch.parent_id.as_deref(),
                     ch.timestamp,
+                    ch.anchor_kind.as_deref(),
+                    ch.anchor_id.as_deref(),
                 )?;
             }
             for f in files {

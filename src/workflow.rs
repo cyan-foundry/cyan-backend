@@ -74,6 +74,48 @@ pub fn coerce_authoring_cell_type(requested: &str) -> String {
     }
 }
 
+/// CHAT §4.1 (Anchored Lane, Stage 1): guarantee the cell's **stable step identity**.
+///
+/// Chat anchors bind to a `step_uid` in the cell's `metadata_json` — NOT to the cell id
+/// wired into views (cell ids are the most volatile identity in the app: reset / reforge /
+/// template-clone / Lens-drafting regenerate them). This helper returns the cell's
+/// effective metadata with `"step_uid"` guaranteed present:
+///
+/// 1. the incoming write's own `step_uid` (already minted) wins;
+/// 2. else the uid is INHERITED from the row being rewritten (the carry that keeps a
+///    thread anchored across every 1:1 rewrite);
+/// 3. else it is minted as the cell's id at first write (so a reader falling back to
+///    the cell id for a never-restamped legacy cell converges on the same value).
+///
+/// Every other metadata key in the incoming write passes through untouched.
+pub fn ensure_step_uid(
+    metadata_json: Option<&str>,
+    existing_metadata_json: Option<&str>,
+    cell_id: &str,
+) -> String {
+    let mut obj = metadata_json
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    let has_uid = obj
+        .get("step_uid")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty());
+    if !has_uid {
+        let inherited = existing_metadata_json
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+            .and_then(|v| {
+                v.get("step_uid")
+                    .and_then(|u| u.as_str())
+                    .map(|s| s.to_string())
+            })
+            .filter(|s| !s.is_empty());
+        let uid = inherited.unwrap_or_else(|| cell_id.to_string());
+        obj.insert("step_uid".to_string(), serde_json::Value::String(uid));
+    }
+    serde_json::Value::Object(obj).to_string()
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Autocomplete index — @ plugins, # artifacts, / actions (tenant-scoped).
 // ════════════════════════════════════════════════════════════════════════════

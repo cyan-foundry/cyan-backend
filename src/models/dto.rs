@@ -126,6 +126,13 @@ pub struct ChatDTO {
     pub author: String,
     pub parent_id: Option<String>,
     pub timestamp: i64,
+    /// CHAT C1 (Anchored Lane, additive): `"step"` | `"board"`; absent ⇒ `#board`.
+    /// Serde defaults keep pre-C1 snapshots/rows decoding unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_kind: Option<String>,
+    /// CHAT C1: the stable `step_uid` when `anchor_kind == "step"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_id: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -138,8 +145,9 @@ pub struct ChatDTO {
 pub const NOTE_SCOPE_VOCAB: [&str; 3] = ["tenant", "group", "board"];
 /// The closed note KIND vocabulary. `constitution` + `preference` feed the merge
 /// resolver (→ `ProposeCtx.constitution` / `.preferences`); `editor-note` is the
-/// pre-existing board-note behavior.
-pub const NOTE_KIND_VOCAB: [&str; 3] = ["constitution", "preference", "editor-note"];
+/// pre-existing board-note behavior; `decision` (CHAT C7) is a board decision
+/// promoted from the chat lane — a local ledger row, offline-capable.
+pub const NOTE_KIND_VOCAB: [&str; 4] = ["constitution", "preference", "editor-note", "decision"];
 
 pub fn note_scope_valid(s: &str) -> bool {
     NOTE_SCOPE_VOCAB.contains(&s)
@@ -176,9 +184,21 @@ pub struct NoteDTO {
     /// DB-compatible: a payload or row without it is a plain board note.
     #[serde(default = "default_note_scope")]
     pub scope: String,
-    /// `constitution` | `preference` | `editor-note`. Same compat contract as `scope`.
+    /// `constitution` | `preference` | `editor-note` | `decision`. Same compat
+    /// contract as `scope`.
     #[serde(default = "default_note_kind")]
     pub kind: String,
+    /// CHAT C7 (additive): note anchor — `"step"` | `"board"`; absent ⇒ unanchored
+    /// (every pre-C7 note). Distinct from the scope-anchor `board_id` above: this is
+    /// the WITHIN-board anchor (a step), that is the scope key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_kind: Option<String>,
+    /// CHAT C7: the stable `step_uid` when `anchor_kind == "step"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_id: Option<String>,
+    /// CHAT C7: provenance — `chat:<message_id>` for a note promoted from chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_ref: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

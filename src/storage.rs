@@ -643,11 +643,14 @@ pub fn board_list_by_workspaces(workspace_ids: &[String]) -> Result<Vec<Whiteboa
 /// Insert a chat keyed to a **board** (R11 §1). Chat is board-scoped: the row carries both
 /// `board_id` (the scope key chat is listed by) and `workspace_id` (kept so the existing
 /// workspace→group snapshot scoping and group gossip resolution are unchanged).
-pub fn chat_insert(id: &str, board_id: &str, workspace_id: &str, message: &str, author: &str, parent_id: Option<&str>, timestamp: i64) -> Result<()> {
+/// CHAT C1 (additive): `anchor_kind`/`anchor_id` persist the message's step/board anchor;
+/// `None` (every pre-C1 row and caller) means the board's general slot.
+#[allow(clippy::too_many_arguments)]
+pub fn chat_insert(id: &str, board_id: &str, workspace_id: &str, message: &str, author: &str, parent_id: Option<&str>, timestamp: i64, anchor_kind: Option<&str>, anchor_id: Option<&str>) -> Result<()> {
     let conn = db().lock_safe();
     conn.execute(
-        "INSERT OR IGNORE INTO objects (id, board_id, workspace_id, type, name, hash, data, created_at) VALUES (?1, ?2, ?3, 'chat', ?4, ?5, ?6, ?7)",
-        params![id, board_id, workspace_id, message, author, parent_id.map(|s| s.as_bytes()), timestamp],
+        "INSERT OR IGNORE INTO objects (id, board_id, workspace_id, type, name, hash, data, created_at, anchor_kind, anchor_id) VALUES (?1, ?2, ?3, 'chat', ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![id, board_id, workspace_id, message, author, parent_id.map(|s| s.as_bytes()), timestamp, anchor_kind, anchor_id],
     )?;
     Ok(())
 }
@@ -665,7 +668,7 @@ pub fn chat_get_workspace_id(chat_id: &str) -> Option<String> {
 }
 
 /// Map a `ChatDTO` out of an `objects` chat row selected as
-/// `(id, board_id, workspace_id, name, hash, data, created_at)`.
+/// `(id, board_id, workspace_id, name, hash, data, created_at, anchor_kind, anchor_id)`.
 fn chat_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChatDTO> {
     let parent_bytes: Option<Vec<u8>> = r.get(5)?;
     let parent_id = parent_bytes.and_then(|b| String::from_utf8(b).ok());
@@ -677,6 +680,8 @@ fn chat_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChatDTO> {
         author: r.get(4)?,
         parent_id,
         timestamp: r.get(6)?,
+        anchor_kind: r.get(7)?,
+        anchor_id: r.get(8)?,
     })
 }
 
@@ -688,7 +693,7 @@ pub fn chat_list_by_workspaces(workspace_ids: &[String]) -> Result<Vec<ChatDTO>>
     let conn = db().lock_safe();
     let placeholders: String = workspace_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT id, board_id, workspace_id, name, hash, data, created_at
+        "SELECT id, board_id, workspace_id, name, hash, data, created_at, anchor_kind, anchor_id
          FROM objects WHERE type = 'chat' AND workspace_id IN ({}) ORDER BY created_at",
         placeholders
     );
@@ -704,7 +709,7 @@ pub fn chat_list_by_workspaces(workspace_ids: &[String]) -> Result<Vec<ChatDTO>>
 pub fn chat_list_by_board(board_id: &str) -> Result<Vec<ChatDTO>> {
     let conn = db().lock_safe();
     let mut stmt = conn.prepare(
-        "SELECT id, board_id, workspace_id, name, hash, data, created_at
+        "SELECT id, board_id, workspace_id, name, hash, data, created_at, anchor_kind, anchor_id
          FROM objects WHERE type = 'chat' AND board_id = ?1 ORDER BY created_at"
     )?;
     let rows = stmt.query_map(params![board_id], chat_from_row)?;
@@ -716,7 +721,7 @@ pub fn chat_list_by_board(board_id: &str) -> Result<Vec<ChatDTO>> {
 pub fn chat_list_by_workspace(workspace_id: &str) -> Result<Vec<ChatDTO>> {
     let conn = db().lock_safe();
     let mut stmt = conn.prepare(
-        "SELECT id, board_id, workspace_id, name, hash, data, created_at
+        "SELECT id, board_id, workspace_id, name, hash, data, created_at, anchor_kind, anchor_id
          FROM objects WHERE type = 'chat' AND workspace_id = ?1 ORDER BY created_at"
     )?;
     let rows = stmt.query_map(params![workspace_id], chat_from_row)?;
@@ -771,8 +776,8 @@ fn migrate_chats_to_boards_conn(conn: &Connection) -> Result<usize> {
 pub fn note_upsert(n: &NoteDTO) -> Result<bool> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
     let changed = conn.execute(
-        "INSERT INTO notes (id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "INSERT INTO notes (id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(id) DO UPDATE SET
             board_id    = excluded.board_id,
             tenant_id   = excluded.tenant_id,
@@ -781,11 +786,15 @@ pub fn note_upsert(n: &NoteDTO) -> Result<bool> {
             text        = excluded.text,
             updated_at  = excluded.updated_at,
             scope       = excluded.scope,
-            kind        = excluded.kind
+            kind        = excluded.kind,
+            anchor_kind = excluded.anchor_kind,
+            anchor_id   = excluded.anchor_id,
+            origin_ref  = excluded.origin_ref
          WHERE excluded.updated_at > notes.updated_at",
         params![
             n.id, n.board_id, n.tenant_id, n.author_id, n.author_name, n.text,
-            n.created_at, n.updated_at, n.scope, n.kind
+            n.created_at, n.updated_at, n.scope, n.kind,
+            n.anchor_kind, n.anchor_id, n.origin_ref
         ],
     )?;
     Ok(changed > 0)
@@ -796,7 +805,7 @@ pub fn note_upsert(n: &NoteDTO) -> Result<bool> {
 pub fn note_list_by_board(board_id: &str, tenant_id: &str) -> Result<Vec<NoteDTO>> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
     let mut stmt = conn.prepare(
-        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref
          FROM notes WHERE board_id = ?1 AND tenant_id = ?2 ORDER BY created_at",
     )?;
     let rows = stmt.query_map(params![board_id, tenant_id], note_from_row)?;
@@ -828,7 +837,7 @@ pub fn note_list_scoped_with(
     kind: &str,
 ) -> Result<Vec<NoteDTO>> {
     let mut stmt = conn.prepare(
-        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref
          FROM notes
          WHERE tenant_id = ?1 AND scope = ?2 AND board_id = ?3 AND kind = ?4
          ORDER BY created_at, id",
@@ -846,7 +855,7 @@ pub fn note_list_by_boards(board_ids: &[String]) -> Result<Vec<NoteDTO>> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
     let placeholders: String = board_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref
          FROM notes WHERE board_id IN ({}) ORDER BY created_at",
         placeholders
     );
@@ -862,7 +871,7 @@ pub fn note_list_by_boards(board_ids: &[String]) -> Result<Vec<NoteDTO>> {
 pub fn note_get(id: &str) -> Result<Option<NoteDTO>> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
     let mut stmt = conn.prepare(
-        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref
          FROM notes WHERE id = ?1",
     )?;
     stmt.query_row(params![id], note_from_row)
@@ -889,6 +898,9 @@ fn note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteDTO> {
         updated_at: r.get(7)?,
         scope: r.get(8)?,
         kind: r.get(9)?,
+        anchor_kind: r.get(10)?,
+        anchor_id: r.get(11)?,
+        origin_ref: r.get(12)?,
     })
 }
 
@@ -2854,6 +2866,21 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
          ON notes(tenant_id, scope, board_id, kind)",
         [],
     );
+    // CHAT C1/C7 (Anchored Lane, additive): chat rows (in `objects`) and notes gain an
+    // optional step/board anchor; notes additionally gain provenance (`origin_ref`,
+    // `chat:<message_id>` for promoted notes). Nullable columns — every pre-C1/C7 row
+    // reads back as NULL ⇒ unanchored, exactly the prior behavior. Idempotent.
+    if conn.prepare("SELECT anchor_kind FROM objects LIMIT 1").is_err() {
+        tracing::info!("Migration: adding anchor_kind/anchor_id columns to objects (chat C1)");
+        let _ = conn.execute("ALTER TABLE objects ADD COLUMN anchor_kind TEXT", []);
+        let _ = conn.execute("ALTER TABLE objects ADD COLUMN anchor_id TEXT", []);
+    }
+    if conn.prepare("SELECT anchor_kind FROM notes LIMIT 1").is_err() {
+        tracing::info!("Migration: adding anchor_kind/anchor_id/origin_ref columns to notes (chat C7)");
+        let _ = conn.execute("ALTER TABLE notes ADD COLUMN anchor_kind TEXT", []);
+        let _ = conn.execute("ALTER TABLE notes ADD COLUMN anchor_id TEXT", []);
+        let _ = conn.execute("ALTER TABLE notes ADD COLUMN origin_ref TEXT", []);
+    }
 
     // ROUND8 §W4: templates — a pre-written English workflow (steps + bound plugins)
     // cloned into a board. Own store; user templates are tenant-scoped (built-in seeds
@@ -3158,15 +3185,18 @@ pub fn cell_insert_simple(
 }
 
 /// Insert a chat by individual fields (for snapshot sync). Carries `board_id` so a synced
-/// chat lands on the right board thread (R11 §1).
+/// chat lands on the right board thread (R11 §1). CHAT C1: anchors ride the snapshot too,
+/// so a late-joining peer sees the same threads as everyone else.
+#[allow(clippy::too_many_arguments)]
 pub fn chat_insert_simple(
     id: &str, board_id: &str, workspace_id: &str, message: &str,
     author: &str, parent_id: Option<&str>, timestamp: i64,
+    anchor_kind: Option<&str>, anchor_id: Option<&str>,
 ) -> Result<()> {
     let conn = db().lock_safe();
     conn.execute(
-        "INSERT OR IGNORE INTO objects (id, board_id, workspace_id, type, name, hash, data, created_at) VALUES (?1, ?2, ?3, 'chat', ?4, ?5, ?6, ?7)",
-        params![id, board_id, workspace_id, message, author, parent_id.map(|s| s.as_bytes()), timestamp],
+        "INSERT OR IGNORE INTO objects (id, board_id, workspace_id, type, name, hash, data, created_at, anchor_kind, anchor_id) VALUES (?1, ?2, ?3, 'chat', ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![id, board_id, workspace_id, message, author, parent_id.map(|s| s.as_bytes()), timestamp, anchor_kind, anchor_id],
     )?;
     Ok(())
 }

@@ -85,7 +85,7 @@ fn reopen_does_not_increment() {
     let msg = format!("{b}-open");
 
     // A message arrives from a peer; the chat row lands on its board and is recorded unread.
-    storage::chat_insert(&msg, &b, &w, "hi", "peer-author", None, 1).expect("chat insert");
+    storage::chat_insert(&msg, &b, &w, "hi", "peer-author", None, 1, None, None).expect("chat insert");
     storage::unread_record(&msg, "chat", &b, 1).expect("record");
 
     // "Open" the board chat several times — drive the real read/load path. It must not touch

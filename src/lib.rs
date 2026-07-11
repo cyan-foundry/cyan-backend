@@ -794,7 +794,7 @@ impl CommandActor {
                     let _ = self.event_tx.send(SwiftEvent::BoardLeft { id });
                 }
 
-                CommandMsg::SendChat { board_id, message, parent_id } => {
+                CommandMsg::SendChat { board_id, message, parent_id, anchor_kind, anchor_id } => {
                     let id = blake3::hash(format!("chat:{}-{}-{}", board_id, message, chrono::Utc::now()).as_bytes()).to_hex().to_string();
                     let now = chrono::Utc::now().timestamp();
                     let author = self.node_id.clone();
@@ -804,10 +804,18 @@ impl CommandActor {
                     let workspace_id = storage::board_get_workspace_id(&board_id).unwrap_or_default();
                     let group_id = storage::board_get_group_id(&board_id);
 
+                    // CHAT C1: an anchor is a matched pair — a kind without an id (or vice
+                    // versa) is meaningless, so normalize to unanchored (#board) rather than
+                    // persist half an anchor.
+                    let (anchor_kind, anchor_id) = match (anchor_kind, anchor_id) {
+                        (Some(k), Some(a)) if !k.is_empty() && !a.is_empty() => (Some(k), Some(a)),
+                        _ => (None, None),
+                    };
+
                     eprintln!("💬 [CHAT] SendChat board={}... author={}...",
                         &board_id[..16.min(board_id.len())], &author[..16.min(author.len())]);
 
-                    match storage::chat_insert(&id, &board_id, &workspace_id, &message, &author, parent_id.as_deref(), now) {
+                    match storage::chat_insert(&id, &board_id, &workspace_id, &message, &author, parent_id.as_deref(), now, anchor_kind.as_deref(), anchor_id.as_deref()) {
                         Ok(_) => eprintln!("💬 [CHAT] ✓ Chat inserted to DB via storage module"),
                         Err(e) => eprintln!("💬 [CHAT] 🔴 DB INSERT FAILED: {}", e),
                     }
@@ -824,6 +832,8 @@ impl CommandActor {
                                 author: author.clone(),
                                 parent_id: parent_id.clone(),
                                 timestamp: now,
+                                anchor_kind: anchor_kind.clone(),
+                                anchor_id: anchor_id.clone(),
                             },
                         });
                     } else {
@@ -838,6 +848,8 @@ impl CommandActor {
                         author,
                         parent_id,
                         timestamp: now,
+                        anchor_kind,
+                        anchor_id,
                     }));
                 }
 
@@ -860,7 +872,7 @@ impl CommandActor {
                 }
 
                 // ── Note commands (ROUND8 §W2) — board-level authored LWW ledger ──
-                CommandMsg::PutNote { board_id, note_id, tenant_id, text, scope, kind } => {
+                CommandMsg::PutNote { board_id, note_id, tenant_id, text, scope, kind, anchor_kind, anchor_id, origin_ref } => {
                     // feat/notes-constitution: scope/kind are additive; absent ⇒ the exact
                     // pre-scope behavior (a board editor-note). Invalid values REJECT the
                     // command (never silently misfile a constitution/preference note).
@@ -874,6 +886,13 @@ impl CommandActor {
                         );
                         continue;
                     }
+                    // CHAT C7: an anchor is a matched pair — normalize half an anchor to
+                    // unanchored rather than persist it.
+                    let (anchor_kind, anchor_id) = match (anchor_kind, anchor_id) {
+                        (Some(k), Some(a)) if !k.is_empty() && !a.is_empty() => (Some(k), Some(a)),
+                        _ => (None, None),
+                    };
+                    let origin_ref = origin_ref.filter(|o| !o.is_empty());
 
                     let now = chrono::Utc::now().timestamp();
                     let author_id = self.node_id.clone();
@@ -919,6 +938,9 @@ impl CommandActor {
                         updated_at: now,
                         scope: scope.clone(),
                         kind: kind.clone(),
+                        anchor_kind: anchor_kind.clone(),
+                        anchor_id: anchor_id.clone(),
+                        origin_ref: origin_ref.clone(),
                     };
                     match storage::note_upsert(&note) {
                         Ok(_) => tracing::info!(tenant_id = %tenant, "obs note_put board={board_id} id={id} scope={scope} kind={kind}"),
@@ -929,11 +951,13 @@ impl CommandActor {
                         NetworkEvent::NoteAdded {
                             id, board_id, tenant_id: tenant, author_id, author_name,
                             text, created_at, updated_at: now, scope, kind,
+                            anchor_kind, anchor_id, origin_ref,
                         }
                     } else {
                         NetworkEvent::NoteUpdated {
                             id, board_id, tenant_id: tenant, author_id, author_name,
                             text, created_at, updated_at: now, scope, kind,
+                            anchor_kind, anchor_id, origin_ref,
                         }
                     };
 
@@ -1145,11 +1169,14 @@ impl CommandActor {
                     let group_id = self.get_group_id_for_board(&board_id);
                     self.note_board_activity(&board_id, group_id.as_deref());
 
+                    // CHAT §4.1: mint the stable step identity at cell birth.
+                    let metadata_json = crate::workflow::ensure_step_uid(None, None, &id);
+
                     {
                         let db = self.db.lock_safe();
                         let _ = db.execute(
-                            "INSERT INTO notebook_cells (id, board_id, cell_type, cell_order, content, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                            params![id, board_id, cell_type, cell_order, content, now, now],
+                            "INSERT INTO notebook_cells (id, board_id, cell_type, cell_order, content, metadata_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            params![id, board_id, cell_type, cell_order, content, metadata_json, now, now],
                         );
                     }
 
@@ -1178,13 +1205,28 @@ impl CommandActor {
                     let group_id = self.get_group_id_for_board(&board_id);
                     self.note_board_activity(&board_id, group_id.as_deref());
 
-                    {
+                    // CHAT §4.1: the stable step identity survives every rewrite — inherit
+                    // the row's `step_uid` when the incoming metadata doesn't carry one.
+                    let metadata_json = {
                         let db = self.db.lock_safe();
+                        let existing: Option<String> = db
+                            .query_row(
+                                "SELECT metadata_json FROM notebook_cells WHERE id=?1",
+                                params![id],
+                                |r| r.get(0),
+                            )
+                            .unwrap_or(None);
+                        let stamped = crate::workflow::ensure_step_uid(
+                            metadata_json.as_deref(),
+                            existing.as_deref(),
+                            &id,
+                        );
                         let _ = db.execute(
                             "UPDATE notebook_cells SET cell_type=?2, cell_order=?3, content=?4, output=?5, collapsed=?6, height=?7, metadata_json=?8, updated_at=?9 WHERE id=?1",
-                            params![id, cell_type, cell_order, content, output, collapsed as i32, height, metadata_json, now],
+                            params![id, cell_type, cell_order, content, output, collapsed as i32, height, stamped, now],
                         );
-                    }
+                        Some(stamped)
+                    };
 
                     if let Some(gid) = group_id {
                         let _ = self.network_tx.send(NetworkCommand::Broadcast {
@@ -1421,6 +1463,8 @@ impl CommandActor {
                                     author: chat.author,
                                     parent_id: chat.parent_id,
                                     timestamp: chat.timestamp,
+                                    anchor_kind: chat.anchor_kind,
+                                    anchor_id: chat.anchor_id,
                                 });
                                 let _ = self.event_tx.send(event);
                             }
@@ -1657,7 +1701,7 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
     .unwrap_or_default();
 
     let chats: Vec<ChatDTO> = (|| -> rusqlite::Result<Vec<ChatDTO>> {
-        let mut stmt = db.prepare("SELECT id, board_id, workspace_id, name, hash, data, created_at FROM objects WHERE type='chat' ORDER BY created_at")?;
+        let mut stmt = db.prepare("SELECT id, board_id, workspace_id, name, hash, data, created_at, anchor_kind, anchor_id FROM objects WHERE type='chat' ORDER BY created_at")?;
         let rows = stmt.query_map([], |r| {
             let parent_bytes: Option<Vec<u8>> = r.get(5)?;
             let parent_id = parent_bytes.and_then(|b| String::from_utf8(b).ok());
@@ -1669,6 +1713,8 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
                 author: r.get(4)?,
                 parent_id,
                 timestamp: r.get(6)?,
+                anchor_kind: r.get(7)?,
+                anchor_id: r.get(8)?,
             })
         })?;
         Ok(rows.filter_map(Result::ok).collect())

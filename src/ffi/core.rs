@@ -647,6 +647,10 @@ pub extern "C" fn cyan_send_chat(
         board_id: bid,
         message: msg,
         parent_id: parent,
+        // CHAT C1: this legacy typed entry point stays unanchored (#board) — an anchored
+        // send rides the JSON `cyan_send_command` path, keeping this C ABI unchanged.
+        anchor_kind: None,
+        anchor_id: None,
     });
 }
 
@@ -706,6 +710,9 @@ pub extern "C" fn cyan_note_put(
         text,
         scope: None,
         kind: None,
+        anchor_kind: None,
+        anchor_id: None,
+        origin_ref: None,
     });
 }
 
@@ -745,6 +752,11 @@ pub extern "C" fn cyan_note_put_scoped(
         text,
         scope,
         kind,
+        // CHAT C7: anchored/promoted notes ride the JSON `cyan_send_command` path
+        // (`PutNote` with anchor_kind/anchor_id/origin_ref); this C ABI is unchanged.
+        anchor_kind: None,
+        anchor_id: None,
+        origin_ref: None,
     });
 }
 
@@ -2249,7 +2261,7 @@ pub extern "C" fn cyan_save_notebook_cell(cell_json: *const c_char) -> bool {
     let output = cell["output"].as_str().map(|s| s.to_string());
     let collapsed = cell["collapsed"].as_bool().unwrap_or(false);
     let height = cell["height"].as_f64();
-    let metadata_json = cell["metadata_json"].as_str().map(|s| s.to_string());
+    let incoming_metadata_json = cell["metadata_json"].as_str().map(|s| s.to_string());
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2264,16 +2276,29 @@ pub extern "C" fn cyan_save_notebook_cell(cell_json: *const c_char) -> bool {
 
     let is_new: bool;
     let group_id: String;
+    let metadata_json: String;
 
     {
         let db = sys.db.lock_safe();
 
-        // Check if exists
+        // Check if exists — and read the row's current metadata, so the stable
+        // `step_uid` (CHAT §4.1) survives a client save that omits metadata_json
+        // (the app's save path sends none; INSERT OR REPLACE would otherwise wipe it).
+        let existing_metadata: Option<String> = db.query_row(
+            "SELECT metadata_json FROM notebook_cells WHERE id = ?1",
+            params![&id],
+            |row| row.get(0)
+        ).ok().flatten();
         is_new = db.query_row(
             "SELECT 1 FROM notebook_cells WHERE id = ?1",
             params![&id],
             |_| Ok(())
         ).is_err();
+        metadata_json = crate::workflow::ensure_step_uid(
+            incoming_metadata_json.as_deref(),
+            existing_metadata.as_deref(),
+            &id,
+        );
 
         // Get group_id via board -> workspace -> group
         group_id = db.query_row(
@@ -2317,7 +2342,7 @@ pub extern "C" fn cyan_save_notebook_cell(cell_json: *const c_char) -> bool {
                 output,
                 collapsed,
                 height,
-                metadata_json,
+                metadata_json: Some(metadata_json),
             }
         };
 

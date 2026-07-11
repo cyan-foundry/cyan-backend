@@ -117,6 +117,9 @@ fn scoped_note(
         updated_at: updated,
         scope: scope.to_string(),
         kind: kind.to_string(),
+        anchor_kind: None,
+        anchor_id: None,
+        origin_ref: None,
     }
 }
 

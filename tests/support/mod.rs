@@ -788,6 +788,8 @@ pub fn seed_group_fixture(group_id: &str, elements: usize, chats: usize) -> (Str
             "author",
             None,
             1,
+            None,
+            None,
         );
     }
     let _ = storage::file_insert_simple(
