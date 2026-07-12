@@ -894,37 +894,38 @@ pub(crate) async fn execute_local_mcp_tool_step(
         }
     };
 
-    let mut dispatched = host
-        .dispatch_mcp_tool(&scope, &step, &side_effects, approved, &ledger, make_connect())
-        .map_err(|e| anyhow!("local plugin dispatch failed: {}", e))?;
+    let mut dispatch_result =
+        host.dispatch_mcp_tool(&scope, &step, &side_effects, approved, &ledger, make_connect());
 
     // B5 — ENVIRONMENTAL SELF-HEAL, no human: an auth-expired tool failure
     // refreshes the Frame.io IMS token (rewriting the cred env file every
     // spawn reads fresh) and retries the step ONCE. Anything else falls
     // through to the structured error path below.
-    if let McpDispatch::Ran(result) = &dispatched {
-        if let Some((error_class, message)) = tool_result_error(&result.result) {
-            if crate::frameio_refresh::is_auth_error(&error_class, &message)
-                && crate::frameio_refresh::refresh_cred_file().unwrap_or(false)
-            {
-                let _ = event_tx.send(SwiftEvent::StatusUpdate {
-                    message: format!(
-                        "🔁 Step '{step_id}': credential expired — token refreshed, retrying"
-                    ),
-                });
-                dispatched = host
-                    .dispatch_mcp_tool(
-                        &scope,
-                        &step,
-                        &side_effects,
-                        approved,
-                        &ledger,
-                        make_connect(),
-                    )
-                    .map_err(|e| anyhow!("local plugin dispatch failed (post-refresh): {}", e))?;
-            }
-        }
+    //
+    // The 401 reaches us in EITHER shape (live-found 2026-07-12): the frameio
+    // plugin surfaces it as a transport `Err` ("protocol error: … 401 …"),
+    // while cyan-media reports it IN-PAYLOAD via `tool_result_error`. The
+    // original rung only inspected the in-payload shape, so a real Frame.io
+    // 401 sailed past the refresh. Detect auth-expiry on BOTH.
+    let is_auth_failure = match &dispatch_result {
+        Err(e) => crate::frameio_refresh::is_auth_error("", &e.to_string()),
+        Ok(McpDispatch::Ran(result)) => tool_result_error(&result.result)
+            .map(|(class, msg)| crate::frameio_refresh::is_auth_error(&class, &msg))
+            .unwrap_or(false),
+        _ => false,
+    };
+    if is_auth_failure && crate::frameio_refresh::refresh_cred_file().unwrap_or(false) {
+        let _ = event_tx.send(SwiftEvent::StatusUpdate {
+            message: format!(
+                "🔁 Step '{step_id}': credential expired — token refreshed, retrying"
+            ),
+        });
+        dispatch_result =
+            host.dispatch_mcp_tool(&scope, &step, &side_effects, approved, &ledger, make_connect());
     }
+
+    let dispatched =
+        dispatch_result.map_err(|e| anyhow!("local plugin dispatch failed: {}", e))?;
 
     match dispatched {
         McpDispatch::Ran(result) => {

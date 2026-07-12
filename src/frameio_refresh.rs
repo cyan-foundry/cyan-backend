@@ -102,3 +102,39 @@ pub fn is_auth_error(error_class: &str, message: &str) -> bool {
     let m = message.to_ascii_lowercase();
     m.contains("401") || m.contains("unauthorized") || m.contains("token expired")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::is_auth_error;
+
+    #[test]
+    fn structured_auth_classes_match() {
+        assert!(is_auth_error("auth", ""));
+        assert!(is_auth_error("unauthorized", ""));
+        assert!(is_auth_error("token_expired", ""));
+        assert!(is_auth_error("http_401", ""));
+    }
+
+    /// LIVE-FOUND (2026-07-12): the frameio plugin's 401 reaches the dispatch
+    /// as a transport `Err` string (NOT an in-payload class) — the rung must
+    /// detect it there too. This is the EXACT string the on-device host
+    /// produced; if this stops matching, the auto-refresh silently regresses.
+    #[test]
+    fn the_real_frameio_protocol_error_string_is_auth() {
+        let real = "local plugin dispatch failed: mcp call_tool frameio.upload_file: \
+             protocol error: tool upload_file reported an error: Error calling tool \
+             'upload_file': Client error '401 Unauthorized' for url \
+             'https://api.frame.io/v4/accounts/…/files/local_upload'";
+        assert!(
+            is_auth_error("", real),
+            "the dispatch-Err 401 must trigger the token refresh"
+        );
+    }
+
+    #[test]
+    fn non_auth_errors_do_not_match() {
+        assert!(!is_auth_error("validation", "missing required argument account_id"));
+        assert!(!is_auth_error("", "500 Internal Server Error"));
+        assert!(!is_auth_error("timeout", "the request timed out"));
+    }
+}
