@@ -1353,6 +1353,8 @@ fn make_step_config(
         timeout_seconds: Some(5),
         retry_count: Some(0),
         auto_advance: false,
+        review_hold: false,
+        waiting_on: None,
         notifications: vec![],
         state: cyan_backend::pipeline::PipelineStepState::default(),
     }

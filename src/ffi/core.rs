@@ -4569,6 +4569,134 @@ pub extern "C" fn cyan_pipeline_approve(
     approved
 }
 
+/// D/P-4 — approve a pipeline step AS a named reviewer (additive; the old
+/// `cyan_pipeline_approve` stays untouched for non-review gates). A
+/// `review_hold` step clears ONLY when `reviewer` matches its `waiting_on`
+/// user — the producer-review gate cannot be cleared by anyone else.
+/// Returns JSON `{"success":true}` or `{"success":false,"error":"review gate
+/// is waiting on '<user>' …"}` so the app can surface WHO is being waited on.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_pipeline_approve_as(
+    board_id: *const c_char,
+    step_id: *const c_char,
+    reviewer: *const c_char,
+) -> *mut c_char {
+    let (Ok(board), Ok(step)) = (
+        unsafe { CStr::from_ptr(board_id) }.to_str(),
+        unsafe { CStr::from_ptr(step_id) }.to_str(),
+    ) else {
+        return json_cstring(r#"{"success":false,"error":"bad args"}"#);
+    };
+    let who = if reviewer.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(reviewer) }.to_str().ok().filter(|s| !s.is_empty())
+    };
+    let system = match SYSTEM.get() {
+        Some(s) => s,
+        None => return json_cstring(r#"{"success":false,"error":"System not initialized"}"#),
+    };
+    match crate::pipeline::approve_step(board, step, who, &system.command_tx, Some(&system.event_tx)) {
+        Ok(()) => json_cstring(r#"{"success":true}"#),
+        Err(e) => json_cstring(
+            &serde_json::json!({"success": false, "error": e.to_string()}).to_string(),
+        ),
+    }
+}
+
+/// D/P-4 — reject a pipeline step AS a named reviewer (the review-hold twin of
+/// `cyan_pipeline_approve_as`; same assignee enforcement, same JSON envelope).
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_pipeline_reject_as(
+    board_id: *const c_char,
+    step_id: *const c_char,
+    reviewer: *const c_char,
+) -> *mut c_char {
+    let (Ok(board), Ok(step)) = (
+        unsafe { CStr::from_ptr(board_id) }.to_str(),
+        unsafe { CStr::from_ptr(step_id) }.to_str(),
+    ) else {
+        return json_cstring(r#"{"success":false,"error":"bad args"}"#);
+    };
+    let who = if reviewer.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(reviewer) }.to_str().ok().filter(|s| !s.is_empty())
+    };
+    let system = match SYSTEM.get() {
+        Some(s) => s,
+        None => return json_cstring(r#"{"success":false,"error":"System not initialized"}"#),
+    };
+    match crate::pipeline::reject_step(board, step, who, &system.command_tx, Some(&system.event_tx)) {
+        Ok(()) => json_cstring(r#"{"success":true}"#),
+        Err(e) => json_cstring(
+            &serde_json::json!({"success": false, "error": e.to_string()}).to_string(),
+        ),
+    }
+}
+
+/// D/P-4 — set the REAL user this board's review gates wait on (compile stamps
+/// it into review-hold steps as `waiting_on`). Additive.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_board_set_review_assignee(
+    board_id: *const c_char,
+    user: *const c_char,
+) -> bool {
+    let (Ok(board), Ok(user)) = (
+        unsafe { CStr::from_ptr(board_id) }.to_str(),
+        unsafe { CStr::from_ptr(user) }.to_str(),
+    ) else {
+        return false;
+    };
+    crate::pipeline::set_review_assignee(board, user).is_ok()
+}
+
+/// D/P-4 — read the board's review assignee (empty string when unset).
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_board_review_assignee(board_id: *const c_char) -> *mut c_char {
+    let Ok(board) = unsafe { CStr::from_ptr(board_id) }.to_str() else {
+        return json_cstring("");
+    };
+    json_cstring(&crate::pipeline::review_assignee(board).unwrap_or_default())
+}
+
+/// D/P-4 — the review panel's ADD-COMMENT verb: post a frame-anchored comment
+/// on the board's current review proxy in Frame.io + echo it locally as a
+/// timecoded note. Input JSON: `{"board_id", "text", "at_seconds", "author"}`.
+/// Returns `{"success":true,"comment":<payload>}` or `{"success":false,"error":…}`.
+/// Blocking (spawns the plugin) — call OFF the main thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_review_add_comment(cmd_json: *const c_char) -> *mut c_char {
+    let Ok(raw) = unsafe { CStr::from_ptr(cmd_json) }.to_str() else {
+        return json_cstring(r#"{"success":false,"error":"bad args"}"#);
+    };
+    let Ok(cmd) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return json_cstring(r#"{"success":false,"error":"bad json"}"#);
+    };
+    let (Some(board), Some(text)) = (
+        cmd.get("board_id").and_then(|v| v.as_str()),
+        cmd.get("text").and_then(|v| v.as_str()),
+    ) else {
+        return json_cstring(r#"{"success":false,"error":"board_id and text required"}"#);
+    };
+    let at_seconds = cmd.get("at_seconds").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let author = cmd.get("author").and_then(|v| v.as_str()).unwrap_or("reviewer");
+    let system = match SYSTEM.get() {
+        Some(s) => s,
+        None => return json_cstring(r#"{"success":false,"error":"System not initialized"}"#),
+    };
+    match crate::pipeline_executor::review_add_comment(
+        board, text, at_seconds, author, &system.command_tx,
+    ) {
+        Ok(payload) => json_cstring(
+            &serde_json::json!({"success": true, "comment": payload}).to_string(),
+        ),
+        Err(e) => json_cstring(
+            &serde_json::json!({"success": false, "error": e.to_string()}).to_string(),
+        ),
+    }
+}
+
 
 /// Run ONE locally-bound pipeline step through the on-device cyan-mcp host —
 /// the MECHANICAL SPINE verb (additive). The step's compiled metadata must

@@ -94,6 +94,8 @@ fn step_config(step_id: &str, executor: &str, depends_on: Vec<&str>) -> Pipeline
         timeout_seconds: Some(5),
         retry_count: Some(0),
         auto_advance: false,
+        review_hold: false,
+        waiting_on: None,
         notifications: vec![],
         state: PipelineStepState::default(),
     }

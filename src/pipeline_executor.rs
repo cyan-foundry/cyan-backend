@@ -827,6 +827,87 @@ pub(crate) async fn execute_local_mcp_tool_step(
         data: json!({ "executor_type": "local", "plugin_id": step.plugin_id, "tool": step.tool }),
     });
 
+    // A/P-1 — the EXECUTOR BACKSTOP for plugin invariants: a frameio tool call
+    // must never die on a missing `account_id`/`folder_id` (they are plugin
+    // CONFIG, not per-call args — 25 tools require account_id and the compiler
+    // never binds it). Inject them from the credential env file (the same file
+    // the token refresher maintains) when the caller omitted them. Curated
+    // plugins also self-default (cyan-forge), but the executor is the backstop.
+    if step.plugin_id == "frameio"
+        && let Some(args) = step.args.as_object_mut()
+    {
+        for key in ["account_id", "folder_id"] {
+            let missing = !args.contains_key(key)
+                || args.get(key).and_then(|v| v.as_str()).is_none_or(str::is_empty);
+            // folder_id only belongs on the upload verb — never force it elsewhere.
+            if key == "folder_id" && step.tool != "upload_file" {
+                continue;
+            }
+            if missing
+                && let Some(v) = cred_env_value(&format!("FRAMEIO_{}", key.to_uppercase()))
+            {
+                args.insert(key.to_string(), json!(v));
+                tracing::info!(
+                    target: "obs",
+                    event = "plugin_invariant_injected",
+                    plugin = "frameio",
+                    tool = step.tool.as_str(),
+                    key = key,
+                    "executor backstop filled a plugin-config invariant"
+                );
+            }
+        }
+    }
+
+    // D/P-4 — SAME-PROXY REUSE: replaying an upload-for-review step must NEVER
+    // mint a fresh Frame.io file (a new file_id orphans every review comment
+    // the producer left on the previous one). If this exact CONTENT (blake3 of
+    // the bytes — the same hash registration stamps) already has a registered
+    // published proxy, short-circuit: reuse the existing file id. No re-upload,
+    // no side-effect gate (nothing external happens), comments preserved.
+    if step.plugin_id == "frameio" && step.tool == "upload_file"
+        && let Some(existing) = existing_uploaded_proxy_ref(board_id, &step)
+    {
+        let summary = format!(
+            "Reused the existing Frame.io upload (file {existing}) — identical content already \
+             uploaded; the reviewer's comments stay attached to it."
+        );
+        tracing::info!(
+            target: "obs",
+            event = "upload_reused",
+            board_id = board_id,
+            step_id = step_id,
+            proxy_ref = existing.as_str(),
+            "same-content upload short-circuited to the existing Frame.io file"
+        );
+        // Idempotent registry/loop tie for THIS board (safe if already present).
+        register_uploaded_review_media(board_id, &step, &json!({ "file_id": existing }));
+        let finding = Finding {
+            timecode_seconds: 0.0,
+            content: summary.clone(),
+            finding_type: "plugin_result".to_string(),
+            severity: "info".to_string(),
+            suggested_action: None,
+        };
+        publish_pipeline_event(event_tx, PipelineEvent {
+            event_type: "step_completed".into(),
+            board_id: board_id.into(),
+            step_id: step_id.into(),
+            run_id: run_id.clone(),
+            timestamp: chrono::Utc::now().timestamp(),
+            data: json!({
+                "summary": summary,
+                "findings_count": 1,
+                "plugin_id": step.plugin_id,
+                "tool": step.tool,
+                "duration_ms": 0,
+                "reused": true,
+                "source": "external",
+            }),
+        });
+        return Ok((summary, vec![finding]));
+    }
+
     let root = plugins_root();
     let tenant = device_tenant();
 
@@ -1514,6 +1595,168 @@ fn resolve_media_args(board_id: &str, step: &mut McpTool) {
 /// as its published proxy ref (`review_loop::register_review_media`) — the
 /// ledger bootstrap the sense→propose leg requires. Best-effort and idempotent
 /// (an already-registered proxy ref is left untouched); a failure only logs.
+/// D/P-4 — the review panel's ADD-COMMENT leg: post a frame-anchored comment on
+/// the board's CURRENT review proxy in Frame.io (the same file the sense step
+/// reads), and echo it locally as a timecoded note so the panel updates
+/// instantly. The human typed it — that IS the approval, so the external_send
+/// gate is pre-cleared. `at_seconds` anchors at the player's current frame
+/// (Frame.io wants integer FRAMES — converted with the registered asset's fps,
+/// the same semantics `parse_sense_comments` reads back).
+pub fn review_add_comment(
+    board_id: &str,
+    text: &str,
+    at_seconds: f64,
+    author: &str,
+    command_tx: &UnboundedSender<CommandMsg>,
+) -> Result<serde_json::Value> {
+    if text.trim().is_empty() {
+        return Err(anyhow!("empty comment"));
+    }
+    // The board's current review proxy + its fps (for the frame anchor).
+    let (proxy_ref, fps) = {
+        let conn = crate::storage::db().lock().map_err(|e| anyhow!("DB lock: {e}"))?;
+        let tenant = crate::review_loop::board_tenant(&conn, board_id);
+        let proxy_ref = crate::review_loop::current_proxy_ref(&conn, &tenant, board_id)?
+            .ok_or_else(|| anyhow!("board has no published review media yet"))?;
+        let fps = crate::asset_registry::find_by_remote_ref(&conn, &tenant, "frameio", &proxy_ref)
+            .ok()
+            .flatten()
+            .and_then(|a| a.fps)
+            .unwrap_or(24.0);
+        (proxy_ref, fps)
+    };
+    let frames = (at_seconds.max(0.0) * fps).round() as i64;
+
+    // account_id is a PLUGIN INVARIANT (P-1) — read it from the credential env
+    // file (the refresher's source of truth) so the call never dies on it.
+    let account_id = cred_env_value("FRAMEIO_ACCOUNT_ID")
+        .ok_or_else(|| anyhow!("FRAMEIO_ACCOUNT_ID missing from the credential env file"))?;
+
+    let step = McpTool {
+        plugin_id: "frameio".to_string(),
+        tool: "create_comment".to_string(),
+        args: json!({
+            "account_id": account_id,
+            "file_id": proxy_ref,
+            "data": { "text": text, "timestamp": frames },
+        }),
+    };
+
+    let root = plugins_root();
+    let tenant = device_tenant();
+    let host = PluginHost::new(
+        Arc::new(cyan_mcp::RecordingSink::new()) as Arc<dyn cyan_mcp::EventSink>,
+        Arc::new(cyan_mcp::LogEmitter::new()) as Arc<dyn cyan_mcp::Emitter>,
+        Arc::new(cyan_mcp::SystemClock::new()) as Arc<dyn cyan_mcp::Clock>,
+        cyan_mcp::BackoffPolicy {
+            base: std::time::Duration::from_millis(500),
+            max: std::time::Duration::from_secs(30),
+            max_restarts: 3,
+        },
+        tenant.clone(),
+    );
+    let side_effects = host
+        .resolve_installed_tool(&root, &step.tool)
+        .map_err(|e| anyhow!("resolve plugin tool {}: {}", step.tool, e))?
+        .map(|(_, tb)| tb.side_effects)
+        .ok_or_else(|| anyhow!("tool 'create_comment' is not installed"))?;
+    let scope = RunScope {
+        tenant_id: tenant.clone(),
+        run_id: format!("review_comment_{}", chrono::Utc::now().timestamp() % 100000),
+    };
+    let ledger = RunCostLedger::new();
+    let bundle_dir = root.join(&step.plugin_id);
+    let plugin_id = step.plugin_id.clone();
+    let spawn_tenant = tenant.clone();
+    let connect = move || -> Result<Box<dyn cyan_mcp::PluginTransport>> {
+        let config = crate::mcp_host::bundle_spawn_config(&plugin_id, &bundle_dir, &spawn_tenant)?;
+        let mut transport = cyan_mcp::StdioTransport::new();
+        transport
+            .spawn(&config)
+            .map_err(|e| anyhow!("spawn plugin frameio: {e}"))?;
+        Ok(Box::new(transport))
+    };
+    // approved=true: the human authored this comment — the gate is them.
+    let dispatched = host
+        .dispatch_mcp_tool(&scope, &step, &side_effects, true, &ledger, connect)
+        .map_err(|e| anyhow!("create_comment dispatch failed: {e}"))?;
+    let result = match dispatched {
+        McpDispatch::Ran(r) => {
+            if let Some((class, msg)) = tool_result_error(&r.result) {
+                return Err(anyhow!("create_comment failed ({class}): {msg}"));
+            }
+            r.result
+        }
+        other => return Err(anyhow!("create_comment did not run: {other:?}")),
+    };
+
+    // Local echo: the panel shows the comment immediately as a timecoded note —
+    // the SAME rail sensed comments land on (note_type review_comment).
+    let note = crate::timecode_notes::TimecodeNote {
+        id: uuid::Uuid::new_v4().to_string(),
+        board_id: board_id.to_string(),
+        timecode_seconds: at_seconds.max(0.0),
+        content: text.to_string(),
+        note_type: "review_comment".to_string(),
+        author: author.to_string(),
+        created_at: chrono::Utc::now().timestamp() as f64,
+        pipeline_step_id: None,
+        pipeline_phase: None,
+        ai_reviewed: false,
+        human_approved: true,
+        action_skill: None,
+        action_status: None,
+        action_result: None,
+        action_model: None,
+        ai_flags_nearby: vec![],
+        reply_to: None,
+        thread_count: 0,
+    };
+    let _ = crate::timecode_notes::save_note(&note, command_tx);
+    tracing::info!(
+        target: "obs",
+        event = "review_comment_added",
+        board_id = board_id,
+        proxy_ref = proxy_ref.as_str(),
+        frames = frames,
+        author = author,
+        "frame-anchored review comment posted to Frame.io + echoed locally"
+    );
+    Ok(unwrap_tool_payload(&result))
+}
+
+/// Read one key from the credential env file (`CYAN_CRED_ENV_FILE`, default
+/// `~/.frameio.env`) — tolerant of `export ` prefixes and quotes.
+fn cred_env_value(key: &str) -> Option<String> {
+    let path = crate::mcp_host::cred_env_file();
+    let body = std::fs::read_to_string(path).ok()?;
+    body.lines()
+        .map(|l| l.trim().strip_prefix("export ").unwrap_or(l.trim()))
+        .filter_map(|l| l.split_once('='))
+        .find(|(k, _)| k.trim() == key)
+        .map(|(_, v)| v.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// D/P-4 — the SAME-PROXY REUSE lookup: does this upload step's exact content
+/// (blake3 of the file bytes, the hash `probe_master_for_registration` stamps)
+/// already have a registered published proxy? Returns its remote ref (the
+/// Frame.io file id) so the dispatch can short-circuit instead of re-uploading.
+fn existing_uploaded_proxy_ref(board_id: &str, step: &McpTool) -> Option<String> {
+    let path = step
+        .args
+        .get("file_path")
+        .or_else(|| step.args.get("input"))
+        .and_then(|v| v.as_str())?;
+    let bytes = std::fs::read(path).ok()?;
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    let conn = crate::storage::db().lock().ok()?;
+    let tenant = crate::review_loop::board_tenant(&conn, board_id);
+    crate::asset_registry::latest_published_proxy(&conn, &tenant, &hash)
+        .ok()
+        .flatten()
+}
+
 fn register_uploaded_review_media(board_id: &str, step: &McpTool, result: &serde_json::Value) {
     if step.plugin_id != "frameio" || step.tool != "upload_file" {
         return;
