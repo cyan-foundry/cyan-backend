@@ -213,8 +213,45 @@ impl TopicActor {
         let (persist_tx, mut persist_rx) = mpsc::unbounded_channel::<NetworkEvent>();
         let persist_event_tx = event_tx.clone();
         let persist_node_id = node_id.clone();
+        let persist_authorizer = authorizer.clone();
+        let persist_group_id = group_id.clone();
         tokio::spawn(async move {
             while let Some(evt) = persist_rx.recv().await {
+                // A2 §6 (enforcement point 2, gossip lane): inside the opt-in
+                // ENFORCED-group arm, an inbound note row is tiered by its
+                // AUTHOR's roster role; a deny/unknown-scope drops the row —
+                // neither persisted nor forwarded (mirrors the transport-peer
+                // refusal above). Un-enforced groups: TR-1, apply-all (only the
+                // sovereign user-scope drop inside `persist_event` runs).
+                if let NetworkEvent::NoteAdded { id, scope, author_id, .. }
+                | NetworkEvent::NoteUpdated { id, scope, author_id, .. } = &evt
+                {
+                    let (enforced, tier) = persist_authorizer
+                        .lock()
+                        .map(|a| {
+                            (
+                                a.is_enforced(&persist_group_id),
+                                a.note_tier_of(&persist_group_id, author_id)
+                                    .map(crate::notes_rbac::tier_from_mesh),
+                            )
+                        })
+                        .unwrap_or((false, None));
+                    if enforced {
+                        let enforcement = crate::notes_rbac::InboundEnforcement {
+                            enforced: true,
+                            tier_of: &|_author: &str| tier,
+                        };
+                        if !crate::notes_rbac::inbound_note_applies(
+                            Some(&enforcement),
+                            id,
+                            scope,
+                            author_id,
+                            "gossip",
+                        ) {
+                            continue;
+                        }
+                    }
+                }
                 Self::persist_event(&evt);
                 // R10FB §N: count an incoming non-author chat as unread (once, ever) and
                 // emit UnreadChanged BEFORE the event itself so badges update live.
@@ -585,6 +622,7 @@ impl TopicActor {
                 let event_tx = self.event_tx.clone();
                 let network_tx = self.network_tx.clone();
                 let grant = self.grant.clone();
+                let authorizer = self.authorizer.clone();
 
                 tokio::spawn(async move {
                     match download_snapshot(
@@ -594,6 +632,7 @@ impl TopicActor {
                         grant.as_deref(),
                         event_tx,
                         false,
+                        Some(authorizer),
                     ).await {
                         Ok(_) => {
                             eprintln!("✅ [SNAP-DL] Snapshot download SUCCESS");
@@ -629,6 +668,7 @@ impl TopicActor {
                 let event_tx = self.event_tx.clone();
                 let network_tx = self.network_tx.clone();
                 let grant = self.grant.clone();
+                let authorizer = self.authorizer.clone();
                 tokio::spawn(async move {
                     match download_snapshot_since(
                         endpoint,
@@ -638,6 +678,7 @@ impl TopicActor {
                         since,
                         event_tx,
                         true,
+                        Some(authorizer),
                     )
                     .await
                     {
@@ -1017,11 +1058,20 @@ impl TopicActor {
         let grant = self.grant.clone();
         let event_tx = self.event_tx.clone();
         let repairing = self.repairing.clone();
+        let authorizer = self.authorizer.clone();
         tokio::spawn(async move {
             // Quiet pull: merge the sender's state into ours WITHOUT re-emitting join-time Sync*
             // events. Reuses the snapshot serve/apply path — no new transfer protocol.
-            if let Err(e) =
-                download_snapshot(endpoint, &node_id, &gid, grant.as_deref(), event_tx, true).await
+            if let Err(e) = download_snapshot(
+                endpoint,
+                &node_id,
+                &gid,
+                grant.as_deref(),
+                event_tx,
+                true,
+                Some(authorizer),
+            )
+            .await
             {
                 tracing::debug!(
                     "🩹 [TOPIC] anti-entropy repair from {}... failed: {}",
@@ -1082,8 +1132,19 @@ impl TopicActor {
         let event_tx = self.event_tx.clone();
         let network_tx = self.network_tx.clone();
         let grant = self.grant.clone();
+        let authorizer = self.authorizer.clone();
         tokio::spawn(async move {
-            match download_snapshot(endpoint, &source_peer, &group_id, grant.as_deref(), event_tx, false).await {
+            match download_snapshot(
+                endpoint,
+                &source_peer,
+                &group_id,
+                grant.as_deref(),
+                event_tx,
+                false,
+                Some(authorizer),
+            )
+            .await
+            {
                 Ok(_) => {
                     let _ = network_tx.send(TopicNetworkCmd::SnapshotComplete { group_id });
                 }
@@ -2044,8 +2105,10 @@ async fn download_snapshot(
     grant: Option<&str>,
     event_tx: UnboundedSender<SwiftEvent>,
     quiet: bool,
+    authorizer: Option<Arc<std::sync::Mutex<MeshAuthorizer>>>,
 ) -> Result<()> {
-    download_snapshot_since(endpoint, source_peer, group_id, grant, None, event_tx, quiet).await
+    download_snapshot_since(endpoint, source_peer, group_id, grant, None, event_tx, quiet, authorizer)
+        .await
 }
 
 /// MESH_HARDENING §5 incremental catch-up: like [`download_snapshot`] but requests only the
@@ -2062,6 +2125,7 @@ async fn download_snapshot_since(
     since: Option<i64>,
     event_tx: UnboundedSender<SwiftEvent>,
     quiet: bool,
+    authorizer: Option<Arc<std::sync::Mutex<MeshAuthorizer>>>,
 ) -> Result<()> {
     use crate::models::protocol::SnapshotRequest;
     use tokio::io::AsyncWriteExt;
@@ -2158,8 +2222,31 @@ async fn download_snapshot_since(
         // the same one the §11 bundle import uses — so a full snapshot, an incremental delta,
         // and an air-gapped import all converge to the identical state. Then emit the per-node
         // `Sync*` progress events (the substrate oracle) for the rows this frame carried.
-        if let Err(e) = crate::snapshot::apply_snapshot_frame(&frame) {
-            eprintln!("   ⚠️ Snapshot frame apply: {}", e);
+        {
+            // A2 §6 (enforcement point 2, snapshot lane): the SAME opt-in
+            // enforced-group notes RBAC as the gossip arm — an author's roster
+            // tier gates each note row; un-enforced groups apply exactly as
+            // before (TR-1 + the sovereign user-scope drop).
+            let enforced = authorizer
+                .as_ref()
+                .and_then(|a| a.lock().ok())
+                .map(|g| g.is_enforced(group_id))
+                .unwrap_or(false);
+            let tier_of = |author: &str| -> Option<cyan_identity::Role> {
+                authorizer
+                    .as_ref()
+                    .and_then(|a| a.lock().ok())
+                    .and_then(|g| g.note_tier_of(group_id, author))
+                    .map(crate::notes_rbac::tier_from_mesh)
+            };
+            let enforcement =
+                crate::notes_rbac::InboundEnforcement { enforced, tier_of: &tier_of };
+            let notes_enforcement = enforced.then_some(&enforcement);
+            if let Err(e) =
+                crate::snapshot::apply_snapshot_frame_enforced(&frame, notes_enforcement)
+            {
+                eprintln!("   \u{26a0}\u{fe0f} Snapshot frame apply: {}", e);
+            }
         }
 
         match frame {

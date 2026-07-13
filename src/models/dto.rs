@@ -306,13 +306,36 @@ pub struct TemplateStep {
     /// The plugin bound to this step (e.g. `"contido"`), if any. `None` ⇒ unbound.
     #[serde(default)]
     pub plugin: Option<String>,
+    /// A3 (additive): the display stage this step belongs to — **DISPLAY-ONLY**.
+    /// Never cloned into cells, never read by compile (the real `infer_step`
+    /// derives stage from cell text and accepts no hint); stripped when a step
+    /// is serialized into a lens `GenTemplateStep`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+}
+
+/// A3 (additive): one plugin a roletype template names. `status` ∈
+/// `role_templates::PLUGIN_STATUS_VOCAB` (`live`|`roadmap` — exists-or-doesn't,
+/// a DIFFERENT axis from task status); `execution` ∈ `PLUGIN_EXECUTION_VOCAB`
+/// (`device`|`cloud`|`both`); `flagship_tool` = the ONE tool whose installed
+/// presence marks the plugin installed (bare tool name, `resolve_installed_tool`
+/// verifies the OWNING plugin id matches).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplatePlugin {
+    pub id: String,
+    pub status: String,
+    pub execution: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flagship_tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<String>,
 }
 
 /// A workflow **template** — a pre-written English workflow (steps + bound plugins)
 /// you clone into a board. Two sources: built-in **media seeds** (`source =
 /// "builtin"`, tenant-agnostic) and user **save-as-template** results (`source =
 /// "user"`, tenant-scoped). Cloning never mutates the template.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Template {
     pub id: String,
     /// The tenant (group) that owns a user template. Empty for built-in seeds, which
@@ -325,6 +348,33 @@ pub struct Template {
     pub source: String,
     pub steps: Vec<TemplateStep>,
     pub created_at: i64,
+    // ── A3 roletype extension (all additive, serde defaults; a pre-A3 template
+    //    decodes with every field at its default — T39) ──
+    /// `role_templates::FORMAT_TYPE_VOCAB` member; `None` = a legacy template
+    /// (in `list_templates`, NEVER in the selector — T50).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_type: Option<String>,
+    /// Display shape: the stage rail the selector UI renders.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<String>,
+    /// The note kinds this format works from — every entry ⊆ `NOTE_KIND_VOCAB`
+    /// **by const reference** (13 at REV 2; save validation tracks A1's vocab
+    /// automatically if it grows again).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub note_kinds: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<TemplatePlugin>,
+    /// `role_templates::TEMPLATE_MATURITY_VOCAB` (`mvp`|`extensible`); all five
+    /// builtins ship `"mvp"` (D-A3.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maturity: Option<String>,
+    /// `role_templates::ROLETYPE_CATALOG_VERSION` at save time; a NULL-column
+    /// user row is a legacy (pre-A3) template and never enters the selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_version: Option<String>,
+    /// `"tenant"` live; `"user"`/`"group"` stored-but-treated-as-tenant (roadmap).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

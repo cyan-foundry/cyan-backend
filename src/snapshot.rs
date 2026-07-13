@@ -65,11 +65,11 @@ pub fn group_high_water(group_id: &str) -> i64 {
     for ch in storage::chat_list_by_workspaces(&ws_ids).unwrap_or_default() {
         bump(ch.timestamp);
     }
-    // feat/notes-constitution: group/tenant-scoped notes anchor at the group id — include
-    // them in the watermark exactly as the digest and the serializer do.
-    let mut note_anchor_ids = board_ids.clone();
-    note_anchor_ids.push(group_id.to_string());
-    for nt in storage::note_list_by_boards(&note_anchor_ids).unwrap_or_default() {
+    // A2 §4a: the tenant-keyed sync feed (tenant == group id) — the watermark
+    // covers exactly what the digest and the serializer sweep, including the
+    // NEW project scope and the previously convergence-dead workflow/producer
+    // anchors (user scope excluded inside the feed).
+    for nt in storage::note_list_for_sync(group_id).unwrap_or_default() {
         bump(nt.updated_at);
     }
     for p in storage::pin_list_by_boards(&board_ids).unwrap_or_default() {
@@ -176,12 +176,11 @@ pub fn build_snapshot_frames(group_id: &str, since: Option<i64>) -> Result<Vec<S
         |i| i.created_at,
     );
     let board_metadata = storage::board_metadata_list_by_boards(&board_ids)?;
-    // feat/notes-constitution: group/tenant-scoped notes anchor at the group id, so the
-    // group id joins the anchor set — a scoped note repairs/cold-joins like a board note.
-    let mut note_anchor_ids = board_ids.clone();
-    note_anchor_ids.push(group_id.to_string());
+    // A2 §4a: the tenant-keyed sync feed (tenant == group id) — a scoped note
+    // (project/workflow/producer/role included) repairs/cold-joins like a board
+    // note; user scope is excluded inside the feed (sovereign).
     let notes = newer_than(
-        storage::note_list_by_boards(&note_anchor_ids)?,
+        storage::note_list_for_sync(group_id)?,
         since,
         |n| n.updated_at,
     );
@@ -270,7 +269,23 @@ pub fn frames_row_count(frames: &[SnapshotFrame]) -> u64 {
 /// path shared by the live download (`topic_actor::download_snapshot`) and the §11 bundle
 /// import — so a P2P catch-up and an air-gapped import converge to the identical state.
 /// Does NOT emit any `SwiftEvent` (the caller owns progress events); pure storage writes.
+///
+/// The DEFAULT (mesh-open) inbound path — A1 TR-1 / ORCH-10: notes apply with
+/// NO validation beyond the sovereign user-scope drop. The opt-in
+/// enforced-group RBAC arm is [`apply_snapshot_frame_enforced`].
 pub fn apply_snapshot_frame(frame: &SnapshotFrame) -> Result<()> {
+    apply_snapshot_frame_enforced(frame, None)
+}
+
+/// [`apply_snapshot_frame`] under an optional notes RBAC enforcement bundle
+/// (A2 §6 enforcement point 2, snapshot lane — the topic-actor gossip arm
+/// threads the SAME `notes_rbac::InboundEnforcement`, so the two inbound lanes
+/// can never diverge). `None` (or `enforced: false`) is byte-for-byte the
+/// default apply.
+pub fn apply_snapshot_frame_enforced(
+    frame: &SnapshotFrame,
+    notes_enforcement: Option<&crate::notes_rbac::InboundEnforcement<'_>>,
+) -> Result<()> {
     match frame {
         SnapshotFrame::Structure { group, workspaces, boards } => {
             storage::group_insert_simple(&group.id, &group.name, &group.icon, &group.color)?;
@@ -384,11 +399,17 @@ pub fn apply_snapshot_frame(frame: &SnapshotFrame) -> Result<()> {
             }
             for n in notes {
                 // LENS_AI_NOTES P1 — USER SCOPE IS SOVEREIGN: a holder never serializes
-                // user-scoped notes (`note_list_by_boards` excludes them), so one in a
-                // frame is foreign. Drop it — a snapshot must not write into this
-                // node's sovereign layer.
-                if n.scope == "user" {
-                    tracing::debug!("dropping inbound user-scoped note {} from snapshot", n.id);
+                // user-scoped notes (`note_list_for_sync` excludes them), so one in a
+                // frame is foreign; drop it (the verdict fn's first rule). A2 §6:
+                // when the group is ENFORCED, the same roster RBAC as the gossip
+                // lane runs here — otherwise snapshot would be a backdoor.
+                if !crate::notes_rbac::inbound_note_applies(
+                    notes_enforcement,
+                    &n.id,
+                    &n.scope,
+                    &n.author_id,
+                    "snapshot",
+                ) {
                     continue;
                 }
                 storage::note_upsert(n)?;

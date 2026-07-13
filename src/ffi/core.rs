@@ -1,3 +1,10 @@
+// The whole module is the C ABI: every verb takes raw C pointers by contract
+// and is dispatched from Swift, never from safe Rust. The module went `pub` (A2,
+// so integration tests can drive the verbs as Rust paths), which put these fns
+// in clippy's public-API scope — the lint below is meaningless for an extern
+// "C" surface and is allowed module-wide rather than per-verb.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use crate::ffi::scaffold::*;
 use crate::util::MutexExt;
 use crate::models::commands::*;
@@ -5830,4 +5837,368 @@ pub extern "C" fn cyan_get_anonymous_status(scope_id: *const c_char) -> *mut c_c
 pub extern "C" fn cyan_exit_anonymous_mode(scope_id: *const c_char) -> bool {
     let Some(scope) = (unsafe { cstr_arg(scope_id) }) else { return false; };
     crate::storage::anonymous_session_delete(&scope).is_ok()
+}
+
+// ============================================================================
+// A2/A3 structured-notes FFI (Build Package A, Phases 2-3) — ALL verbs below
+// are ADDITIVE and appended at the END of this file (never modify existing
+// verbs). Shapes per DETAILED §5/§7/§8/§9d + SYN-6/7/8.
+// ============================================================================
+
+/// SYN-6 — the ONE scoped-list verb: `cyan_note_list_scoped(board_id, scope,
+/// kind /*nullable ⇒ every kind*/)`. The ENGINE derives tenant + scope anchor
+/// so read-side derivation exactly matches write-side stamping:
+/// `tenant`/`group` ⇒ anchor = the board's group id (tenant == group id);
+/// `board` ⇒ anchor = the board (tenant = its group, else the board);
+/// `user` ⇒ anchor = tenant = THIS node id (sovereign). Every other scope ⇒
+/// `{"error":"unsupported_scope"}` (v1 supports the four loadable scopes).
+/// Returns a JSON array of `NoteDTO`; caller frees with `cyan_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_note_list_scoped(
+    board_id: *const c_char,
+    scope: *const c_char,
+    kind: *const c_char,
+) -> *mut c_char {
+    let Some(board) = (unsafe { cstr_arg(board_id) }) else {
+        return json_cstring(r#"{"error":"missing_param"}"#);
+    };
+    let Some(scope) = (unsafe { cstr_arg(scope) }) else {
+        return json_cstring(r#"{"error":"missing_param"}"#);
+    };
+    let kind = unsafe { cstr_arg(kind) }.filter(|k| !k.is_empty()); // null/"" ⇒ every kind
+
+    let (tenant, anchor) = match scope.as_str() {
+        "tenant" | "group" => {
+            let g = storage::board_get_group_id(&board).unwrap_or_else(|| board.clone());
+            (g.clone(), g)
+        }
+        "board" => {
+            let tenant = storage::board_get_group_id(&board).unwrap_or_else(|| board.clone());
+            (tenant, board.clone())
+        }
+        "user" => {
+            // The sovereign anchor: tenant = anchor = THIS node id. The engine
+            // identity comes from the running system, else the persisted
+            // NODE_ID (the `cyan_set_xaero_id` path — also the test seam).
+            let node = SYSTEM
+                .get()
+                .map(|s| s.node_id.clone())
+                .or_else(|| NODE_ID.get().cloned());
+            let Some(node) = node else {
+                return json_cstring(r#"{"error":"System not initialized"}"#);
+            };
+            (node.clone(), node)
+        }
+        _ => return json_cstring(r#"{"error":"unsupported_scope"}"#),
+    };
+    let notes = match kind.as_deref() {
+        Some(k) => storage::note_list_scoped(&tenant, &scope, &anchor, k),
+        None => storage::note_list_scoped_any_kind(&tenant, &scope, &anchor),
+    }
+    .unwrap_or_default();
+    json_cstring(&serde_json::to_string(&notes).unwrap_or_else(|_| "[]".to_string()))
+}
+
+/// SYN-7 — the ONE cloud-bound constitution verb (A2 owns the verb; the `hard`
+/// key's schema is A6's `constitution_hard::HardRule`, ORCH-6 v2):
+/// `{"markdown", "hash", "contributing_ids", "hard"}`. `include_user: false`
+/// BY CONSTRUCTION (sovereignty is structural, never a caller option). PLAIN
+/// lock (deterministic, never budget-missed — the 250 ms budget belongs to the
+/// step-dispatch thread only). Contract: resolved-empty ⇒ `{"markdown":"",
+/// "hash":<real hash over chain_canonical + zero parts>, "contributing_ids":[],
+/// "hard":[]}`; resolver Err ⇒ `{"error":…}` — NO hash ever (empty ≠ unknown,
+/// D-A2.21).
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_constitution_effective(board_id: *const c_char) -> *mut c_char {
+    let Some(board) = (unsafe { cstr_arg(board_id) }) else {
+        return json_cstring(r#"{"error":"missing_param"}"#);
+    };
+    let Ok(conn) = storage::db().lock() else {
+        return json_cstring(r#"{"error":"db lock poisoned"}"#);
+    };
+    match crate::constitution::board_constitution_markdown_chain(&conn, &board) {
+        Ok(resolved) => {
+            // A6 (PLAN 2.11, ORCH-6 v2): `hard[]` is a PURE POST-PASS over the
+            // typed rows — composed HERE, never inside the merge traversal.
+            let hard = crate::constitution_hard::classify_hard(&resolved.notes);
+            let ids: Vec<&str> = resolved.contributing.iter().map(|c| c.id.as_str()).collect();
+            let out = serde_json::json!({
+                "markdown": resolved.constitution,
+                "hash": resolved.hash,
+                "contributing_ids": ids,
+                "hard": hard,
+            });
+            json_cstring(&out.to_string())
+        }
+        Err(e) => json_cstring(&serde_json::json!({ "error": e.to_string() }).to_string()),
+    }
+}
+
+/// SYN-8 — the SEPARATE on-device preview verb (the caller IS the device
+/// owner): request JSON `{"board_id", "workflow_id"?, "producer_id"?,
+/// "production_role"?, "include_user"? (default TRUE on this surface),
+/// "include_project"? (default true)}`. An invalid `production_role` ⇒
+/// `{"error":…}` (never silently ignored on the preview surface). Response:
+/// `{"markdown", "preferences", "hash", "contributing":[{id,scope,kind,updated_at}]}`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_constitution_resolved(request_json: *const c_char) -> *mut c_char {
+    #[derive(serde::Deserialize)]
+    struct Req {
+        board_id: String,
+        #[serde(default)]
+        workflow_id: Option<String>,
+        #[serde(default)]
+        producer_id: Option<String>,
+        #[serde(default)]
+        production_role: Option<String>,
+        #[serde(default = "default_true")]
+        include_user: bool,
+        #[serde(default = "default_true")]
+        include_project: bool,
+    }
+    fn default_true() -> bool {
+        true
+    }
+
+    let Some(req_str) = (unsafe { cstr_arg(request_json) }) else {
+        return json_cstring(r#"{"error":"missing_param"}"#);
+    };
+    let req: Req = match serde_json::from_str(&req_str) {
+        Ok(r) => r,
+        Err(e) => return json_cstring(&serde_json::json!({ "error": format!("bad request: {e}") }).to_string()),
+    };
+    if let Some(role) = req.production_role.as_deref()
+        && !crate::models::dto::production_role_valid(role)
+    {
+        return json_cstring(
+            &serde_json::json!({
+                "error": "invalid_production_role",
+                "given": role,
+                "allowed": crate::models::dto::PRODUCTION_ROLE_VOCAB,
+            })
+            .to_string(),
+        );
+    }
+    let node_id = SYSTEM
+        .get()
+        .map(|s| s.node_id.clone())
+        .or_else(|| NODE_ID.get().cloned())
+        .unwrap_or_default();
+    let Ok(conn) = storage::db().lock() else {
+        return json_cstring(r#"{"error":"db lock poisoned"}"#);
+    };
+    let opts = crate::constitution::ResolveOpts {
+        workflow_id: req.workflow_id,
+        producer_id: req.producer_id,
+        production_role: req.production_role,
+        include_user: req.include_user,
+        include_project: req.include_project,
+    };
+    let chain = crate::constitution::resolve_chain(&conn, &req.board_id, &node_id, &opts);
+    match crate::constitution::resolve_with_provenance(&conn, &chain) {
+        Ok(resolved) => {
+            let out = serde_json::json!({
+                "markdown": resolved.constitution,
+                "preferences": resolved.preferences,
+                "hash": resolved.hash,
+                "contributing": resolved.contributing,
+            });
+            json_cstring(&out.to_string())
+        }
+        Err(e) => json_cstring(&serde_json::json!({ "error": e.to_string() }).to_string()),
+    }
+}
+
+/// A2 §7 — set the device craft-role pref (`local_prefs.production_role`;
+/// device-LOCAL, never synced by construction). Validates ∈
+/// `PRODUCTION_ROLE_VOCAB`; empty string CLEARS; invalid ⇒ `false`, pref
+/// untouched. Exactly two writers (XP-1): package B's LandingRouter rung 0 and
+/// any manual settings surface — last write wins.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_set_production_role(role: *const c_char) -> bool {
+    let Some(role) = (unsafe { cstr_arg(role) }) else {
+        return false;
+    };
+    if !role.is_empty() && !crate::models::dto::production_role_valid(&role) {
+        return false;
+    }
+    if storage::try_db().is_none() {
+        return false;
+    }
+    storage::local_pref_set(storage::PREF_PRODUCTION_ROLE, &role).is_ok()
+}
+
+/// A2 §7 — read the device craft-role pref. `""` = unset. Caller frees with
+/// `cyan_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_production_role() -> *mut c_char {
+    if storage::try_db().is_none() {
+        return json_cstring("");
+    }
+    json_cstring(&storage::local_pref_get(storage::PREF_PRODUCTION_ROLE).unwrap_or_default())
+}
+
+/// A2 §7 (Seq 9) — install the broker-minted SSO session grant. `trust_json`:
+/// `{"tenant": "<id>", "org_did": "did:cyan:…"|null, "legacy_rsa_public_pem":
+/// "…"|null, "grace_secs": 604800}` — tenant required; ≥1 trust source required
+/// (else `{"error":"no trust material"}` shape via `{"active":false,…}`).
+/// Success ⇒ granted groups seeded via the existing JoinGroup path, session
+/// stored in the process-global `SSO_SESSION` (RBAC flips Active), returns
+/// `{"active":true,"tenant":…,"role":…,"exp":…}`. Failure ⇒
+/// `{"active":false,"reason":…}` and the previously installed session is
+/// UNTOUCHED. GrantCache is never written (its prod backing is the iOS keychain
+/// account `cyan_session_grant` — D-A2.20; iOS re-installs each launch).
+/// Honesty (R9): revocation is checked at verify time only.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_sso_install_grant(
+    grant_token: *const c_char,
+    trust_json: *const c_char,
+) -> *mut c_char {
+    let Some(token) = (unsafe { cstr_arg(grant_token) }) else {
+        return json_cstring(r#"{"active":false,"reason":"missing grant_token"}"#);
+    };
+    let Some(trust) = (unsafe { cstr_arg(trust_json) }) else {
+        return json_cstring(r#"{"active":false,"reason":"missing trust_json"}"#);
+    };
+    let Some(sys) = SYSTEM.get() else {
+        return json_cstring(r#"{"active":false,"reason":"System not initialized"}"#);
+    };
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let out = crate::sso_grant::install_grant(
+        &token,
+        &trust,
+        &sys.node_id,
+        now,
+        Some(&sys.network_tx),
+    );
+    json_cstring(&out.to_string())
+}
+
+/// A2 §7 — clear the installed SSO session (RBAC returns to fail-open
+/// `NoSession`). No engine persistence to clear; iOS clears its own keychain
+/// account (`cyan_session_grant`).
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_sso_sign_out() {
+    crate::sso_grant::sign_out();
+}
+
+/// A3 §9d — the deterministic role×type selector resolve. `tenant_id` nullable
+/// (null ⇒ builtin-only — the tenant-override lookup is skipped). The result
+/// carries the template (JSON `null` for studio_exec — key always present),
+/// per-plugin installed flags, the (role, format)-resolved agentification map,
+/// and the two REV-2 arrays: `ae_duties` (assistant_editor only) +
+/// `orchestration` (5 handoffs; both arrays ABSENT when empty — old clients
+/// ignore the new keys). The prod installed-lookup indexes the device plugins
+/// root per call (`resolve_installed_tool`); a registry error degrades to
+/// not-installed + obs `selector_registry_error` — resolve never fails on
+/// lookup. Errors: `{"error":"unknown_role"|"unknown_format_type"|
+/// "missing_param","given":…,"allowed":[…]}`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_selector_resolve(
+    tenant_id: *const c_char,
+    role: *const c_char,
+    format_type: *const c_char,
+) -> *mut c_char {
+    let tenant = unsafe { cstr_arg(tenant_id) }.filter(|t| !t.is_empty());
+    let role = unsafe { cstr_arg(role) }.unwrap_or_default();
+    let format_type = unsafe { cstr_arg(format_type) }.unwrap_or_default();
+
+    // The prod installed-lookup (§9d): PluginHost per call over the device
+    // plugins root — the executor's exact pattern.
+    let lookup = |tool: &str| -> Option<String> {
+        let host = crate::mcp_host::PluginHost::new(
+            std::sync::Arc::new(cyan_mcp::RecordingSink::new()) as std::sync::Arc<dyn cyan_mcp::EventSink>,
+            std::sync::Arc::new(cyan_mcp::LogEmitter::new()) as std::sync::Arc<dyn cyan_mcp::Emitter>,
+            std::sync::Arc::new(cyan_mcp::SystemClock::new()) as std::sync::Arc<dyn cyan_mcp::Clock>,
+            cyan_mcp::BackoffPolicy {
+                base: std::time::Duration::from_millis(500),
+                max: std::time::Duration::from_secs(30),
+                max_restarts: 3,
+            },
+            std::env::var("CYAN_TENANT_ID").unwrap_or_else(|_| "device".to_string()),
+        );
+        match host.resolve_installed_tool(&crate::mcp_host::plugins_root(), tool) {
+            Ok(hit) => hit.map(|(plugin_id, _tool)| plugin_id),
+            Err(e) => {
+                // Swallowed to None — resolve never fails on lookup (§9d step 4).
+                tracing::warn!("obs selector_registry_error tool={tool} err={e}");
+                None
+            }
+        }
+    };
+    match crate::role_templates::resolve(tenant.as_deref(), &role, &format_type, &lookup) {
+        Ok(result) => json_cstring(
+            &serde_json::to_string(&result)
+                .unwrap_or_else(|_| r#"{"error":"encode_failed"}"#.to_string()),
+        ),
+        Err(e) => json_cstring(&e.to_json().to_string()),
+    }
+}
+
+/// A3 §9d — the v2 (roletype) template save. The old 4-arg `cyan_template_save`
+/// C signature cannot carry the new fields (FFI additive-only, so this is a NEW
+/// verb). Unknown template keys — ae_duties/orchestration/deltas — are
+/// tolerated-and-ignored (catalog constants, not template fields); `note_kinds`
+/// validates ⊆ `NOTE_KIND_VOCAB` by const reference. ANY violation rejects the
+/// WHOLE save with an `{"error":…,"given":…,"allowed":[…]}` JSON (never null —
+/// deliberate delta vs the old verb). Caller frees with `cyan_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_template_save_v2(
+    tenant_id: *const c_char,
+    template_json: *const c_char,
+) -> *mut c_char {
+    let Some(tenant) = (unsafe { cstr_arg(tenant_id) }) else {
+        return json_cstring(r#"{"error":"missing_param","given":"tenant_id"}"#);
+    };
+    let Some(body) = (unsafe { cstr_arg(template_json) }) else {
+        return json_cstring(r#"{"error":"missing_param","given":"template_json"}"#);
+    };
+    if storage::try_db().is_none() {
+        return json_cstring(r#"{"error":"System not initialized"}"#);
+    }
+    json_cstring(&crate::templates::save_roletype_template(&tenant, &body).to_string())
+}
+
+/// A5 device piece (§9e) — the installed-plugin catalog the iOS GenContext
+/// assembler feeds to `/generate`: `{"plugins":[{id, version, tools:[{name,
+/// side_effects}]}]}`, sorted by plugin id then tool name. One subdir per
+/// bundle under the device plugins root (dir name = plugin id, the Registry
+/// convention); a bad-manifest bundle is SKIPPED; an empty/missing root ⇒
+/// `{"plugins":[]}` — never an error. Caller frees with `cyan_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_plugin_catalog() -> *mut c_char {
+    let root = crate::mcp_host::plugins_root();
+    let mut plugins: Vec<serde_json::Value> = Vec::new();
+    if let Ok(dir) = std::fs::read_dir(&root) {
+        let mut entries: Vec<_> = dir.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        entries.sort();
+        for path in entries {
+            let Some(plugin_id) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // Bad bundle: skip, never fatal (the Registry::index posture).
+            let Ok(manifest) = cyan_mcp::Manifest::from_bundle(&path) else {
+                continue;
+            };
+            let mut tools: Vec<serde_json::Value> = manifest
+                .tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({ "name": t.name, "side_effects": t.side_effects })
+                })
+                .collect();
+            tools.sort_by(|a, b| {
+                a["name"].as_str().unwrap_or_default().cmp(b["name"].as_str().unwrap_or_default())
+            });
+            plugins.push(serde_json::json!({
+                "id": plugin_id,
+                "version": manifest.version,
+                "tools": tools,
+            }));
+        }
+    }
+    plugins.sort_by(|a, b| {
+        a["id"].as_str().unwrap_or_default().cmp(b["id"].as_str().unwrap_or_default())
+    });
+    json_cstring(&serde_json::json!({ "plugins": plugins }).to_string())
 }

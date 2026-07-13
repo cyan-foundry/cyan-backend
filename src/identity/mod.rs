@@ -317,6 +317,12 @@ impl GrantVerifier {
         }
     }
 
+    /// Read access to the authority roster (A2 notes RBAC reads an author's
+    /// roster tier through `MeshAuthorizer::note_tier_of`).
+    pub fn roster(&self) -> &GroupRoster {
+        &self.roster
+    }
+
     /// Mutable access to the authority roster (e.g. to promote/demote an admin as group state
     /// changes). Kept current so `IssuerNotAdmin` reflects *current* admins, not founding ones.
     pub fn roster_mut(&mut self) -> &mut GroupRoster {

@@ -22,7 +22,10 @@ pub mod anti_entropy;
 pub mod chat_lens_relay;
 pub mod cyan_lens_client;
 pub mod device_vault;
-mod ffi;
+// A2: `pub` so the integration tests can drive the new `cyan_*` verbs as Rust
+// paths (`cyan_backend::ffi::core::…`) — a visibility-only widening; the C ABI
+// symbols are unchanged.
+pub mod ffi;
 pub mod group_bundle;
 pub mod group_rekey;
 pub mod identity;
@@ -486,6 +489,7 @@ pub fn dispatch_put_note(
     dispatch_put_note_inner(
         node_id, board_group, network_tx, event_tx, board_id, note_id, tenant_id, text, scope,
         kind, anchor_kind, anchor_id, origin_ref, None, None, false,
+        &crate::sso_grant::installed_tier,
     );
 }
 
@@ -533,6 +537,36 @@ pub fn dispatch_put_note_v2(
     dispatch_put_note_inner(
         node_id, board_group, network_tx, event_tx, board_id, note_id, tenant_id, text, scope,
         kind, anchor_kind, anchor_id, origin_ref, payload, author_role, true,
+        &crate::sso_grant::installed_tier,
+    );
+}
+
+/// [`dispatch_put_note_v2`] with an INJECTED RBAC tier source (A2 §6) — the
+/// testable surface (`tier` plumbed like `board_group`; the prod closure samples
+/// the §7 `SSO_SESSION` global, which is exactly what v2 injects). Additive: the
+/// v1/v2 signatures stay frozen for existing callers.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_put_note_v3(
+    node_id: &str,
+    board_group: &dyn Fn(&str) -> Option<String>,
+    network_tx: &mpsc::UnboundedSender<NetworkCommand>,
+    event_tx: &mpsc::UnboundedSender<SwiftEvent>,
+    board_id: String,
+    note_id: Option<String>,
+    tenant_id: Option<String>,
+    text: String,
+    scope: Option<String>,
+    kind: Option<String>,
+    anchor_kind: Option<String>,
+    anchor_id: Option<String>,
+    origin_ref: Option<String>,
+    payload: Option<serde_json::Value>,
+    author_role: Option<String>,
+    tier: &dyn Fn() -> Option<cyan_identity::Role>,
+) {
+    dispatch_put_note_inner(
+        node_id, board_group, network_tx, event_tx, board_id, note_id, tenant_id, text, scope,
+        kind, anchor_kind, anchor_id, origin_ref, payload, author_role, true, tier,
     );
 }
 
@@ -557,6 +591,7 @@ fn dispatch_put_note_inner(
     payload: Option<serde_json::Value>,
     author_role: Option<String>,
     emit_rejects: bool,
+    tier: &dyn Fn() -> Option<cyan_identity::Role>,
 ) {
     // A1 (SYN-11): every reject surfaces a reasoned, LOCAL-ONLY event so the UI
     // can short-circuit its 3 s echo timer. `note_id` is the client's correlation
@@ -635,6 +670,29 @@ fn dispatch_put_note_inner(
     }
     let origin_ref = origin_ref.filter(|o| !o.is_empty());
 
+    // ── A2 RBAC (§6, AFTER the A1 validation block) ──
+    // The scope-major matrix over the INSTALLED session tier (prod closure
+    // samples `sso_grant::SSO_SESSION`; tests inject). `scope_anchor` is the
+    // command's `board_id` FIELD — never the within-board `anchor_id` local
+    // above. Fail-open with no session (today's literal behavior preserved).
+    if let Err(denied) = crate::notes_rbac::note_write_allowed(
+        tier(),
+        &scope,
+        &kind,
+        &board_id,
+        node_id,
+    ) {
+        tracing::warn!(
+            "obs note_put_denied board={board_id} id={} scope={scope} check={} needed={} held={}",
+            note_id.as_deref().unwrap_or(""),
+            denied.check,
+            denied.needed,
+            denied.held
+        );
+        reject(denied.check);
+        return;
+    }
+
     let now = chrono::Utc::now().timestamp();
     let author_id = node_id.to_string();
     // author_name resolves from the author's XaeroID profile (same path
@@ -648,9 +706,22 @@ fn dispatch_put_note_inner(
     // tenant scope, `board_id` IS the anchor (the group/tenant id), so it is
     // also the broadcast group. USER SCOPE NEVER RESOLVES A BROADCAST GROUP —
     // a sovereign note has nowhere to go by construction.
+    //
+    // A2 §4a — broadcast-group mapping v2: the NEW `project` arm resolves the
+    // workspace anchor to its owning group (an unknown workspace REJECTS
+    // locally, §10 row B3 — a stranded row would never replicate; inbound
+    // tolerates the same row per TR-1). `workflow`/`producer`/`role` ride the
+    // existing `_ =>` arm unchanged.
     let group_id = match scope.as_str() {
         "board" => board_group(&board_id),
         "user" => None,
+        "project" => match storage::workspace_get_group_id(&board_id) {
+            Some(g) => Some(g),
+            None => {
+                reject("project_anchor_unknown");
+                return;
+            }
+        },
         _ => Some(board_id.clone()),
     };
     let tenant = tenant_id
@@ -795,6 +866,28 @@ pub fn dispatch_delete_note(
     event_tx: &mpsc::UnboundedSender<SwiftEvent>,
     id: String,
 ) {
+    dispatch_delete_note_v2(
+        board_group,
+        network_tx,
+        event_tx,
+        id,
+        "",
+        &crate::sso_grant::installed_tier,
+    );
+}
+
+/// [`dispatch_delete_note`] with the A2 RBAC inputs injected (`node_id` for the
+/// user-scope self-anchor row; `tier` like [`dispatch_put_note_v3`]'s). The A1
+/// legal gate runs FIRST (§4.9 fail-closed), then the SAME scope-major check as
+/// the put door, for the STORED note's scope (`scope_anchor = note.board_id`).
+pub fn dispatch_delete_note_v2(
+    board_group: &dyn Fn(&str) -> Option<String>,
+    network_tx: &mpsc::UnboundedSender<NetworkCommand>,
+    event_tx: &mpsc::UnboundedSender<SwiftEvent>,
+    id: String,
+    node_id: &str,
+    tier: &dyn Fn() -> Option<cyan_identity::Role>,
+) {
     let existing = storage::note_get(&id).ok().flatten();
     if let Some(n) = existing.as_ref().filter(|n| n.kind == "legal-clearance") {
         let reason = match crate::note_payload::clearance_status(n.payload.as_ref()) {
@@ -815,6 +908,30 @@ pub fn dispatch_delete_note(
             });
             return;
         }
+    }
+    // ── A2 RBAC (§6): the same scope-major matrix as the put door, for the
+    // STORED note's scope (`scope_anchor = note.board_id`). The user-scope
+    // self-anchor check needs a caller identity — the frozen wrapper cannot
+    // supply one, so it is skipped there (sovereign rows never left the device
+    // anyway; the pre-A2 delete behavior is preserved for frozen callers).
+    if let Some(n) = existing.as_ref()
+        && !(n.scope == "user" && node_id.is_empty())
+        && let Err(denied) =
+            crate::notes_rbac::note_write_allowed(tier(), &n.scope, &n.kind, &n.board_id, node_id)
+    {
+        tracing::warn!(
+            "obs note_delete_denied id={id} scope={} check={} needed={} held={}",
+            n.scope,
+            denied.check,
+            denied.needed,
+            denied.held
+        );
+        let _ = event_tx.send(SwiftEvent::NoteRejected {
+            note_id: id,
+            board_id: n.board_id.clone(),
+            reason: denied.check.to_string(),
+        });
+        return;
     }
     let group_id = existing.as_ref().and_then(|n| board_group(&n.board_id));
     let _ = storage::note_delete(&id);
@@ -1400,8 +1517,9 @@ impl CommandActor {
                     // Extracted behavior-identically into `dispatch_put_note_v2`
                     // (LENS_AI_NOTES P1 / A1) so the sovereignty contract — a
                     // user-scoped note NEVER broadcasts — and the A1 validation
-                    // block are testable with captured channels.
-                    dispatch_put_note_v2(
+                    // block are testable with captured channels. A2: the RBAC
+                    // tier samples the installed SSO session per write (§7).
+                    dispatch_put_note_v3(
                         &self.node_id,
                         &|b: &str| self.get_group_id_for_board(b),
                         &self.network_tx,
@@ -1417,18 +1535,22 @@ impl CommandActor {
                         origin_ref,
                         payload,
                         author_role,
+                        &crate::sso_grant::installed_tier,
                     );
                 }
 
                 CommandMsg::DeleteNote { id } => {
                     // Extracted behavior-identically into `dispatch_delete_note`
                     // (A1) so the §4.9 delete gate is testable with captured
-                    // channels.
-                    dispatch_delete_note(
+                    // channels. A2: the same RBAC matrix gates the delete for
+                    // the stored note's scope.
+                    dispatch_delete_note_v2(
                         &|b: &str| self.get_group_id_for_board(b),
                         &self.network_tx,
                         &self.event_tx,
                         id,
+                        &self.node_id,
+                        &crate::sso_grant::installed_tier,
                     );
                 }
 
@@ -2784,6 +2906,7 @@ pub mod changelist;
 pub mod conform_dispatch;
 pub mod conform_map;
 pub mod constitution;
+pub mod constitution_hard;
 pub mod dashboard;
 pub mod exec_plan;
 pub mod ingest;
@@ -2793,6 +2916,7 @@ pub mod llm_proposer;
 pub mod media_staging;
 pub mod note_inference;
 pub mod note_payload;
+pub mod notes_rbac;
 pub mod ops_eval;
 pub mod ops_proposer;
 pub mod pipeline;
@@ -2800,6 +2924,7 @@ pub mod pipeline_executor;
 pub mod plugin_config;
 pub mod review_loop;
 pub mod review_state;
+pub mod role_templates;
 pub mod seed;
 pub mod step_history;
 pub mod frameio_refresh;

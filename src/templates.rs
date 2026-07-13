@@ -40,6 +40,7 @@ pub fn seed_templates() -> Vec<Template> {
     let s = |text: &str, plugin: Option<&str>| TemplateStep {
         text: text.to_string(),
         plugin: plugin.map(str::to_string),
+        stage: None,
     };
     vec![
         Template {
@@ -54,6 +55,7 @@ pub fn seed_templates() -> Vec<Template> {
                 s("Send the mezzanine to Contido for delivery @contido", Some("contido")),
             ],
             created_at: 0,
+            ..Default::default()
         },
         Template {
             id: "builtin:transcribe-qc".to_string(),
@@ -67,6 +69,7 @@ pub fn seed_templates() -> Vec<Template> {
                 s("Run compliance QC on the transcript", None),
             ],
             created_at: 0,
+            ..Default::default()
         },
         Template {
             id: "builtin:conform-approve-master".to_string(),
@@ -81,6 +84,7 @@ pub fn seed_templates() -> Vec<Template> {
                 s("Master the approved cut", None),
             ],
             created_at: 0,
+            ..Default::default()
         },
         // The review LOOP as an authorable workflow (CYAN_CHANGELIST_STORE_AND_
         // REVIEW_LOOP §Part 2; step text per E2E_LIVE_SCRIPT §4). A tenant
@@ -114,24 +118,34 @@ pub fn seed_templates() -> Vec<Template> {
                 ),
             ],
             created_at: 0,
+            ..Default::default()
         },
     ]
 }
 
-/// All templates visible to `tenant_id`: the built-in seeds (always) followed by the
-/// tenant's own user-saved templates. User templates from other tenants never appear.
+/// All templates visible to `tenant_id`: the built-in seeds (always), the A3
+/// roletype builtins (always — source `builtin:roletype`, one per format),
+/// followed by the tenant's own user-saved templates. User templates from other
+/// tenants never appear.
 pub fn list_templates(tenant_id: &str) -> Vec<Template> {
     let mut out = seed_templates();
+    out.extend(crate::role_templates::builtin_roletype_templates());
     out.extend(storage::template_list_by_tenant(tenant_id).unwrap_or_default());
     out
 }
 
-/// Fetch one template by id for `tenant_id`: a built-in seed (tenant-agnostic) or one
-/// of the tenant's own user templates. Returns `None` for an unknown id OR a user
-/// template owned by a different tenant (no cross-tenant read).
+/// Fetch one template by id for `tenant_id`: a built-in seed / roletype builtin
+/// (tenant-agnostic) or one of the tenant's own user templates. Returns `None`
+/// for an unknown id OR a user template owned by a different tenant (no
+/// cross-tenant read).
 pub fn get_template(id: &str, tenant_id: &str) -> Option<Template> {
     if let Some(seed) = seed_templates().into_iter().find(|t| t.id == id) {
         return Some(seed);
+    }
+    if let Some(rt) =
+        crate::role_templates::builtin_roletype_templates().into_iter().find(|t| t.id == id)
+    {
+        return Some(rt);
     }
     storage::template_get(id, tenant_id).ok().flatten()
 }
@@ -157,10 +171,138 @@ pub fn save_as_template(
         source: SOURCE_USER.to_string(),
         steps,
         created_at: now,
+        ..Default::default()
     };
     storage::template_insert(&template)?;
     tracing::info!(tenant_id = %tenant_id, "obs template_save id={} steps={}", template.id, template.steps.len());
     Ok(template)
+}
+
+/// The v2 (roletype) save core behind `cyan_template_save_v2` (A3 §9d, E10
+/// validation). `template_json` carries the client's template body; ANY
+/// violation rejects the WHOLE save with a §9d-style error JSON (never null —
+/// a deliberate delta vs the old 4-arg verb). Unknown template keys
+/// (ae_duties/orchestration/deltas — catalog constants, not template fields)
+/// are tolerated-and-ignored (the non-deny-unknown posture).
+///
+/// Server stamps: `id` (blake3 mint), `tenant_id`, `source: "user"`, `scope`
+/// (`"tenant"` unless a valid vocab scope was provided — stored-but-treated-as-
+/// tenant, roadmap), `created_at`, `catalog_version`. `note_kinds` validates ⊆
+/// A1's `NOTE_KIND_VOCAB` **by const reference** — if A1 grows the vocab again,
+/// save validation tracks automatically.
+pub fn save_roletype_template(tenant_id: &str, template_json: &str) -> serde_json::Value {
+    use crate::role_templates as rt;
+
+    let err = |code: &str, given: &str, allowed: serde_json::Value| {
+        serde_json::json!({ "error": code, "given": given, "allowed": allowed })
+    };
+
+    // Tolerant partial decode: unknown keys (ae_duties/orchestration/deltas)
+    // ignored; server-stamped fields in the body (id/source/tenant_id/
+    // created_at/catalog_version) are ALSO ignored — the server re-stamps.
+    #[derive(serde::Deserialize)]
+    struct SaveBody {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        format_type: Option<String>,
+        #[serde(default)]
+        maturity: Option<String>,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        stages: Vec<String>,
+        #[serde(default)]
+        note_kinds: Vec<String>,
+        #[serde(default)]
+        plugins: Vec<crate::models::dto::TemplatePlugin>,
+        #[serde(default)]
+        steps: Vec<TemplateStep>,
+    }
+    let body: SaveBody = match serde_json::from_str(template_json) {
+        Ok(b) => b,
+        Err(e) => return serde_json::json!({ "error": "bad_template_json", "detail": e.to_string() }),
+    };
+    let mut t = Template {
+        id: String::new(),
+        tenant_id: String::new(),
+        name: body.name,
+        description: body.description,
+        source: String::new(),
+        steps: body.steps,
+        created_at: 0,
+        format_type: body.format_type,
+        stages: body.stages,
+        note_kinds: body.note_kinds,
+        plugins: body.plugins,
+        maturity: body.maturity,
+        catalog_version: None,
+        scope: body.scope,
+    };
+
+    // E10 validation — format_type REQUIRED.
+    let Some(format_type) = t.format_type.clone() else {
+        return err("invalid_format_type", "", serde_json::json!(rt::FORMAT_TYPE_VOCAB));
+    };
+    if !rt::FORMAT_TYPE_VOCAB.contains(&format_type.as_str()) {
+        return err("invalid_format_type", &format_type, serde_json::json!(rt::FORMAT_TYPE_VOCAB));
+    }
+    if let Some(m) = t.maturity.as_deref()
+        && !rt::TEMPLATE_MATURITY_VOCAB.contains(&m)
+    {
+        return err("invalid_maturity", m, serde_json::json!(rt::TEMPLATE_MATURITY_VOCAB));
+    }
+    let scope_valid =
+        t.scope.as_deref().filter(|s| rt::TEMPLATE_SCOPE_VOCAB.contains(s)).map(str::to_string);
+    if let Some(s) = t.scope.as_deref()
+        && scope_valid.is_none()
+    {
+        return err("invalid_scope", s, serde_json::json!(rt::TEMPLATE_SCOPE_VOCAB));
+    }
+    for p in &t.plugins {
+        if !rt::PLUGIN_STATUS_VOCAB.contains(&p.status.as_str()) {
+            return err("invalid_plugin_status", &p.status, serde_json::json!(rt::PLUGIN_STATUS_VOCAB));
+        }
+        if !rt::PLUGIN_EXECUTION_VOCAB.contains(&p.execution.as_str()) {
+            return err(
+                "invalid_plugin_execution",
+                &p.execution,
+                serde_json::json!(rt::PLUGIN_EXECUTION_VOCAB),
+            );
+        }
+    }
+    if t.steps.is_empty() || t.steps.iter().any(|s| s.text.trim().is_empty()) {
+        return serde_json::json!({ "error": "invalid_steps", "detail": "steps must be non-empty with non-empty texts" });
+    }
+    for k in &t.note_kinds {
+        // ⊆ NOTE_KIND_VOCAB by const reference (13 today; tracks A1).
+        if !crate::models::dto::NOTE_KIND_VOCAB.contains(&k.as_str()) {
+            return err("invalid_note_kind", k, serde_json::json!(crate::models::dto::NOTE_KIND_VOCAB));
+        }
+    }
+    if t.name.trim().is_empty() {
+        return serde_json::json!({ "error": "missing_param", "given": "name" });
+    }
+
+    // Server stamps.
+    let now = chrono::Utc::now().timestamp();
+    let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(now);
+    t.id = blake3::hash(format!("template-v2:{tenant_id}:{}:{nanos}", t.name).as_bytes())
+        .to_hex()
+        .to_string();
+    t.tenant_id = tenant_id.to_string();
+    t.source = SOURCE_USER.to_string();
+    t.scope = Some(scope_valid.unwrap_or_else(|| "tenant".to_string()));
+    t.created_at = now;
+    t.catalog_version = Some(rt::ROLETYPE_CATALOG_VERSION.to_string());
+
+    if let Err(e) = storage::template_insert(&t) {
+        return serde_json::json!({ "error": "store_failed", "detail": e.to_string() });
+    }
+    tracing::info!(tenant_id = %tenant_id, "obs template_save_v2 id={} format_type={format_type} steps={}", t.id, t.steps.len());
+    serde_json::to_value(&t).unwrap_or_else(|_| serde_json::json!({ "error": "encode_failed" }))
 }
 
 /// Clone a template into `board_id` as real W1 `step` cells — one cell per template

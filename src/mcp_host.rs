@@ -291,6 +291,23 @@ impl PluginHost {
 /// IDENTICAL to the lens host so a bundle behaves the same on device and
 /// cloud): `<PLUGIN>_<PROVIDER-LAST-SEGMENT>_TOKEN`, uppercased. The frameio
 /// manifest's `oauth2`/`adobe_ims` credential resolves `FRAMEIO_IMS_TOKEN`.
+/// The device's installed-plugins root: one subdir per plugin (the unpacked
+/// `.cyanplugin` bundles the file-swarm fetched). Overridable for tests/ops via
+/// `CYAN_PLUGINS_ROOT`.
+///
+/// NOTE (A3 PLAN 3.7 deviation): the spec asked to HOIST the private
+/// `pipeline_executor::plugins_root` here; that file is owned by another
+/// workstream this pass, so this is a faithful COPY (same env, same default) —
+/// the executor's private twin should be deleted in favor of this one when that
+/// file next opens.
+pub fn plugins_root() -> std::path::PathBuf {
+    if let Ok(root) = std::env::var("CYAN_PLUGINS_ROOT") {
+        return std::path::PathBuf::from(root);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home).join(".cyan").join("plugins")
+}
+
 pub fn cred_env_var(plugin_name: &str, provider: &str) -> String {
     let segment = provider.rsplit(['_', '-']).next().unwrap_or(provider);
     format!("{}_{}_TOKEN", env_token(plugin_name), env_token(segment))

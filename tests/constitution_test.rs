@@ -295,9 +295,11 @@ fn chain_merges_all_six_scopes_most_specific_last() {
     let chain = constitution::ScopeChain {
         tenant_id: tenant.to_string(),
         group_id: Some("ch6-g".to_string()),
+        project_id: None,
         board_id: "ch6-b".to_string(),
         workflow_id: Some("ch6-w".to_string()),
         producer_id: Some("ch6-p".to_string()),
+        role_id: None,
         user_id: Some("ch6-u".to_string()),
     };
     let eff = constitution::effective_notes_chain(&chain).expect("resolve chain");
@@ -332,9 +334,11 @@ fn chain_user_scope_is_innermost_and_wins() {
     let chain = constitution::ScopeChain {
         tenant_id: tenant.to_string(),
         group_id: None,
+        project_id: None,
         board_id: "chu-b".to_string(),
         workflow_id: None,
         producer_id: None,
+        role_id: None,
         user_id: Some("chu-user".to_string()),
     };
     let eff = constitution::effective_notes_chain(&chain).expect("resolve");
@@ -367,9 +371,11 @@ fn chain_tenant_isolation_holds() {
     let chain_a = constitution::ScopeChain {
         tenant_id: ta.to_string(),
         group_id: Some(ta.to_string()),
+        project_id: None,
         board_id: board.to_string(),
         workflow_id: Some(wf.to_string()),
         producer_id: Some(prod.to_string()),
+        role_id: None,
         user_id: Some(user.to_string()),
     };
     let a = constitution::effective_notes_chain(&chain_a).expect("a");
@@ -402,9 +408,11 @@ fn creative_dna_rides_constitution_as_labeled_subsections() {
     let chain = constitution::ScopeChain {
         tenant_id: tenant.to_string(),
         group_id: None,
+        project_id: None,
         board_id: "chd-b".to_string(),
         workflow_id: None,
         producer_id: None,
+        role_id: None,
         user_id: Some("chd-u".to_string()),
     };
     let eff = constitution::effective_notes_chain(&chain).expect("resolve");
@@ -444,9 +452,11 @@ fn absent_links_have_no_sections_and_three_arg_seam_is_a_none_chain() {
     let chain = constitution::ScopeChain {
         tenant_id: tenant.to_string(),
         group_id: Some(tenant.to_string()),
+        project_id: None,
         board_id: "chn-b".to_string(),
         workflow_id: None,
         producer_id: None,
+        role_id: None,
         user_id: None,
     };
     let chained = constitution::effective_notes_chain(&chain).expect("chain");
