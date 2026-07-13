@@ -1636,6 +1636,26 @@ pub(crate) fn is_review_upload(bound_command: Option<&str>, content: &str) -> bo
         && !content_lower.contains("publish")
 }
 
+/// D/P-4 — is this step currently parked on the PRE-DISPATCH side-effect gate
+/// (`local_gate: true` in its persisted state)? That park is the operator's
+/// "release the send" — the tool has NOT run yet, so it is not the review
+/// window. Reads the freshest metadata (best-effort; absent/unreadable ⇒ false).
+fn step_state_is_local_gate(cell_id: &str) -> bool {
+    let Ok(conn) = storage::db().lock() else { return false };
+    let meta: Option<String> = conn
+        .query_row(
+            "SELECT metadata_json FROM notebook_cells WHERE id = ?1",
+            rusqlite::params![cell_id],
+            |row| row.get(0),
+        )
+        .ok();
+    drop(conn);
+    meta.as_deref()
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+        .and_then(|v| v["pipeline"]["state"]["local_gate"].as_bool())
+        .unwrap_or(false)
+}
+
 /// D/P-4 — the LIVE-assignee wrapper: the effective reviewer is the compiled
 /// `waiting_on` OR the board's current `review_assignees` row, so assigning a
 /// reviewer takes effect immediately — even on an already-parked hold, no
@@ -1693,7 +1713,12 @@ pub fn approve_step(
         .ok_or_else(|| anyhow!("Step {} not found", step_id))?;
 
     // D/P-4 — a review hold clears only for its assigned reviewer (live lookup).
-    if let Some(config) = cell.pipeline_config.as_ref() {
+    // EXEMPT the PRE-DISPATCH side-effect release (`local_gate`): that approval
+    // means "yes, send it to review" and belongs to the OPERATOR; the assignee
+    // owns only the POST-upload review window (the parked hold after the tool ran).
+    if let Some(config) = cell.pipeline_config.as_ref()
+        && !step_state_is_local_gate(&cell.cell_id)
+    {
         enforce_review_gate_for(board_id, config, reviewer)?;
     }
     let stage = cell.pipeline_config.as_ref().map(step_stage).unwrap_or_else(|| step_id.to_string());
@@ -1794,8 +1819,11 @@ pub fn reject_step(
     let cell = cells.iter()
         .find(|c| c.pipeline_config.as_ref().map(|p| p.step_id.as_str()) == Some(step_id))
         .ok_or_else(|| anyhow!("Step {} not found", step_id))?;
-    // D/P-4 — a review hold is the assigned reviewer's decision, reject included.
-    if let Some(config) = cell.pipeline_config.as_ref() {
+    // D/P-4 — a review hold is the assigned reviewer's decision, reject included
+    // (same pre-dispatch local_gate exemption as approve).
+    if let Some(config) = cell.pipeline_config.as_ref()
+        && !step_state_is_local_gate(&cell.cell_id)
+    {
         enforce_review_gate_for(board_id, config, reviewer)?;
     }
     let stage = cell.pipeline_config.as_ref().map(step_stage).unwrap_or_else(|| step_id.to_string());
