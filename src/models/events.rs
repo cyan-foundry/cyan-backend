@@ -120,6 +120,14 @@ pub enum NetworkEvent {
         /// CHAT C7: provenance for promoted notes — `chat:<message_id>`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_ref: Option<String>,
+        /// A1 (additive): the note's typed payload, FLAT on the event — the
+        /// echo/gossip carrier iOS chips + optimistic confirm consume. Old peers
+        /// silently drop the key; the origin's row wins on `updated_at`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<serde_json::Value>,
+        /// A1 (additive): the author's craft role (provenance, not authz).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        author_role: Option<String>,
     },
     /// A note was edited. Conflict resolution is LWW on `updated_at` (older edits drop).
     NoteUpdated {
@@ -143,6 +151,11 @@ pub enum NetworkEvent {
         anchor_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_ref: Option<String>,
+        /// Same A1 payload/author_role contract as `NoteAdded`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        author_role: Option<String>,
     },
     NoteDeleted {
         id: String,
@@ -394,6 +407,17 @@ pub enum SwiftEvent {
     PeerJoined { group_id: String, peer_id: String },
     /// Peer left a group topic
     PeerLeft { group_id: String, peer_id: String },
+    /// A1 (SYN-11): a locally-dispatched `PutNote`/`DeleteNote` was REJECTED at the
+    /// write door — A1's typed payload/legal reasons (and A2's RBAC denies later)
+    /// both ride `reason`. LOCAL-ONLY by construction: emitted on the `SwiftEvent`
+    /// channel at every reject, routed to the whiteboard buffer, NEVER gossiped
+    /// (it is not a `NetworkEvent`). Old iOS builds fall through on the unknown
+    /// type; the 3 s echo-timeout stays their fallback.
+    NoteRejected {
+        note_id: String,
+        board_id: String,
+        reason: String,
+    },
     /// Live count of connected mesh peers in a group, emitted on every join/leave. Additive and
     /// receive-only — feeds the app's honest status bar (the live peer count).
     PeerCountChanged { group_id: String, count: u32 },

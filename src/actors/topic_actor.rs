@@ -1258,15 +1258,17 @@ impl TopicActor {
             // are handled identically (the split is informational for the UI).
             NetworkEvent::NoteAdded {
                 id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at,
-                scope, kind, anchor_kind, anchor_id, origin_ref,
+                scope, kind, anchor_kind, anchor_id, origin_ref, payload, author_role,
             }
             | NetworkEvent::NoteUpdated {
                 id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at,
-                scope, kind, anchor_kind, anchor_id, origin_ref,
+                scope, kind, anchor_kind, anchor_id, origin_ref, payload, author_role,
             } => {
                 // LENS_AI_NOTES P1 — USER SCOPE IS SOVEREIGN: our own user-scoped notes
                 // are never broadcast, so an inbound one is foreign (buggy or malicious).
                 // Drop it — nobody writes into another node's sovereign layer.
+                // A1 TR-1: payload/author_role ride the row VERBATIM — inbound apply
+                // validates NOTHING (convergence over validation).
                 if scope == "user" {
                     tracing::debug!("dropping inbound user-scoped note {id} (sovereign scope)");
                 } else {
@@ -1284,6 +1286,8 @@ impl TopicActor {
                         anchor_kind: anchor_kind.clone(),
                         anchor_id: anchor_id.clone(),
                         origin_ref: origin_ref.clone(),
+                        payload: payload.clone(),
+                        author_role: author_role.clone(),
                     };
                     let _ = storage::note_upsert(&note);
                 }

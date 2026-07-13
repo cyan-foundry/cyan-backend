@@ -120,6 +120,8 @@ fn scoped_note(
         anchor_kind: None,
         anchor_id: None,
         origin_ref: None,
+        payload: None,
+        author_role: None,
     }
 }
 

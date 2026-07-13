@@ -203,6 +203,8 @@ fn user_scope_notes_never_enter_the_sync_feed() {
         anchor_kind: None,
         anchor_id: None,
         origin_ref: None,
+        payload: None,
+        author_role: None,
     };
     storage::note_upsert(&mk("us-feed-g", "group", "shared house rule")).expect("group note");
     storage::note_upsert(&mk("us-feed-u", "user", "sovereign private rule")).expect("user note");

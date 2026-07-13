@@ -775,9 +775,12 @@ fn migrate_chats_to_boards_conn(conn: &Connection) -> Result<usize> {
 /// edits. Returns `true` iff a row was inserted or updated (i.e. state changed).
 pub fn note_upsert(n: &NoteDTO) -> Result<bool> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    // A1: the typed payload persists as its serialized JSON (nullable TEXT column —
+    // absent stays NULL so a pre-A1 row keeps reading back `None`).
+    let payload_json = n.payload.as_ref().map(|p| p.to_string());
     let changed = conn.execute(
-        "INSERT INTO notes (id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        "INSERT INTO notes (id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref, payload_json, author_role)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(id) DO UPDATE SET
             board_id    = excluded.board_id,
             tenant_id   = excluded.tenant_id,
@@ -789,12 +792,14 @@ pub fn note_upsert(n: &NoteDTO) -> Result<bool> {
             kind        = excluded.kind,
             anchor_kind = excluded.anchor_kind,
             anchor_id   = excluded.anchor_id,
-            origin_ref  = excluded.origin_ref
+            origin_ref  = excluded.origin_ref,
+            payload_json = excluded.payload_json,
+            author_role = excluded.author_role
          WHERE excluded.updated_at > notes.updated_at",
         params![
             n.id, n.board_id, n.tenant_id, n.author_id, n.author_name, n.text,
             n.created_at, n.updated_at, n.scope, n.kind,
-            n.anchor_kind, n.anchor_id, n.origin_ref
+            n.anchor_kind, n.anchor_id, n.origin_ref, payload_json, n.author_role
         ],
     )?;
     Ok(changed > 0)
@@ -805,7 +810,7 @@ pub fn note_upsert(n: &NoteDTO) -> Result<bool> {
 pub fn note_list_by_board(board_id: &str, tenant_id: &str) -> Result<Vec<NoteDTO>> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
     let mut stmt = conn.prepare(
-        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref, payload_json, author_role
          FROM notes WHERE board_id = ?1 AND tenant_id = ?2 ORDER BY created_at",
     )?;
     let rows = stmt.query_map(params![board_id, tenant_id], note_from_row)?;
@@ -829,6 +834,11 @@ pub fn note_list_scoped(
 /// `note_list_scoped` against an ALREADY-HELD connection — for callers running
 /// inside a dispatch that owns the global DB mutex (re-locking self-deadlocks;
 /// the std Mutex is not reentrant). Same pattern as `board_get_group_id_with`.
+///
+/// A1 pre-migration tolerance: `_with` fns accept CALLER-OWNED connections whose
+/// `notes` table may predate the A1 columns (frozen consumers build their own
+/// schemas) — when `payload_json` is missing, fall back to the pre-A1 column
+/// list; the two new fields read back `None` (TR-1: readers degrade, never error).
 pub fn note_list_scoped_with(
     conn: &rusqlite::Connection,
     tenant_id: &str,
@@ -836,12 +846,17 @@ pub fn note_list_scoped_with(
     anchor_id: &str,
     kind: &str,
 ) -> Result<Vec<NoteDTO>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref
-         FROM notes
+    let where_clause = "FROM notes
          WHERE tenant_id = ?1 AND scope = ?2 AND board_id = ?3 AND kind = ?4
-         ORDER BY created_at, id",
-    )?;
+         ORDER BY created_at, id";
+    let mut stmt = match conn.prepare(&format!(
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref, payload_json, author_role {where_clause}"
+    )) {
+        Ok(s) => s,
+        Err(_) => conn.prepare(&format!(
+            "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref {where_clause}"
+        ))?,
+    };
     let rows = stmt.query_map(params![tenant_id, scope, anchor_id, kind], note_from_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
@@ -860,7 +875,7 @@ pub fn note_list_by_boards(board_ids: &[String]) -> Result<Vec<NoteDTO>> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
     let placeholders: String = board_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref, payload_json, author_role
          FROM notes WHERE board_id IN ({}) AND scope != 'user' ORDER BY created_at",
         placeholders
     );
@@ -876,12 +891,53 @@ pub fn note_list_by_boards(board_ids: &[String]) -> Result<Vec<NoteDTO>> {
 pub fn note_get(id: &str) -> Result<Option<NoteDTO>> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
     let mut stmt = conn.prepare(
-        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref, payload_json, author_role
          FROM notes WHERE id = ?1",
     )?;
     stmt.query_row(params![id], note_from_row)
         .optional()
         .map_err(Into::into)
+}
+
+/// List a role-scoped note lane (A1 §1): role rules are GROUP-anchored (so they
+/// actually replicate — the group id is a real gossip group and already in the
+/// sweep set), with the craft slug riding the anchor pair (`anchor_kind = 'role'`,
+/// `anchor_id = '<slug>'`). Rides `idx_notes_tenant_scope_kind`; deterministic
+/// order like every resolver query.
+pub fn note_list_role_scoped(
+    tenant_id: &str,
+    group_anchor: &str,
+    role_slug: &str,
+    kind: &str,
+) -> Result<Vec<NoteDTO>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    note_list_role_scoped_with(&conn, tenant_id, group_anchor, role_slug, kind)
+}
+
+/// `note_list_role_scoped` against an ALREADY-HELD connection (the non-reentrant
+/// global-mutex house rule — same pattern as `note_list_scoped_with`, including
+/// its pre-A1-table fallback for caller-owned connections).
+pub fn note_list_role_scoped_with(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    group_anchor: &str,
+    role_slug: &str,
+    kind: &str,
+) -> Result<Vec<NoteDTO>> {
+    let where_clause = "FROM notes
+         WHERE tenant_id = ?1 AND scope = 'role' AND board_id = ?2 AND anchor_kind = 'role' AND anchor_id = ?3 AND kind = ?4
+         ORDER BY created_at, id";
+    let mut stmt = match conn.prepare(&format!(
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref, payload_json, author_role {where_clause}"
+    )) {
+        Ok(s) => s,
+        Err(_) => conn.prepare(&format!(
+            "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref {where_clause}"
+        ))?,
+    };
+    let rows =
+        stmt.query_map(params![tenant_id, group_anchor, role_slug, kind], note_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 /// Delete a note by id (hard delete, mirrors `chat_delete`).
@@ -892,8 +948,23 @@ pub fn note_delete(id: &str) -> Result<()> {
 }
 
 fn note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteDTO> {
+    // A1 (GC-3 / TR-1 tolerant read): a payload that fails to parse reads back as
+    // `None` + a warn — the row is ALWAYS returned, never dropped, never an error.
+    // Columns 13/14 are read tolerantly so the pre-A1 SELECT fallback (see
+    // `note_list_scoped_with`) maps through the same fn.
+    let id: String = r.get(0)?;
+    let payload = r
+        .get::<_, Option<String>>(13)
+        .unwrap_or(None)
+        .and_then(|s| match serde_json::from_str::<serde_json::Value>(&s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("note {id}: payload_json parse failed, reading as None: {e}");
+                None
+            }
+        });
     Ok(NoteDTO {
-        id: r.get(0)?,
+        id,
         board_id: r.get(1)?,
         tenant_id: r.get(2)?,
         author_id: r.get(3)?,
@@ -906,6 +977,8 @@ fn note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteDTO> {
         anchor_kind: r.get(10)?,
         anchor_id: r.get(11)?,
         origin_ref: r.get(12)?,
+        payload,
+        author_role: r.get::<_, Option<String>>(14).unwrap_or(None),
     })
 }
 
@@ -2885,6 +2958,15 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         let _ = conn.execute("ALTER TABLE notes ADD COLUMN anchor_kind TEXT", []);
         let _ = conn.execute("ALTER TABLE notes ADD COLUMN anchor_id TEXT", []);
         let _ = conn.execute("ALTER TABLE notes ADD COLUMN origin_ref TEXT", []);
+    }
+    // A1 structured notes: notes gain a per-kind typed payload + the author's craft
+    // role. Nullable, NO DEFAULT — a pre-A1 row must read back as `None`, never
+    // `Some(json!({}))` (deliberate delta from the IntegrationBindingDTO.config
+    // `DEFAULT '{}'` precedent). Idempotent probe-by-SELECT, the C7 pattern.
+    if conn.prepare("SELECT payload_json FROM notes LIMIT 1").is_err() {
+        tracing::info!("Migration: adding payload_json/author_role columns to notes (A1)");
+        let _ = conn.execute("ALTER TABLE notes ADD COLUMN payload_json TEXT", []);
+        let _ = conn.execute("ALTER TABLE notes ADD COLUMN author_role TEXT", []);
     }
 
     // ROUND8 §W4: templates — a pre-written English workflow (steps + bound plugins)

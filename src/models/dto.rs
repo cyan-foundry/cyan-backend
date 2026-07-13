@@ -140,26 +140,47 @@ pub struct ChatDTO {
 // NOTE (ROUND8 §W2 — board-level, authored, LWW ledger)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// The closed note SCOPE vocabulary (feat/notes-constitution + LENS_AI_NOTES P1).
-/// `board_id` doubles as the scope ANCHOR: the board id for `board`, the group id for
-/// `group`, the tenant id for `tenant` (tenant == group id in this engine), the
-/// workflow id for `workflow`, the producer id for `producer`, and the user id for
-/// `user`. The merge chain runs tenant → group → board → workflow → producer → user,
+/// The closed note SCOPE vocabulary (feat/notes-constitution + LENS_AI_NOTES P1 +
+/// A1 structured notes). `board_id` doubles as the scope ANCHOR: the board id for
+/// `board`, the group id for `group`, the tenant id for `tenant` (tenant == group id
+/// in this engine), the workflow id for `workflow`, the producer id for `producer`,
+/// the user id for `user`, the **workspace id** for `project` (A2 populates its
+/// chain link), and the **GROUP id** for `role` (the craft slug rides the anchor
+/// pair `anchor_kind:"role"` / `anchor_id:"<PRODUCTION_ROLE_VOCAB slug>"` — a slug
+/// anchor would be replication-dead AND a cross-tenant shared key). The merge chain
+/// runs tenant → group → project → board → workflow → producer → role → user,
 /// most-specific LAST. `user` is SOVEREIGN: local-only, never gossiped or snapshot.
-pub const NOTE_SCOPE_VOCAB: [&str; 6] =
-    ["tenant", "group", "board", "workflow", "producer", "user"];
+pub const NOTE_SCOPE_VOCAB: [&str; 8] =
+    ["tenant", "group", "board", "workflow", "producer", "user", "project", "role"];
 /// The closed note KIND vocabulary. `constitution` + `preference` feed the merge
 /// resolver (→ `ProposeCtx.constitution` / `.preferences`); `editor-note` is the
 /// pre-existing board-note behavior; `decision` (CHAT C7) is a board decision
 /// promoted from the chat lane — a local ledger row, offline-capable; `creative-dna`
 /// (LENS_AI_NOTES P1) carries producer/house/director/studio/genre/feel/episodic
 /// material at any scope and rides the constitution rail as a labeled subsection.
-pub const NOTE_KIND_VOCAB: [&str; 5] = [
+///
+/// A1 structured notes (additive, one edit 5→13): `creative-brief`, `shot-log` (one
+/// note = one entry), `lined-script`, `continuity`, `script` (whole script,
+/// .fdx-import-ready), `legal-clearance` (first-class; payload REQUIRED — the one
+/// exception, `note_payload` §4.9), and the two OFF-RAIL operational RECORDS (like
+/// `legal-clearance`, records not rules — never on the constitution rail, never
+/// promotable): `turnover` (the AE orchestration-bridge handoff record, §4.10) and
+/// `qc-report` (QC-against-house-rules result record, §4.11). Per-kind payload
+/// schemas + defaults live in `crate::note_payload`.
+pub const NOTE_KIND_VOCAB: [&str; 13] = [
     "constitution",
     "preference",
     "editor-note",
     "decision",
     "creative-dna",
+    "creative-brief",
+    "shot-log",
+    "lined-script",
+    "continuity",
+    "script",
+    "legal-clearance",
+    "turnover",
+    "qc-report",
 ];
 
 pub fn note_scope_valid(s: &str) -> bool {
@@ -173,13 +194,45 @@ pub fn note_kind_valid(k: &str) -> bool {
 /// The closed ANCHOR-KIND vocabulary (LENS_AI_NOTES P4, unified): what a chat
 /// message or note anchors to WITHIN a board. `step` → a stable `step_uid`;
 /// `board` → the board's general slot; `run` → a `workflow_run.run_id`; `frame` →
-/// `"<asset>@<master_frame>"` (an opaque string — the engine never parses it).
+/// `"<asset>@<master_frame>"` (an opaque string — the engine never parses it);
+/// `scene` (A1) → a `scene_id` (`note_payload::scene_id`, opaque to the engine —
+/// the `frame` precedent); `role` (A1) → a `PRODUCTION_ROLE_VOCAB` slug, VALID
+/// ONLY on `scope == "role"` (the pair is reserved — `dispatch_put_note` rejects
+/// `role_anchor_invalid` in every other combination).
 /// Anchors stay a free (kind, id) pair on the wire (pair-normalization in SendChat
 /// is unchanged); this vocab validates where notes are PUT.
-pub const ANCHOR_KIND_VOCAB: [&str; 4] = ["step", "board", "run", "frame"];
+pub const ANCHOR_KIND_VOCAB: [&str; 6] = ["step", "board", "run", "frame", "scene", "role"];
 
 pub fn anchor_kind_valid(k: &str) -> bool {
     ANCHOR_KIND_VOCAB.contains(&k)
+}
+
+/// The SINGLE craft-role vocabulary (A1 owns the const's home; A3 owns the VALUES
+/// and consumes it via `use crate::models::dto::PRODUCTION_ROLE_VOCAB` — never a
+/// second const). The array ORDER below is CANONICAL program-wide (cyan-identity
+/// mirrors this exact ordered literal); value OR order drift is a test failure
+/// (T8b). Slugs are the only valid `anchor_id` values for `anchor_kind:"role"`,
+/// and the craft half of `author_role`. Orthogonal to org-RBAC: a `producer` may
+/// hold org role `member`.
+pub const PRODUCTION_ROLE_VOCAB: [&str; 7] =
+    ["producer", "assistant_editor", "editor", "director", "colorist", "sound", "studio_exec"];
+
+/// Authorship-provenance ONLY: `agent` marks a note written WITHOUT a per-note
+/// human confirm (a true agent run / an explicit auto-accept policy). NOT a
+/// selector role, NOT a valid role-scope anchor slug — `author_role_valid` is the
+/// union, `production_role_valid` is not.
+pub const AUTHOR_ROLE_EXTRA: [&str; 1] = ["agent"];
+
+/// Is `r` a craft-role slug (selector roles + role-scope anchor slugs)?
+pub fn production_role_valid(r: &str) -> bool {
+    PRODUCTION_ROLE_VOCAB.contains(&r)
+}
+
+/// Is `r` a valid `author_role` (craft slugs ∪ `agent`)? Invalid/empty values are
+/// COERCED to `None` at the write door — provenance never blocks a write (but a
+/// coerced-None role then fails any legal transition needing `"producer"`).
+pub fn author_role_valid(r: &str) -> bool {
+    production_role_valid(r) || AUTHOR_ROLE_EXTRA.contains(&r)
 }
 
 pub fn default_note_scope() -> String {
@@ -222,8 +275,22 @@ pub struct NoteDTO {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_id: Option<String>,
     /// CHAT C7: provenance — `chat:<message_id>` for a note promoted from chat.
+    /// A1 grammar v2 (`note_payload` module docs): `<lane>:<opaque>` — the engine
+    /// never parses past the first `:`; unknown prefixes are legal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_ref: Option<String>,
+    /// A1 (additive): per-kind typed payload (`note_payload` §4 schemas). Absent ⇒
+    /// a plain freeform note of its kind (exception: kind `legal-clearance`
+    /// REQUIRES it, §4.9). SQLite column `payload_json TEXT` (nullable — a pre-A1
+    /// row reads back `None`, never `Some(json!({}))`); read-back parse failure ⇒
+    /// `None` + warn, row still returned (GC-3 / TR-1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+    /// A1 (additive): the author's CRAFT role at authoring time. Provenance, NOT
+    /// authz. Valid set = `PRODUCTION_ROLE_VOCAB` ∪ `AUTHOR_ROLE_EXTRA`; invalid ⇒
+    /// COERCED `None` at the write door (never a reject). Column `author_role TEXT`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_role: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

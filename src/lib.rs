@@ -462,19 +462,12 @@ impl CyanSystem {
 // COMMAND ACTOR
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// The `PutNote` dispatch (ROUND8 §W2 / feat/notes-constitution / LENS_AI_NOTES P1),
-/// extracted behavior-identically from `CommandActor::run` so tests can drive it
-/// with captured channels (the mcp_host pattern): validate scope/kind, persist via
-/// the LWW ledger, then gossip `NoteAdded`/`NoteUpdated` to the scope's group.
-///
-/// **USER SCOPE IS SOVEREIGN (local-first):** a `scope = "user"` note persists
-/// locally and surfaces to the local UI (`SwiftEvent`), but NO `NetworkCommand` is
-/// ever issued for it — it never gossips. (The other egress lanes, snapshot and
-/// anti-entropy, feed from `storage::note_list_by_boards`, which excludes user
-/// scope; inbound applies drop foreign user-scoped notes.)
-///
-/// `board_group` resolves a board id to its gossip group (the actor's DB lookup);
-/// it is only consulted for board scope.
+/// The frozen pre-A1 `PutNote` dispatch — delegates to the shared dispatch with
+/// no payload, no author role, AND the pre-A1 silent-reject posture (rejects log
+/// only — no `NoteRejected` event; frozen consumers assert on it). Kept so
+/// pre-A1 call sites stay source-compatible; additive change only (the
+/// `cyan_template_save_v2` precedent).
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_put_note(
     node_id: &str,
     board_group: &dyn Fn(&str) -> Option<String>,
@@ -490,6 +483,98 @@ pub fn dispatch_put_note(
     anchor_id: Option<String>,
     origin_ref: Option<String>,
 ) {
+    dispatch_put_note_inner(
+        node_id, board_group, network_tx, event_tx, board_id, note_id, tenant_id, text, scope,
+        kind, anchor_kind, anchor_id, origin_ref, None, None, false,
+    );
+}
+
+/// The `PutNote` dispatch (ROUND8 §W2 / feat/notes-constitution / LENS_AI_NOTES P1
+/// / A1 structured notes), extracted behavior-identically from `CommandActor::run`
+/// so tests can drive it with captured channels (the mcp_host pattern): validate
+/// scope/kind/anchor + the A1 payload block, persist via the LWW ledger, then
+/// gossip `NoteAdded`/`NoteUpdated` to the scope's group.
+///
+/// **USER SCOPE IS SOVEREIGN (local-first):** a `scope = "user"` note persists
+/// locally and surfaces to the local UI (`SwiftEvent`), but NO `NetworkCommand` is
+/// ever issued for it — it never gossips. (The other egress lanes, snapshot and
+/// anti-entropy, feed from `storage::note_list_by_boards`, which excludes user
+/// scope; inbound applies drop foreign user-scoped notes.)
+///
+/// `board_group` resolves a board id to its gossip group (the actor's DB lookup);
+/// it is only consulted for board scope.
+///
+/// A1 — the §6 write-door order, LOCAL AUTHORING ONLY (inbound gossip/snapshot
+/// never validates payloads — convergence over validation, TR-1): scope/kind
+/// vocab (8/13) → half-anchor coerce + anchor_kind vocab (6) → the A1 validation
+/// block (role-anchor rule, author_role coerce-to-None,
+/// `note_payload::validate`, the §4.9 legal-clearance transition machine with
+/// SERVER-controlled `cleared_by`/`cleared_at` stamps). EVERY reject emits the
+/// local-only `SwiftEvent::NoteRejected {note_id, board_id, reason}` (SYN-11) —
+/// nothing persists, nothing gossips.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_put_note_v2(
+    node_id: &str,
+    board_group: &dyn Fn(&str) -> Option<String>,
+    network_tx: &mpsc::UnboundedSender<NetworkCommand>,
+    event_tx: &mpsc::UnboundedSender<SwiftEvent>,
+    board_id: String,
+    note_id: Option<String>,
+    tenant_id: Option<String>,
+    text: String,
+    scope: Option<String>,
+    kind: Option<String>,
+    anchor_kind: Option<String>,
+    anchor_id: Option<String>,
+    origin_ref: Option<String>,
+    payload: Option<serde_json::Value>,
+    author_role: Option<String>,
+) {
+    dispatch_put_note_inner(
+        node_id, board_group, network_tx, event_tx, board_id, note_id, tenant_id, text, scope,
+        kind, anchor_kind, anchor_id, origin_ref, payload, author_role, true,
+    );
+}
+
+/// The shared dispatch body. `emit_rejects` is the ONE behavior fork between the
+/// frozen pre-A1 surface (`dispatch_put_note`: silent rejects, log-only) and the
+/// A1 surface (`dispatch_put_note_v2`: `NoteRejected` on every reject, SYN-11).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_put_note_inner(
+    node_id: &str,
+    board_group: &dyn Fn(&str) -> Option<String>,
+    network_tx: &mpsc::UnboundedSender<NetworkCommand>,
+    event_tx: &mpsc::UnboundedSender<SwiftEvent>,
+    board_id: String,
+    note_id: Option<String>,
+    tenant_id: Option<String>,
+    text: String,
+    scope: Option<String>,
+    kind: Option<String>,
+    anchor_kind: Option<String>,
+    anchor_id: Option<String>,
+    origin_ref: Option<String>,
+    payload: Option<serde_json::Value>,
+    author_role: Option<String>,
+    emit_rejects: bool,
+) {
+    // A1 (SYN-11): every reject surfaces a reasoned, LOCAL-ONLY event so the UI
+    // can short-circuit its 3 s echo timer. `note_id` is the client's correlation
+    // key (always set by new clients; empty on a legacy id-less create).
+    let reject = |reason: &str| {
+        tracing::warn!(
+            "obs note_put_rejected board={board_id} id={} reason={reason}",
+            note_id.as_deref().unwrap_or("")
+        );
+        if emit_rejects {
+            let _ = event_tx.send(SwiftEvent::NoteRejected {
+                note_id: note_id.clone().unwrap_or_default(),
+                board_id: board_id.clone(),
+                reason: reason.to_string(),
+            });
+        }
+    };
+
     // feat/notes-constitution: scope/kind are additive; absent ⇒ the exact
     // pre-scope behavior (a board editor-note). Invalid values REJECT the
     // command (never silently misfile a constitution/preference note).
@@ -498,6 +583,7 @@ pub fn dispatch_put_note(
     if !crate::models::dto::note_scope_valid(&scope) || !crate::models::dto::note_kind_valid(&kind)
     {
         tracing::error!("PutNote rejected: invalid scope={scope:?} kind={kind:?} board={board_id}");
+        reject("invalid_scope_or_kind");
         return;
     }
     // CHAT C7: an anchor is a matched pair — normalize half an anchor to
@@ -507,12 +593,44 @@ pub fn dispatch_put_note(
         _ => (None, None),
     };
     // LENS_AI_NOTES P4: an anchor kind, when present, must come from the closed
-    // vocabulary (step|board|run|frame) — reject rather than persist an unroutable
-    // anchor. Absent stays valid (every pre-anchor note).
+    // vocabulary (step|board|run|frame|scene|role) — reject rather than persist an
+    // unroutable anchor. Absent stays valid (every pre-anchor note).
     if let Some(k) = anchor_kind.as_deref()
         && !crate::models::dto::anchor_kind_valid(k)
     {
         tracing::error!("PutNote rejected: invalid anchor_kind={k:?} board={board_id}");
+        reject("invalid_anchor_kind");
+        return;
+    }
+
+    // ── A1 validation block (§6) ──
+    // Role-anchor rule: `scope == "role"` REQUIRES the pair ("role", <craft slug>)
+    // — the anchor pair is REPURPOSED for this scope ("agent" is NOT a valid
+    // slug) — and the pair is RESERVED for it (invalid on every other scope).
+    let has_role_pair = anchor_kind.as_deref() == Some("role");
+    if scope == "role" {
+        let slug_valid = has_role_pair
+            && anchor_id.as_deref().is_some_and(crate::models::dto::production_role_valid);
+        if !slug_valid {
+            reject(crate::note_payload::REASON_ROLE_ANCHOR_INVALID);
+            return;
+        }
+    } else if has_role_pair {
+        reject(crate::note_payload::REASON_ROLE_ANCHOR_INVALID);
+        return;
+    }
+    // author_role is provenance, never authz: an out-of-vocab or empty value
+    // COERCES to None rather than rejecting (but a coerced-None role then fails
+    // any legal transition needing "producer").
+    let author_role = author_role.filter(|r| crate::models::dto::author_role_valid(r));
+    // Per-kind payload validation (§4 schemas + size caps; `_meta` ignored and
+    // preserved; v>1 stored opaque except legal-clearance). May coerce in place
+    // (turnover from_role/to_role).
+    let mut payload = payload;
+    if let Some(p) = payload.as_mut()
+        && let Err(e) = crate::note_payload::validate(&kind, p)
+    {
+        reject(&e.to_string());
         return;
     }
     let origin_ref = origin_ref.filter(|o| !o.is_empty());
@@ -542,15 +660,53 @@ pub fn dispatch_put_note(
     // Editing an existing note preserves its original created_at; a new
     // note gets a generated id + created_at = now. An id that resolves to
     // an existing row is an edit (NoteUpdated); otherwise it's an add.
-    let id = note_id.unwrap_or_else(|| {
+    // `note_id` stays borrowed by the reject closure (the echo correlation key),
+    // so the working id is a clone.
+    let id = note_id.clone().unwrap_or_else(|| {
         blake3::hash(format!("note:{board_id}-{text}-{now}").as_bytes())
             .to_hex()
             .to_string()
     });
     let existing = storage::note_get(&id).ok().flatten();
     let is_new = existing.is_none();
-    let created_at = existing.map(|n| n.created_at).unwrap_or(now);
+    let created_at = existing.as_ref().map(|n| n.created_at).unwrap_or(now);
 
+    // §4.9 legal-clearance state machine — runs whenever the INCOMING or the
+    // STORED kind is legal-clearance (so an edit cannot bypass the machine by
+    // re-kinding the row). `cleared_by`/`cleared_at` are SERVER-controlled: the
+    // returned action stamps/strips them; caller values are never trusted.
+    let is_legal = kind == "legal-clearance"
+        || existing.as_ref().is_some_and(|n| n.kind == "legal-clearance");
+    if is_legal {
+        match crate::note_payload::check_legal_transition(
+            existing.as_ref(),
+            &text,
+            payload.as_ref(),
+            author_role.as_deref(),
+        ) {
+            Err(e) => {
+                reject(&e.to_string());
+                return;
+            }
+            Ok(action) => {
+                if let Some(map) = payload.as_mut().and_then(serde_json::Value::as_object_mut) {
+                    match action {
+                        crate::note_payload::LegalStampAction::Stamp => {
+                            map.insert("cleared_by".to_string(), serde_json::json!(author_id));
+                            map.insert("cleared_at".to_string(), serde_json::json!(now));
+                        }
+                        crate::note_payload::LegalStampAction::Strip => {
+                            map.remove("cleared_by");
+                            map.remove("cleared_at");
+                        }
+                        crate::note_payload::LegalStampAction::Keep => {}
+                    }
+                }
+            }
+        }
+    }
+
+    let has_payload = payload.is_some();
     let note = crate::models::dto::NoteDTO {
         id: id.clone(),
         board_id: board_id.clone(),
@@ -565,10 +721,12 @@ pub fn dispatch_put_note(
         anchor_kind: anchor_kind.clone(),
         anchor_id: anchor_id.clone(),
         origin_ref: origin_ref.clone(),
+        payload: payload.clone(),
+        author_role: author_role.clone(),
     };
     match storage::note_upsert(&note) {
         Ok(_) =>
-            tracing::info!(tenant_id = %tenant, "obs note_put board={board_id} id={id} scope={scope} kind={kind}"),
+            tracing::info!(tenant_id = %tenant, "obs note_put board={board_id} id={id} scope={scope} kind={kind} has_payload={has_payload}"),
         Err(e) => eprintln!("📝 [NOTE] 🔴 note_upsert failed: {e}"),
     }
 
@@ -587,6 +745,8 @@ pub fn dispatch_put_note(
             anchor_kind,
             anchor_id,
             origin_ref,
+            payload,
+            author_role,
         }
     } else {
         NetworkEvent::NoteUpdated {
@@ -603,6 +763,8 @@ pub fn dispatch_put_note(
             anchor_kind,
             anchor_id,
             origin_ref,
+            payload,
+            author_role,
         }
     };
 
@@ -613,6 +775,56 @@ pub fn dispatch_put_note(
         });
     }
     let _ = event_tx.send(SwiftEvent::Network(event));
+}
+
+/// The `DeleteNote` dispatch, extracted behavior-identically from
+/// `CommandActor::run` (the `dispatch_put_note` pattern) so the A1 legal gate is
+/// testable with captured channels.
+///
+/// A1 (§4.9, fail-closed on BOTH doors): a `legal-clearance` row is gated on its
+/// STORED status via `note_payload::clearance_status` — `Decided` ⇒ REJECT
+/// `legal_record_frozen` (legal removal path: producer re-opens → pending →
+/// delete); `Unreadable` (absent/unparseable/`v>1`/status ∉ vocab) ⇒ REJECT
+/// `legal_record_unreadable` (a record whose status cannot be read must be
+/// treated as possibly-decided; recovery = fleet upgrade). On a reject: no local
+/// delete, no `NoteDeleted` gossip, obs `note_delete_rejected`, and the
+/// local-only `SwiftEvent::NoteRejected`. A readable `pending` deletes normally.
+pub fn dispatch_delete_note(
+    board_group: &dyn Fn(&str) -> Option<String>,
+    network_tx: &mpsc::UnboundedSender<NetworkCommand>,
+    event_tx: &mpsc::UnboundedSender<SwiftEvent>,
+    id: String,
+) {
+    let existing = storage::note_get(&id).ok().flatten();
+    if let Some(n) = existing.as_ref().filter(|n| n.kind == "legal-clearance") {
+        let reason = match crate::note_payload::clearance_status(n.payload.as_ref()) {
+            crate::note_payload::ClearanceStatus::Decided => {
+                Some(crate::note_payload::REASON_LEGAL_RECORD_FROZEN)
+            }
+            crate::note_payload::ClearanceStatus::Unreadable => {
+                Some(crate::note_payload::REASON_LEGAL_RECORD_UNREADABLE)
+            }
+            crate::note_payload::ClearanceStatus::Pending => None,
+        };
+        if let Some(reason) = reason {
+            tracing::warn!("obs note_delete_rejected id={id} reason={reason}");
+            let _ = event_tx.send(SwiftEvent::NoteRejected {
+                note_id: id,
+                board_id: n.board_id.clone(),
+                reason: reason.to_string(),
+            });
+            return;
+        }
+    }
+    let group_id = existing.as_ref().and_then(|n| board_group(&n.board_id));
+    let _ = storage::note_delete(&id);
+    if let Some(gid) = group_id {
+        let _ = network_tx.send(NetworkCommand::Broadcast {
+            group_id: gid,
+            event: NetworkEvent::NoteDeleted { id: id.clone() },
+        });
+    }
+    let _ = event_tx.send(SwiftEvent::Network(NetworkEvent::NoteDeleted { id }));
 }
 
 struct CommandActor {
@@ -1182,11 +1394,14 @@ impl CommandActor {
                     anchor_kind,
                     anchor_id,
                     origin_ref,
+                    payload,
+                    author_role,
                 } => {
-                    // Extracted behavior-identically into `dispatch_put_note` (LENS_AI_NOTES
-                    // P1) so the sovereignty contract — a user-scoped note NEVER broadcasts —
-                    // is testable with captured channels.
-                    dispatch_put_note(
+                    // Extracted behavior-identically into `dispatch_put_note_v2`
+                    // (LENS_AI_NOTES P1 / A1) so the sovereignty contract — a
+                    // user-scoped note NEVER broadcasts — and the A1 validation
+                    // block are testable with captured channels.
+                    dispatch_put_note_v2(
                         &self.node_id,
                         &|b: &str| self.get_group_id_for_board(b),
                         &self.network_tx,
@@ -1200,24 +1415,21 @@ impl CommandActor {
                         anchor_kind,
                         anchor_id,
                         origin_ref,
+                        payload,
+                        author_role,
                     );
                 }
 
                 CommandMsg::DeleteNote { id } => {
-                    let group_id = storage::note_get(&id)
-                        .ok()
-                        .flatten()
-                        .and_then(|n| self.get_group_id_for_board(&n.board_id));
-                    let _ = storage::note_delete(&id);
-                    if let Some(gid) = group_id {
-                        let _ = self.network_tx.send(NetworkCommand::Broadcast {
-                            group_id: gid,
-                            event: NetworkEvent::NoteDeleted { id: id.clone() },
-                        });
-                    }
-                    let _ = self
-                        .event_tx
-                        .send(SwiftEvent::Network(NetworkEvent::NoteDeleted { id }));
+                    // Extracted behavior-identically into `dispatch_delete_note`
+                    // (A1) so the §4.9 delete gate is testable with captured
+                    // channels.
+                    dispatch_delete_note(
+                        &|b: &str| self.get_group_id_for_board(b),
+                        &self.network_tx,
+                        &self.event_tx,
+                        id,
+                    );
                 }
 
                 // ── Template + pin commands (ROUND8 §W4) ──
@@ -2542,6 +2754,12 @@ fn route_event_to_buffers(
             board_grid.lock_safe().push_back(event_json.to_string());
             network_status.lock_safe().push_back(event_json.to_string());
         }
+
+        // A1 (SYN-11): note write-door rejects → Whiteboard buffer, beside the
+        // note events the ledger already polls. Local-only, never gossiped.
+        SwiftEvent::NoteRejected { .. } => {
+            whiteboard.lock_safe().push_back(event_json.to_string());
+        }
     }
 }
 
@@ -2574,6 +2792,7 @@ pub mod llm;
 pub mod llm_proposer;
 pub mod media_staging;
 pub mod note_inference;
+pub mod note_payload;
 pub mod ops_eval;
 pub mod ops_proposer;
 pub mod pipeline;

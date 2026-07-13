@@ -713,6 +713,8 @@ pub extern "C" fn cyan_note_put(
         anchor_kind: None,
         anchor_id: None,
         origin_ref: None,
+        payload: None,
+        author_role: None,
     });
 }
 
@@ -721,6 +723,11 @@ pub extern "C" fn cyan_note_put(
 /// (`constitution`|`preference`|`editor-note`); null ⇒ `board`/`editor-note`. For
 /// `group`/`tenant` scope, `board_id` carries the ANCHOR id (the group/tenant id).
 /// Additive verb — never replaces any existing FFI.
+///
+/// A1 structured notes: PAYLOAD AUTHORS DO NOT USE THIS VERB — a typed note
+/// (`payload`/`author_role`, the C7 comment pattern) rides the JSON
+/// `cyan_send_command` path (`PutNote` with `payload`/`author_role` beside the
+/// anchor/origin_ref keys); this C ABI is unchanged.
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_note_put_scoped(
     board_id: *const c_char,
@@ -757,6 +764,9 @@ pub extern "C" fn cyan_note_put_scoped(
         anchor_kind: None,
         anchor_id: None,
         origin_ref: None,
+        // A1: same rule for typed payloads — `cyan_send_command` only.
+        payload: None,
+        author_role: None,
     });
 }
 

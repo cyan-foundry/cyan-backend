@@ -234,6 +234,17 @@ pub enum CommandMsg {
         /// in the lane derive from this.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_ref: Option<String>,
+        /// A1 (additive): per-kind typed payload (`note_payload` §4). Absent keeps
+        /// the exact pre-A1 behavior (a plain freeform note of its kind); kind
+        /// `legal-clearance` REQUIRES it (§4.9). Old engines silently DROP this key
+        /// (no `deny_unknown_fields` anywhere) — the write lands payload-less there.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<serde_json::Value>,
+        /// A1 (additive): the author's CRAFT role at authoring time
+        /// (`PRODUCTION_ROLE_VOCAB` ∪ `AUTHOR_ROLE_EXTRA`). Provenance, not authz;
+        /// invalid values COERCE to `None` at the write door.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        author_role: Option<String>,
     },
     DeleteNote {
         id: String,

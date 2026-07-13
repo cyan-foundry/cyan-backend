@@ -224,6 +224,8 @@ fn c7_note_anchor_and_provenance_roundtrip() {
         anchor_kind: Some("step".into()),
         anchor_id: Some("uid-42".into()),
         origin_ref: Some("chat:msg-abc".into()),
+        payload: None,
+        author_role: None,
     };
     assert!(
         storage::note_upsert(&note).expect("upsert"),
@@ -278,6 +280,8 @@ fn c7_note_event_wire_compat() {
         anchor_kind: None,
         anchor_id: None,
         origin_ref: None,
+        payload: None,
+        author_role: None,
     };
     let json = serde_json::to_string(&plain).expect("serializes");
     assert!(
@@ -473,6 +477,8 @@ fn p4_note_event_run_anchor_wire_roundtrip() {
         anchor_kind: Some("run".into()),
         anchor_id: Some("run-2024-042".into()),
         origin_ref: Some("chat:m-run".into()),
+        payload: None,
+        author_role: None,
     };
     let json = serde_json::to_string(&anchored).expect("serializes");
     let back: NetworkEvent = serde_json::from_str(&json).expect("round-trips");

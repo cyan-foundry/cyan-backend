@@ -817,6 +817,8 @@ async fn handle_verb(
                     anchor_kind: None,
                     anchor_id: None,
                     origin_ref: None,
+                    payload: None,
+                    author_role: None,
                 };
                 storage::note_upsert(&note).map_err(|e| anyhow!("note_upsert: {e}"))?;
             }
