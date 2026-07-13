@@ -1547,6 +1547,12 @@ pub fn pipeline_status(board_id: &str) -> Result<serde_json::Value> {
                 "review_hold": config.review_hold,
                 "waiting_on": config.waiting_on.clone().filter(|w| !w.is_empty())
                     .or_else(|| if config.review_hold { review_assignee(board_id) } else { None }),
+                // Is this step currently parked on the PRE-DISPATCH side-effect
+                // gate (the operator's "send it for review", exempt from the
+                // assignee lock)? The app must let the operator release THIS,
+                // and only lock to the assignee once the upload has run and the
+                // step re-parks on the real post-upload review window.
+                "local_gate": step_state_is_local_gate(&cell.cell_id),
             }));
         }
     }

@@ -858,6 +858,40 @@ pub(crate) async fn execute_local_mcp_tool_step(
             }
         }
     }
+    // D/P-4 — `file_id` BACKSTOP for the review READ tools (list_comments):
+    // the compiler leaves `file_id` pending for the dispatch to lift from the
+    // upstream upload step's `{"file_id": …}` result. That linkage breaks on
+    // REPLAY — the same-proxy-reuse short-circuit returns a prose result, and
+    // a fresh run from an intermediate step has no upstream upload output to
+    // read — so the sense step died on a missing file_id (found live). The
+    // board's REGISTERED review proxy is the same file id either way; fill it
+    // from there when the caller left it empty. Never overrides an explicit id.
+    if step.plugin_id == "frameio" && matches!(step.tool.as_str(), "list_comments" | "get_comments") {
+        let file_id_missing = step
+            .args
+            .get("file_id")
+            .and_then(|v| v.as_str())
+            .is_none_or(str::is_empty);
+        if file_id_missing
+            && let Some(proxy_ref) = crate::storage::db().lock().ok().and_then(|conn| {
+                let tenant = crate::review_loop::board_tenant(&conn, board_id);
+                crate::review_loop::current_proxy_ref(&conn, &tenant, board_id)
+                    .ok()
+                    .flatten()
+            })
+            && let Some(args) = step.args.as_object_mut()
+        {
+            args.insert("file_id".to_string(), json!(proxy_ref));
+            tracing::info!(
+                target: "obs",
+                event = "plugin_invariant_injected",
+                plugin = "frameio",
+                tool = step.tool.as_str(),
+                key = "file_id",
+                "executor backstop filled list_comments file_id from the registered review proxy"
+            );
+        }
+    }
 
     // D/P-4 — SAME-PROXY REUSE: replaying an upload-for-review step must NEVER
     // mint a fresh Frame.io file (a new file_id orphans every review comment
