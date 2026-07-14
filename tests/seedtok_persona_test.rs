@@ -18,6 +18,14 @@ fn ensure_db() {
         init_base_schema(&path).expect("base schema");
         storage::init_db(path.to_str().expect("utf8 db path")).expect("init_db");
         std::mem::forget(dir);
+        // A hermetic media root with a stand-in playable asset (board_video_media only
+        // STATS the file, never decodes), so the review-media bind is deterministic and
+        // independent of the machine's ~/.cyan-phase3/media. Process-global on purpose.
+        let media = tempfile::tempdir().expect("media tempdir");
+        std::fs::write(media.path().join("sig_source.mp4"), b"\x00\x00seedtok-fake-mp4")
+            .expect("write fake asset");
+        unsafe { std::env::set_var("CYAN_MEDIA_ROOT", media.path()) };
+        std::mem::forget(media);
     });
 }
 
@@ -124,6 +132,37 @@ fn seed_is_provenance_stamped_and_maps_surfaces() {
         let notes = storage::note_list_by_board(&row.board_id, tenant).unwrap();
         assert!(!notes.iter().any(|n| n.id.ends_with("-review")), "{token} has NO review note");
     }
+}
+
+#[test]
+fn review_boards_bind_a_playable_master() {
+    ensure_db();
+    let manifest = seed_personas("seedtok", "owner-media").expect("seed");
+
+    // Every review-facing board resolves a master that ACTUALLY EXISTS on disk — the real
+    // review-loop asset — through the SAME path the app's Video-face detection calls, so the
+    // face materializes AND plays (director → review player, not a black poster).
+    for token in ["seedtok_director", "seedtok_producer", "seedtok_colorist"] {
+        let row = manifest.iter().find(|m| m.token == token).unwrap();
+        let media = cyan_backend::pipeline_executor::board_video_media(&row.board_id);
+        let master = media.get("master_uri").and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("{token} board has a master_uri: {media}"));
+        assert!(master.starts_with('/'), "{token} master is an absolute path: {master}");
+        assert!(master.ends_with("sig_source.mp4"), "reuses the review-loop asset: {master}");
+        assert!(std::path::Path::new(master).is_file(), "{token} master is a REAL file: {master}");
+    }
+
+    // The editor board (non-review) binds no real master: its only media reference is the
+    // bare seed clip, which does NOT exist on disk → the player would have nothing to play,
+    // so it correctly stays on its notebook landing (no materialized Video face in prod,
+    // where no CYAN_MEDIA_ROOT join fabricates a phantom path).
+    let editor = manifest.iter().find(|m| m.token == "seedtok_editor").unwrap();
+    let em = cyan_backend::pipeline_executor::board_video_media(&editor.board_id);
+    let em_master = em.get("master_uri").and_then(|v| v.as_str());
+    assert!(
+        em_master.map(|m| !std::path::Path::new(m).is_file()).unwrap_or(true),
+        "editor board has no REAL playable master: {em}"
+    );
 }
 
 #[test]

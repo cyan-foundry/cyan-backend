@@ -251,8 +251,11 @@ fn seed_persona_board(ws: &str, tenant: &str, p: &SeedPersona, now: i64) -> Resu
     };
     storage::note_upsert(&note).map_err(|e| anyhow!("note_upsert({board}-note): {e}"))?;
 
-    // Review-facing roles: a v2 review version artifact + a decision note referencing it.
+    // Review-facing roles: bind a REAL playable master so the board's Video face
+    // materializes (the director lands on the actual review player, not Dashboard),
+    // plus a v2 review version artifact + a decision note referencing it.
     if p.review {
+        bind_review_master(board, ws, now);
         storage::file_insert_simple(
             &format!("{board}-v2"), Some(SEEDTOK_GROUP_ID), Some(ws), Some(board),
             &format!("{}-v2.mp4", board), &format!("seed-{board}-v2"), 12_000_000, None, now,
@@ -279,4 +282,64 @@ fn seed_persona_board(ws: &str, tenant: &str, p: &SeedPersona, now: i64) -> Resu
             .map_err(|e| anyhow!("note_upsert({board}-review): {e}"))?;
     }
     Ok(())
+}
+
+/// Bind a REAL playable master to a review board so `board_video_media`'s master_uri
+/// resolves to a concrete on-disk path (`resolve_video_uri_from` step 2 → the Video face
+/// materializes and the review player actually plays). Reuses the same demo asset the
+/// review loop already provisions (`<media_root>/sig_source.mp4`), else the first playable
+/// clip found in the media root. Idempotent (INSERT OR IGNORE + a settled local_path).
+/// Graceful: if no real asset is present, logs and skips — the board keeps its non-video
+/// faces, never a broken/black player. Best-effort — errors never fail the seed.
+fn bind_review_master(board: &str, ws: &str, now: i64) {
+    let Some(src) = find_playable_asset() else {
+        tracing::info!("obs seedtok_review_media_skip board={board} reason=no_asset_in_media_root");
+        return;
+    };
+    // Stage into the confined media root (a no-op when already inside it) so the player +
+    // the confined cyan-media plugin read the SAME path; keep the display name/extension.
+    let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("review-master.mp4");
+    let staged = crate::media_staging::stage_local_media_named(&src.display().to_string(), Some(name));
+    let file_id = format!("{board}-video");
+    if let Err(e) = storage::file_insert_simple(
+        &file_id, Some(SEEDTOK_GROUP_ID), Some(ws), Some(board), name,
+        &format!("seed-{board}-video"), 1_000_000, None, now,
+    ) {
+        tracing::warn!("obs seedtok_review_media_err board={board} step=insert err={e}");
+        return;
+    }
+    if let Err(e) = storage::file_set_local_path(&file_id, &staged) {
+        tracing::warn!("obs seedtok_review_media_err board={board} step=local_path err={e}");
+        return;
+    }
+    tracing::info!("obs seedtok_review_media board={board} master={staged}");
+}
+
+/// Locate a real, playable video in the confined media root: the review-loop master
+/// (`sig_source.mp4`) first, else the newest `*.mp4` at the root or its `master/` dir.
+fn find_playable_asset() -> Option<std::path::PathBuf> {
+    let root = crate::media_staging::effective_media_root();
+    let preferred = root.join("sig_source.mp4");
+    if preferred.is_file() {
+        return Some(preferred);
+    }
+    for dir in [root.clone(), root.join("master")] {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+        for e in entries.flatten() {
+            let p = e.path();
+            let is_mp4 = p.extension().and_then(|x| x.to_str()).map(|x| x.eq_ignore_ascii_case("mp4"))
+                .unwrap_or(false);
+            if is_mp4 && p.is_file() {
+                let m = e.metadata().and_then(|md| md.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                if best.as_ref().map(|(bm, _)| m > *bm).unwrap_or(true) {
+                    best = Some((m, p));
+                }
+            }
+        }
+        if let Some((_, p)) = best {
+            return Some(p);
+        }
+    }
+    None
 }
