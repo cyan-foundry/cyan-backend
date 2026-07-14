@@ -673,6 +673,12 @@ pub struct SelectorResult {
     pub role: String,
     pub format_type: String,
     pub observe_only: bool,
+    /// Deterministic role → primary landing surface (additive; nav only, NOT
+    /// authz/provenance). The iOS app routes to this at sign-in. Always present
+    /// on encode; old-shape JSON without it decodes to the safe `board_wall`
+    /// fallback (T-A3-4 additive-wire rule).
+    #[serde(default = "default_primary_surface")]
+    pub primary_surface: String,
     pub template: Option<SelectorTemplate>,
     pub plugins: Vec<SelectorPluginEntry>,
     pub agentification: SelectorAgentification,
@@ -706,6 +712,34 @@ impl SelectorError {
                 "error": "missing_param", "given": p,
             }),
         }
+    }
+}
+
+/// Deterministic role → primary landing surface (§9d additive dimension).
+/// Nav routing only — orthogonal to workflow template, RBAC, and author_role
+/// provenance. Surface ids are the iOS routing contract:
+///   `board_wall`     → the board-grid wall (all shows/boards; studio_exec)
+///   `shows`          → shows/boards list (producer; review+notebook are pieces)
+///   `review_player`  → open the home board on the review face (director)
+///   `notebook`       → open the home board on the notebook face (editor, colorist, sound)
+///   `ae_queue`       → the assistant-editor queue
+/// Unknown roles fall back to `board_wall` (safe read-only landing).
+/// Serde default for the additive `primary_surface` field — the safe read-only
+/// landing when decoding old-shape JSON that predates the dimension.
+fn default_primary_surface() -> String {
+    "board_wall".to_string()
+}
+
+pub fn primary_surface_for(role: &str) -> &'static str {
+    match role {
+        "studio_exec" => "board_wall",
+        "producer" => "shows",
+        "director" => "review_player",
+        "editor" => "notebook",
+        "colorist" => "notebook",
+        "sound" => "notebook",
+        "assistant_editor" => "ae_queue",
+        _ => "board_wall",
     }
 }
 
@@ -773,6 +807,7 @@ pub fn resolve(
             role: role.to_string(),
             format_type: format_type.to_string(),
             observe_only: true,
+            primary_surface: primary_surface_for(role).to_string(),
             template: None,
             plugins: Vec::new(),
             agentification: serialize_agentification(role, Vec::new()),
@@ -780,7 +815,8 @@ pub fn resolve(
             orchestration: Vec::new(),
         };
         tracing::info!(
-            "obs selector_resolved role={role} format_type={format_type} observe_only=true deltas_applied=0 duties=0 handoffs=0"
+            "obs selector_resolved role={role} format_type={format_type} observe_only=true primary_surface={} deltas_applied=0 duties=0 handoffs=0",
+            result.primary_surface
         );
         return Ok(result);
     }
@@ -855,7 +891,8 @@ pub fn resolve(
 
     // (7) obs — flat u64 fields (3.2b).
     tracing::info!(
-        "obs selector_resolved role={role} format_type={format_type} observe_only=false deltas_applied={} duties={} handoffs={}",
+        "obs selector_resolved role={role} format_type={format_type} observe_only=false primary_surface={} deltas_applied={} duties={} handoffs={}",
+        primary_surface_for(role),
         deltas_applied,
         ae_duties.len() as u64,
         orchestration.len() as u64
@@ -866,6 +903,7 @@ pub fn resolve(
         role: role.to_string(),
         format_type: format_type.to_string(),
         observe_only: false,
+        primary_surface: primary_surface_for(role).to_string(),
         template,
         plugins,
         agentification,

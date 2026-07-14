@@ -12,8 +12,9 @@ use std::{
 use cyan_backend::{
     models::dto::{Template, NOTE_KIND_VOCAB, PRODUCTION_ROLE_VOCAB},
     role_templates::{
-        self, ae_duty_catalog, builtin_roletype_templates, orchestration_bridge, resolve,
-        SelectorError, SelectorResult, GATE_VOCAB, LIVE_BOUND_MENTIONS, TASK_STATUS_VOCAB,
+        self, ae_duty_catalog, builtin_roletype_templates, orchestration_bridge,
+        primary_surface_for, resolve, SelectorError, SelectorResult, GATE_VOCAB,
+        LIVE_BOUND_MENTIONS, TASK_STATUS_VOCAB,
     },
     storage, templates,
 };
@@ -881,4 +882,55 @@ fn save_v2_rejects_invalid_format_type() {
     assert_eq!(saved["catalog_version"], serde_json::json!("roletype.v1"));
     assert_eq!(saved["id"].as_str().map(str::len), Some(64), "blake3-minted id");
     assert_ne!(saved["id"], serde_json::json!("spoofed-id"));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ROLE→SURFACE — the additive `primary_surface` dimension (nav only; orthogonal
+// to template/RBAC/author_role). Every vocab role maps to a stable surface id;
+// resolve() carries it; the wire stays additive (old shape → board_wall).
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn primary_surface_maps_every_vocab_role() {
+    // Deterministic, total over the vocab — no role falls through to fallback
+    // by accident (the fallback is reserved for genuinely-unknown roles).
+    assert_eq!(primary_surface_for("studio_exec"), "board_wall");
+    assert_eq!(primary_surface_for("producer"), "shows");
+    assert_eq!(primary_surface_for("director"), "review_player");
+    assert_eq!(primary_surface_for("editor"), "notebook");
+    assert_eq!(primary_surface_for("colorist"), "notebook");
+    assert_eq!(primary_surface_for("sound"), "notebook");
+    assert_eq!(primary_surface_for("assistant_editor"), "ae_queue");
+    // Unknown role → safe read-only landing, never a crash.
+    assert_eq!(primary_surface_for("showrunner"), "board_wall");
+    // Coverage: every canonical vocab role resolves to a non-empty surface.
+    for role in PRODUCTION_ROLE_VOCAB {
+        assert!(!primary_surface_for(role).is_empty(), "surface for {role}");
+    }
+}
+
+#[test]
+fn resolve_carries_primary_surface() {
+    ensure_db();
+    let prod = resolve(None, "producer", "promo", &no_lookup).expect("resolve");
+    assert_eq!(prod.primary_surface, "shows");
+    let exec = resolve(None, "studio_exec", "promo", &no_lookup).expect("resolve");
+    assert_eq!(exec.primary_surface, "board_wall", "observe_only role still lands");
+    let ae = resolve(None, "assistant_editor", "feature", &no_lookup).expect("resolve");
+    assert_eq!(ae.primary_surface, "ae_queue");
+    // Present on the wire.
+    let wire = serde_json::to_value(&prod).expect("encode");
+    assert_eq!(wire["primary_surface"], serde_json::json!("shows"));
+}
+
+#[test]
+fn primary_surface_wire_is_additive() {
+    // Old-shape JSON (predating the dimension) decodes to the safe fallback.
+    let old = serde_json::json!({
+        "catalog_version": "roletype.v1", "role": "editor", "format_type": "promo",
+        "observe_only": false, "template": null, "plugins": [],
+        "agentification": { "role": "editor", "tasks": [], "agent_does": [], "human_does": [] },
+    });
+    let decoded: SelectorResult = serde_json::from_value(old).expect("old shape decodes");
+    assert_eq!(decoded.primary_surface, "board_wall", "absent → board_wall fallback");
 }

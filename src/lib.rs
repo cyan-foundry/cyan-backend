@@ -2926,6 +2926,7 @@ pub mod review_loop;
 pub mod review_state;
 pub mod role_templates;
 pub mod seed;
+pub mod seed_personas;
 pub mod step_history;
 pub mod frameio_refresh;
 pub mod skills;

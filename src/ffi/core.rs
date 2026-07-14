@@ -1083,6 +1083,37 @@ pub extern "C" fn cyan_seed_demo() {
     }
 }
 
+/// SeedTok multi-persona seed — seeds the six-role cast IN-PROCESS (under the app's own db
+/// + identity) and returns the routing manifest JSON `{"personas":[{token, craft_role,
+/// display_role, primary_surface, group_id, board_id, board_name, display}, ...]}` so the
+/// iOS sign-in can route each `seedtok_<persona>` login to its home surface.
+///
+/// GATED: refuses unless `CYAN_SEED_DEMO=1` — never runs in a production build. Returns
+/// `{"error":"seed_disabled"}` when the gate is off, `{"error":"..."}` on a seed failure.
+/// Idempotent (truncates the managed group first). Caller frees with `cyan_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_seed_personas(
+    tenant_id: *const c_char,
+    owner_node_id: *const c_char,
+) -> *mut c_char {
+    if std::env::var("CYAN_SEED_DEMO").ok().as_deref() != Some("1") {
+        tracing::warn!("obs seedtok_seed_refused reason=gate_off");
+        return json_cstring(r#"{"error":"seed_disabled"}"#);
+    }
+    let tenant = unsafe { cstr_arg(tenant_id) }.unwrap_or_default();
+    let owner = unsafe { cstr_arg(owner_node_id) }.unwrap_or_default();
+    match crate::seed_personas::seed_personas(&tenant, &owner) {
+        Ok(manifest) => json_cstring(
+            &serde_json::to_string(&serde_json::json!({ "personas": manifest }))
+                .unwrap_or_else(|_| r#"{"error":"encode_failed"}"#.to_string()),
+        ),
+        Err(e) => {
+            tracing::warn!("obs seedtok_seed_error err={e}");
+            json_cstring(&serde_json::json!({ "error": e.to_string() }).to_string())
+        }
+    }
+}
+
 // ---------- FFI: unread / notifications (R10FB §N) ----------
 
 /// Unread counts as a JSON object `{board_id: count}` — **board-level only** (R11 §3). One
