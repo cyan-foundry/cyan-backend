@@ -1894,6 +1894,19 @@ pub struct PluginBundleFile {
 /// `local_path` is set), is an installed plugin the local MCP host should run.
 /// It reuses the existing files/objects scope — no new tables and no new FFI; the
 /// app just sees a file appear in a workspace.
+///
+/// TOMBSTONED bundles are EXCLUDED (R10FB §F4 — "all file reads filter deleted=0";
+/// this read was the lone exception). That filter is what makes uninstall real: the
+/// only removal path is the ordinary file tombstone (`CommandMsg::DeleteFile` →
+/// [`file_soft_delete`] → `NetworkEvent::FileDeleted`, which converges to peers),
+/// and without this predicate the tombstone had NO observable effect — the row kept
+/// listing here, so `workflow::autocomplete_index` kept offering `@plugin.` and an
+/// accidentally-installed plugin could not be removed at all (found live 2026-07-15).
+///
+/// Bytes are deliberately NOT consulted: `plugin_bundles_dir()` is device-global and
+/// keyed by plugin id alone, while an install is per-group. The `objects` row is the
+/// per-group install fact; the bundle file is a shared device cache another group may
+/// still be using. Uninstall tombstones the row and leaves the bytes.
 pub fn plugin_bundles_in_group(
     group_id: &str,
     workspace_name: &str,
@@ -1909,6 +1922,7 @@ pub fn plugin_bundles_in_group(
            AND w.name = ?2
            AND o.local_path IS NOT NULL
            AND o.name LIKE '%' || ?3
+           AND COALESCE(o.deleted, 0) = 0
          ORDER BY o.name",
     )?;
     let rows = stmt.query_map(params![group_id, workspace_name, suffix], |r| {
