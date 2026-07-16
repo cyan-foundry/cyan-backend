@@ -963,6 +963,50 @@ fn gate_satisfied(exec_steps: &HashMap<String, ExecStep>, gate_id: &str) -> bool
     exec_steps.get(gate_id).map(|s| s.status == "human_approved").unwrap_or(false)
 }
 
+/// G4 — SIDE-EFFECT-AWARE AUTO-RETRY. Tools whose SUCCESS has an external side
+/// effect (upload/publish/email/comment) must NEVER be re-dispatched — a retry would
+/// re-upload / re-send / re-publish. They surface for a human instead. Everything
+/// else (cyan-media analysis/transform: probe/proxy/conform/qc/thumbnail…) is
+/// side-effect-free and safe to re-run.
+const NON_IDEMPOTENT_TOOLS: &[&str] = &[
+    "upload_file", "publish", "send_email", "create_comment", "post_comment", "inject_notes",
+];
+
+/// Transient/environmental error classes worth a bounded retry. Deterministic classes
+/// (path_denied, validation, needs_human, not_installed) are NOT retried — retrying
+/// only burns attempts and delays the human surfacing.
+fn is_transient_error_class(class: &str) -> bool {
+    matches!(
+        class,
+        "timeout" | "transport" | "unreachable" | "network" | "engine_error"
+            | "gateway" | "temporarily_unavailable" | "rate_limited"
+    )
+}
+
+/// The retry DECISION (pure, unit-tested): retry iff budget remains AND the tool is
+/// idempotent (safe to re-dispatch) AND the error is transient. Auth-expiry has its
+/// own one-shot self-heal in the executor (B5) and is handled before this.
+fn should_auto_retry(tool: &str, error_class: &str, attempt: u32, budget: u32) -> bool {
+    attempt < budget
+        && !NON_IDEMPOTENT_TOOLS.contains(&tool)
+        && is_transient_error_class(error_class)
+}
+
+/// Pull `error_class` out of the executor's structured failure envelope (a JSON
+/// string `{"error_class": …}`). Unknown/unparseable → "" (not transient → not
+/// retried), so a non-enveloped error never triggers a re-dispatch.
+fn auto_retry_error_class(err: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(err)
+        .ok()
+        .and_then(|v| v.get("error_class").and_then(|c| c.as_str()).map(String::from))
+        .unwrap_or_default()
+}
+
+/// Default bounded auto-retry budget for an idempotent step (attempts BEYOND the
+/// first). Keep small: a transient blip clears in 1–2 tries; more just delays a real
+/// failure reaching the human.
+const DEFAULT_AUTO_RETRY_BUDGET: u32 = 2;
+
 /// Run ONE step: emit running → progress, execute it, emit the terminal state, and
 /// build its obs/result. Owned args so it can be spawned. Shared by both paths.
 async fn exec_one_step(
@@ -995,12 +1039,49 @@ async fn exec_one_step(
     if let Some(mcp_tool) = step.mcp_tool.clone() {
         metadata["mcp_tool"] = mcp_tool;
     }
-    let metadata = Some(metadata);
 
-    let result = crate::pipeline_executor::execute_pipeline_step(
-        &board_id, &step.step_id, &step.content, &step.executor,
-        metadata, dependency_outputs, &command_tx, &event_tx,
-    ).await.map(|(summary, _findings)| summary);
+    // G4 — bounded, side-effect-aware auto-retry with exponential backoff. A transient
+    // failure of an IDEMPOTENT tool is re-dispatched before it reds the step; a
+    // non-idempotent tool (upload/publish/email/comment) or a deterministic error
+    // (path_denied/validation) falls straight through to the failure path below — it
+    // is NEVER re-uploaded / re-sent / re-published, only surfaced for a human.
+    let retry_tool = step
+        .mcp_tool
+        .as_ref()
+        .and_then(|m| m.get("tool"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut attempt: u32 = 0;
+    let result = loop {
+        let r = crate::pipeline_executor::execute_pipeline_step(
+            &board_id, &step.step_id, &step.content, &step.executor,
+            Some(metadata.clone()), dependency_outputs.clone(), &command_tx, &event_tx,
+        )
+        .await
+        .map(|(summary, _findings)| summary);
+        match &r {
+            Ok(_) => break r,
+            Err(e) => {
+                let class = auto_retry_error_class(&e.to_string());
+                if should_auto_retry(&retry_tool, &class, attempt, DEFAULT_AUTO_RETRY_BUDGET) {
+                    attempt += 1;
+                    let backoff = std::time::Duration::from_millis(
+                        500u64.saturating_mul(1u64 << attempt.min(5)),
+                    );
+                    let _ = event_tx.send(SwiftEvent::StatusUpdate {
+                        message: format!(
+                            "🔁 step '{}' transient ({}) — auto-retry {}/{}",
+                            step.step_id, class, attempt, DEFAULT_AUTO_RETRY_BUDGET
+                        ),
+                    });
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                break r;
+            }
+        }
+    };
 
     let duration = start.elapsed().as_secs_f64();
     let wall_ms = (duration * 1000.0) as u64;
@@ -2616,6 +2697,58 @@ fn find_scope_id(board_id: &str) -> Option<String> {
         })
 }
 // ============================================================================
+// G4 — auto-retry decision unit tests (pure fns; no engine/system required)
+// ============================================================================
+
+#[cfg(test)]
+mod auto_retry_tests {
+    use super::*;
+
+    #[test]
+    fn transient_idempotent_step_retries_within_budget() {
+        // cyan-media analysis/transform tools are side-effect-free → safe to re-run.
+        assert!(should_auto_retry("probe", "timeout", 0, 2));
+        assert!(should_auto_retry("proxy", "engine_error", 1, 2));
+        assert!(should_auto_retry("conform", "unreachable", 0, 2));
+    }
+
+    #[test]
+    fn budget_exhaustion_stops_retrying() {
+        assert!(!should_auto_retry("probe", "timeout", 2, 2));
+        assert!(!should_auto_retry("probe", "timeout", 3, 2));
+    }
+
+    #[test]
+    fn non_idempotent_tools_never_retry() {
+        // The load-bearing invariant: NEVER re-upload / re-send / re-publish / re-comment,
+        // even on a transient error with budget to spare. These surface for a human.
+        assert!(!should_auto_retry("upload_file", "timeout", 0, 2));
+        assert!(!should_auto_retry("send_email", "engine_error", 0, 2));
+        assert!(!should_auto_retry("publish", "unreachable", 0, 2));
+        assert!(!should_auto_retry("create_comment", "timeout", 0, 2));
+    }
+
+    #[test]
+    fn deterministic_errors_are_not_retried() {
+        // Retrying a path/validation/gate error just burns attempts.
+        assert!(!should_auto_retry("probe", "path_denied", 0, 2));
+        assert!(!should_auto_retry("probe", "validation", 0, 2));
+        assert!(!should_auto_retry("probe", "needs_human", 0, 2));
+        assert!(!should_auto_retry("probe", "not_installed", 0, 2));
+    }
+
+    #[test]
+    fn error_class_is_read_from_the_structured_envelope() {
+        assert_eq!(
+            auto_retry_error_class(r#"{"error_class":"timeout","message":"x"}"#),
+            "timeout"
+        );
+        // A non-enveloped error yields "" → never transient → never retried.
+        assert_eq!(auto_retry_error_class("plain error, not json"), "");
+        assert!(!should_auto_retry("probe", &auto_retry_error_class("plain error"), 0, 2));
+    }
+}
+
 // D/P-4 — review-gate unit tests (pure fns; no engine/system required)
 // ============================================================================
 
