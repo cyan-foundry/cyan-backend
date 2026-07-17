@@ -475,13 +475,16 @@ pub(crate) fn dotenv_lookup(path: &std::path::Path, key: &str) -> Option<String>
 pub const SIDE_EFFECT_EXTERNAL_SEND: &str = "external_send";
 /// Side effect that requires the human-approval gate before a tool runs.
 pub const SIDE_EFFECT_DELETE: &str = "delete";
+/// A local work-in-progress mutation (a Resolve grade node, a Pro Tools edit) —
+/// gates like the others but never leaves the device.
+pub const SIDE_EFFECT_MUTATE_LOCAL: &str = "mutate_local";
 
 /// Whether a tool's declared `side_effects` require human approval before it may
-/// auto-execute. `external_send` / `delete` do; a pure/read-only tool does not.
+/// auto-execute. Routed through the shared `cyan_mcp` predicate so the gated-label
+/// set (external_send / delete / mutate_local) lives in exactly one place and the
+/// three hosts never drift.
 pub fn requires_approval(side_effects: &[String]) -> bool {
-    side_effects
-        .iter()
-        .any(|s| s == SIDE_EFFECT_EXTERNAL_SEND || s == SIDE_EFFECT_DELETE)
+    side_effects.iter().any(|s| cyan_mcp::is_gated_side_effect(s))
 }
 
 /// Run scope carried on every external cost obs line: which tenant + pipeline run
@@ -619,4 +622,20 @@ struct DiscardEmitter;
 
 impl Emitter for DiscardEmitter {
     fn emit(&self, _obs: &Obs) {}
+}
+
+#[cfg(test)]
+mod mutate_local_gate_tests {
+    use super::requires_approval;
+
+    /// A local WIP mutation (mutate_local) must require approval like external_send
+    /// and delete — a gated mutation may never auto-fire. Routed through the shared
+    /// cyan_mcp predicate so the three hosts never drift.
+    #[test]
+    fn mutate_local_requires_approval() {
+        assert!(requires_approval(&["mutate_local".to_string()]));
+        assert!(requires_approval(&["external_send".to_string()]));
+        assert!(requires_approval(&["delete".to_string()]));
+        assert!(!requires_approval(&[])); // a read is free
+    }
 }
