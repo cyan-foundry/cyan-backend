@@ -3275,6 +3275,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         tracing::warn!("Migration: ingest tables failed: {e}");
     }
 
+    // GAP 2 inbound (PULL): watched inbound plugin sources (cyan-email) whose
+    // polled events route to board notes. Creates `inbound_source`. Idempotent
+    // (CREATE TABLE IF NOT EXISTS); additive — no existing table or behavior
+    // changes.
+    if let Err(e) = crate::inbound::migrate(conn) {
+        tracing::warn!("Migration: inbound_source table failed: {e}");
+    }
+
     // Per-install / per-workflow plugin CONFIG (PLUGIN_CREDENTIAL_ONBOARDING
     // §A): non-secret plugin targets (account_id/folder_id/…) scoped board →
     // tenant, replacing the global env stopgap. Creates `plugin_config`.

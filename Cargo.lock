@@ -786,6 +786,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
+ "blake3",
  "ed25519-dalek 2.2.0",
  "getrandom 0.2.16",
  "jsonwebtoken",

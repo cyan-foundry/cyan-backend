@@ -2909,6 +2909,7 @@ pub mod constitution;
 pub mod constitution_hard;
 pub mod dashboard;
 pub mod exec_plan;
+pub mod inbound;
 pub mod ingest;
 pub mod ingest_connectors;
 pub mod llm;
