@@ -1,0 +1,41 @@
+{
+ "comment": "Pinned cross-repo parity vectors for A1 P-4 batch_note_id (ORCH-2). Input string = 'structrow:'+kind+':'+board_id+':'+natural_key, hashed blake3, full 64-hex lowercase. natural_key inner separators are the literal 0x1F byte (escaped here as \\x1f); natural_key bytes are used VERBATIM as produced by A5's parse — no Unicode normalization. Minted at spec time 2026-07-12; any change is a contract break.",
+ "vectors": [
+  {
+   "kind": "shot-log",
+   "board_id": "stk-nh1-a",
+   "natural_key": "12A\\x1f3\\x1fA001",
+   "expected_id": "40a097ece7fbdd754e06f671574c87e301e5ce99f0ec71108159c80d1d9ff624"
+  },
+  {
+   "kind": "shot-log",
+   "board_id": "stk-nh1-a",
+   "natural_key": "12A\\x1f3\\x1f-",
+   "expected_id": "341ffc53f8091f58d93920d42052026eb1b414f3c8f04367f117bd3cc7def655"
+  },
+  {
+   "kind": "shot-log",
+   "board_id": "stk-sb2-a",
+   "natural_key": "4\\x1f12\\x1fB002",
+   "expected_id": "8b772a93492caf88972022c8a61cf41f6edcb0eb729de106daf632131bf35952"
+  },
+  {
+   "kind": "continuity",
+   "board_id": "stk-nh1-a",
+   "natural_key": "7\\x1f1",
+   "expected_id": "f194cc0777211e0ab13d5e63a85b4ec1a65fff6a67f8603f3e162ac14ce75b03"
+  },
+  {
+   "kind": "continuity",
+   "board_id": "st-jelly-idents",
+   "natural_key": "104\\x1f22",
+   "expected_id": "9444b99f3a3d0cb184717bd6ee54c954835130f9ef312476a3e359df5c69d874"
+  },
+  {
+   "kind": "shot-log",
+   "board_id": "stk-nh1-a",
+   "natural_key": "12Á\\x1f3\\x1fA001",
+   "expected_id": "cfb8c5726a35269aac2f7b182e06fd79a7fa3831ad209d2e35d5d374ce56e120"
+  }
+ ]
+}

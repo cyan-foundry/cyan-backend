@@ -117,6 +117,11 @@ fn scoped_note(
         updated_at: updated,
         scope: scope.to_string(),
         kind: kind.to_string(),
+        anchor_kind: None,
+        anchor_id: None,
+        origin_ref: None,
+        payload: None,
+        author_role: None,
     }
 }
 
@@ -278,16 +283,20 @@ fn legacy_wire_payload_defaults_scope_and_kind() {
 
 #[test]
 fn scope_and_kind_vocab_are_closed() {
-    for s in ["tenant", "group", "board"] {
+    // LENS_AI_NOTES P1: the scope chain grows to workflow/producer/user (user
+    // innermost, most specific). Still a CLOSED vocabulary — garbage rejects.
+    for s in ["tenant", "group", "board", "workflow", "producer", "user"] {
         assert!(dto::note_scope_valid(s), "{s} is a valid scope");
     }
-    for s in ["", "Board", "workspace", "cell"] {
+    for s in ["", "Board", "workspace", "cell", "zzz", "User"] {
         assert!(!dto::note_scope_valid(s), "{s:?} must be rejected");
     }
-    for k in ["constitution", "preference", "editor-note"] {
+    // LENS_AI_NOTES P1: `creative-dna` carries producer/house/director/studio/
+    // genre/feel/episodic material at any scope.
+    for k in ["constitution", "preference", "editor-note", "decision", "creative-dna"] {
         assert!(dto::note_kind_valid(k), "{k} is a valid kind");
     }
-    for k in ["", "Constitution", "note", "editor note"] {
+    for k in ["", "Constitution", "note", "editor note", "zzz", "creative_dna"] {
         assert!(!dto::note_kind_valid(k), "{k:?} must be rejected");
     }
 }

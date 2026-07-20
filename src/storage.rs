@@ -614,6 +614,13 @@ pub fn board_set_mode(board_id: &str, mode: &str) -> Result<()> {
 
 pub fn board_get_workspace_id(board_id: &str) -> Option<String> {
     let conn = db().lock_safe();
+    board_get_workspace_id_with(&conn, board_id)
+}
+
+/// `board_get_workspace_id` against an ALREADY-HELD connection (A2 §5: the
+/// resolver's `project` chain link — twin of `board_get_group_id_with`; the
+/// non-reentrant global-mutex house rule).
+pub fn board_get_workspace_id_with(conn: &rusqlite::Connection, board_id: &str) -> Option<String> {
     let mut stmt = conn.prepare("SELECT workspace_id FROM objects WHERE id=?1 AND type='whiteboard' LIMIT 1").ok()?;
     stmt.query_row(params![board_id], |r| r.get(0)).optional().ok()?
 }
@@ -643,11 +650,14 @@ pub fn board_list_by_workspaces(workspace_ids: &[String]) -> Result<Vec<Whiteboa
 /// Insert a chat keyed to a **board** (R11 §1). Chat is board-scoped: the row carries both
 /// `board_id` (the scope key chat is listed by) and `workspace_id` (kept so the existing
 /// workspace→group snapshot scoping and group gossip resolution are unchanged).
-pub fn chat_insert(id: &str, board_id: &str, workspace_id: &str, message: &str, author: &str, parent_id: Option<&str>, timestamp: i64) -> Result<()> {
+/// CHAT C1 (additive): `anchor_kind`/`anchor_id` persist the message's step/board anchor;
+/// `None` (every pre-C1 row and caller) means the board's general slot.
+#[allow(clippy::too_many_arguments)]
+pub fn chat_insert(id: &str, board_id: &str, workspace_id: &str, message: &str, author: &str, parent_id: Option<&str>, timestamp: i64, anchor_kind: Option<&str>, anchor_id: Option<&str>) -> Result<()> {
     let conn = db().lock_safe();
     conn.execute(
-        "INSERT OR IGNORE INTO objects (id, board_id, workspace_id, type, name, hash, data, created_at) VALUES (?1, ?2, ?3, 'chat', ?4, ?5, ?6, ?7)",
-        params![id, board_id, workspace_id, message, author, parent_id.map(|s| s.as_bytes()), timestamp],
+        "INSERT OR IGNORE INTO objects (id, board_id, workspace_id, type, name, hash, data, created_at, anchor_kind, anchor_id) VALUES (?1, ?2, ?3, 'chat', ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![id, board_id, workspace_id, message, author, parent_id.map(|s| s.as_bytes()), timestamp, anchor_kind, anchor_id],
     )?;
     Ok(())
 }
@@ -665,7 +675,7 @@ pub fn chat_get_workspace_id(chat_id: &str) -> Option<String> {
 }
 
 /// Map a `ChatDTO` out of an `objects` chat row selected as
-/// `(id, board_id, workspace_id, name, hash, data, created_at)`.
+/// `(id, board_id, workspace_id, name, hash, data, created_at, anchor_kind, anchor_id)`.
 fn chat_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChatDTO> {
     let parent_bytes: Option<Vec<u8>> = r.get(5)?;
     let parent_id = parent_bytes.and_then(|b| String::from_utf8(b).ok());
@@ -677,6 +687,8 @@ fn chat_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChatDTO> {
         author: r.get(4)?,
         parent_id,
         timestamp: r.get(6)?,
+        anchor_kind: r.get(7)?,
+        anchor_id: r.get(8)?,
     })
 }
 
@@ -688,7 +700,7 @@ pub fn chat_list_by_workspaces(workspace_ids: &[String]) -> Result<Vec<ChatDTO>>
     let conn = db().lock_safe();
     let placeholders: String = workspace_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT id, board_id, workspace_id, name, hash, data, created_at
+        "SELECT id, board_id, workspace_id, name, hash, data, created_at, anchor_kind, anchor_id
          FROM objects WHERE type = 'chat' AND workspace_id IN ({}) ORDER BY created_at",
         placeholders
     );
@@ -704,7 +716,7 @@ pub fn chat_list_by_workspaces(workspace_ids: &[String]) -> Result<Vec<ChatDTO>>
 pub fn chat_list_by_board(board_id: &str) -> Result<Vec<ChatDTO>> {
     let conn = db().lock_safe();
     let mut stmt = conn.prepare(
-        "SELECT id, board_id, workspace_id, name, hash, data, created_at
+        "SELECT id, board_id, workspace_id, name, hash, data, created_at, anchor_kind, anchor_id
          FROM objects WHERE type = 'chat' AND board_id = ?1 ORDER BY created_at"
     )?;
     let rows = stmt.query_map(params![board_id], chat_from_row)?;
@@ -716,7 +728,7 @@ pub fn chat_list_by_board(board_id: &str) -> Result<Vec<ChatDTO>> {
 pub fn chat_list_by_workspace(workspace_id: &str) -> Result<Vec<ChatDTO>> {
     let conn = db().lock_safe();
     let mut stmt = conn.prepare(
-        "SELECT id, board_id, workspace_id, name, hash, data, created_at
+        "SELECT id, board_id, workspace_id, name, hash, data, created_at, anchor_kind, anchor_id
          FROM objects WHERE type = 'chat' AND workspace_id = ?1 ORDER BY created_at"
     )?;
     let rows = stmt.query_map(params![workspace_id], chat_from_row)?;
@@ -770,9 +782,12 @@ fn migrate_chats_to_boards_conn(conn: &Connection) -> Result<usize> {
 /// edits. Returns `true` iff a row was inserted or updated (i.e. state changed).
 pub fn note_upsert(n: &NoteDTO) -> Result<bool> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    // A1: the typed payload persists as its serialized JSON (nullable TEXT column —
+    // absent stays NULL so a pre-A1 row keeps reading back `None`).
+    let payload_json = n.payload.as_ref().map(|p| p.to_string());
     let changed = conn.execute(
-        "INSERT INTO notes (id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "INSERT INTO notes (id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref, payload_json, author_role)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(id) DO UPDATE SET
             board_id    = excluded.board_id,
             tenant_id   = excluded.tenant_id,
@@ -781,11 +796,17 @@ pub fn note_upsert(n: &NoteDTO) -> Result<bool> {
             text        = excluded.text,
             updated_at  = excluded.updated_at,
             scope       = excluded.scope,
-            kind        = excluded.kind
+            kind        = excluded.kind,
+            anchor_kind = excluded.anchor_kind,
+            anchor_id   = excluded.anchor_id,
+            origin_ref  = excluded.origin_ref,
+            payload_json = excluded.payload_json,
+            author_role = excluded.author_role
          WHERE excluded.updated_at > notes.updated_at",
         params![
             n.id, n.board_id, n.tenant_id, n.author_id, n.author_name, n.text,
-            n.created_at, n.updated_at, n.scope, n.kind
+            n.created_at, n.updated_at, n.scope, n.kind,
+            n.anchor_kind, n.anchor_id, n.origin_ref, payload_json, n.author_role
         ],
     )?;
     Ok(changed > 0)
@@ -796,7 +817,7 @@ pub fn note_upsert(n: &NoteDTO) -> Result<bool> {
 pub fn note_list_by_board(board_id: &str, tenant_id: &str) -> Result<Vec<NoteDTO>> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
     let mut stmt = conn.prepare(
-        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref, payload_json, author_role
          FROM notes WHERE board_id = ?1 AND tenant_id = ?2 ORDER BY created_at",
     )?;
     let rows = stmt.query_map(params![board_id, tenant_id], note_from_row)?;
@@ -820,6 +841,11 @@ pub fn note_list_scoped(
 /// `note_list_scoped` against an ALREADY-HELD connection — for callers running
 /// inside a dispatch that owns the global DB mutex (re-locking self-deadlocks;
 /// the std Mutex is not reentrant). Same pattern as `board_get_group_id_with`.
+///
+/// A1 pre-migration tolerance: `_with` fns accept CALLER-OWNED connections whose
+/// `notes` table may predate the A1 columns (frozen consumers build their own
+/// schemas) — when `payload_json` is missing, fall back to the pre-A1 column
+/// list; the two new fields read back `None` (TR-1: readers degrade, never error).
 pub fn note_list_scoped_with(
     conn: &rusqlite::Connection,
     tenant_id: &str,
@@ -827,18 +853,28 @@ pub fn note_list_scoped_with(
     anchor_id: &str,
     kind: &str,
 ) -> Result<Vec<NoteDTO>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind
-         FROM notes
+    let where_clause = "FROM notes
          WHERE tenant_id = ?1 AND scope = ?2 AND board_id = ?3 AND kind = ?4
-         ORDER BY created_at, id",
-    )?;
+         ORDER BY created_at, id";
+    let mut stmt = match conn.prepare(&format!(
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref, payload_json, author_role {where_clause}"
+    )) {
+        Ok(s) => s,
+        Err(_) => conn.prepare(&format!(
+            "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref {where_clause}"
+        ))?,
+    };
     let rows = stmt.query_map(params![tenant_id, scope, anchor_id, kind], note_from_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 /// List all notes attached to the given boards (for the digest + snapshot serializer).
 /// A group is a single tenant, so this is naturally tenant-scoped by the board set.
+///
+/// LENS_AI_NOTES P1 — USER SCOPE IS SOVEREIGN: `scope = 'user'` rows are excluded
+/// OUTRIGHT. This is the single feed behind snapshot + anti-entropy, so filtering
+/// here guarantees a user-scoped note never leaves the device on either lane, even
+/// if its anchor id ever collided with a board/group id.
 pub fn note_list_by_boards(board_ids: &[String]) -> Result<Vec<NoteDTO>> {
     if board_ids.is_empty() {
         return Ok(vec![]);
@@ -846,8 +882,8 @@ pub fn note_list_by_boards(board_ids: &[String]) -> Result<Vec<NoteDTO>> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
     let placeholders: String = board_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind
-         FROM notes WHERE board_id IN ({}) ORDER BY created_at",
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref, payload_json, author_role
+         FROM notes WHERE board_id IN ({}) AND scope != 'user' ORDER BY created_at",
         placeholders
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -862,12 +898,121 @@ pub fn note_list_by_boards(board_ids: &[String]) -> Result<Vec<NoteDTO>> {
 pub fn note_get(id: &str) -> Result<Option<NoteDTO>> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
     let mut stmt = conn.prepare(
-        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref, payload_json, author_role
          FROM notes WHERE id = ?1",
     )?;
     stmt.query_row(params![id], note_from_row)
         .optional()
         .map_err(Into::into)
+}
+
+/// List a role-scoped note lane (A1 §1): role rules are GROUP-anchored (so they
+/// actually replicate — the group id is a real gossip group and already in the
+/// sweep set), with the craft slug riding the anchor pair (`anchor_kind = 'role'`,
+/// `anchor_id = '<slug>'`). Rides `idx_notes_tenant_scope_kind`; deterministic
+/// order like every resolver query.
+pub fn note_list_role_scoped(
+    tenant_id: &str,
+    group_anchor: &str,
+    role_slug: &str,
+    kind: &str,
+) -> Result<Vec<NoteDTO>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    note_list_role_scoped_with(&conn, tenant_id, group_anchor, role_slug, kind)
+}
+
+/// `note_list_role_scoped` against an ALREADY-HELD connection (the non-reentrant
+/// global-mutex house rule — same pattern as `note_list_scoped_with`, including
+/// its pre-A1-table fallback for caller-owned connections).
+pub fn note_list_role_scoped_with(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    group_anchor: &str,
+    role_slug: &str,
+    kind: &str,
+) -> Result<Vec<NoteDTO>> {
+    let where_clause = "FROM notes
+         WHERE tenant_id = ?1 AND scope = 'role' AND board_id = ?2 AND anchor_kind = 'role' AND anchor_id = ?3 AND kind = ?4
+         ORDER BY created_at, id";
+    let mut stmt = match conn.prepare(&format!(
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref, payload_json, author_role {where_clause}"
+    )) {
+        Ok(s) => s,
+        Err(_) => conn.prepare(&format!(
+            "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref {where_clause}"
+        ))?,
+    };
+    let rows =
+        stmt.query_map(params![tenant_id, group_anchor, role_slug, kind], note_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// A2 §1 — the TENANT-KEYED sync feed (digest + snapshot watermark + snapshot
+/// serializer): every non-sovereign note the tenant holds, whatever its scope
+/// anchor. Replaces the anchor-set sweep (`note_list_by_boards`) at the three
+/// replication sites, which closes the pre-existing workflow/producer
+/// convergence gap AND carries the NEW `project` scope (whose anchor — a
+/// workspace id — was never in the anchor set). The sovereignty clause is
+/// copied verbatim: `scope != 'user'` — a user-scoped note never leaves the
+/// device on either lane. Deterministic order (`id`) so two peers with equal
+/// state digest identically.
+pub fn note_list_for_sync(tenant_id: &str) -> Result<Vec<NoteDTO>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    note_list_for_sync_with(&conn, tenant_id)
+}
+
+/// `note_list_for_sync` against an ALREADY-HELD connection (the non-reentrant
+/// global-mutex house rule; pre-A1-table fallback like `note_list_scoped_with`).
+pub fn note_list_for_sync_with(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+) -> Result<Vec<NoteDTO>> {
+    let where_clause = "FROM notes WHERE tenant_id = ?1 AND scope != 'user' ORDER BY id";
+    let mut stmt = match conn.prepare(&format!(
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref, payload_json, author_role {where_clause}"
+    )) {
+        Ok(s) => s,
+        Err(_) => conn.prepare(&format!(
+            "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref {where_clause}"
+        ))?,
+    };
+    let rows = stmt.query_map(params![tenant_id], note_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// A2 — the NULL-kind scoped read behind `cyan_note_list_scoped` (SYN-6): every
+/// kind at one (tenant, scope, anchor). Same tenant enforcement + deterministic
+/// order as `note_list_scoped`.
+pub fn note_list_scoped_any_kind(
+    tenant_id: &str,
+    scope: &str,
+    anchor_id: &str,
+) -> Result<Vec<NoteDTO>> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    note_list_scoped_any_kind_with(&conn, tenant_id, scope, anchor_id)
+}
+
+/// `note_list_scoped_any_kind` against an ALREADY-HELD connection (house rule;
+/// pre-A1-table fallback like `note_list_scoped_with`).
+pub fn note_list_scoped_any_kind_with(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    scope: &str,
+    anchor_id: &str,
+) -> Result<Vec<NoteDTO>> {
+    let where_clause = "FROM notes
+         WHERE tenant_id = ?1 AND scope = ?2 AND board_id = ?3
+         ORDER BY created_at, id";
+    let mut stmt = match conn.prepare(&format!(
+        "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref, payload_json, author_role {where_clause}"
+    )) {
+        Ok(s) => s,
+        Err(_) => conn.prepare(&format!(
+            "SELECT id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at, scope, kind, anchor_kind, anchor_id, origin_ref {where_clause}"
+        ))?,
+    };
+    let rows = stmt.query_map(params![tenant_id, scope, anchor_id], note_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 /// Delete a note by id (hard delete, mirrors `chat_delete`).
@@ -878,8 +1023,23 @@ pub fn note_delete(id: &str) -> Result<()> {
 }
 
 fn note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteDTO> {
+    // A1 (GC-3 / TR-1 tolerant read): a payload that fails to parse reads back as
+    // `None` + a warn — the row is ALWAYS returned, never dropped, never an error.
+    // Columns 13/14 are read tolerantly so the pre-A1 SELECT fallback (see
+    // `note_list_scoped_with`) maps through the same fn.
+    let id: String = r.get(0)?;
+    let payload = r
+        .get::<_, Option<String>>(13)
+        .unwrap_or(None)
+        .and_then(|s| match serde_json::from_str::<serde_json::Value>(&s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("note {id}: payload_json parse failed, reading as None: {e}");
+                None
+            }
+        });
     Ok(NoteDTO {
-        id: r.get(0)?,
+        id,
         board_id: r.get(1)?,
         tenant_id: r.get(2)?,
         author_id: r.get(3)?,
@@ -889,6 +1049,11 @@ fn note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteDTO> {
         updated_at: r.get(7)?,
         scope: r.get(8)?,
         kind: r.get(9)?,
+        anchor_kind: r.get(10)?,
+        anchor_id: r.get(11)?,
+        origin_ref: r.get(12)?,
+        payload,
+        author_role: r.get::<_, Option<String>>(14).unwrap_or(None),
     })
 }
 
@@ -901,23 +1066,43 @@ fn note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteDTO> {
 /// (see `templates::seed_templates`) and are never written to the DB.
 pub fn template_insert(t: &Template) -> Result<()> {
     let steps_json = serde_json::to_string(&t.steps)?;
+    // A3 (additive, nullable): the roletype columns persist as JSON/text; a
+    // legacy template (all fields default) writes NULLs — indistinguishable
+    // from a pre-A3 row, exactly the wire posture.
+    let stages_json = if t.stages.is_empty() { None } else { Some(serde_json::to_string(&t.stages)?) };
+    let note_kinds_json =
+        if t.note_kinds.is_empty() { None } else { Some(serde_json::to_string(&t.note_kinds)?) };
+    let plugins_json = if t.plugins.is_empty() { None } else { Some(serde_json::to_string(&t.plugins)?) };
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
     conn.execute(
-        "INSERT OR REPLACE INTO templates (id, tenant_id, name, description, source, steps_json, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![t.id, t.tenant_id, t.name, t.description, t.source, steps_json, t.created_at],
+        "INSERT OR REPLACE INTO templates (id, tenant_id, name, description, source, steps_json, created_at,
+                                           format_type, stages_json, note_kinds_json, plugins_json, maturity, catalog_version, scope)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            t.id, t.tenant_id, t.name, t.description, t.source, steps_json, t.created_at,
+            t.format_type, stages_json, note_kinds_json, plugins_json, t.maturity,
+            t.catalog_version, t.scope
+        ],
     )?;
     Ok(())
 }
+
+const TEMPLATE_COLS_V2: &str = "id, tenant_id, name, description, source, steps_json, created_at, \
+     format_type, stages_json, note_kinds_json, plugins_json, maturity, catalog_version, scope";
+const TEMPLATE_COLS_V1: &str = "id, tenant_id, name, description, source, steps_json, created_at";
 
 /// List the user templates owned by `tenant_id` (tenant-scoped — a user template never
 /// crosses the tenant boundary). Built-in seeds are merged in by `templates::list_templates`.
 pub fn template_list_by_tenant(tenant_id: &str) -> Result<Vec<Template>> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
-    let mut stmt = conn.prepare(
-        "SELECT id, tenant_id, name, description, source, steps_json, created_at
-         FROM templates WHERE tenant_id = ?1 ORDER BY created_at",
-    )?;
+    let where_clause = "FROM templates WHERE tenant_id = ?1 ORDER BY created_at";
+    // Pre-A3-column fallback (the A1 note_list_scoped_with recipe): a
+    // caller-owned schema without the roletype columns reads the v1 list; the
+    // new fields come back as their serde defaults.
+    let mut stmt = match conn.prepare(&format!("SELECT {TEMPLATE_COLS_V2} {where_clause}")) {
+        Ok(s) => s,
+        Err(_) => conn.prepare(&format!("SELECT {TEMPLATE_COLS_V1} {where_clause}"))?,
+    };
     let rows = stmt.query_map(params![tenant_id], template_from_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
@@ -926,10 +1111,11 @@ pub fn template_list_by_tenant(tenant_id: &str) -> Result<Vec<Template>> {
 /// unknown OR belongs to a different tenant (no cross-tenant read).
 pub fn template_get(id: &str, tenant_id: &str) -> Result<Option<Template>> {
     let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
-    let mut stmt = conn.prepare(
-        "SELECT id, tenant_id, name, description, source, steps_json, created_at
-         FROM templates WHERE id = ?1 AND tenant_id = ?2",
-    )?;
+    let where_clause = "FROM templates WHERE id = ?1 AND tenant_id = ?2";
+    let mut stmt = match conn.prepare(&format!("SELECT {TEMPLATE_COLS_V2} {where_clause}")) {
+        Ok(s) => s,
+        Err(_) => conn.prepare(&format!("SELECT {TEMPLATE_COLS_V1} {where_clause}"))?,
+    };
     stmt.query_row(params![id, tenant_id], template_from_row)
         .optional()
         .map_err(Into::into)
@@ -938,14 +1124,44 @@ pub fn template_get(id: &str, tenant_id: &str) -> Result<Option<Template>> {
 fn template_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Template> {
     let steps_json: String = r.get(5)?;
     let steps = serde_json::from_str(&steps_json).unwrap_or_default();
+    // A3 columns are read tolerantly (the note_from_row recipe): absent columns
+    // (pre-A3 SELECT fallback) or NULLs map to the serde defaults; a JSON parse
+    // failure degrades to the default + warn, the row is always returned.
+    let json_col = |idx: usize| -> Option<String> { r.get::<_, Option<String>>(idx).unwrap_or(None) };
+    let id: String = r.get(0)?;
+    fn parse_or_default<T: serde::de::DeserializeOwned + Default>(
+        raw: Option<String>,
+        id: &str,
+        what: &str,
+    ) -> T {
+        raw.and_then(|s| match serde_json::from_str(&s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("template {id}: {what} parse failed, reading as default: {e}");
+                None
+            }
+        })
+        .unwrap_or_default()
+    }
+    let stages: Vec<String> = parse_or_default(json_col(8), &id, "stages_json");
+    let note_kinds: Vec<String> = parse_or_default(json_col(9), &id, "note_kinds_json");
+    let plugins: Vec<crate::models::dto::TemplatePlugin> =
+        parse_or_default(json_col(10), &id, "plugins_json");
     Ok(Template {
-        id: r.get(0)?,
+        id: id.clone(),
         tenant_id: r.get(1)?,
         name: r.get(2)?,
         description: r.get(3)?,
         source: r.get(4)?,
         steps,
         created_at: r.get(6)?,
+        format_type: json_col(7),
+        stages,
+        note_kinds,
+        plugins,
+        maturity: json_col(11),
+        catalog_version: json_col(12),
+        scope: json_col(13),
     })
 }
 
@@ -1678,6 +1894,19 @@ pub struct PluginBundleFile {
 /// `local_path` is set), is an installed plugin the local MCP host should run.
 /// It reuses the existing files/objects scope — no new tables and no new FFI; the
 /// app just sees a file appear in a workspace.
+///
+/// TOMBSTONED bundles are EXCLUDED (R10FB §F4 — "all file reads filter deleted=0";
+/// this read was the lone exception). That filter is what makes uninstall real: the
+/// only removal path is the ordinary file tombstone (`CommandMsg::DeleteFile` →
+/// [`file_soft_delete`] → `NetworkEvent::FileDeleted`, which converges to peers),
+/// and without this predicate the tombstone had NO observable effect — the row kept
+/// listing here, so `workflow::autocomplete_index` kept offering `@plugin.` and an
+/// accidentally-installed plugin could not be removed at all (found live 2026-07-15).
+///
+/// Bytes are deliberately NOT consulted: `plugin_bundles_dir()` is device-global and
+/// keyed by plugin id alone, while an install is per-group. The `objects` row is the
+/// per-group install fact; the bundle file is a shared device cache another group may
+/// still be using. Uninstall tombstones the row and leaves the bytes.
 pub fn plugin_bundles_in_group(
     group_id: &str,
     workspace_name: &str,
@@ -1693,6 +1922,7 @@ pub fn plugin_bundles_in_group(
            AND w.name = ?2
            AND o.local_path IS NOT NULL
            AND o.name LIKE '%' || ?3
+           AND COALESCE(o.deleted, 0) = 0
          ORDER BY o.name",
     )?;
     let rows = stmt.query_map(params![group_id, workspace_name, suffix], |r| {
@@ -2854,6 +3084,30 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
          ON notes(tenant_id, scope, board_id, kind)",
         [],
     );
+    // CHAT C1/C7 (Anchored Lane, additive): chat rows (in `objects`) and notes gain an
+    // optional step/board anchor; notes additionally gain provenance (`origin_ref`,
+    // `chat:<message_id>` for promoted notes). Nullable columns — every pre-C1/C7 row
+    // reads back as NULL ⇒ unanchored, exactly the prior behavior. Idempotent.
+    if conn.prepare("SELECT anchor_kind FROM objects LIMIT 1").is_err() {
+        tracing::info!("Migration: adding anchor_kind/anchor_id columns to objects (chat C1)");
+        let _ = conn.execute("ALTER TABLE objects ADD COLUMN anchor_kind TEXT", []);
+        let _ = conn.execute("ALTER TABLE objects ADD COLUMN anchor_id TEXT", []);
+    }
+    if conn.prepare("SELECT anchor_kind FROM notes LIMIT 1").is_err() {
+        tracing::info!("Migration: adding anchor_kind/anchor_id/origin_ref columns to notes (chat C7)");
+        let _ = conn.execute("ALTER TABLE notes ADD COLUMN anchor_kind TEXT", []);
+        let _ = conn.execute("ALTER TABLE notes ADD COLUMN anchor_id TEXT", []);
+        let _ = conn.execute("ALTER TABLE notes ADD COLUMN origin_ref TEXT", []);
+    }
+    // A1 structured notes: notes gain a per-kind typed payload + the author's craft
+    // role. Nullable, NO DEFAULT — a pre-A1 row must read back as `None`, never
+    // `Some(json!({}))` (deliberate delta from the IntegrationBindingDTO.config
+    // `DEFAULT '{}'` precedent). Idempotent probe-by-SELECT, the C7 pattern.
+    if conn.prepare("SELECT payload_json FROM notes LIMIT 1").is_err() {
+        tracing::info!("Migration: adding payload_json/author_role columns to notes (A1)");
+        let _ = conn.execute("ALTER TABLE notes ADD COLUMN payload_json TEXT", []);
+        let _ = conn.execute("ALTER TABLE notes ADD COLUMN author_role TEXT", []);
+    }
 
     // ROUND8 §W4: templates — a pre-written English workflow (steps + bound plugins)
     // cloned into a board. Own store; user templates are tenant-scoped (built-in seeds
@@ -3021,6 +3275,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         tracing::warn!("Migration: ingest tables failed: {e}");
     }
 
+    // GAP 2 inbound (PULL): watched inbound plugin sources (cyan-email) whose
+    // polled events route to board notes. Creates `inbound_source`. Idempotent
+    // (CREATE TABLE IF NOT EXISTS); additive — no existing table or behavior
+    // changes.
+    if let Err(e) = crate::inbound::migrate(conn) {
+        tracing::warn!("Migration: inbound_source table failed: {e}");
+    }
+
     // Per-install / per-workflow plugin CONFIG (PLUGIN_CREDENTIAL_ONBOARDING
     // §A): non-secret plugin targets (account_id/folder_id/…) scoped board →
     // tenant, replacing the global env stopgap. Creates `plugin_config`.
@@ -3029,6 +3291,73 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         tracing::warn!("Migration: plugin_config table failed: {e}");
     }
 
+    // B4 — per-step edit history (undo/redo stacks). Creates
+    // `cell_edit_history`. Idempotent; additive.
+    if let Err(e) = crate::step_history::migrate(conn) {
+        tracing::warn!("Migration: cell_edit_history table failed: {e}");
+    }
+
+    // A2 §7 — device-local k/v prefs (`production_role`). NEVER synced by
+    // construction: snapshot/anti-entropy enumerate their tables explicitly and
+    // `local_prefs` is never wired in (T35 pins it). Idempotent; additive.
+    if conn.prepare("SELECT k FROM local_prefs LIMIT 1").is_err() {
+        tracing::info!("Migration: creating local_prefs table (A2)");
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS local_prefs (k TEXT PRIMARY KEY, v TEXT NOT NULL)",
+            [],
+        );
+    }
+
+    // A3 — roletype template columns (format_type/stages/note_kinds/plugins/
+    // maturity/catalog_version/scope, all nullable). Idempotent; additive.
+    if let Err(e) = crate::role_templates::migrate(conn) {
+        tracing::warn!("Migration: roletype template columns failed: {e}");
+    }
+
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LOCAL PREFS (A2 §7 — device-local k/v; sovereign by construction)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The device craft-role pref key (§7). Exactly two writers (XP-1): package B's
+/// LandingRouter rung 0 (`cyan_set_production_role` on every landing fetch that
+/// carries the field) and any manual settings surface — last write wins. The ONE
+/// device-side source for both the resolver's role chain link (§5) and iOS's
+/// `author_role` stamping (§8 S3). The PREF never leaves the device; the
+/// group-replicated `## Role: <slug>` SECTION it selects does ride the derived
+/// markdown (D9).
+pub const PREF_PRODUCTION_ROLE: &str = "production_role";
+
+/// Read one device-local pref. `None` = unset. Never replicated: the snapshot
+/// serializer and the anti-entropy digest enumerate their tables explicitly and
+/// this one is not among them.
+pub fn local_pref_get(key: &str) -> Option<String> {
+    let conn = db().lock_safe();
+    local_pref_get_with(&conn, key)
+}
+
+/// `local_pref_get` against an ALREADY-HELD connection (the resolver reads the
+/// `production_role` pref inside its one read set — house rule).
+pub fn local_pref_get_with(conn: &rusqlite::Connection, key: &str) -> Option<String> {
+    let mut stmt = conn.prepare("SELECT v FROM local_prefs WHERE k = ?1").ok()?;
+    stmt.query_row(params![key], |r| r.get(0)).optional().ok()?
+}
+
+/// Write (upsert) one device-local pref. An empty `value` DELETES the row
+/// (`cyan_set_production_role("")` clears).
+pub fn local_pref_set(key: &str, value: &str) -> Result<()> {
+    let conn = db().lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    if value.is_empty() {
+        conn.execute("DELETE FROM local_prefs WHERE k = ?1", params![key])?;
+    } else {
+        conn.execute(
+            "INSERT INTO local_prefs (k, v) VALUES (?1, ?2)
+             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            params![key, value],
+        )?;
+    }
     Ok(())
 }
 
@@ -3158,15 +3487,18 @@ pub fn cell_insert_simple(
 }
 
 /// Insert a chat by individual fields (for snapshot sync). Carries `board_id` so a synced
-/// chat lands on the right board thread (R11 §1).
+/// chat lands on the right board thread (R11 §1). CHAT C1: anchors ride the snapshot too,
+/// so a late-joining peer sees the same threads as everyone else.
+#[allow(clippy::too_many_arguments)]
 pub fn chat_insert_simple(
     id: &str, board_id: &str, workspace_id: &str, message: &str,
     author: &str, parent_id: Option<&str>, timestamp: i64,
+    anchor_kind: Option<&str>, anchor_id: Option<&str>,
 ) -> Result<()> {
     let conn = db().lock_safe();
     conn.execute(
-        "INSERT OR IGNORE INTO objects (id, board_id, workspace_id, type, name, hash, data, created_at) VALUES (?1, ?2, ?3, 'chat', ?4, ?5, ?6, ?7)",
-        params![id, board_id, workspace_id, message, author, parent_id.map(|s| s.as_bytes()), timestamp],
+        "INSERT OR IGNORE INTO objects (id, board_id, workspace_id, type, name, hash, data, created_at, anchor_kind, anchor_id) VALUES (?1, ?2, ?3, 'chat', ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![id, board_id, workspace_id, message, author, parent_id.map(|s| s.as_bytes()), timestamp, anchor_kind, anchor_id],
     )?;
     Ok(())
 }

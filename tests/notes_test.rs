@@ -93,6 +93,11 @@ fn note(id: &str, board: &str, tenant: &str, text: &str, created: i64, updated: 
         // original board-note behavior, which must stay byte-for-byte intact.
         scope: "board".to_string(),
         kind: "editor-note".to_string(),
+        anchor_kind: None,
+        anchor_id: None,
+        origin_ref: None,
+        payload: None,
+        author_role: None,
     }
 }
 

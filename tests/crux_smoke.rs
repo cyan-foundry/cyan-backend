@@ -126,6 +126,8 @@ async fn crux_pipeline_runs_live_mcp_tool_end_to_end() {
         timeout_seconds: Some(30),
         retry_count: Some(1),
         auto_advance: false,
+        review_hold: false,
+        waiting_on: None,
         notifications: vec![],
         state: PipelineStepState::default(),
     };

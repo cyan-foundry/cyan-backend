@@ -151,12 +151,11 @@ pub fn group_digest(group_id: &str) -> (u64, String) {
     }
     // ROUND8 §W2: notes are board-level + mutable (LWW) — version on `updated_at`, so an
     // edit flips the hash and the sweep pulls the latest, exactly like a mutable cell.
-    // feat/notes-constitution: group/tenant-SCOPED notes anchor at the GROUP id (tenant ==
-    // group id), so the group id joins the anchor set — otherwise a scoped note would be
-    // invisible to the sweep and never converge.
-    let mut note_anchor_ids = board_ids.clone();
-    note_anchor_ids.push(group_id.to_string());
-    for nt in storage::note_list_by_boards(&note_anchor_ids).unwrap_or_default() {
+    // A2 §4a: the feed is TENANT-KEYED (`note_list_for_sync`, tenant == group id) rather
+    // than anchor-set-keyed — so `project` rows (workspace-anchored) and the previously
+    // convergence-dead `workflow`/`producer` anchors join the sweep (flagged delta);
+    // `scope != 'user'` sovereignty is enforced inside the feed itself.
+    for nt in storage::note_list_for_sync(group_id).unwrap_or_default() {
         entries.push(format!("n{SEP}{}{SEP}{}", nt.id, nt.updated_at));
     }
     // ROUND8 §W4: pinned-workflow state is board-level + mutable (LWW) — version on

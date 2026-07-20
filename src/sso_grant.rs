@@ -27,15 +27,16 @@
 //! Tokens are `SecretString` end-to-end and are never logged or persisted in the
 //! clear.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use cyan_identity::{
-    Action, Actor, AuthZ, Decision, Grant, GrantVerifier, OrgGrantVerifier, Resource, Role,
-    RolePolicy, SignedRevocationList,
+    Action, Actor, AuthZ, Decision, Grant, GrantVerifier, OrgGrantVerifier, OrgPubKey, Resource,
+    Role, RolePolicy, SignedRevocationList,
 };
 use secrecy::SecretString;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::models::commands::NetworkCommand;
 
@@ -271,6 +272,178 @@ impl SignIn {
     pub const fn local_read_allowed(&self) -> bool {
         true
     }
+}
+
+// ============================================================================
+// A2 §7 — the INSTALLED session (the ONE process-global RBAC tier source)
+// ============================================================================
+//
+// Grounded gap this closes: `sign_in()` had ZERO callers, `GrantCache` was
+// unwired, and no FFI verb accepted a grant. `cyan_sso_install_grant` (ffi/core)
+// is the front door; this module owns the verify + seed + store core so tests
+// drive it without the FFI layer.
+//
+// GrantCache is UNTOUCHED by install (its prod backing is the iOS keychain —
+// account `cyan_session_grant`, service `io.blockxaero.cyan.sso`, D-A2.20; iOS
+// re-installs each launch after `cyan_init_with_identity`; the engine persists
+// nothing). `SsoSession` resolves offline from the cached token.
+//
+// Honesty (R9): revocation is checked at VERIFY (install) time only — a
+// revoked-but-unexpired grant stays Active until exp+grace / sign-out /
+// re-install; mitigation = short broker TTLs.
+//
+// Writers of the device `production_role` pref (cross-package XP-1) are NOT
+// here — that pref is a `local_prefs` row (storage); this global is org-RBAC
+// (tier) only, never craft-role provenance.
+
+/// A verified, installed SSO session plus its offline grace window.
+pub struct InstalledSession {
+    pub session: SsoSession,
+    pub grace_secs: u64,
+}
+
+/// The process-global installed session. `None` = fail-open (`NoSession`);
+/// `Some` = Active until `exp + grace`, then fail-open again (`Expired`) —
+/// the tier fn does the arithmetic per write, no timer.
+pub static SSO_SESSION: RwLock<Option<InstalledSession>> = RwLock::new(None);
+
+/// The RBAC tier fn (`notes_rbac`'s injected source): the installed session's
+/// role while live at `now` (`now <= exp + grace`), else `None` ⇒ fail-open.
+pub fn installed_tier_at(now: u64) -> Option<Role> {
+    let guard = SSO_SESSION.read().ok()?;
+    let installed = guard.as_ref()?;
+    let grant = installed.session.grant();
+    if now > grant.exp.saturating_add(installed.grace_secs) {
+        return None; // Expired past grace ⇒ fail-open locally (mesh/lens still enforce).
+    }
+    Some(installed.session.role())
+}
+
+/// [`installed_tier_at`] at the wall clock — the prod closure `dispatch_put_note`
+/// samples per write.
+pub fn installed_tier() -> Option<Role> {
+    installed_tier_at(chrono::Utc::now().timestamp().max(0) as u64)
+}
+
+/// Clear the installed session (`cyan_sso_sign_out`). Local data untouched.
+pub fn sign_out() {
+    if let Ok(mut guard) = SSO_SESSION.write() {
+        *guard = None;
+    }
+}
+
+/// The parsed `trust_json` of `cyan_sso_install_grant` (§7): `tenant` required;
+/// ≥1 trust source (`org_did` and/or `legacy_rsa_public_pem`) required; grace
+/// defaults to 7 days.
+#[derive(serde::Deserialize)]
+pub struct TrustConfig {
+    pub tenant: String,
+    #[serde(default)]
+    pub org_did: Option<String>,
+    #[serde(default)]
+    pub legacy_rsa_public_pem: Option<String>,
+    #[serde(default = "default_grace_secs")]
+    pub grace_secs: u64,
+}
+
+fn default_grace_secs() -> u64 {
+    604_800
+}
+
+/// Rebuild an [`OrgPubKey`] from its `did:cyan:<base64url-pubkey>` DID (the
+/// grant-issuer string a broker publishes; `OrgPubKey::did()` is the inverse).
+fn org_pubkey_from_did(did: &str) -> Result<OrgPubKey> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let b64 = did
+        .strip_prefix("did:cyan:")
+        .ok_or_else(|| anyhow::anyhow!("org_did must start with did:cyan:"))?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(b64)
+        .map_err(|e| anyhow::anyhow!("org_did key is not base64url: {e}"))?;
+    OrgPubKey::from_bytes(&bytes)
+}
+
+/// The verify + seed + store core behind `cyan_sso_install_grant` (§7, Seq 9).
+///
+/// Builds `OrgGrantVerifier::new(grace).trust_org(tenant, OrgPubKey::from(did))`
+/// [+ `.with_legacy(GrantVerifier::from_rsa_pem(pem, "cyan-lens", grace))`],
+/// verifies via [`SsoSession::from_org_token`] against `xaero_pubkey` (the
+/// engine identity from `cyan_init_with_identity`) at `now`, and on success:
+/// seeds the granted groups through the EXISTING `JoinGroup` path (the
+/// `sign_in()` pattern; `network_tx == None` in storage-only tests skips the
+/// seed), stores the session in [`SSO_SESSION`], and returns
+/// `{"active":true,"tenant":…,"role":…,"exp":…}`.
+///
+/// On ANY failure the previously installed session is left UNTOUCHED and
+/// `{"active":false,"reason":…}` is returned — a bad re-install never signs the
+/// device out. GrantCache is never written (T24c).
+pub fn install_grant(
+    grant_token: &str,
+    trust_json: &str,
+    xaero_pubkey: &str,
+    now: u64,
+    network_tx: Option<&UnboundedSender<NetworkCommand>>,
+) -> serde_json::Value {
+    let fail = |reason: String| serde_json::json!({ "active": false, "reason": reason });
+
+    let trust: TrustConfig = match serde_json::from_str(trust_json) {
+        Ok(t) => t,
+        Err(e) => return fail(format!("bad trust_json: {e}")),
+    };
+    if trust.tenant.is_empty() {
+        return fail("trust_json.tenant required".to_string());
+    }
+    if trust.org_did.is_none() && trust.legacy_rsa_public_pem.is_none() {
+        return fail("no trust material".to_string());
+    }
+
+    let mut verifier = OrgGrantVerifier::new(trust.grace_secs);
+    if let Some(did) = trust.org_did.as_deref() {
+        match org_pubkey_from_did(did) {
+            Ok(org) => verifier = verifier.trust_org(trust.tenant.clone(), org),
+            Err(e) => return fail(format!("bad org_did: {e}")),
+        }
+    }
+    if let Some(pem) = trust.legacy_rsa_public_pem.as_deref() {
+        match GrantVerifier::from_rsa_pem(pem.as_bytes(), "cyan-lens", trust.grace_secs) {
+            Ok(legacy) => verifier = verifier.with_legacy(legacy),
+            Err(e) => return fail(format!("bad legacy_rsa_public_pem: {e}")),
+        }
+    }
+
+    let token = SecretString::new(grant_token.to_string());
+    let session = match SsoSession::from_org_token(&token, &verifier, xaero_pubkey, now) {
+        Ok(s) => s,
+        Err(e) => {
+            // Previously installed session stays untouched — verified above by T24/T24c.
+            return fail(format!("grant did not verify: {e}"));
+        }
+    };
+
+    // Seed granted groups via the EXISTING JoinGroup path (idempotent; the mesh
+    // capability grant is carried separately, so this join presents none).
+    if let Some(tx) = network_tx {
+        for group in session.groups() {
+            let _ = tx.send(NetworkCommand::JoinGroup {
+                group_id: group.clone(),
+                bootstrap_peer: None,
+                grant: None,
+            });
+        }
+    }
+
+    let out = serde_json::json!({
+        "active": true,
+        "tenant": session.tenant(),
+        "role": session.role().as_str(),
+        "exp": session.grant().exp,
+    });
+    if let Ok(mut guard) = SSO_SESSION.write() {
+        *guard = Some(InstalledSession { session, grace_secs: trust.grace_secs });
+    }
+    tracing::info!("obs sso_grant_installed tenant={} exp={}", out["tenant"], out["exp"]);
+    out
 }
 
 /// Sign in from a cached signed grant: verify it OFFLINE (signature + binding +

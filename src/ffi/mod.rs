@@ -4,7 +4,9 @@
 // This is the single source of truth for FFI - no duplicates in lib.rs.
 
 mod scaffold;
-mod core;
+// A2: `pub` so integration tests can call the `cyan_*` verbs as Rust paths —
+// visibility-only; the exported C symbols are unchanged.
+pub mod core;
 
 // Re-export scaffold utilities (used internally by FFI functions)
 

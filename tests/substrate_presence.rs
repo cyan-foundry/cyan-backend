@@ -211,6 +211,8 @@ async fn presence_matches_data_connectivity() {
             author: "node-0".to_string(),
             parent_id: None,
             timestamp: 1,
+            anchor_kind: None,
+            anchor_id: None,
         },
     );
     nodes[1]

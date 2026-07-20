@@ -47,7 +47,8 @@ fn db() -> Connection {
             id TEXT PRIMARY KEY, board_id TEXT NOT NULL, tenant_id TEXT NOT NULL,
             author_id TEXT, author_name TEXT, text TEXT NOT NULL,
             created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-            scope TEXT NOT NULL DEFAULT 'board', kind TEXT NOT NULL DEFAULT 'editor-note'
+            scope TEXT NOT NULL DEFAULT 'board', kind TEXT NOT NULL DEFAULT 'editor-note',
+            anchor_kind TEXT, anchor_id TEXT, origin_ref TEXT
         );
         CREATE TABLE IF NOT EXISTS workspaces (
             id TEXT PRIMARY KEY, group_id TEXT NOT NULL, name TEXT NOT NULL,
@@ -121,7 +122,11 @@ fn seed_with_note(conn: &Connection, proxy_ref: &str, note_text: &str) {
             outcome: None,
             updated_at: 0,
             updated_by: None,
-        },
+                referent: None,
+        region: None,
+        intent_struct: None,
+        capture_ctx: None,
+},
     )
     .expect("append seed level");
     rv::start_draft(conn, T, MASTER, B).expect("start_draft");

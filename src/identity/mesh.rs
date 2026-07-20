@@ -286,6 +286,18 @@ impl MeshAuthorizer {
             .map(|a| a.role)
     }
 
+    /// A2 notes RBAC (§6 enforcement point 2): the tier of an AUTHOR id in
+    /// `group_id` — the roster entry (`GroupRoster::role_of`, the authority
+    /// oracle seeded from group state) first, else the role a presented grant
+    /// recorded for that id. `None` = this node cannot tier the author (an
+    /// ENFORCED group then denies the note row; un-enforced groups never ask).
+    pub fn note_tier_of(&self, group_id: &str, author_id: &str) -> Option<Role> {
+        self.verifier
+            .roster()
+            .role_of(group_id, author_id)
+            .or_else(|| self.role_of_peer(group_id, author_id))
+    }
+
     /// Decide whether `peer_id` may write to `group_id`. Fail-open if the group is not enforced;
     /// otherwise the peer must hold a recorded, write-capable (Owner/Admin/Member) grant.
     pub fn authorize_write(&self, group_id: &str, peer_id: &str) -> WriteDecision {

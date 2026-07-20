@@ -256,6 +256,8 @@ async fn chat_delivers_during_large_transfer() {
             author: nodes[0].node_id.clone(),
             parent_id: None,
             timestamp: 1,
+            anchor_kind: None,
+            anchor_id: None,
         },
     );
 

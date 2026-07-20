@@ -814,6 +814,11 @@ async fn handle_verb(
                     updated_at: now,
                     scope: cyan_backend::models::dto::default_note_scope(),
                     kind: cyan_backend::models::dto::default_note_kind(),
+                    anchor_kind: None,
+                    anchor_id: None,
+                    origin_ref: None,
+                    payload: None,
+                    author_role: None,
                 };
                 storage::note_upsert(&note).map_err(|e| anyhow!("note_upsert: {e}"))?;
             }
@@ -921,7 +926,7 @@ async fn handle_verb(
                 // deterministic board id derived from the workspace (the workspace's default
                 // board), kept consistent between sender and receiver assertions.
                 let board = format!("{ws}-board");
-                storage::chat_insert(&id, &board, &ws, &message, node_id, None, now)
+                storage::chat_insert(&id, &board, &ws, &message, node_id, None, now, None, None)
                     .map_err(|e| anyhow!("chat_insert: {e}"))?;
                 let event = NetworkEvent::ChatSent {
                     id,
@@ -931,6 +936,8 @@ async fn handle_verb(
                     author: node_id.to_string(),
                     parent_id: None,
                     timestamp: now,
+                    anchor_kind: None,
+                    anchor_id: None,
                 };
                 cmd_tx
                     .send(NetworkCommand::Broadcast {
@@ -1346,6 +1353,8 @@ fn make_step_config(
         timeout_seconds: Some(5),
         retry_count: Some(0),
         auto_advance: false,
+        review_hold: false,
+        waiting_on: None,
         notifications: vec![],
         state: cyan_backend::pipeline::PipelineStepState::default(),
     }
@@ -1797,6 +1806,8 @@ fn seed_fixture(group_id: &str) -> Result<()> {
             "test-author",
             None,
             now,
+            None,
+            None,
         )
         .map_err(|e| anyhow!("chat_insert_simple: {e}"))?;
     }

@@ -78,7 +78,11 @@ fn op_entry(tenant: &str, asset: &str, op: &str, tc_in: i64) -> ChangeEntry {
         outcome: None,
         updated_at: 0,
         updated_by: None,
-    }
+        referent: None,
+    region: None,
+    intent_struct: None,
+    capture_ctx: None,
+}
 }
 
 /// Run `f` against the shared process-global DB without holding the lock across awaits.

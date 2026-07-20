@@ -52,6 +52,17 @@ pub struct PipelineStepConfig {
     pub timeout_seconds: Option<u64>,
     pub retry_count: Option<u32>,
     pub auto_advance: bool,
+    /// D/P-4 — REVIEW HOLD: this step's post-effect gate is a PRODUCER-REVIEW
+    /// WINDOW (upload lands, then the run parks until the assigned reviewer
+    /// approves), not a generic "AI done" acknowledgement. Stamped at compile
+    /// for an external upload-for-review step. Additive + `serde(default)`.
+    #[serde(default)]
+    pub review_hold: bool,
+    /// The REAL user the review gate waits on — an sso_user (e.g. "producer"),
+    /// never a role string. Resolved at compile from the board's review
+    /// assignee; `approve_step` clears the gate ONLY for this user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<String>,
     #[serde(default)]
     pub notifications: Vec<StepNotification>,
     pub state: PipelineStepState,
@@ -244,6 +255,8 @@ pub fn apply_compiled_configs(
             timeout_seconds: step["timeout_seconds"].as_u64(),
             retry_count: step["retry_count"].as_u64().map(|v| v as u32),
             auto_advance: step["auto_advance"].as_bool().unwrap_or(false),
+            review_hold: step["review_hold"].as_bool().unwrap_or(false),
+            waiting_on: step["waiting_on"].as_str().map(String::from),
             notifications: vec![],
             state: PipelineStepState::default(),
         };
@@ -950,6 +963,50 @@ fn gate_satisfied(exec_steps: &HashMap<String, ExecStep>, gate_id: &str) -> bool
     exec_steps.get(gate_id).map(|s| s.status == "human_approved").unwrap_or(false)
 }
 
+/// G4 — SIDE-EFFECT-AWARE AUTO-RETRY. Tools whose SUCCESS has an external side
+/// effect (upload/publish/email/comment) must NEVER be re-dispatched — a retry would
+/// re-upload / re-send / re-publish. They surface for a human instead. Everything
+/// else (cyan-media analysis/transform: probe/proxy/conform/qc/thumbnail…) is
+/// side-effect-free and safe to re-run.
+const NON_IDEMPOTENT_TOOLS: &[&str] = &[
+    "upload_file", "publish", "send_email", "create_comment", "post_comment", "inject_notes",
+];
+
+/// Transient/environmental error classes worth a bounded retry. Deterministic classes
+/// (path_denied, validation, needs_human, not_installed) are NOT retried — retrying
+/// only burns attempts and delays the human surfacing.
+fn is_transient_error_class(class: &str) -> bool {
+    matches!(
+        class,
+        "timeout" | "transport" | "unreachable" | "network" | "engine_error"
+            | "gateway" | "temporarily_unavailable" | "rate_limited"
+    )
+}
+
+/// The retry DECISION (pure, unit-tested): retry iff budget remains AND the tool is
+/// idempotent (safe to re-dispatch) AND the error is transient. Auth-expiry has its
+/// own one-shot self-heal in the executor (B5) and is handled before this.
+fn should_auto_retry(tool: &str, error_class: &str, attempt: u32, budget: u32) -> bool {
+    attempt < budget
+        && !NON_IDEMPOTENT_TOOLS.contains(&tool)
+        && is_transient_error_class(error_class)
+}
+
+/// Pull `error_class` out of the executor's structured failure envelope (a JSON
+/// string `{"error_class": …}`). Unknown/unparseable → "" (not transient → not
+/// retried), so a non-enveloped error never triggers a re-dispatch.
+fn auto_retry_error_class(err: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(err)
+        .ok()
+        .and_then(|v| v.get("error_class").and_then(|c| c.as_str()).map(String::from))
+        .unwrap_or_default()
+}
+
+/// Default bounded auto-retry budget for an idempotent step (attempts BEYOND the
+/// first). Keep small: a transient blip clears in 1–2 tries; more just delays a real
+/// failure reaching the human.
+const DEFAULT_AUTO_RETRY_BUDGET: u32 = 2;
+
 /// Run ONE step: emit running → progress, execute it, emit the terminal state, and
 /// build its obs/result. Owned args so it can be spawned. Shared by both paths.
 async fn exec_one_step(
@@ -982,12 +1039,49 @@ async fn exec_one_step(
     if let Some(mcp_tool) = step.mcp_tool.clone() {
         metadata["mcp_tool"] = mcp_tool;
     }
-    let metadata = Some(metadata);
 
-    let result = crate::pipeline_executor::execute_pipeline_step(
-        &board_id, &step.step_id, &step.content, &step.executor,
-        metadata, dependency_outputs, &command_tx, &event_tx,
-    ).await.map(|(summary, _findings)| summary);
+    // G4 — bounded, side-effect-aware auto-retry with exponential backoff. A transient
+    // failure of an IDEMPOTENT tool is re-dispatched before it reds the step; a
+    // non-idempotent tool (upload/publish/email/comment) or a deterministic error
+    // (path_denied/validation) falls straight through to the failure path below — it
+    // is NEVER re-uploaded / re-sent / re-published, only surfaced for a human.
+    let retry_tool = step
+        .mcp_tool
+        .as_ref()
+        .and_then(|m| m.get("tool"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut attempt: u32 = 0;
+    let result = loop {
+        let r = crate::pipeline_executor::execute_pipeline_step(
+            &board_id, &step.step_id, &step.content, &step.executor,
+            Some(metadata.clone()), dependency_outputs.clone(), &command_tx, &event_tx,
+        )
+        .await
+        .map(|(summary, _findings)| summary);
+        match &r {
+            Ok(_) => break r,
+            Err(e) => {
+                let class = auto_retry_error_class(&e.to_string());
+                if should_auto_retry(&retry_tool, &class, attempt, DEFAULT_AUTO_RETRY_BUDGET) {
+                    attempt += 1;
+                    let backoff = std::time::Duration::from_millis(
+                        500u64.saturating_mul(1u64 << attempt.min(5)),
+                    );
+                    let _ = event_tx.send(SwiftEvent::StatusUpdate {
+                        message: format!(
+                            "🔁 step '{}' transient ({}) — auto-retry {}/{}",
+                            step.step_id, class, attempt, DEFAULT_AUTO_RETRY_BUDGET
+                        ),
+                    });
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                break r;
+            }
+        }
+    };
 
     let duration = start.elapsed().as_secs_f64();
     let wall_ms = (duration * 1000.0) as u64;
@@ -1352,6 +1446,14 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
             _ => None,
         };
 
+        // D/P-4 — REVIEW HOLD detection: an external upload FOR REVIEW is the
+        // producer-review window. Its post-effect gate must park "waiting on
+        // <the board's assigned reviewer>" (a REAL user) and hold until THAT
+        // user approves — the window in which the reviewer watches the proxy
+        // and leaves frame-anchored comments before the sense step reads them.
+        let review_hold = is_review_upload(bound_command.as_deref(), &cell.content);
+        let waiting_on = if review_hold { review_assignee(board_id) } else { None };
+
         let config = PipelineStepConfig {
             step_id: step_id.clone(),
             depends_on: prev_step_id.clone().into_iter().collect(),
@@ -1365,6 +1467,8 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
             timeout_seconds: Some(300),
             retry_count: Some(1),
             auto_advance: false,
+            review_hold,
+            waiting_on,
             notifications: vec![],
             state: preserved_state,
         };
@@ -1518,6 +1622,18 @@ pub fn pipeline_status(board_id: &str) -> Result<serde_json::Value> {
                 "error": config.state.error,
                 "duration": config.state.duration,
                 "cost_usd": step_cost,
+                // D/P-4 — the review-hold gate identity, so the app renders
+                // "In review — waiting on <user>" instead of a generic gate.
+                // The LIVE assignee wins when the compiled snapshot is unset.
+                "review_hold": config.review_hold,
+                "waiting_on": config.waiting_on.clone().filter(|w| !w.is_empty())
+                    .or_else(|| if config.review_hold { review_assignee(board_id) } else { None }),
+                // Is this step currently parked on the PRE-DISPATCH side-effect
+                // gate (the operator's "send it for review", exempt from the
+                // assignee lock)? The app must let the operator release THIS,
+                // and only lock to the assignee once the upload has run and the
+                // step re-parks on the real post-upload review window.
+                "local_gate": step_state_is_local_gate(&cell.cell_id),
             }));
         }
     }
@@ -1551,6 +1667,125 @@ pub fn pipeline_status(board_id: &str) -> Result<serde_json::Value> {
 // Approve: Human Approves a Step
 // ============================================================================
 
+// ============================================================================
+// D/P-4 — the board's REVIEW ASSIGNEE (the real user review gates wait on)
+// ============================================================================
+
+/// Lazily-created k/v: board → the sso_user its review gates wait on. Lives
+/// here (not storage.rs) as a self-contained review-gate concern; CREATE TABLE
+/// IF NOT EXISTS makes every call safe on any DB.
+fn ensure_review_assignee_table(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS review_assignees (
+            board_id   TEXT PRIMARY KEY,
+            user       TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Assign the REAL user this board's review gates wait on (e.g. "producer").
+pub fn set_review_assignee(board_id: &str, user: &str) -> Result<()> {
+    let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
+    ensure_review_assignee_table(&conn)?;
+    conn.execute(
+        "INSERT INTO review_assignees (board_id, user, updated_at) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(board_id) DO UPDATE SET user=excluded.user, updated_at=excluded.updated_at",
+        rusqlite::params![board_id, user, chrono::Utc::now().timestamp()],
+    )?;
+    tracing::info!("review assignee for board {} → {}", board_id, user);
+    Ok(())
+}
+
+/// The board's assigned reviewer, if one is set.
+pub fn review_assignee(board_id: &str) -> Option<String> {
+    let conn = storage::db().lock().ok()?;
+    ensure_review_assignee_table(&conn).ok()?;
+    conn.query_row(
+        "SELECT user FROM review_assignees WHERE board_id = ?1",
+        rusqlite::params![board_id],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// D/P-4 — is this step the producer-review upload (the review WINDOW)?
+/// Pure: an external Frame.io upload whose authored text says "review" —
+/// and not the round-N "publish revised cut" delivery leg.
+pub(crate) fn is_review_upload(bound_command: Option<&str>, content: &str) -> bool {
+    let content_lower = content.to_lowercase();
+    bound_command
+        .map(|c| c.starts_with("@frameio.upload"))
+        .unwrap_or(false)
+        && content_lower.contains("review")
+        && !content_lower.contains("publish")
+}
+
+/// D/P-4 — is this step currently parked on the PRE-DISPATCH side-effect gate
+/// (`local_gate: true` in its persisted state)? That park is the operator's
+/// "release the send" — the tool has NOT run yet, so it is not the review
+/// window. Reads the freshest metadata (best-effort; absent/unreadable ⇒ false).
+fn step_state_is_local_gate(cell_id: &str) -> bool {
+    let Ok(conn) = storage::db().lock() else { return false };
+    let meta: Option<String> = conn
+        .query_row(
+            "SELECT metadata_json FROM notebook_cells WHERE id = ?1",
+            rusqlite::params![cell_id],
+            |row| row.get(0),
+        )
+        .ok();
+    drop(conn);
+    meta.as_deref()
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+        .and_then(|v| v["pipeline"]["state"]["local_gate"].as_bool())
+        .unwrap_or(false)
+}
+
+/// D/P-4 — the LIVE-assignee wrapper: the effective reviewer is the compiled
+/// `waiting_on` OR the board's current `review_assignees` row, so assigning a
+/// reviewer takes effect immediately — even on an already-parked hold, no
+/// recompile needed.
+fn enforce_review_gate_for(
+    board_id: &str,
+    config: &PipelineStepConfig,
+    reviewer: Option<&str>,
+) -> Result<()> {
+    if !config.review_hold {
+        return Ok(());
+    }
+    let mut cfg = config.clone();
+    if cfg.waiting_on.as_deref().unwrap_or("").is_empty() {
+        cfg.waiting_on = review_assignee(board_id);
+    }
+    enforce_review_gate(&cfg, reviewer)
+}
+
+/// D/P-4 — the review-gate guard shared by approve/reject: a `review_hold`
+/// step clears ONLY for the assigned reviewer. `Ok(())` for non-hold steps,
+/// for holds with no assignee configured (nothing to enforce), and for the
+/// assignee themself; a typed error naming the waited-on user otherwise.
+fn enforce_review_gate(config: &PipelineStepConfig, reviewer: Option<&str>) -> Result<()> {
+    if !config.review_hold {
+        return Ok(());
+    }
+    let Some(want) = config.waiting_on.as_deref().filter(|w| !w.is_empty()) else {
+        return Ok(());
+    };
+    match reviewer {
+        Some(who) if who == want => Ok(()),
+        Some(who) => Err(anyhow!(
+            "review gate is waiting on '{}' — '{}' cannot clear it",
+            want, who
+        )),
+        None => Err(anyhow!(
+            "review gate is waiting on '{}' — approve as that user (no reviewer identity supplied)",
+            want
+        )),
+    }
+}
+
 pub fn approve_step(
     board_id: &str,
     step_id: &str,
@@ -1563,6 +1798,16 @@ pub fn approve_step(
     let cell = cells.iter()
         .find(|c| c.pipeline_config.as_ref().map(|p| p.step_id.as_str()) == Some(step_id))
         .ok_or_else(|| anyhow!("Step {} not found", step_id))?;
+
+    // D/P-4 — a review hold clears only for its assigned reviewer (live lookup).
+    // EXEMPT the PRE-DISPATCH side-effect release (`local_gate`): that approval
+    // means "yes, send it to review" and belongs to the OPERATOR; the assignee
+    // owns only the POST-upload review window (the parked hold after the tool ran).
+    if let Some(config) = cell.pipeline_config.as_ref()
+        && !step_state_is_local_gate(&cell.cell_id)
+    {
+        enforce_review_gate_for(board_id, config, reviewer)?;
+    }
     let stage = cell.pipeline_config.as_ref().map(step_stage).unwrap_or_else(|| step_id.to_string());
     let name = first_line(&cell.content);
 
@@ -1661,6 +1906,13 @@ pub fn reject_step(
     let cell = cells.iter()
         .find(|c| c.pipeline_config.as_ref().map(|p| p.step_id.as_str()) == Some(step_id))
         .ok_or_else(|| anyhow!("Step {} not found", step_id))?;
+    // D/P-4 — a review hold is the assigned reviewer's decision, reject included
+    // (same pre-dispatch local_gate exemption as approve).
+    if let Some(config) = cell.pipeline_config.as_ref()
+        && !step_state_is_local_gate(&cell.cell_id)
+    {
+        enforce_review_gate_for(board_id, config, reviewer)?;
+    }
     let stage = cell.pipeline_config.as_ref().map(step_stage).unwrap_or_else(|| step_id.to_string());
     let name = first_line(&cell.content);
 
@@ -1728,6 +1980,35 @@ pub fn retry_step(
     step_id: &str,
     command_tx: &UnboundedSender<CommandMsg>,
 ) -> Result<()> {
+    step_state_surgery(board_id, step_id, command_tx, StepSurgery::Retry)
+}
+
+/// B4 — per-step RESET: back to `pending`, result cleared, attempt counter
+/// ZEROED and any human decision cleared (a reset is a clean slate, not a
+/// retry — it never inflates the attempt/metering trail). The app decides
+/// whether to run afterwards; this is state surgery only.
+pub fn reset_step(
+    board_id: &str,
+    step_id: &str,
+    command_tx: &UnboundedSender<CommandMsg>,
+) -> Result<()> {
+    step_state_surgery(board_id, step_id, command_tx, StepSurgery::Reset)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum StepSurgery {
+    /// → pending, result cleared, attempt += 1 (an attempt is being spent).
+    Retry,
+    /// → pending, result cleared, attempt = 0, human decision cleared.
+    Reset,
+}
+
+fn step_state_surgery(
+    board_id: &str,
+    step_id: &str,
+    command_tx: &UnboundedSender<CommandMsg>,
+    surgery: StepSurgery,
+) -> Result<()> {
     let cells = load_pipeline_cells(board_id)?;
 
     let cell = cells.iter()
@@ -1757,10 +2038,20 @@ pub fn retry_step(
     metadata["pipeline"]["state"]["duration"] = json!(null);
     metadata["pipeline"]["state"]["started_at"] = json!(null);
     metadata["pipeline"]["state"]["ai_completed_at"] = json!(null);
-    
-    // Increment attempt counter
-    let attempt = metadata["pipeline"]["state"]["attempt"].as_u64().unwrap_or(0);
-    metadata["pipeline"]["state"]["attempt"] = json!(attempt + 1);
+
+    match surgery {
+        StepSurgery::Retry => {
+            // An attempt is being spent — the counter tells the truth.
+            let attempt = metadata["pipeline"]["state"]["attempt"].as_u64().unwrap_or(0);
+            metadata["pipeline"]["state"]["attempt"] = json!(attempt + 1);
+        }
+        StepSurgery::Reset => {
+            // Clean slate: no attempts spent, no lingering human decision.
+            metadata["pipeline"]["state"]["attempt"] = json!(0);
+            metadata["pipeline"]["state"]["approved_by"] = json!(null);
+            metadata["pipeline"]["state"]["approved_at"] = json!(null);
+        }
+    }
 
     // SYNCHRONOUS persist (C/S): the resume-run spawned right after Retry must read the
     // step as `pending` NOW so it re-executes it (resume from the failed step).
@@ -1789,7 +2080,11 @@ pub fn retry_step(
         metadata_json: Some(metadata.to_string()),
     });
 
-    tracing::info!("Step {} reset to pending (retry)", step_id);
+    tracing::info!(
+        "Step {} reset to pending ({})",
+        step_id,
+        if surgery == StepSurgery::Retry { "retry" } else { "reset" }
+    );
     Ok(())
 }
 
@@ -2400,4 +2695,129 @@ fn find_scope_id(board_id: &str) -> Option<String> {
                 |row| row.get::<_, String>(0),
             ).ok()
         })
+}
+// ============================================================================
+// G4 — auto-retry decision unit tests (pure fns; no engine/system required)
+// ============================================================================
+
+#[cfg(test)]
+mod auto_retry_tests {
+    use super::*;
+
+    #[test]
+    fn transient_idempotent_step_retries_within_budget() {
+        // cyan-media analysis/transform tools are side-effect-free → safe to re-run.
+        assert!(should_auto_retry("probe", "timeout", 0, 2));
+        assert!(should_auto_retry("proxy", "engine_error", 1, 2));
+        assert!(should_auto_retry("conform", "unreachable", 0, 2));
+    }
+
+    #[test]
+    fn budget_exhaustion_stops_retrying() {
+        assert!(!should_auto_retry("probe", "timeout", 2, 2));
+        assert!(!should_auto_retry("probe", "timeout", 3, 2));
+    }
+
+    #[test]
+    fn non_idempotent_tools_never_retry() {
+        // The load-bearing invariant: NEVER re-upload / re-send / re-publish / re-comment,
+        // even on a transient error with budget to spare. These surface for a human.
+        assert!(!should_auto_retry("upload_file", "timeout", 0, 2));
+        assert!(!should_auto_retry("send_email", "engine_error", 0, 2));
+        assert!(!should_auto_retry("publish", "unreachable", 0, 2));
+        assert!(!should_auto_retry("create_comment", "timeout", 0, 2));
+    }
+
+    #[test]
+    fn deterministic_errors_are_not_retried() {
+        // Retrying a path/validation/gate error just burns attempts.
+        assert!(!should_auto_retry("probe", "path_denied", 0, 2));
+        assert!(!should_auto_retry("probe", "validation", 0, 2));
+        assert!(!should_auto_retry("probe", "needs_human", 0, 2));
+        assert!(!should_auto_retry("probe", "not_installed", 0, 2));
+    }
+
+    #[test]
+    fn error_class_is_read_from_the_structured_envelope() {
+        assert_eq!(
+            auto_retry_error_class(r#"{"error_class":"timeout","message":"x"}"#),
+            "timeout"
+        );
+        // A non-enveloped error yields "" → never transient → never retried.
+        assert_eq!(auto_retry_error_class("plain error, not json"), "");
+        assert!(!should_auto_retry("probe", &auto_retry_error_class("plain error"), 0, 2));
+    }
+}
+
+// D/P-4 — review-gate unit tests (pure fns; no engine/system required)
+// ============================================================================
+
+#[cfg(test)]
+mod review_gate_tests {
+    use super::*;
+
+    fn hold_config(waiting_on: Option<&str>) -> PipelineStepConfig {
+        PipelineStepConfig {
+            step_id: "upload_review".into(),
+            depends_on: vec![],
+            stage: None,
+            executor: "local".into(),
+            model: None,
+            model_config: None,
+            tools: vec![],
+            output_format: "markdown".into(),
+            command: Some("@frameio.upload_file".into()),
+            timeout_seconds: None,
+            retry_count: None,
+            auto_advance: false,
+            review_hold: true,
+            waiting_on: waiting_on.map(String::from),
+            notifications: vec![],
+            state: PipelineStepState::default(),
+        }
+    }
+
+    #[test]
+    fn review_upload_detection_is_exact() {
+        // The producer-review upload IS the window…
+        assert!(is_review_upload(
+            Some("@frameio.upload_file"),
+            "upload to @frameio.upload for producer review /needs-approval"
+        ));
+        // …the round-N delivery leg is NOT (publish)…
+        assert!(!is_review_upload(
+            Some("@frameio.upload_file"),
+            "publish revised cut to @frameio.upload /needs-approval"
+        ));
+        // …nor a non-upload bind, nor an unbound step, nor a non-review upload.
+        assert!(!is_review_upload(Some("@frameio.list_comments"), "get review comments"));
+        assert!(!is_review_upload(None, "upload for producer review"));
+        assert!(!is_review_upload(Some("@frameio.upload_file"), "upload the master archive"));
+    }
+
+    #[test]
+    fn review_hold_clears_only_for_the_assigned_reviewer() {
+        let cfg = hold_config(Some("producer"));
+        // The assignee clears it.
+        assert!(enforce_review_gate(&cfg, Some("producer")).is_ok());
+        // Anyone else is refused — and the error NAMES who is being waited on.
+        let err = enforce_review_gate(&cfg, Some("alice")).unwrap_err().to_string();
+        assert!(err.contains("waiting on 'producer'") && err.contains("'alice'"), "{err}");
+        // No identity at all is refused too (the legacy anonymous verb can't bypass).
+        let err = enforce_review_gate(&cfg, None).unwrap_err().to_string();
+        assert!(err.contains("waiting on 'producer'"), "{err}");
+    }
+
+    #[test]
+    fn non_hold_and_unassigned_holds_stay_open() {
+        // A plain gate: anyone (or no one) approves — unchanged legacy behavior.
+        let mut plain = hold_config(None);
+        plain.review_hold = false;
+        assert!(enforce_review_gate(&plain, None).is_ok());
+        assert!(enforce_review_gate(&plain, Some("anyone")).is_ok());
+        // A hold with NO assignee configured has nothing to enforce.
+        assert!(enforce_review_gate(&hold_config(None), None).is_ok());
+        // An empty-string assignee is "unset", not a lockout.
+        assert!(enforce_review_gate(&hold_config(Some("")), None).is_ok());
+    }
 }

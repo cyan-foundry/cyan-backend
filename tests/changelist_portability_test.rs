@@ -64,7 +64,11 @@ fn entry(kind: &str, op: Option<&str>, tc_in: i64, tc_out: Option<i64>, params: 
         outcome: None,
         updated_at: 0,
         updated_by: None,
-    }
+        referent: None,
+    region: None,
+    intent_struct: None,
+    capture_ctx: None,
+}
 }
 
 /// Strip per-store identity (entry_id/seq) so two stores' projections compare on

@@ -100,6 +100,8 @@ async fn offline_chat_all_levels() {
                 author: "a".to_string(),
                 parent_id: None,
                 timestamp: 1,
+                anchor_kind: None,
+                anchor_id: None,
             },
         );
         let want = id.clone();

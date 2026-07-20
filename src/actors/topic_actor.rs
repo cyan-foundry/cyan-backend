@@ -51,6 +51,10 @@ pub const SNAPSHOT_ALPN: &[u8] = b"cyan-snapshot-v1";
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[derive(Debug)]
+// `Broadcast` carries the full `NetworkEvent` by value (the C1 anchor fields tipped it
+// over clippy's size threshold). Boxing it would touch every broadcast site for a
+// transient, short-lived command — not worth the churn.
+#[allow(clippy::large_enum_variant)]
 pub enum TopicCommand {
     /// Broadcast a NetworkEvent to this group
     Broadcast(NetworkEvent),
@@ -209,8 +213,45 @@ impl TopicActor {
         let (persist_tx, mut persist_rx) = mpsc::unbounded_channel::<NetworkEvent>();
         let persist_event_tx = event_tx.clone();
         let persist_node_id = node_id.clone();
+        let persist_authorizer = authorizer.clone();
+        let persist_group_id = group_id.clone();
         tokio::spawn(async move {
             while let Some(evt) = persist_rx.recv().await {
+                // A2 §6 (enforcement point 2, gossip lane): inside the opt-in
+                // ENFORCED-group arm, an inbound note row is tiered by its
+                // AUTHOR's roster role; a deny/unknown-scope drops the row —
+                // neither persisted nor forwarded (mirrors the transport-peer
+                // refusal above). Un-enforced groups: TR-1, apply-all (only the
+                // sovereign user-scope drop inside `persist_event` runs).
+                if let NetworkEvent::NoteAdded { id, scope, author_id, .. }
+                | NetworkEvent::NoteUpdated { id, scope, author_id, .. } = &evt
+                {
+                    let (enforced, tier) = persist_authorizer
+                        .lock()
+                        .map(|a| {
+                            (
+                                a.is_enforced(&persist_group_id),
+                                a.note_tier_of(&persist_group_id, author_id)
+                                    .map(crate::notes_rbac::tier_from_mesh),
+                            )
+                        })
+                        .unwrap_or((false, None));
+                    if enforced {
+                        let enforcement = crate::notes_rbac::InboundEnforcement {
+                            enforced: true,
+                            tier_of: &|_author: &str| tier,
+                        };
+                        if !crate::notes_rbac::inbound_note_applies(
+                            Some(&enforcement),
+                            id,
+                            scope,
+                            author_id,
+                            "gossip",
+                        ) {
+                            continue;
+                        }
+                    }
+                }
                 Self::persist_event(&evt);
                 // R10FB §N: count an incoming non-author chat as unread (once, ever) and
                 // emit UnreadChanged BEFORE the event itself so badges update live.
@@ -581,6 +622,7 @@ impl TopicActor {
                 let event_tx = self.event_tx.clone();
                 let network_tx = self.network_tx.clone();
                 let grant = self.grant.clone();
+                let authorizer = self.authorizer.clone();
 
                 tokio::spawn(async move {
                     match download_snapshot(
@@ -590,6 +632,7 @@ impl TopicActor {
                         grant.as_deref(),
                         event_tx,
                         false,
+                        Some(authorizer),
                     ).await {
                         Ok(_) => {
                             eprintln!("✅ [SNAP-DL] Snapshot download SUCCESS");
@@ -625,6 +668,7 @@ impl TopicActor {
                 let event_tx = self.event_tx.clone();
                 let network_tx = self.network_tx.clone();
                 let grant = self.grant.clone();
+                let authorizer = self.authorizer.clone();
                 tokio::spawn(async move {
                     match download_snapshot_since(
                         endpoint,
@@ -634,6 +678,7 @@ impl TopicActor {
                         since,
                         event_tx,
                         true,
+                        Some(authorizer),
                     )
                     .await
                     {
@@ -1013,11 +1058,20 @@ impl TopicActor {
         let grant = self.grant.clone();
         let event_tx = self.event_tx.clone();
         let repairing = self.repairing.clone();
+        let authorizer = self.authorizer.clone();
         tokio::spawn(async move {
             // Quiet pull: merge the sender's state into ours WITHOUT re-emitting join-time Sync*
             // events. Reuses the snapshot serve/apply path — no new transfer protocol.
-            if let Err(e) =
-                download_snapshot(endpoint, &node_id, &gid, grant.as_deref(), event_tx, true).await
+            if let Err(e) = download_snapshot(
+                endpoint,
+                &node_id,
+                &gid,
+                grant.as_deref(),
+                event_tx,
+                true,
+                Some(authorizer),
+            )
+            .await
             {
                 tracing::debug!(
                     "🩹 [TOPIC] anti-entropy repair from {}... failed: {}",
@@ -1078,8 +1132,19 @@ impl TopicActor {
         let event_tx = self.event_tx.clone();
         let network_tx = self.network_tx.clone();
         let grant = self.grant.clone();
+        let authorizer = self.authorizer.clone();
         tokio::spawn(async move {
-            match download_snapshot(endpoint, &source_peer, &group_id, grant.as_deref(), event_tx, false).await {
+            match download_snapshot(
+                endpoint,
+                &source_peer,
+                &group_id,
+                grant.as_deref(),
+                event_tx,
+                false,
+                Some(authorizer),
+            )
+            .await
+            {
                 Ok(_) => {
                     let _ = network_tx.send(TopicNetworkCmd::SnapshotComplete { group_id });
                 }
@@ -1234,7 +1299,7 @@ impl TopicActor {
                     Err(e) => eprintln!("💾 [PERSIST] 🔴 File insert FAILED: {}", e),
                 }
             }
-            NetworkEvent::ChatSent { id, board_id, workspace_id, message, author, parent_id, timestamp } => {
+            NetworkEvent::ChatSent { id, board_id, workspace_id, message, author, parent_id, timestamp, anchor_kind, anchor_id } => {
                 eprintln!("💾 [PERSIST] ChatSent:");
                 eprintln!("   chat_id: {}...", &id[..16.min(id.len())]);
                 eprintln!("   board_id: {}...", &board_id[..16.min(board_id.len())]);
@@ -1242,7 +1307,7 @@ impl TopicActor {
                 // R11 §1: chat is board-scoped. If a pre-R11 peer omits board_id, fall back to
                 // the message's workspace so the row is never dropped.
                 let board_key = if board_id.is_empty() { workspace_id.as_str() } else { board_id.as_str() };
-                match storage::chat_insert(id, board_key, workspace_id, message, author, parent_id.as_deref(), *timestamp) {
+                match storage::chat_insert(id, board_key, workspace_id, message, author, parent_id.as_deref(), *timestamp, anchor_kind.as_deref(), anchor_id.as_deref()) {
                     Ok(_) => eprintln!("💾 [PERSIST] ✓ Chat inserted to DB"),
                     Err(e) => eprintln!("💾 [PERSIST] 🔴 Chat insert FAILED: {}", e),
                 }
@@ -1254,25 +1319,39 @@ impl TopicActor {
             // are handled identically (the split is informational for the UI).
             NetworkEvent::NoteAdded {
                 id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at,
-                scope, kind,
+                scope, kind, anchor_kind, anchor_id, origin_ref, payload, author_role,
             }
             | NetworkEvent::NoteUpdated {
                 id, board_id, tenant_id, author_id, author_name, text, created_at, updated_at,
-                scope, kind,
+                scope, kind, anchor_kind, anchor_id, origin_ref, payload, author_role,
             } => {
-                let note = crate::models::dto::NoteDTO {
-                    id: id.clone(),
-                    board_id: board_id.clone(),
-                    tenant_id: tenant_id.clone(),
-                    author_id: author_id.clone(),
-                    author_name: author_name.clone(),
-                    text: text.clone(),
-                    created_at: *created_at,
-                    updated_at: *updated_at,
-                    scope: scope.clone(),
-                    kind: kind.clone(),
-                };
-                let _ = storage::note_upsert(&note);
+                // LENS_AI_NOTES P1 — USER SCOPE IS SOVEREIGN: our own user-scoped notes
+                // are never broadcast, so an inbound one is foreign (buggy or malicious).
+                // Drop it — nobody writes into another node's sovereign layer.
+                // A1 TR-1: payload/author_role ride the row VERBATIM — inbound apply
+                // validates NOTHING (convergence over validation).
+                if scope == "user" {
+                    tracing::debug!("dropping inbound user-scoped note {id} (sovereign scope)");
+                } else {
+                    let note = crate::models::dto::NoteDTO {
+                        id: id.clone(),
+                        board_id: board_id.clone(),
+                        tenant_id: tenant_id.clone(),
+                        author_id: author_id.clone(),
+                        author_name: author_name.clone(),
+                        text: text.clone(),
+                        created_at: *created_at,
+                        updated_at: *updated_at,
+                        scope: scope.clone(),
+                        kind: kind.clone(),
+                        anchor_kind: anchor_kind.clone(),
+                        anchor_id: anchor_id.clone(),
+                        origin_ref: origin_ref.clone(),
+                        payload: payload.clone(),
+                        author_role: author_role.clone(),
+                    };
+                    let _ = storage::note_upsert(&note);
+                }
             }
             NetworkEvent::NoteDeleted { id } => {
                 let _ = storage::note_delete(id);
@@ -2026,8 +2105,10 @@ async fn download_snapshot(
     grant: Option<&str>,
     event_tx: UnboundedSender<SwiftEvent>,
     quiet: bool,
+    authorizer: Option<Arc<std::sync::Mutex<MeshAuthorizer>>>,
 ) -> Result<()> {
-    download_snapshot_since(endpoint, source_peer, group_id, grant, None, event_tx, quiet).await
+    download_snapshot_since(endpoint, source_peer, group_id, grant, None, event_tx, quiet, authorizer)
+        .await
 }
 
 /// MESH_HARDENING §5 incremental catch-up: like [`download_snapshot`] but requests only the
@@ -2044,6 +2125,7 @@ async fn download_snapshot_since(
     since: Option<i64>,
     event_tx: UnboundedSender<SwiftEvent>,
     quiet: bool,
+    authorizer: Option<Arc<std::sync::Mutex<MeshAuthorizer>>>,
 ) -> Result<()> {
     use crate::models::protocol::SnapshotRequest;
     use tokio::io::AsyncWriteExt;
@@ -2140,8 +2222,31 @@ async fn download_snapshot_since(
         // the same one the §11 bundle import uses — so a full snapshot, an incremental delta,
         // and an air-gapped import all converge to the identical state. Then emit the per-node
         // `Sync*` progress events (the substrate oracle) for the rows this frame carried.
-        if let Err(e) = crate::snapshot::apply_snapshot_frame(&frame) {
-            eprintln!("   ⚠️ Snapshot frame apply: {}", e);
+        {
+            // A2 §6 (enforcement point 2, snapshot lane): the SAME opt-in
+            // enforced-group notes RBAC as the gossip arm — an author's roster
+            // tier gates each note row; un-enforced groups apply exactly as
+            // before (TR-1 + the sovereign user-scope drop).
+            let enforced = authorizer
+                .as_ref()
+                .and_then(|a| a.lock().ok())
+                .map(|g| g.is_enforced(group_id))
+                .unwrap_or(false);
+            let tier_of = |author: &str| -> Option<cyan_identity::Role> {
+                authorizer
+                    .as_ref()
+                    .and_then(|a| a.lock().ok())
+                    .and_then(|g| g.note_tier_of(group_id, author))
+                    .map(crate::notes_rbac::tier_from_mesh)
+            };
+            let enforcement =
+                crate::notes_rbac::InboundEnforcement { enforced, tier_of: &tier_of };
+            let notes_enforcement = enforced.then_some(&enforcement);
+            if let Err(e) =
+                crate::snapshot::apply_snapshot_frame_enforced(&frame, notes_enforcement)
+            {
+                eprintln!("   \u{26a0}\u{fe0f} Snapshot frame apply: {}", e);
+            }
         }
 
         match frame {

@@ -174,10 +174,11 @@ fn save_as_template() {
     let group = "tpl-save-grp";
 
     let steps = vec![
-        TemplateStep { text: "Conform the edit from the AAF".to_string(), plugin: None },
+        TemplateStep { text: "Conform the edit from the AAF".to_string(), plugin: None, stage: None },
         TemplateStep {
             text: "Send the master to delivery".to_string(),
             plugin: Some("contido".to_string()),
+            stage: None,
         },
     ];
     let saved = templates::save_as_template(group, "My Delivery Flow", "Saved from a board", steps.clone())
@@ -219,7 +220,7 @@ fn template_tenant_scoped() {
     let (group_a, group_b) = ("tpl-tenant-a", "tpl-tenant-b");
 
     // Tenant A saves a private template.
-    let steps = vec![TemplateStep { text: "Tenant A secret step".to_string(), plugin: None }];
+    let steps = vec![TemplateStep { text: "Tenant A secret step".to_string(), plugin: None, stage: None }];
     let saved = templates::save_as_template(group_a, "A Private Flow", "", steps).expect("save A");
 
     // Tenant A sees it…

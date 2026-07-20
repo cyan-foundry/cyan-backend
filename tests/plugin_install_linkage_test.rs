@@ -144,3 +144,115 @@ fn install_into_unknown_group_is_a_clear_error_not_a_raw_fk_failure() {
         "no workspaces may be provisioned for a nonexistent group; got: {wss:?}"
     );
 }
+
+/// Whether `plugin_id` currently lists as installed in `group`.
+fn is_listed(group: &str, plugin_id: &str) -> bool {
+    storage::plugin_bundles_in_group(group, PLUGINS_WORKSPACE_NAME, PLUGIN_BUNDLE_SUFFIX)
+        .expect("list bundles")
+        .iter()
+        .any(|b| b.name == format!("{plugin_id}{PLUGIN_BUNDLE_SUFFIX}"))
+}
+
+/// UNINSTALL, rung 1 (found live 2026-07-15 — Rick installed a plugin by accident and
+/// could not remove it).
+///
+/// A plugin is removed by the ORDINARY file tombstone — the same `file_soft_delete`
+/// path `CommandMsg::DeleteFile` drives, which broadcasts `NetworkEvent::FileDeleted`
+/// and converges to peers. There is no second removal path.
+///
+/// The bug this pins: `plugin_bundles_in_group` was the ONE file read that ignored the
+/// tombstone (R10FB §F4 says all of them filter `deleted=0`), so the delete path ran,
+/// the row tombstoned, peers converged — and NOTHING observable changed. The bundle
+/// kept listing and `@plugin.` kept resolving in authoring. Uninstall was unreachable
+/// not because the path was missing, but because the read ignored it.
+#[test]
+fn tombstoned_plugin_bundle_is_uninstalled_and_leaves_authoring() {
+    ensure_db();
+
+    let group = "uninstall-group";
+    let (default_ws, _plugins_ws) = create_fresh_group(group, "Uninstall Group");
+    let board = "uninstall-board";
+    storage::board_insert(board, &default_ws, "Board 1", chrono::Utc::now().timestamp())
+        .expect("board insert");
+
+    let file_id = storage::install_plugin_bundle(group, "frameio", b"frameio-cyanplugin-bytes")
+        .expect("install");
+    assert!(is_listed(group, "frameio"), "precondition: the install lists");
+    assert!(
+        workflow::autocomplete_index(board).plugins.iter().any(|e| e.value == "frameio"),
+        "precondition: @frameio resolves in authoring after install"
+    );
+
+    // Uninstall == the ordinary file tombstone, addressed by install's DETERMINISTIC
+    // file id. No new path, no bytes touched.
+    storage::file_soft_delete(&file_id, chrono::Utc::now().timestamp()).expect("tombstone");
+
+    assert!(
+        !is_listed(group, "frameio"),
+        "a tombstoned bundle must NOT list as installed — this is the assertion that \
+         was false before the deleted=0 filter, and the reason an accidental install \
+         could not be removed"
+    );
+    assert!(
+        !workflow::autocomplete_index(board).plugins.iter().any(|e| e.value == "frameio"),
+        "@frameio must leave the board's authoring surface once uninstalled"
+    );
+}
+
+/// Idempotence: tombstoning an already-tombstoned bundle is a no-op, not an error —
+/// uninstalling something already uninstalled must never fail.
+#[test]
+fn repeat_uninstall_is_a_no_op_not_an_error() {
+    ensure_db();
+
+    let group = "uninstall-idem-group";
+    create_fresh_group(group, "Idempotent Uninstall");
+    let file_id = storage::install_plugin_bundle(group, "frameio", b"frameio-cyanplugin-bytes")
+        .expect("install");
+    let now = chrono::Utc::now().timestamp();
+
+    storage::file_soft_delete(&file_id, now).expect("first tombstone");
+    storage::file_soft_delete(&file_id, now).expect("repeat tombstone must be a no-op, not an error");
+    assert!(!is_listed(group, "frameio"), "still uninstalled after a repeat tombstone");
+
+    // A never-installed plugin's deterministic id: tombstoning it is also a no-op.
+    storage::file_soft_delete("no-such-plugin-file-id", now)
+        .expect("tombstoning an absent bundle must be a no-op, not an error");
+}
+
+/// Bytes are device-global; install records are per-group. Uninstalling in group A must
+/// NOT disturb group B, which shares the SAME on-disk bundle bytes
+/// (`plugin_bundles_dir()` is keyed by plugin id alone).
+///
+/// This is why uninstall tombstones the row and leaves the bytes: the `objects` row is
+/// the per-group install fact, the file is a shared device cache. No refcount needed —
+/// nothing ever deletes the bytes.
+#[test]
+fn uninstall_in_one_group_leaves_another_groups_install_intact() {
+    ensure_db();
+
+    let (a, b) = ("shared-bytes-group-a", "shared-bytes-group-b");
+    create_fresh_group(a, "Group A");
+    let (b_default_ws, _) = create_fresh_group(b, "Group B");
+    let b_board = "shared-bytes-board-b";
+    storage::board_insert(b_board, &b_default_ws, "B Board", chrono::Utc::now().timestamp())
+        .expect("board insert");
+
+    let a_file = storage::install_plugin_bundle(a, "frameio", b"frameio-cyanplugin-bytes")
+        .expect("install into A");
+    let b_file = storage::install_plugin_bundle(b, "frameio", b"frameio-cyanplugin-bytes")
+        .expect("install into B");
+    assert_ne!(a_file, b_file, "install rows are per-group (distinct deterministic ids)");
+
+    storage::file_soft_delete(&a_file, chrono::Utc::now().timestamp()).expect("uninstall from A");
+
+    assert!(!is_listed(a, "frameio"), "A is uninstalled");
+    assert!(
+        is_listed(b, "frameio"),
+        "B must keep its install — A's uninstall may never reach across groups"
+    );
+    assert!(
+        workflow::autocomplete_index(b_board).plugins.iter().any(|e| e.value == "frameio"),
+        "@frameio must still resolve in B's authoring — the shared device bytes are untouched"
+    );
+}

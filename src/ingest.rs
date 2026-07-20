@@ -833,6 +833,16 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
             let out = scan_due_global(at)?;
             return Ok(serde_json::to_value(out)?);
         }
+        // GAP 2 (inbound PULL) — poll every DUE inbound source: for each, call the
+        // plugin's `poll_inbound` tool (in-process MCP dispatch) and route the
+        // returned events → board notes. Multi-phase (spawns the plugin, runs the
+        // network), so it manages its OWN locking like `scan_due` — routed BEFORE
+        // the dispatch-wide lock.
+        "poll_inbound_due" => {
+            let at = cmd.get("now").and_then(|v| v.as_i64()).unwrap_or_else(now);
+            let out = crate::inbound::poll_inbound_due_global(at)?;
+            return Ok(serde_json::to_value(out)?);
+        }
         // produce_master downloads masters + renders the delivery (minutes) —
         // it manages its own locking too (read → LOCKLESS retrieve/render →
         // write). Holding the dispatch-wide lock across it parked every other
@@ -855,7 +865,7 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
     // on every board open and a 60s cadence) take a BOUNDED acquire — parked
     // behind a mesh sync / plugin unpack they are the P0 hang family. Mutations
     // keep the blocking acquire.
-    const READ_OPS: &[&str] = &["source_list", "runs_for_board", "produce_master_plan"];
+    const READ_OPS: &[&str] = &["source_list", "runs_for_board", "produce_master_plan", "inbound_source_list"];
     let lock = if READ_OPS.contains(&op) {
         crate::storage::try_db_read(crate::storage::READ_LOCK_BUDGET)
             .ok_or_else(|| anyhow!("store busy — try again"))?
@@ -893,6 +903,27 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value> {
         }
         "source_remove" => {
             source_remove(conn, &s("tenant_id")?, &s("id")?)?;
+            Ok(serde_json::json!({ "removed": true }))
+        }
+        // GAP 2 (inbound PULL) — inbound-source CRUD (DB-only; the poll RUNNER is
+        // `poll_inbound_due`, routed before the lock above). Mirrors source_*.
+        "inbound_source_add" => {
+            let schedule_secs = cmd.get("schedule_secs").and_then(|v| v.as_i64());
+            let out = crate::inbound::inbound_source_add(
+                conn,
+                &s("tenant_id")?,
+                &s("board_id")?,
+                &s("plugin_id")?,
+                schedule_secs,
+            )?;
+            Ok(serde_json::to_value(out)?)
+        }
+        "inbound_source_list" => {
+            let out = crate::inbound::inbound_source_list(conn, &s("tenant_id")?)?;
+            Ok(serde_json::to_value(out)?)
+        }
+        "inbound_source_remove" => {
+            crate::inbound::inbound_source_remove(conn, &s("tenant_id")?, &s("id")?)?;
             Ok(serde_json::json!({ "removed": true }))
         }
         // C1 — register a SEQUENCE (timeline referencing many clips, in order).

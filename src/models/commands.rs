@@ -185,6 +185,14 @@ pub enum CommandMsg {
         board_id: String,
         message: String,
         parent_id: Option<String>,
+        /// CHAT C1 (Anchored Lane, additive): what the message anchors to — `"step"` or
+        /// `"board"`. Absent ⇒ the board's general slot (`#board`), the exact pre-C1
+        /// behavior. `skip_serializing_if` keeps the wire byte-identical when unset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor_kind: Option<String>,
+        /// CHAT C1: the anchor target — a stable `step_uid` when `anchor_kind == "step"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor_id: Option<String>,
     },
     DeleteChat {
         id: String,
@@ -214,6 +222,29 @@ pub enum CommandMsg {
         scope: Option<String>,
         #[serde(default)]
         kind: Option<String>,
+        /// CHAT C7 (Anchored Lane, additive): what the note anchors to — `"step"` or
+        /// `"board"`. Absent ⇒ no anchor, the exact pre-C7 behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor_kind: Option<String>,
+        /// CHAT C7: the stable `step_uid` when `anchor_kind == "step"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor_id: Option<String>,
+        /// CHAT C7: provenance of a promoted note — `chat:<message_id>` when the note
+        /// was promoted from a chat message. Copies, never moves; render-time markers
+        /// in the lane derive from this.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_ref: Option<String>,
+        /// A1 (additive): per-kind typed payload (`note_payload` §4). Absent keeps
+        /// the exact pre-A1 behavior (a plain freeform note of its kind); kind
+        /// `legal-clearance` REQUIRES it (§4.9). Old engines silently DROP this key
+        /// (no `deny_unknown_fields` anywhere) — the write lands payload-less there.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<serde_json::Value>,
+        /// A1 (additive): the author's CRAFT role at authoring time
+        /// (`PRODUCTION_ROLE_VOCAB` ∪ `AUTHOR_ROLE_EXTRA`). Provenance, not authz;
+        /// invalid values COERCE to `None` at the write door.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        author_role: Option<String>,
     },
     DeleteNote {
         id: String,

@@ -291,6 +291,23 @@ impl PluginHost {
 /// IDENTICAL to the lens host so a bundle behaves the same on device and
 /// cloud): `<PLUGIN>_<PROVIDER-LAST-SEGMENT>_TOKEN`, uppercased. The frameio
 /// manifest's `oauth2`/`adobe_ims` credential resolves `FRAMEIO_IMS_TOKEN`.
+/// The device's installed-plugins root: one subdir per plugin (the unpacked
+/// `.cyanplugin` bundles the file-swarm fetched). Overridable for tests/ops via
+/// `CYAN_PLUGINS_ROOT`.
+///
+/// NOTE (A3 PLAN 3.7 deviation): the spec asked to HOIST the private
+/// `pipeline_executor::plugins_root` here; that file is owned by another
+/// workstream this pass, so this is a faithful COPY (same env, same default) —
+/// the executor's private twin should be deleted in favor of this one when that
+/// file next opens.
+pub fn plugins_root() -> std::path::PathBuf {
+    if let Ok(root) = std::env::var("CYAN_PLUGINS_ROOT") {
+        return std::path::PathBuf::from(root);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home).join(".cyan").join("plugins")
+}
+
 pub fn cred_env_var(plugin_name: &str, provider: &str) -> String {
     let segment = provider.rsplit(['_', '-']).next().unwrap_or(provider);
     format!("{}_{}_TOKEN", env_token(plugin_name), env_token(segment))
@@ -458,13 +475,16 @@ pub(crate) fn dotenv_lookup(path: &std::path::Path, key: &str) -> Option<String>
 pub const SIDE_EFFECT_EXTERNAL_SEND: &str = "external_send";
 /// Side effect that requires the human-approval gate before a tool runs.
 pub const SIDE_EFFECT_DELETE: &str = "delete";
+/// A local work-in-progress mutation (a Resolve grade node, a Pro Tools edit) —
+/// gates like the others but never leaves the device.
+pub const SIDE_EFFECT_MUTATE_LOCAL: &str = "mutate_local";
 
 /// Whether a tool's declared `side_effects` require human approval before it may
-/// auto-execute. `external_send` / `delete` do; a pure/read-only tool does not.
+/// auto-execute. Routed through the shared `cyan_mcp` predicate so the gated-label
+/// set (external_send / delete / mutate_local) lives in exactly one place and the
+/// three hosts never drift.
 pub fn requires_approval(side_effects: &[String]) -> bool {
-    side_effects
-        .iter()
-        .any(|s| s == SIDE_EFFECT_EXTERNAL_SEND || s == SIDE_EFFECT_DELETE)
+    side_effects.iter().any(|s| cyan_mcp::is_gated_side_effect(s))
 }
 
 /// Run scope carried on every external cost obs line: which tenant + pipeline run
@@ -602,4 +622,20 @@ struct DiscardEmitter;
 
 impl Emitter for DiscardEmitter {
     fn emit(&self, _obs: &Obs) {}
+}
+
+#[cfg(test)]
+mod mutate_local_gate_tests {
+    use super::requires_approval;
+
+    /// A local WIP mutation (mutate_local) must require approval like external_send
+    /// and delete — a gated mutation may never auto-fire. Routed through the shared
+    /// cyan_mcp predicate so the three hosts never drift.
+    #[test]
+    fn mutate_local_requires_approval() {
+        assert!(requires_approval(&["mutate_local".to_string()]));
+        assert!(requires_approval(&["external_send".to_string()]));
+        assert!(requires_approval(&["delete".to_string()]));
+        assert!(!requires_approval(&[])); // a read is free
+    }
 }

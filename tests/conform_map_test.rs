@@ -54,7 +54,11 @@ fn entry(kind: &str, op: Option<&str>, tc_in: i64, tc_out: Option<i64>, params: 
         outcome: None,
         updated_at: 0,
         updated_by: None,
-    }
+        referent: None,
+    region: None,
+    intent_struct: None,
+    capture_ctx: None,
+}
 }
 
 fn conform_op(seq: i64, op: &str, tc_in: i64, tc_out: Option<i64>, params: serde_json::Value) -> ConformOp {

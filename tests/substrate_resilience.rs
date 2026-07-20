@@ -48,6 +48,8 @@ fn chat(id: &str, scope: &str, message: &str) -> NetworkEvent {
         author: "author-a".to_string(),
         parent_id: None,
         timestamp: 1,
+        anchor_kind: None,
+        anchor_id: None,
     }
 }
 

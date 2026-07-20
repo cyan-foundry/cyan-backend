@@ -1335,9 +1335,23 @@ fn dispatch(json_str: &str) -> Result<serde_json::Value, ReviewError> {
         // "conform_proxy" is routed BEFORE the dispatch-wide lock (see the top of
         // this fn) — the render must never run with the store held.
         "review_media_info" => {
-            let tenant = tenant_or_board(&cmd)?;
-            crate::review_loop::review_media_info(conn, &tenant, &s("proxy_ref")?)
-                .map_err(|e| ReviewError::Other(e.to_string()))?
+            // BOARD-KEYED (B3): `proxy_ref` is optional when `board_id` is given —
+            // the engine resolves the board's own published proxy. Explicit ref wins.
+            let pref = cmd
+                .get("proxy_ref")
+                .and_then(|v| v.as_str())
+                .filter(|p| !p.is_empty());
+            match cmd.get("board_id").and_then(|v| v.as_str()) {
+                Some(board) if !board.is_empty() => {
+                    crate::review_loop::review_media_info_for_board(conn, board, pref)
+                        .map_err(|e| ReviewError::Other(e.to_string()))?
+                }
+                _ => {
+                    let tenant = tenant_or_board(&cmd)?;
+                    crate::review_loop::review_media_info(conn, &tenant, &s("proxy_ref")?)
+                        .map_err(|e| ReviewError::Other(e.to_string()))?
+                }
+            }
         }
         // The app player's confirm gate (BOARD-keyed): approve / reject / edit one
         // proposed entry; when the LAST open agent proposal resolves and the machine
