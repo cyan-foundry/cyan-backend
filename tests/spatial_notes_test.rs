@@ -539,6 +539,54 @@ fn t_v7_junction_broken_adjacency_goes_latent_then_resurfaces() {
 }
 
 // ============================================================================
+// T-VERSION-SPAN — a version-class note does NOT migrate. (Not in the run's
+// list, but `resolve_version` exists, so it gets a test rather than shipping
+// unverified.)
+// ============================================================================
+
+#[test]
+fn t_version_span() {
+    let fm = frames();
+    // "the middle section drags" on v2, with a timeline span and a region — an
+    // encode glitch is a place on a DELIVERABLE, not in any source.
+    let r = EntryRef::version("v2", Some(300), Some(480));
+
+    // On v2 it pins, in the version's own timeline space.
+    match spatial::resolve(&r, None, "v2", &fm, &NoLineage) {
+        Resolution::OnCut { pins } => {
+            assert_eq!(pins.len(), 1);
+            assert_eq!(pins[0].tl_frame, 300);
+            assert!(!pins[0].via_lineage);
+        }
+        other => panic!("a version-class note pins on its own version, got {other:?}"),
+    }
+
+    // On v3 it does NOT migrate — v2 either addressed it or didn't. It lists as
+    // "authored on v2" and pins nowhere. THIS non-migration is the assertion.
+    match spatial::resolve(&r, None, "v3", &fm, &NoLineage) {
+        Resolution::AuthoredOnOtherVersion { authored_on } => {
+            assert_eq!(authored_on, "v2");
+        }
+        other => panic!("a version-class note must NOT migrate to v3, got {other:?}"),
+    }
+
+    // A version-class ref may carry a region (deliverable-artifact defects) and
+    // still append cleanly.
+    let conn = db();
+    let ok = changelist::append(
+        &conn,
+        "master-1",
+        "main",
+        ChangeEntry {
+            referent: Some(r),
+            region: Some(a_region()),
+            ..base_entry("tenant-1", "note", None)
+        },
+    );
+    assert!(ok.is_ok(), "version-class + region is legal: {ok:?}");
+}
+
+// ============================================================================
 // T-OFFCUT-LATENT — listed, queryable, never orphaned; no data change.
 // ============================================================================
 
