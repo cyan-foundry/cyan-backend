@@ -51,7 +51,11 @@ fn op_entry(tenant: &str, asset: &str, op: &str, tc_in: i64, params: serde_json:
         outcome: None,
         updated_at: 0,
         updated_by: None,
-    }
+        referent: None,
+    region: None,
+    intent_struct: None,
+    capture_ctx: None,
+}
 }
 
 // ── round-trip: append → snapshot → get ───────────────────────────────────────

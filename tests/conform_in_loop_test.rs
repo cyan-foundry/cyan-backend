@@ -72,7 +72,11 @@ fn op_entry(op: &str, tc_in: i64, tc_out: Option<i64>, params: serde_json::Value
         outcome: None,
         updated_at: 0,
         updated_by: None,
-    }
+        referent: None,
+    region: None,
+    intent_struct: None,
+    capture_ctx: None,
+}
 }
 
 /// A creative note (kind=note, no op) — must NEVER be conformed.

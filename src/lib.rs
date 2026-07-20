@@ -2900,6 +2900,7 @@ pub mod tests {
     }
 }
 
+pub mod spatial;
 pub mod asset_registry;
 pub mod batch_confirm;
 pub mod changelist;

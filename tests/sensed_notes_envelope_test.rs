@@ -77,7 +77,11 @@ fn ledger_note(source_ref: &str, tc_in: i64) -> ChangeEntry {
         outcome: None,
         updated_at: 0,
         updated_by: None,
-    }
+        referent: None,
+    region: None,
+    intent_struct: None,
+    capture_ctx: None,
+}
 }
 
 #[test]

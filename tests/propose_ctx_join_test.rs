@@ -122,7 +122,11 @@ fn seed_with_note(conn: &Connection, proxy_ref: &str, note_text: &str) {
             outcome: None,
             updated_at: 0,
             updated_by: None,
-        },
+                referent: None,
+        region: None,
+        intent_struct: None,
+        capture_ctx: None,
+},
     )
     .expect("append seed level");
     rv::start_draft(conn, T, MASTER, B).expect("start_draft");

@@ -409,7 +409,11 @@ fn propose(env: &Env) -> Result<()> {
         outcome: None,
         updated_at: 0,
         updated_by: None,
-    };
+        referent: None,
+    region: None,
+    intent_struct: None,
+    capture_ctx: None,
+};
     let proposed = verb(json!({
         "op": "propose_op",
         "asset_hash": master,
