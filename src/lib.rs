@@ -2003,6 +2003,7 @@ pub mod workflow_bind;
 pub mod templates;
 pub mod timecode_notes;
 pub mod changelist;
+pub mod spatial;
 pub mod conform_map;
 pub mod conform_dispatch;
 pub mod review_state;

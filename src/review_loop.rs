@@ -565,7 +565,11 @@ pub fn ingest_sense_result(
             outcome: None,
             updated_at: 0,
             updated_by: None,
-        };
+                referent: None,
+        region: None,
+        intent_struct: None,
+        capture_ctx: None,
+};
         let stored = changelist::append(conn, &master, &version.branch, entry)?;
         if stored.id == minted_id {
             ingest.appended.push(stored);
@@ -949,7 +953,11 @@ fn conform_needs_manual_ask(
         outcome: None,
         updated_at: 0,
         updated_by: None,
-    };
+        referent: None,
+    region: None,
+    intent_struct: None,
+    capture_ctx: None,
+};
     changelist::append(conn, asset_hash, branch, entry)
 }
 
@@ -1083,7 +1091,11 @@ fn escalate_ask(
         outcome: None,
         updated_at: 0,
         updated_by: None,
-    };
+        referent: None,
+    region: None,
+    intent_struct: None,
+    capture_ctx: None,
+};
     changelist::append(conn, asset_hash, branch, entry)
 }
 
@@ -1587,7 +1599,11 @@ pub fn propose_from_note_with(
         outcome: None,
         updated_at: 0,
         updated_by: None,
-    };
+        referent: None,
+    region: None,
+    intent_struct: None,
+    capture_ctx: None,
+};
     review_state::propose_op(conn, asset_hash, branch, entry, review_state::Actor::Agent)
         .map_err(|e| anyhow!("propose_op: {e}"))
 }
@@ -2116,7 +2132,11 @@ fn merge_sensed_notes(
             outcome: None,
             updated_at: 0,
             updated_by: None,
-        });
+                referent: None,
+        region: None,
+        intent_struct: None,
+        capture_ctx: None,
+});
     }
 }
 

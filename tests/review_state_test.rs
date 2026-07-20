@@ -56,7 +56,11 @@ fn op_entry(op: &str, tc_in: i64, params: serde_json::Value, proposed_by: &str) 
         outcome: None,
         updated_at: 0,
         updated_by: None,
-    }
+        referent: None,
+    region: None,
+    intent_struct: None,
+    capture_ctx: None,
+}
 }
 
 fn note_entry(intent: &str) -> ChangeEntry {

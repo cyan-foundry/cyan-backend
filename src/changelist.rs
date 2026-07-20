@@ -145,6 +145,29 @@ pub struct ChangeEntry {
     /// (§6.3: equal clocks ⇒ higher actor id wins).
     #[serde(default)]
     pub updated_by: Option<String>,
+
+    // ── spatial notes (REVIEW_WAIST_SPEC §1–§3) — ADDITIVE, hashed ─────
+    // All three are `skip_serializing_if = "Option::is_none"`: absent = omitted
+    // entirely, null forbidden. An entry without them serializes byte-identically
+    // to before these fields existed, so every pre-region `entry_hash` is
+    // unchanged (T-HASH-BACKCOMPAT).
+    /// What the note is ABOUT (source | junction | entry | version). The legacy
+    /// `asset_hash`/`tc_in`/`tc_out` anchor stays the ledger key and capture
+    /// context; `ref` is the note's identity, and timeline position is DERIVED.
+    #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
+    pub referent: Option<crate::spatial::EntryRef>,
+    /// The spatial seed — exact at `key_frame`, raster-independent, untracked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<crate::spatial::Region>,
+    /// Structured intent (craft + optional payload). Absent = general.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_struct: Option<crate::spatial::IntentStruct>,
+
+    /// Capture-context provenance — what the author was looking at. **Excluded
+    /// from `entry_hash`** (§3): display aids are not identity, so two peers
+    /// capturing the same note with and without a hint dedup to one row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_ctx: Option<crate::spatial::CaptureCtx>,
 }
 
 /// An immutable version snapshot: `master@asset_hash + list_hash`.
@@ -219,8 +242,30 @@ pub fn compute_entry_hash(e: &ChangeEntry) -> String {
         "proposed_by": e.proposed_by,
         "depends_on": e.depends_on,
     });
-    // serde_json::Value serializes object keys in a stable (sorted) order, so this
-    // canonical form is reproducible across processes/peers.
+    // The spatial groups (REVIEW_WAIST_SPEC §3) append after `depends_on`:
+    // `ref`, `region`, `intent_struct`, each OMITTED ENTIRELY when absent (null is
+    // forbidden). This is what keeps every pre-region entry_hash unchanged
+    // (T-HASH-BACKCOMPAT) — with all three absent not a single key is added and
+    // the canonical bytes are exactly what they were before.
+    //
+    // `capture_ctx` is deliberately NOT here: occurrence_hint and the rest are
+    // display aids, not identity, so the same note captured with and without a
+    // hint dedups to one row.
+    let mut canonical = canonical;
+    if let Some(obj) = canonical.as_object_mut() {
+        for (k, v) in crate::spatial::canonical_extra(
+            e.referent.as_ref(),
+            e.region.as_ref(),
+            e.intent_struct.as_ref(),
+        ) {
+            obj.insert(k, v);
+        }
+    }
+    // serde_json::Value serializes object keys in a stable (sorted) order — its
+    // Map is a BTreeMap (no `preserve_order` feature) — so this canonical form is
+    // reproducible across processes/peers, and the nested region/ref objects are
+    // sorted-key by the same mechanism. Region coordinates are fixed-point ints:
+    // no float ever enters hashed content.
     let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
     blake3::hash(&bytes).to_hex().to_string()
 }
@@ -291,7 +336,14 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             version_ref   TEXT,
             outcome       TEXT,
             updated_at    INTEGER NOT NULL DEFAULT 0,
-            updated_by    TEXT
+            updated_by    TEXT,
+            -- spatial notes (REVIEW_WAIST_SPEC §3) — additive, all nullable.
+            -- `ref` is a SQL keyword in some dialects; the column is `ref_json`.
+            ref_json      TEXT,
+            region_json   TEXT,
+            intent_struct_json TEXT,
+            -- capture context: stored, never hashed.
+            capture_ctx_json   TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_ce_asset
             ON change_entry(tenant_id, asset_hash, branch);
@@ -362,6 +414,22 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             "ALTER TABLE change_branch ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
+    }
+    // Spatial notes (REVIEW_WAIST_SPEC §3) — purely additive nullable columns. A
+    // device holding the pre-spatial tables gains them empty, and every entry it
+    // already holds keeps its entry_hash (the groups are omitted, not nulled).
+    for col in [
+        "ref_json",
+        "region_json",
+        "intent_struct_json",
+        "capture_ctx_json",
+    ] {
+        if !has_column(conn, "change_entry", col)? {
+            conn.execute(
+                &format!("ALTER TABLE change_entry ADD COLUMN {col} TEXT"),
+                [],
+            )?;
+        }
     }
     if !has_column(conn, "change_entry", "updated_by")? {
         conn.execute("ALTER TABLE change_entry ADD COLUMN updated_by TEXT", [])?;
@@ -466,6 +534,28 @@ fn validate_entry(e: &ChangeEntry) -> Result<()> {
     {
         return Err(anyhow!("op '{}' not in closed vocab", op));
     }
+    // Spatial groups (REVIEW_WAIST_SPEC §1–§3). `kind` gains no new values: a
+    // region note is `kind=note` + `region`, a frame marker is `kind=marker`.
+    if let Some(r) = &e.referent {
+        r.validate()?;
+    }
+    if let Some(g) = &e.region {
+        g.validate()?;
+        // A region rides on SOURCE-class anchors (and VERSION-class, for
+        // deliverable-artifact defects) — ANNOTATION_TAXONOMY §3.5. A region on a
+        // junction or an entry has no aperture to be normalized in.
+        if let Some(r) = &e.referent
+            && !matches!(r.class.as_str(), "source" | "version")
+        {
+            return Err(anyhow!(
+                "region requires a source- or version-class ref, got '{}'",
+                r.class
+            ));
+        }
+    }
+    if let Some(i) = &e.intent_struct {
+        i.validate()?;
+    }
     Ok(())
 }
 
@@ -504,7 +594,28 @@ fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<ChangeEntry> {
         outcome: row.get("outcome")?,
         updated_at: row.get("updated_at")?,
         updated_by: row.get("updated_by")?,
+        referent: json_col(row, "ref_json")?,
+        region: json_col(row, "region_json")?,
+        intent_struct: json_col(row, "intent_struct_json")?,
+        capture_ctx: json_col(row, "capture_ctx_json")?,
     })
+}
+
+/// Read one optional JSON-encoded spatial column. A NULL column (the common case
+/// — most entries carry none of these) is `None`; malformed JSON is also `None`
+/// rather than a hard read failure, so one bad row can never make an entire
+/// change-list unreadable on a shipping device.
+fn json_col<T: serde::de::DeserializeOwned>(
+    row: &rusqlite::Row,
+    col: &str,
+) -> rusqlite::Result<Option<T>> {
+    let raw: Option<String> = row.get(col)?;
+    Ok(raw.and_then(|s| serde_json::from_str(&s).ok()))
+}
+
+/// Encode an optional spatial group for its column. `None` → SQL NULL.
+fn json_cell<T: Serialize>(v: Option<&T>) -> Option<String> {
+    v.and_then(|x| serde_json::to_string(x).ok())
 }
 
 /// Canonical Blake3 hash of an audit row's content:
@@ -635,9 +746,10 @@ pub fn append(
             id, entry_hash, asset_hash, tenant_id, branch, track, tc_in, tc_out, \
             kind, op, params, intent, source, source_ref, author, role, proposed_by, \
             created_at, state, active, approved_by, approved_at, supersedes, \
-            superseded_by, seq, depends_on, version_ref, outcome) \
+            superseded_by, seq, depends_on, version_ref, outcome, \
+            ref_json, region_json, intent_struct_json, capture_ctx_json) \
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,\
-                 ?20,?21,?22,?23,?24,?25,?26,?27,?28)",
+                 ?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32)",
         params![
             entry.id,
             entry.entry_hash,
@@ -667,6 +779,10 @@ pub fn append(
             entry.depends_on,
             entry.version_ref,
             entry.outcome,
+            json_cell(entry.referent.as_ref()),
+            json_cell(entry.region.as_ref()),
+            json_cell(entry.intent_struct.as_ref()),
+            json_cell(entry.capture_ctx.as_ref()),
         ],
     )?;
     audit(
@@ -1472,9 +1588,10 @@ pub fn apply_entry(conn: &Connection, entry: &ChangeEntry) -> Result<ChangeEntry
             id, entry_hash, asset_hash, tenant_id, branch, track, tc_in, tc_out, \
             kind, op, params, intent, source, source_ref, author, role, proposed_by, \
             created_at, state, active, approved_by, approved_at, supersedes, \
-            superseded_by, seq, depends_on, version_ref, outcome, updated_at, updated_by) \
+            superseded_by, seq, depends_on, version_ref, outcome, updated_at, updated_by, \
+            ref_json, region_json, intent_struct_json, capture_ctx_json) \
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,\
-                 ?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30)",
+                 ?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34)",
         params![
             e.id,
             e.entry_hash,
@@ -1506,6 +1623,14 @@ pub fn apply_entry(conn: &Connection, entry: &ChangeEntry) -> Result<ChangeEntry
             e.outcome,
             e.updated_at,
             e.updated_by,
+            // The spatial groups ride the existing gossip/snapshot lane opaquely —
+            // they are content, so they arrive with the row and dedup by
+            // entry_hash like everything else. `capture_ctx` rides too but is
+            // unhashed: the union key never sees it.
+            json_cell(e.referent.as_ref()),
+            json_cell(e.region.as_ref()),
+            json_cell(e.intent_struct.as_ref()),
+            json_cell(e.capture_ctx.as_ref()),
         ],
     )?;
 
