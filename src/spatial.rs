@@ -598,11 +598,170 @@ pub fn resolve(
     frames: &dyn FrameMapProvider,
     lineage: &dyn LineageProvider,
 ) -> Resolution {
-    let _ = (ctx, version, frames, lineage);
-    // STUB — implemented in the next commit; the §5 tests observe RED against it.
-    Resolution::Latent {
-        reason: format!("unimplemented for class={}", r#ref.class),
+    let hint = ctx.and_then(|c| c.occurrence_hint);
+    match r#ref.class.as_str() {
+        "source" => resolve_source(r#ref, hint, version, frames, lineage),
+        "junction" => resolve_junction(r#ref, hint, version, frames, lineage),
+        "entry" => match &r#ref.about_entry_hash {
+            Some(h) => Resolution::AboutEntry {
+                entry_hash: h.clone(),
+            },
+            None => Resolution::Latent {
+                reason: "entry-class ref without about_entry_hash".to_string(),
+            },
+        },
+        "version" => resolve_version(r#ref, version),
+        other => Resolution::Latent {
+            reason: format!("unknown ref class '{other}'"),
+        },
     }
+}
+
+/// SOURCE class — try the authored asset first, then its lineage descendants;
+/// only when none is on-cut does the note go latent.
+fn resolve_source(
+    r#ref: &EntryRef,
+    hint: Option<i64>,
+    version: &str,
+    frames: &dyn FrameMapProvider,
+    lineage: &dyn LineageProvider,
+) -> Resolution {
+    let Some(src) = &r#ref.src else {
+        return Resolution::Latent {
+            reason: "source-class ref without src payload".to_string(),
+        };
+    };
+    // `lineage_walk` yields the authored asset at depth 0, so the original is
+    // always preferred over a descendant.
+    for d in lineage_walk(lineage, &src.asset_hash, src.frame_in) {
+        let occ = frames.occurrences(version, &d.asset_hash, d.frame);
+        if occ.is_empty() {
+            continue;
+        }
+        // A repeated source range pins at EVERY occurrence; the capture-context
+        // hint marks the authored one (display only — it never forks identity).
+        let pins = occ
+            .iter()
+            .enumerate()
+            .map(|(i, o)| Pin {
+                asset_hash: d.asset_hash.clone(),
+                tl_frame: o.tl_frame,
+                src_frame: o.src_frame,
+                via_lineage: d.depth > 0,
+                authored: hint == Some(i as i64),
+            })
+            .collect();
+        return Resolution::OnCut { pins };
+    }
+    Resolution::Latent {
+        reason: format!(
+            "no lineage descendant of {} is on-cut in {version}",
+            src.asset_hash
+        ),
+    }
+}
+
+/// JUNCTION class — resolves to ALL A→B boundaries in the version. Each side is
+/// matched against its own lineage set, so a re-graded A still forms the seam.
+fn resolve_junction(
+    r#ref: &EntryRef,
+    hint: Option<i64>,
+    version: &str,
+    frames: &dyn FrameMapProvider,
+    lineage: &dyn LineageProvider,
+) -> Resolution {
+    let Some(j) = &r#ref.junction else {
+        return Resolution::Latent {
+            reason: "junction-class ref without junction payload".to_string(),
+        };
+    };
+    let side_set = |s: &SideFrame| -> HashSet<String> {
+        lineage_walk(lineage, &s.asset_hash, s.frame)
+            .into_iter()
+            .map(|d| d.asset_hash)
+            .collect()
+    };
+    let out_set = side_set(&j.out);
+    let in_set = side_set(&j.incoming);
+
+    let mut pins: Vec<JunctionPin> = frames
+        .boundaries(version)
+        .into_iter()
+        .filter(|b| out_set.contains(&b.out.asset_hash) && in_set.contains(&b.incoming.asset_hash))
+        .map(|b| JunctionPin {
+            tl_frame: b.tl_frame,
+            // Drift against the authored frames: "the cut moved +6 since this
+            // note" is `out.frame - authored out.frame`.
+            drift: b.out.frame - j.out.frame,
+            out: b.out,
+            incoming: b.incoming,
+            authored: false,
+        })
+        .collect();
+
+    if pins.is_empty() {
+        // A and B are nowhere adjacent, post-lineage-walk on both sides.
+        return Resolution::Latent {
+            reason: format!(
+                "{} and {} are nowhere adjacent in {version}",
+                j.out.asset_hash, j.incoming.asset_hash
+            ),
+        };
+    }
+    if let Some(h) = hint
+        && let Some(p) = pins.get_mut(h as usize)
+    {
+        p.authored = true;
+    }
+    Resolution::Junction { pins }
+}
+
+/// VERSION class — deliberately does NOT migrate. "v1 drags" is feedback on v1;
+/// v2 either addressed it or didn't. On any other version it lists as
+/// "authored on v_k" rather than pinning somewhere it does not belong.
+fn resolve_version(r#ref: &EntryRef, version: &str) -> Resolution {
+    let Some(v) = &r#ref.version else {
+        return Resolution::Latent {
+            reason: "version-class ref without version payload".to_string(),
+        };
+    };
+    if v.version_id != version {
+        return Resolution::AuthoredOnOtherVersion {
+            authored_on: v.version_id.clone(),
+        };
+    }
+    // Version-class frames are TIMELINE frames of the version itself — there is
+    // no source to map through, which is the whole point of the class.
+    let at = v.tl_frame_in.unwrap_or(0);
+    Resolution::OnCut {
+        pins: vec![Pin {
+            asset_hash: v.version_id.clone(),
+            tl_frame: at,
+            src_frame: at,
+            via_lineage: false,
+            authored: true,
+        }],
+    }
+}
+
+// ============================================================================
+// Proxy-orphan guard (T-PROXY-ORPHAN-GUARD).
+// ============================================================================
+
+/// Refuse a proxy swap inside a live review round.
+///
+/// Re-uploading a proxy mid-round is the known orphaning foot-gun: every comment
+/// anchored to the old proxy's frames is stranded. The rule is that a new proxy
+/// is a NEW ROUND — so the seam refuses the swap and says so.
+pub fn check_proxy_swap(bound_proxy: &str, incoming_proxy: &str, round: i64) -> Result<()> {
+    if bound_proxy == incoming_proxy {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "proxy swap refused: round {round} is bound to proxy '{bound_proxy}', and \
+         swapping in '{incoming_proxy}' would orphan every comment anchored to the \
+         old one — publish a new round instead"
+    ))
 }
 
 // ============================================================================
